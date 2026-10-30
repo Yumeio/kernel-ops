@@ -37,7 +37,7 @@ struct IndexerParams {
  * otherwise ragged prefill keys.
  */
 template <typename DTypeQ, typename DTypeK, int INDEX_HEADS, int INDEX_DIM, bool kPaged, typename ArchTag>
-__global__ void lightning_indexer_kernel(const __grid_constant__ IndexerParams params);
+__global__ void lightning_indexer_kernel(const KOPS_GRID_CONST IndexerParams params);
 
 /**
  * sparse_topk_kernel — exact top-K indices per row of a variable-length fp32 score matrix
@@ -110,7 +110,7 @@ struct SparseMLAParams {
  */
 template <int HEADS_PER_CTA, int TOPK_TILE, typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename ArchTag>
-__global__ void sparse_mla_kernel(const __grid_constant__ SparseMLAParams params);
+__global__ void sparse_mla_kernel(const KOPS_GRID_CONST SparseMLAParams params);
 
 // -----------------------------------------------------------------------------
 // DeepSeek-V4 CSA / HCA
@@ -154,7 +154,7 @@ struct KVCompressorParams {
  * prefill chunks and decode steps produce identical entries (serial/chunk parity test).
  */
 template <typename DTypeIn, typename DTypeCache, int RATIO_M, int ENTRY_DIM, bool kOverlap>
-__global__ void kv_compressor_kernel(const __grid_constant__ KVCompressorParams params);
+__global__ void kv_compressor_kernel(const KOPS_GRID_CONST KVCompressorParams params);
 
 /// Shared-KV MQA over (a) indexed compressed entries and/or (b) all compressed entries and
 /// (c) a sliding-window branch of raw recent tokens, with an attention sink, in ONE softmax.
@@ -183,6 +183,6 @@ struct CompressedAttentionParams {
  */
 template <int HEADS_PER_CTA, int ENTRY_DIM, int VALUE_DIM, typename DTypeQ, typename DTypeKV,
           typename DTypeO, typename ArchTag>
-__global__ void compressed_attention_kernel(const __grid_constant__ CompressedAttentionParams params);
+__global__ void compressed_attention_kernel(const KOPS_GRID_CONST CompressedAttentionParams params);
 
 }  // namespace kops::attn

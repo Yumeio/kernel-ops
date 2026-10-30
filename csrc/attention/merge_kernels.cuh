@@ -60,6 +60,11 @@ __global__ void merge_states_kernel(
  * shared softmax (DeepSeek-V4: compressed sparse / heavily compressed entries + sliding-window
  * branch + sink; Llama-4/Gemma local+global never share a softmax and do not use this).
  * Identical to merge_states but tolerates per-branch head counts mapped by branch_head_map.
+ *
+ * branch_o / branch_lse are host arrays of device pointers (one per branch). Graph capture
+ * requires them to be pinned, at a stable address, and unchanged between capture and replay;
+ * a caller that rebuilds the array per step must use the device-pointer variant instead
+ * (TODO A14b) or recapture. Anchors are validated by the launcher (null branch = absent).
  */
 template <typename DTypeO, int HEAD_DIM, int VEC_SIZE, int MAX_BRANCHES>
 __global__ void merge_hybrid_branches_kernel(

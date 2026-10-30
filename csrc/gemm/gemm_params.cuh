@@ -95,6 +95,9 @@ struct ScaledOperand {
   const int32_t* g_idx = nullptr;       // GPTQ act-order group index [K]
   const int32_t* perm = nullptr;        // K permutation (GPTQ desc_act) applied consistently to A and B
   const void* second_level = nullptr;   // two-level scales (QServe int8 channel scales, NF4 double-quant)
+  // Encoding of the payload when dtype is an FP8 type. FNUZ (AMD gfx94x) and OCP
+  // (NVIDIA / OCP checkpoints) are different formats, not different names.
+  Fp8Encoding fp8 = Fp8Encoding::kOCP;
 };
 
 // -----------------------------------------------------------------------------
@@ -161,7 +164,11 @@ struct EpilogueParams {
 // Problem / arguments
 // -----------------------------------------------------------------------------
 
-/// Static description used for capability lookup / tactic selection.
+/// Static description used for capability lookup / tactic selection. The quant
+/// fields here describe what the *tactic search* must satisfy; the authoritative
+/// per-call pointers/scales/layouts live in ScaledOperand/ScaledGemmArgs. When the
+/// two disagree the launcher rejects with kInvalidArgument (never silently
+/// prefers one), so callers must build both from the same descriptor.
 struct GemmProblem {
   int64_t m = 0, n = 0, k = 0;
   int32_t batch = 1;                       // strided batched (MLA absorption bmm)
@@ -192,6 +199,9 @@ struct GemmArgs {
   const int32_t* b_azp_adj = nullptr;              // precomputed sum_k(B) * azp correction [N]
   EpilogueParams epi;
   int32_t split_k = 1;                             // >1 uses fp32 workspace + splitk_reduce_kernel
+  // DEPRECATED (ABI v2): pass workspace through the `const Workspace&` argument
+  // of the launcher instead. These two fields remain only so adapters that
+  // pre-build GemmArgs keep compiling; a non-null workspace here is an error.
   void* workspace = nullptr;                       // device scratch from WorkspaceRequirements
   size_t workspace_bytes = 0;
   int32_t* locks = nullptr;                        // Marlin / stream-K inter-CTA locks (zeroed, epoch-tagged)
@@ -211,7 +221,10 @@ struct ScaledGemmArgs {
   GemmRecipe recipe = GemmRecipe::kBF16;
   Fp8Accum fp8_accum = Fp8Accum::kPromoted;
   int32_t fp8_promotion_k = 128;         // K elements between fp32 promotions (kPromoted)
-  void* workspace = nullptr;             // split-K partials, stream-K fix-up, locks
+  // Authoritative workspace for split-K partials / stream-K fix-up / locks. Kept in
+  // the args (not a separate parameter) because the tactic decides the size; the
+  // launcher still validates it against gemm_workspace_requirements().
+  void* workspace = nullptr;
   size_t workspace_bytes = 0;
   uint32_t epoch = 0;                    // epoch for semaphores / locks (graph replay safe)
 };
@@ -273,14 +286,14 @@ struct GemmTactic {
 // -----------------------------------------------------------------------------
 
 /// Tensor maps are encoded on the host at plan time (cuTensorMapEncodeTiled), or patched on
-/// device per group for grouped GEMM (grouped_gemm_prepare_kernel). Passed as __grid_constant__.
+/// device per group for grouped GEMM (grouped_gemm_prepare_kernel). Passed as KOPS_GRID_CONST.
 struct GemmTmaParams {
-  CUtensorMap tma_a;           // A tiles (FP4 operands for kind::mxf8f6f4 use the padded 4->8-bit TMA mode)
-  CUtensorMap tma_b;
-  CUtensorMap tma_sfa;         // block scale factors of A (block-scaled recipes)
-  CUtensorMap tma_sfb;
-  CUtensorMap tma_c;           // source C / residual (TMA load in epilogue)
-  CUtensorMap tma_d;           // TMA store of D
+  KOPS_TMA_DESC tma_a;           // A tiles (FP4 operands for kind::mxf8f6f4 use the padded 4->8-bit TMA mode)
+  KOPS_TMA_DESC tma_b;
+  KOPS_TMA_DESC tma_sfa;         // block scale factors of A (block-scaled recipes)
+  KOPS_TMA_DESC tma_sfb;
+  KOPS_TMA_DESC tma_c;           // source C / residual (TMA load in epilogue)
+  KOPS_TMA_DESC tma_d;           // TMA store of D
   ScaledGemmArgs args;         // raw pointers + scalars (epilogue inputs, fallbacks)
   int32_t num_tiles_m, num_tiles_n, num_tiles_k;
   uint32_t* tile_counter;      // dynamic persistent scheduler / CLC fallback (epoch-tagged)
@@ -309,6 +322,10 @@ struct GemmTraits {
 };
 
 /// Backend implementing a capability (recorded in the registry, never inferred).
+/// kAuto is a *selector*, not a provider: it is resolved by the registry into one
+/// of the concrete values below before any kernel is chosen, and never appears in
+/// a registry row. registry::Provider is the ABI-stable union of these values plus
+/// providers that only implement non-GEMM ops.
 enum class GemmBackend : uint8_t {
   kNative = 0,       // kernels declared in csrc/gemm/*.cuh
   kCublasLt = 1,     // dense BF16/FP16/TF32; FP8 scale modes as supported by the installed cuBLASLt
@@ -318,6 +335,9 @@ enum class GemmBackend : uint8_t {
   kMarlin = 5,
   kMachete = 6,
   kTriton = 7,
+  kHipblasLt = 8,    // AMD: hipBLASLt (BF16/FP16/FP8 on gfx942/gfx950)
+  kCk = 9,           // AMD: Composable Kernel (MFMA mainloops, block-scaled on gfx950)
+  kAiter = 10,       // AMD: AITER kernels (attention/MoE the way FlashInfer is on NVIDIA)
   kAuto = 255,       // registry picks among release-supported candidates
 };
 

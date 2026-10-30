@@ -13,12 +13,17 @@ namespace kops::comm {
 inline constexpr int kMaxRanks = 16;
 
 /// Peer-mapped buffers of one communicator (prepared by the engine's handle exchange).
+/// kMaxRanks is the maximum ranks *in one group* (intra-node NVLink domain or one
+/// multi-node group). Multi-node groups also set num_nodes/node_rank; the transport
+/// (NVLink P2P, NVSHMEM/IBGDA RDMA, mscclpp) is described by EPBuffers/RankGroup, not here.
 struct PeerBuffers {
   void* data[kMaxRanks];           // each rank's staging buffer, mapped into this process
   uint32_t* flags[kMaxRanks];      // per-rank signal arrays (epoch-tagged)
   void* multicast_ptr;             // NVLS multicast address (SM90+ with NVSwitch) or null
   int32_t rank;
   int32_t world_size;
+  int32_t num_nodes;               // 1 = intra-node only
+  int32_t node_rank;
   size_t buffer_bytes;
 };
 
@@ -26,7 +31,10 @@ enum class AllReduceAlgo : uint8_t {
   kOneShot = 0,        // every rank reads all peers (small messages)
   kTwoShot = 1,        // reduce-scatter + all-gather (medium)
   kLamportOneShot = 2, // flag-free Lamport (-0.0 sentinel) triple buffering (TRT-LLM style, lowest latency)
-  kMultimem = 3,       // multimem.ld_reduce / st on NVSwitch (H100/B200 NVL)
+                       //   Requires a floating-point T: the -0.0 sentinel is not representable for integers.
+  kMultimem = 3,       // multimem.ld_reduce / st on NVSwitch (H100/B200 NVL); CUDA only
+  kQuickReduce = 4,    // block-scaled quantized reduction (FP8/INT8 payload + fp32 block scale)
+  kDeterministic = 5,  // fixed reduction order regardless of arrival order (batch-invariant rollouts)
 };
 
 /**
@@ -60,7 +68,7 @@ struct AllReduceFusionParams {
  * boundary (HPC-Ops fused allreduce-RMSNorm, TRT-LLM allreduce fusion). Supports PDL.
  */
 template <typename T, int WORLD_SIZE, AllReduceAlgo kAlgo, ActQuantMode kQuant>
-__global__ void allreduce_fusion_kernel(const __grid_constant__ AllReduceFusionParams params);
+__global__ void allreduce_fusion_kernel(const KOPS_GRID_CONST AllReduceFusionParams params);
 
 /// all-gather along dim 0 (vocab-parallel logits, sequence parallel, AttnRes SP sharding).
 template <typename T, int WORLD_SIZE>

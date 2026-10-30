@@ -52,14 +52,14 @@ struct FusedMoEGemmParams {
  */
 template <typename a_t, typename w_t, typename c_t, int BLOCK_M, int BLOCK_N, int BLOCK_K, int STAGES,
           typename ArchTag>
-__global__ void fused_moe_gemm_kernel(const __grid_constant__ FusedMoEGemmParams params);
+__global__ void fused_moe_gemm_kernel(const KOPS_GRID_CONST FusedMoEGemmParams params);
 
 /**
  * moe_gemv_kernel — decode MoE (num_tokens * topk small): one CTA per (slot, N-tile) streams the
  * selected expert's rows once. Weight bandwidth bound; supports bf16 / fp8 block / int4 / fp4.
  */
 template <typename a_t, typename w_t, typename c_t, int SLOTS_PER_CTA, int ROWS_PER_WARP, int WARPS>
-__global__ void moe_gemv_kernel(const __grid_constant__ FusedMoEGemmParams params);
+__global__ void moe_gemv_kernel(const KOPS_GRID_CONST FusedMoEGemmParams params);
 
 /// Whole-layer description consumed by the host orchestrator moe_forward() in ops.h.
 struct MoELayerParams {
@@ -127,7 +127,7 @@ __global__ void latent_moe_combine_norm_kernel(
  * per-group scales, unpacked to FP8/BF16 in registers. Opt-in only; quality gate first.
  */
 template <typename a_t, typename c_t, int BLOCK_M, int BLOCK_N, int GROUP_SIZE>
-__global__ void moe_w2_gemm_kernel(const __grid_constant__ FusedMoEGemmParams params);
+__global__ void moe_w2_gemm_kernel(const KOPS_GRID_CONST FusedMoEGemmParams params);
 
 /// Pack an MXFP4 / bf16 expert tensor into the experimental W2 layout (offline).
 __global__ void moe_w2_pack_kernel(

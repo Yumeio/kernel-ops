@@ -70,7 +70,7 @@ struct ActMulQuantParams {
  * Skips padded / masked rows (no NaN from garbage), matching HPC-Ops masked act_mul_and_quant.
  */
 template <typename scalar_t, ActFn kAct, GateLayout kLayout, ActQuantMode kMode, int VEC_SIZE>
-__global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantParams params);
+__global__ void act_and_mul_quant_kernel(const KOPS_GRID_CONST ActMulQuantParams params);
 
 /**
  * gate_mul_kernel — out = x * act(gate) with broadcast of the gate.

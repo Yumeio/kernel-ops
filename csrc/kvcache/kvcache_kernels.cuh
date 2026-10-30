@@ -122,10 +122,13 @@ struct FusedQKVAppendParams {
  *   q <- RoPE(Norm(q)) [-> FP8];  k <- codec(RoPE(Norm(k))) -> cache;  v <- codec(v) -> cache
  * Models : Qwen3/3.5 family, Gemma 3, GLM-4.5, Llama 2/3 (no norm), Mistral, Phi, GPT-OSS
  *          (no norm, sinks handled in attention), HPC-Ops rope_norm_store_kv equivalent.
- * Numerics must match the unfused chain bit-for-bit in fp32 order (norm -> rope -> round once).
+ * Numerics: the fused path keeps y in fp32 from the norm through the RoPE rotation and
+ * rounds once at the cache store. The unfused reference rounds the normalized value to
+ * bf16/fp16 before RoPE, so the two are NOT bit-identical: tolerance is that of one
+ * rounding (see docs/CONTRACTS.md, "fused chain" row), verified by a golden test.
  */
 template <typename scalar_t, typename cache_t, int HEAD_DIM, KVCodec kCodec, KVLayout kLayout, bool kHasNorm>
-__global__ void fused_qkv_norm_rope_append_kernel(const __grid_constant__ FusedQKVAppendParams params);
+__global__ void fused_qkv_norm_rope_append_kernel(const KOPS_GRID_CONST FusedQKVAppendParams params);
 
 /**
  * ring_kv_append_kernel — per-sequence ring buffer for sliding-window layers: position p is written

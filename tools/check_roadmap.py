@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Check that docs/ROADMAP.md assigns every __global__ kernel in csrc/ to exactly one step.
+"""Check the ROADMAP assigns every __global__ kernel in csrc/ to exactly one step, and that
+kernel source files follow the naming policy.
 
 Rules
   * A step is a level-2 heading `## B<n> ...`. Any other level-2 heading ends the step.
@@ -7,9 +8,13 @@ Rules
     `_kernel` in the second column are the kernels that step introduces (first native version).
   * Instantiation tables (other header rows) and prose are ignored, so a kernel may be
     mentioned anywhere else without counting.
+  * The roadmap is ROADMAP.md at the repo root when present, else docs/ROADMAP.md.
+  * File naming (§1.5): a `.cu` name must not end in `_part<N>` / `_v<N>`, and its stem must
+    appear in Phụ lục E.2 (the closed catalog). This is what keeps the "no part2/part3"
+    rule enforceable instead of aspirational.
 
-Exit code 1 on: a declared kernel not assigned, a kernel assigned twice, or an assigned name
-that no header declares. Prints per-step counts (used for the overview table).
+Exit code 1 on: a declared kernel not assigned, a kernel assigned twice, an assigned name
+that no header declares, a banned file name, or a `.cu` outside E.2.
 """
 import pathlib
 import re
@@ -40,7 +45,7 @@ def assigned_kernels(markdown):
         if line.startswith("## "):
             step, in_table = None, False
             continue
-        if line.startswith("| Header | Kernel |"):
+        if line.startswith(("| Header | Kernel |", "| File | Kernel |")):
             in_table = step is not None
             continue
         if not in_table:
@@ -56,8 +61,30 @@ def assigned_kernels(markdown):
     return result, order
 
 
+ORDINAL_RE = re.compile(r"_(part|v)[0-9]+$")
+
+
+def source_name_problems(roadmap_text):
+    """Enforce the §1.5 naming policy on every .cu under csrc/."""
+    problems = []
+    if "### E.2" in roadmap_text and "### E.3" in roadmap_text:
+        catalog = roadmap_text.split("### E.2")[1].split("### E.3")[0]
+    else:
+        catalog = roadmap_text
+    for path in sorted((ROOT / "csrc").rglob("*.cu")):
+        stem = path.stem
+        rel = path.relative_to(ROOT).as_posix()
+        if ORDINAL_RE.search(stem):
+            problems.append(f"{rel}: ordinal suffix is banned; use a concern name (ROADMAP 1.5)")
+        if f"`{stem}`" not in catalog:
+            problems.append(f"{rel}: stem '{stem}' is not in ROADMAP Appendix E.2")
+    return problems
+
+
 def main():
-    roadmap = ROOT / "docs" / "ROADMAP.md"
+    roadmap = ROOT / "ROADMAP.md"
+    if not roadmap.exists():
+        roadmap = ROOT / "docs" / "ROADMAP.md"
     declared = declared_kernels()
     assigned, order = assigned_kernels(roadmap.read_text(encoding="utf-8"))
 
@@ -89,6 +116,12 @@ def main():
         print("NOT DECLARED IN ANY HEADER:")
         for name in unknown:
             print(f"  {name}")
+    name_problems = source_name_problems(roadmap.read_text(encoding="utf-8"))
+    if name_problems:
+        ok = False
+        print("BAD SOURCE FILE NAMES:")
+        for problem in name_problems:
+            print(f"  {problem}")
     print("OK" if ok else "FAILED")
     return 0 if ok else 1
 

@@ -28,5 +28,11 @@ Status mega_run_attention_block(const MegaPlan& plan, const MegaAttentionBlockPa
 Status mega_run_moe_local(const MegaPlan& plan, const MegaMoELocalParams& params,
                           const LaunchContext& ctx);
 Status mega_run_moe_ep(const MegaPlan& plan, const MegaMoEEPParams& params, const LaunchContext& ctx);
+/// E08 (experimental): a whole decoder layer as one DAG. Requires a plan prepared with
+/// MegaKind::kDecoder and the attention/MLP/MoE parameter blocks describing the same
+/// layer; the plan's num_device_launches includes any reset/copy outside the kernel.
+Status mega_run_decoder(const MegaPlan& plan, const MegaAttentionBlockParams& attn,
+                        const MegaMLPParams& mlp, const MegaMoELocalParams& moe,
+                        const LaunchContext& ctx);
 
 }  // namespace kops::mega

@@ -6,6 +6,15 @@
 // Every flag protocol carries an epoch so counters never need a host reset
 // between graph replays.
 // Requires: common/macros.cuh.
+//
+// Backend contract (ABI v2):
+//   CUDA : full contract as documented below.
+//   HIP  : acquire/release map to s_waitcnt + __threadfence_block/device. The
+//          async-proxy fence, cluster barrier and programmatic dependent launch
+//          do not exist. They are no-ops that PRESERVE ORDERING (the release/
+//          acquire pairs around them still hold) but provide NO overlap: a plan
+//          that requests PDL on HIP must be rejected by the launcher
+//          (kUnsupportedBackend), never silently serialized.
 // =============================================================================
 
 namespace kops {
@@ -32,8 +41,11 @@ KOPS_DEVICE void wait_epoch_count(const uint32_t* counter, uint32_t epoch, uint3
 KOPS_DEVICE void signal_epoch_count(uint32_t* counter, uint32_t epoch);
 
 /// fence.proxy.async (make generic-proxy writes visible to TMA / async proxy).
+/// HIP: no-op (single generic proxy); ordering is already covered by release/acquire.
 KOPS_DEVICE void fence_proxy_async();
 /// Cluster-wide barrier (barrier.cluster.arrive + wait), SM90+.
+/// HIP: no-op when KOPS_HAS_CLUSTERS == 0; callers must not build a protocol that
+/// depends on it there (kUnsupportedBackend at plan time).
 KOPS_DEVICE void cluster_sync();
 
 // ---- Programmatic Dependent Launch (SM90+, no-op elsewhere) --------------------

@@ -75,6 +75,10 @@ struct QuantScheme {
   DType storage_dtype = DType::kInvalid;   // payload element type
   DType scale_dtype = DType::kFloat32;     // f32 | bf16 | e4m3 (NVFP4) | ue8m0 (MX)
   DType zero_dtype = DType::kInvalid;      // kInvalid = symmetric
+  // FP8 interpretation of the payload. Only meaningful for kFloat8E4M3 /
+  // kFloat8E5M2; FNUZ payloads set DType::kFloat8E4M3FNUZ and enc == kFNUZ.
+  // Never infer the encoding from the backend: a gfx94x reader must be told.
+  Fp8Encoding fp8 = Fp8Encoding::kOCP;
   ScaleGranularity granularity = ScaleGranularity::kNone;
   ScaleLayout scale_layout = ScaleLayout::kRowMajor;
   WeightPacking packing = WeightPacking::kNone;
@@ -120,6 +124,8 @@ struct ActQuantOut {
   int32_t group_size = 0;               // 128 (per-group), 32 (MX), 16 (NVFP4)
   bool scale_ue8m0 = false;             // round per-group scales up to powers of two
   bool symmetric = true;
+  // Encoding of the payload when q_dtype is an FP8 type (see common/dtype.cuh).
+  Fp8Encoding fp8 = Fp8Encoding::kOCP;
 };
 
 /// Physical bytes for a quantized tensor of `rows x cols` incl. scales, zero points,

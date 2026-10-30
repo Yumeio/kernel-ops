@@ -8,6 +8,13 @@
 
 namespace kops::kv {
 
+/// Cross-check a PagedKVDesc for internal consistency before it reaches a kernel:
+/// stride_unit vs entry_bytes, codec vs dtype/fp8 encoding, page_size > 0,
+/// head_dim_k/v vs entry_bytes, CSR vs block-table fields, scale pointer strides.
+/// Returns the first violation found and fills last_error_message(). Never reads
+/// device memory, so it is safe before capture.
+Status kv_desc_validate(const PagedKVDesc& desc);
+
 // ---- K01 writes -------------------------------------------------------------------------
 /// Dispatches to reshape_and_cache_flash_kernel (NHD/HND) or reshape_and_cache_legacy_kernel
 /// (KVLayout::kVllmLegacy) or the per-token-quant kernel, by cache.layout / cache.k_codec.

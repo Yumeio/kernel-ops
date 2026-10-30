@@ -48,7 +48,14 @@ enum class KVCodec : uint8_t {
                           //   page = [page_size x head_dim e4m3 | page_size x (head_dim / quant_block) fp32 scales]
                           //   (scales follow all keys of the page, they are NOT interleaved per token)
   kIndexerFP4 = 11,       // DeepSeek-V4 FP4 indexer QK path (same split-page idea, e2m1 + block scales)
+  kMLAFp8DSFNUZ = 12,     // Same 656 B record as kMLAFp8DS but e4m3fnuz (max 240, bias 8) and
+                          //   scale exponent base 240, required by AMD gfx94x readers. A record
+                          //   written as kMLAFp8DS must never be read as kMLAFp8DSFNUZ.
 };
+
+// Unit of the PagedKVDesc stride fields is kops::StrideUnit (common/macros.cuh):
+// entry_bytes != 0 => k_stride_* are bytes and stride_unit must be kByte;
+// otherwise they are elements. kv_desc_validate() enforces this.
 
 /// Paged KV cache descriptor (one attention layer).
 struct PagedKVDesc {
@@ -58,6 +65,10 @@ struct PagedKVDesc {
   DType v_dtype = DType::kBFloat16;
   KVCodec k_codec = KVCodec::kNative;
   KVCodec v_codec = KVCodec::kNative;
+  // FP8 interpretation of the payload when k_dtype/v_dtype is an FP8 type.
+  // kMLAFp8DS implies kOCP and kMLAFp8DSFNUZ implies kFNUZ; any other mismatch
+  // is rejected by kv_desc_validate().
+  Fp8Encoding fp8 = Fp8Encoding::kOCP;
   KVLayout layout = KVLayout::kNHD;
   int32_t page_size = 16;          // tokens per page (1, 16, 32, 64, 128, 256)
   int32_t num_kv_heads = 0;        // local kv heads (1 for MLA / MQA)
@@ -65,6 +76,8 @@ struct PagedKVDesc {
   int32_t head_dim_v = 0;          // e.g. 128; MLA: 512 (reads first 512 of the same entry)
   int32_t entry_bytes = 0;         // bytes per (token, head) record incl. inline scales; 0 = dense dtype
   int32_t legacy_x = 0;            // kVllmLegacy: elements per 16-byte K vector (8 for bf16, 16 for fp8)
+  // Unit of the four stride fields below. entry_bytes != 0 => kByte.
+  StrideUnit stride_unit = StrideUnit::kElement;
   int64_t k_stride_page = 0;       // elements (or bytes when entry_bytes != 0) between pages ("block_stride")
   int64_t k_stride_token = 0;      // "page_stride" in vLLM flash terms (between tokens of a page)
   int64_t k_stride_head = 0;

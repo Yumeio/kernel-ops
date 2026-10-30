@@ -7,6 +7,7 @@
 // contain no #include directives.
 // =============================================================================
 #pragma once
+#define KOPS_CUDA_HOST_SHIM 1
 #include <cstddef>
 #include <cstdint>
 

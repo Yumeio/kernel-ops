@@ -65,7 +65,7 @@ struct RouterParams {
  * NUM_EXPERTS = 0 selects the generic runtime-E path (slower; for unusual E).
  */
 template <typename logits_t, RouterScore kScore, int NUM_EXPERTS, int MAX_TOPK>
-__global__ void moe_topk_kernel(const __grid_constant__ RouterParams params);
+__global__ void moe_topk_kernel(const KOPS_GRID_CONST RouterParams params);
 
 /**
  * moe_grouped_topk_kernel — group-limited routing:
@@ -76,7 +76,7 @@ __global__ void moe_topk_kernel(const __grid_constant__ RouterParams params);
  *          GLM-4.5 (n_group = 1 reduces to moe_topk_kernel with bias), MiniMax-M2.
  */
 template <typename logits_t, RouterScore kScore, int NUM_EXPERTS, int NUM_GROUPS, int MAX_TOPK>
-__global__ void moe_grouped_topk_kernel(const __grid_constant__ RouterParams params);
+__global__ void moe_grouped_topk_kernel(const KOPS_GRID_CONST RouterParams params);
 
 /**
  * moe_hash_route_kernel — hash routing (Roller et al. 2021): experts chosen from the token id,
@@ -100,7 +100,7 @@ __global__ void moe_hash_route_kernel(
  */
 template <typename x_t, typename w_t, RouterScore kScore, int NUM_EXPERTS, int NUM_GROUPS, int MAX_TOPK>
 __global__ void moe_fused_router_topk_kernel(
-    const __grid_constant__ RouterParams params,
+    const KOPS_GRID_CONST RouterParams params,
     const x_t* __restrict__ hidden,           // [num_tokens, hidden]
     const int64_t hidden_stride,
     const w_t* __restrict__ router_weight,    // [num_experts, hidden]

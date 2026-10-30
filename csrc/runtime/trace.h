@@ -21,13 +21,20 @@ struct TraceConfig {
 struct TraceRecord {
   const char* op_id;
   uint64_t kernel_id;
-  const char* shape_key;           // canonical shape / dtype / layout string
+  const char* shape_key;           // canonical shape / dtype / layout string; owned by the tracer
+                                   // (interned at trace_configure, stable until the next configure)
   int32_t num_launches;
   float plan_ms;                   // host planning time
   float kernel_ms;                 // GPU time of the kernel(s)
   float total_ms;                  // incl. reset / copy / routing / merge launches
   size_t scratch_bytes, persistent_bytes, pinned_bytes;
   double max_abs_err, rms_err;     // filled by numerics harness, NaN otherwise
+  // Roofline inputs: what the kernel actually moved and computed, so a benchmark
+  // can report achieved bandwidth / TFLOPS instead of only elapsed time.
+  int64_t bytes_moved;             // logical traffic (weights + KV + IO), 0 = unknown
+  double flops;                    // 0 = unknown
+  double achieved_bytes_per_s;     // 0 when bytes_moved or kernel_ms is 0
+  double achieved_flops;           // 0 when flops or kernel_ms is 0
 };
 
 Status trace_configure(const TraceConfig& cfg);

@@ -6,6 +6,12 @@
 
 namespace kops::sample {
 
+/// Workspace for one sample() call: the CTAS_PER_ROW softmax state when the vocabulary
+/// is split, plus the per-row rejection-sampling scratch. Callers must query this
+/// before reserving (the sampler may switch split counts by vocab size).
+Status sampling_workspace_requirements(int32_t max_batch, int32_t max_vocab, int32_t ctas_per_row,
+                                       WorkspaceRequirements* out);
+
 /// One-call sampler: (optional processors already applied) -> greedy rows via argmax, others via
 /// top-k/top-p/min-p rejection sampling or Gumbel-max, chosen per capability. Device outputs only.
 Status sample(const Tensor& out_ids, const Tensor& logits, const SamplingParams& params,

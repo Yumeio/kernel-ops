@@ -50,7 +50,7 @@ struct AttnResParams {
  * RMSNorm + quantization. Bitwise independent of batch composition.
  */
 template <typename scalar_t, int MAX_SOURCES, int VEC_SIZE, ActQuantMode kQuant>
-__global__ void attn_res_kernel(const __grid_constant__ AttnResParams params);
+__global__ void attn_res_kernel(const KOPS_GRID_CONST AttnResParams params);
 
 /**
  * attn_res_commit_kernel — at a block boundary: copy partial into source slot `slot`, compute and

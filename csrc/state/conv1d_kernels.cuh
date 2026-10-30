@@ -36,7 +36,7 @@ struct Conv1dFwdParams {
  * Launch : grid = (B, ceil(dim / CHANNELS_PER_CTA), num_token_chunks), block = kNThreads.
  */
 template <typename input_t, typename weight_t, int kWidth, int kNThreads, bool kChannelLast>
-__global__ void causal_conv1d_fwd_kernel(const __grid_constant__ Conv1dFwdParams params);
+__global__ void causal_conv1d_fwd_kernel(const KOPS_GRID_CONST Conv1dFwdParams params);
 
 /// Arguments of causal_conv1d_update_kernel (decode, 1..k tokens per sequence).
 struct Conv1dUpdateParams {
@@ -60,6 +60,6 @@ struct Conv1dUpdateParams {
 
 /// causal_conv1d_update_kernel — decode-time conv with in-place state update.
 template <typename input_t, typename weight_t, int kWidth, int kNThreads>
-__global__ void causal_conv1d_update_kernel(const __grid_constant__ Conv1dUpdateParams params);
+__global__ void causal_conv1d_update_kernel(const KOPS_GRID_CONST Conv1dUpdateParams params);
 
 }  // namespace kops::state

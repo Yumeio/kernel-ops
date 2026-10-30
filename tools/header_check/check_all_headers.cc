@@ -89,5 +89,10 @@
 #include "csrc/mega/ops.h"
 #include "csrc/runtime/registry.h"
 #include "csrc/runtime/trace.h"
+// 11. host-only service families
+#include "csrc/memory/ops.h"
+#include "csrc/load/ops.h"
+#include "csrc/backends/ops.h"
+#include "csrc/reference/ops.h"
 
 int main() { return 0; }

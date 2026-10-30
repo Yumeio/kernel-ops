@@ -30,8 +30,10 @@ Status gemm_workspace_requirements(const GemmProblem& problem, const GemmTactic*
                                    WorkspaceRequirements* out);
 
 // ---- G01 dense 16/32-bit -------------------------------------------------------------
+/// Workspace is passed explicitly (not through GemmArgs) so every family has one
+/// convention: query gemm_workspace_requirements(), then pass the same lease here.
 Status gemm(const GemmProblem& problem, const GemmArgs& args, GemmBackend backend,
-            const LaunchContext& ctx);
+            const Workspace& ws, const LaunchContext& ctx);
 Status gemm_with_tactic(const ScaledGemmArgs& args, const GemmTactic& tactic, const Workspace& ws,
                         const LaunchContext& ctx);
 Status dual_gemm(const DualGemmParams& params, DType dtype, const LaunchContext& ctx);
@@ -68,7 +70,10 @@ Status gguf_gemm(const Tensor& out, const Tensor& a, const Tensor& qweight, GGUF
 Status lut_gemv(const Tensor& out, const Tensor& a, const Tensor& qweight, const Tensor& codebook,
                 const Tensor& absmax, const Tensor& absmax_scale, const Tensor& absmax_offset,
                 int32_t block_size, const LaunchContext& ctx);
-/// Legacy flat block-scaled entry (adapters).
+/// Legacy flat adapter entry (BlockScaledGemmParams). It is a thin alias: the call is
+/// validated against the same recipe rules and dispatched to fp4_gemm_tcgen05_kernel
+/// (SM100a/103a) or fp4_gemm_sm120_kernel (SM120a/121a). There is no separate kernel
+/// and no separate header; NVFP4 != MXFP4 (scale dtype, block size, global scale).
 Status block_scaled_gemm(const BlockScaledGemmParams& params, GemmBackend backend,
                          const LaunchContext& ctx);
 

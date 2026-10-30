@@ -29,10 +29,10 @@ struct LinearAttentionParams {
 
 /// Chunked prefill (block_size 64..256): intra-block with decay mask + state passing.
 template <typename input_t, int HEAD_DIM, int BLOCK>
-__global__ void lightning_attention_prefill_kernel(const __grid_constant__ LinearAttentionParams params);
+__global__ void lightning_attention_prefill_kernel(const KOPS_GRID_CONST LinearAttentionParams params);
 
 /// Decode: per (sequence, head) state update and readout.
 template <typename input_t, int HEAD_DIM, int BLOCK_V>
-__global__ void linear_attention_decode_kernel(const __grid_constant__ LinearAttentionParams params);
+__global__ void linear_attention_decode_kernel(const KOPS_GRID_CONST LinearAttentionParams params);
 
 }  // namespace kops::state
