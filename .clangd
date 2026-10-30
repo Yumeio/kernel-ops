@@ -1,0 +1,59 @@
+# Generate this database on each machine (never share absolute include paths):
+#   python tools/gen_compile_commands.py
+# Ninja supports compile_commands.json on Windows and Linux; Visual Studio does not.
+CompileFlags:
+  CompilationDatabase: build-clangd
+
+Completion:
+  # CUDA/PyTorch headers can depend on include order.
+  HeaderInsertion: Never
+
+Diagnostics:
+  # CUDA wrappers and dispatch macros make include-cleaner suggestions unreliable.
+  UnusedIncludes: None
+  MissingIncludes: None
+
+---
+# Paths in project fragments are relative and use '/' even on Windows.
+# CompileFlags must be a sibling of If, not nested inside it.
+If:
+  PathMatch: '.*\.(cu|cuh)'
+CompileFlags:
+  Compiler: clang++
+  # Preserve include paths and definitions from CMake, remove NVCC-only options.
+  # CMake/project options here use joined arguments (-gencode=..., -Xcompiler=...).
+  Remove:
+    - '--generate-code*'
+    - '-gencode*'
+    - '--expt-*'
+    - '-expt-*'
+    - '--extended-lambda'
+    - '--use_fast_math'
+    - '-use_fast_math'
+    - '--generate-line-info'
+    - '-lineinfo'
+    - '--ptxas-options*'
+    - '-Xptxas*'
+    - '--compiler-options*'
+    - '-Xcompiler*'
+    - '--threads*'
+    - '--forward-unknown-to-host-compiler'
+    - '-forward-unknown-to-host-compiler'
+    - '--allow-unsupported-compiler'
+    - '-allow-unsupported-compiler'
+    - '-diag-suppress*'
+    - '--diag-suppress*'
+  Add:
+    - '-xcuda'
+    - '-std=c++20'
+    # Parse one portable target rather than NVCC's multi-architecture fat binary.
+    - '--cuda-gpu-arch=sm_80'
+    - '-Wno-unknown-cuda-version'
+    - '-Xclang'
+    - '-fcuda-allow-variadic-functions'
+
+---
+If:
+  PathMatch: '(build[^/]*/.*|cutlass/.*|third_party/.*|\.venv/.*)'
+Index:
+  Background: Skip
