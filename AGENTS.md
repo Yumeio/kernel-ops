@@ -185,18 +185,29 @@ proves the C ABI header is self-contained. The last one checks that every declar
 `__global__` kernel is assigned to exactly one ROADMAP step. `g++` can replace
 `clang++`, and `gcc`/`cc` can replace `clang` for the C check.
 
-Build and run the implemented kernels (needs CUDA toolkit; `native` targets the
-local GPU, or pass an explicit exact-target list):
+Build and run the implemented kernels (needs CUDA toolkit). Presets live in
+`CMakePresets.json`: `dev` targets the local GPU, `dev-sm90a`/`dev-sm100a`
+target H100/B200, `ci-sm*` are compile-only, `release*` builds without tests.
 
 ```bash
 # Windows: vcvars64 + Ninja + ccache + ctest, one command.
-tools\build-windows.bat
+tools\build-windows.bat              # dev (native arch)
+tools\build-windows.bat dev-debug    # RelWithDebInfo
 
-# Any platform, Ninja (required for ccache; the VS generator ignores it):
-cmake -S . -B build -G Ninja -DKOPS_CUDA_ARCHS=native
-cmake --build build -j
-ctest --test-dir build --output-on-failure
+# Linux / any platform (same presets):
+tools/build-linux.sh                 # dev
+tools/build-linux.sh ci-sm90a        # compile-only sm90a (no GPU needed)
+
+# Equivalent raw commands:
+cmake --preset dev
+cmake --build --preset dev
+ctest --preset dev
 ```
+
+`native` lets CMake detect the host GPU, but CMake reports `90`/`100`/`120`
+**without the `a` suffix** even on H100/B200/RTX 50, so a native build cannot use
+WGMMA/tcgen05/block-scaled instructions. Use `dev-sm90a`, `dev-sm100a` or an
+explicit `KOPS_CUDA_ARCHS` list for those parts.
 
 The test exits with the number of failed checks. It compares every implemented
 kernel against `csrc/reference/` on device memory and asserts the `Status`
@@ -209,21 +220,33 @@ contract for bad dtype / shape / alignment.
 `-DKOPS_CCACHE_PROGRAM=<path>` when the binary is not on `PATH`, or
 `-DKOPS_USE_CCACHE=OFF` to disable. This only works with the Makefile/Ninja
 generators — CMake silently ignores the launcher with the Visual Studio
-generator, which is why `tools/build-windows.bat` uses Ninja.
+generator, which is why the presets use Ninja. The presets also set
+`CCACHE_BASEDIR`, `CCACHE_SLOPPINESS=time_macros,random_seed`,
+`CCACHE_COMPRESS` and `CCACHE_MAXSIZE=5G`.
 
-Measured on the dev machine (RTX 3050, CUDA 12.9, MSVC 19.44): cold build 15 s,
-`ninja -t clean` + rebuild 4 s, 9/9 compilations served from cache (5 host
-`.cc` + 4 CUDA `.cu`). Useful knobs:
+`csrc/common/tensor.cc` is compiled as plain C++ (it calls the runtime but has
+no device code), so it is built once instead of once per gencode target.
+`tests/unit/test_m1.cc` is still compiled by nvcc because `attention/ops.h`
+exposes parameter types declared in the attention kernel headers.
+
+Measured on the dev machine (RTX 3050, CUDA 12.9, MSVC 19.44, CMake 4.2,
+Ninja 1.13.1, ccache 4.14.2): cold build 23 s without a cache, full clean
+rebuild 0.9 s with a warm ccache, no-op rebuild 0.2 s. When `ninja`/`ccache`
+are not on `PATH`, `tools\build-windows.bat` uses `tools\ninja\ninja.exe` and
+`tools\ccache\ccache.exe`; both directories are gitignored. Useful knobs:
 
 ```bash
-ccache -M 5G          # cache size; also read from CCACHE_MAXSIZE
 ccache -s             # hit/miss stats
+cmake --build --preset dev -- -d stats   # Ninja per-target timing
 ```
 
-`KOPS_BUILD_TYPE` defaults to `Release`. CMake >= 4 defaults single-config
-generators to `Debug`, which makes kernels ~10x slower and adds MSVC `/Zi` that
-ccache treats as uncacheable; use `-DKOPS_BUILD_TYPE=Debug` only when needed.
+`KOPS_BUILD_TYPE` is only the default used when `CMAKE_BUILD_TYPE` is unset.
+CMake >= 4 leaves single-config generators without a build type, which makes
+kernels ~10x slower and adds MSVC `/Zi` that ccache treats as uncacheable; use
+`dev-debug` (RelWithDebInfo) only when needed.
 `KOPS_NVCC_THREADS` (default 4) passes `--threads` to nvcc for one TU.
+`KOPS_LINEINFO` (off) adds `-lineinfo`, and `KOPS_PTXAS_VERBOSE` (off) adds
+`-Xptxas=-v`; both cost build time and are for profiling only.
 
 ## Adding functionality
 

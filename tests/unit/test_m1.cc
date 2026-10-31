@@ -29,7 +29,6 @@
 #include "csrc/attention/attention_params.cuh"
 #include "csrc/attention/prefill_kernels.cuh"
 #include "csrc/attention/decode_kernels.cuh"
-#include "csrc/attention/merge_kernels.cuh"
 #include "csrc/attention/mla_kernels.cuh"
 #include "csrc/attention/sparse_kernels.cuh"
 #include "csrc/attention/ops.h"

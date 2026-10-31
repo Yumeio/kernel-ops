@@ -44,6 +44,10 @@ build/
 Build/
 build-*/
 
+# Local tool cache (ninja/ccache binaries; see tools/build-windows.bat)
+tools/ninja/
+tools/ccache/
+
 # CMake generated files
 CMakeFiles/
 CMakeCache.txt

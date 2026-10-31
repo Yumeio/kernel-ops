@@ -1,8 +1,8 @@
 // =============================================================================
 // kernel-ops | csrc/common/tensor.cc
-// Host-side tensor validation and device probing. This file touches the CUDA
-// runtime (cuda_runtime.h), so it is compiled with CUDA language enabled; the
-// public header stays backend-neutral.
+// Host-side tensor validation and device probing. This file calls the CUDA
+// runtime but contains no device code, so it is compiled as plain C++ (the
+// public header stays backend-neutral).
 // =============================================================================
 #include <cstdint>
 #include <cstring>
@@ -10,10 +10,6 @@
 #include "csrc/common/macros.cuh"
 
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-#include <cuda_fp4.h>
 
 #include "csrc/common/status.h"
 #include "csrc/common/dtype.cuh"

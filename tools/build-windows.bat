@@ -1,27 +1,21 @@
 @echo off
 rem =============================================================================
 rem kernel-ops | tools/build-windows.bat
-rem Configure + build with Ninja and ccache on Windows (MSVC + CUDA).
+rem Configure + build + test through the CMake presets (Ninja + ccache).
 rem
-rem   tools\build-windows.bat                 -> Release, build-ninja\
-rem   tools\build-windows.bat Debug           -> Debug (slow; symbols)
-rem   tools\build-windows.bat Release out\b   -> custom build directory
+rem   tools\build-windows.bat              -> dev preset (native arch, Release)
+rem   tools\build-windows.bat dev-debug    -> RelWithDebInfo
+rem   tools\build-windows.bat release      -> multi-arch, no tests
 rem
-rem Why Ninja: CMake only honours CMAKE_{CXX,CUDA}_COMPILER_LAUNCHER with the
-rem Makefile/Ninja generators. The Visual Studio generator silently ignores
-rem ccache, so the kernel rebuild after a header change stays expensive.
-rem
-rem Requirements: Visual Studio 2022 (C++ tools), CUDA toolkit, ninja on PATH or
-rem tools\ninja\ninja.exe, ccache on PATH or KOPS_CCACHE_PROGRAM set to its path.
+rem Requirements: Visual Studio 2022 (C++ tools), CUDA toolkit, ninja, ccache.
+rem Why Ninja: CMake ignores CMAKE_*_COMPILER_LAUNCHER with the Visual Studio
+rem generator, so a VS build silently loses the compiler cache.
 rem =============================================================================
 setlocal EnableDelayedExpansion
 
 for %%I in ("%~dp0..") do set "ROOT=%%~fI"
-set "CFG=%~1"
-if "%CFG%"=="" set "CFG=Release"
-set "BUILD=%~2"
-if "%BUILD%"=="" set "BUILD=%ROOT%\build-ninja"
-if not defined KOPS_CUDA_ARCHS set "KOPS_CUDA_ARCHS=native"
+set "PRESET=%~1"
+if "%PRESET%"=="" set "PRESET=dev"
 
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 if not exist "!VSWHERE!" (
@@ -39,38 +33,50 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set "NINJA="
-if defined KOPS_NINJA set "NINJA=!KOPS_NINJA!"
-if not defined NINJA where ninja >nul 2>nul && set "NINJA=ninja"
-if not defined NINJA if exist "%ROOT%\tools\ninja\ninja.exe" set "NINJA=%ROOT%\tools\ninja\ninja.exe"
-if not defined NINJA (
-  echo [error] ninja not found: put it on PATH or at tools\ninja\ninja.exe
-  exit /b 1
+rem Ninja is required for the compiler launcher. tools\ninja\ninja.exe is used
+rem when ninja is not on PATH.
+where ninja >nul 2>nul
+if errorlevel 1 (
+  if exist "%ROOT%\tools\ninja\ninja.exe" (
+    set "PATH=%ROOT%\tools\ninja;!PATH!"
+    echo [info] ninja = %ROOT%\tools\ninja\ninja.exe
+  ) else (
+    echo [error] ninja not found.
+    echo         install it with:  winget install Ninja-build.Ninja
+    echo         or:               python -m pip install ninja
+    echo         or place ninja.exe at tools\ninja\ninja.exe
+    exit /b 1
+  )
 )
 
-if not defined KOPS_CCACHE_PROGRAM (
-  where ccache >nul 2>nul && for /f "delims=" %%i in ('where ccache') do set "KOPS_CCACHE_PROGRAM=%%i"
-)
 if defined KOPS_CCACHE_PROGRAM (
-  set "CCACHE_SLOPPINESS=time_macros,random_seed"
-  if not defined CCACHE_MAXSIZE set "CCACHE_MAXSIZE=5G"
   echo [info] ccache = !KOPS_CCACHE_PROGRAM!
 ) else (
-  echo [warn] ccache not found: build will not be cached.
+  where ccache >nul 2>nul
+  if errorlevel 1 (
+    if exist "%ROOT%\tools\ccache\ccache.exe" (
+      set "PATH=%ROOT%\tools\ccache;!PATH!"
+      echo [info] ccache = %ROOT%\tools\ccache\ccache.exe
+    ) else (
+      echo [warn] ccache not found: builds work but are not cached.
+      echo        install it with:  winget install ccache.ccache
+      echo        or place ccache.exe at tools\ccache\ccache.exe
+    )
+  )
 )
 
-echo [info] configure %CFG% -> %BUILD%
-cmake -S "%ROOT%" -B "%BUILD%" -G Ninja ^
-  -DCMAKE_MAKE_PROGRAM="!NINJA!" ^
-  -DKOPS_BUILD_TYPE=%CFG% ^
-  -DKOPS_CUDA_ARCHS=%KOPS_CUDA_ARCHS% ^
-  -DKOPS_CCACHE_PROGRAM="!KOPS_CCACHE_PROGRAM!"
+cd /d "%ROOT%"
+echo [info] configure preset %PRESET%
+cmake --preset %PRESET%
 if errorlevel 1 exit /b 1
 
-echo [info] build
-cmake --build "%BUILD%" -j %NUMBER_OF_PROCESSORS%
+echo [info] build preset %PRESET%
+cmake --build --preset %PRESET%
 if errorlevel 1 exit /b 1
 
-echo [info] test
-ctest --test-dir "%BUILD%" --output-on-failure
-exit /b %errorlevel%
+if exist "%ROOT%\build\%PRESET%\CTestTestfile.cmake" (
+  echo [info] test preset %PRESET%
+  ctest --test-dir "%ROOT%\build\%PRESET%" --output-on-failure
+  exit /b %errorlevel%
+)
+exit /b 0

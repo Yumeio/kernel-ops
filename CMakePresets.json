@@ -1,0 +1,159 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 24,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "KOPS_BUILD_TESTS": "ON",
+        "KOPS_USE_CCACHE": "ON",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      },
+      "environment": {
+        "CCACHE_BASEDIR": "${sourceDir}",
+        "CCACHE_SLOPPINESS": "time_macros,random_seed",
+        "CCACHE_COMPRESS": "true",
+        "CCACHE_MAXSIZE": "5G"
+      }
+    },
+    {
+      "name": "dev",
+      "displayName": "Dev: native arch, tests on",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "native"
+      }
+    },
+    {
+      "name": "dev-debug",
+      "displayName": "Dev: native arch, symbols, no device -G",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "KOPS_CUDA_ARCHS": "native"
+      }
+    },
+    {
+      "name": "dev-sm90a",
+      "displayName": "Dev: H100/H200 (wgmma enabled)",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "90a"
+      }
+    },
+    {
+      "name": "dev-sm100a",
+      "displayName": "Dev: B200/GB200 (tcgen05 enabled)",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "100a"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release: multi-arch, no tests",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "80;86;89;90a;100a;120a",
+        "KOPS_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "release-sm90a",
+      "displayName": "Release: H100/H200 only",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "90a",
+        "KOPS_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "release-sm100a",
+      "displayName": "Release: B200/GB200 only",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "100a",
+        "KOPS_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "ci-sm86",
+      "displayName": "CI: compile-only sm86",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "86",
+        "KOPS_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "ci-sm90a",
+      "displayName": "CI: compile-only sm90a",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "90a",
+        "KOPS_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "ci-sm100a",
+      "displayName": "CI: compile-only sm100a",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "100a",
+        "KOPS_BUILD_TESTS": "OFF"
+      }
+    },
+    {
+      "name": "ci-sm120a",
+      "displayName": "CI: compile-only sm120a",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "120a",
+        "KOPS_BUILD_TESTS": "OFF"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "dev", "configurePreset": "dev" },
+    { "name": "dev-debug", "configurePreset": "dev-debug" },
+    { "name": "dev-sm90a", "configurePreset": "dev-sm90a" },
+    { "name": "dev-sm100a", "configurePreset": "dev-sm100a" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "release-sm90a", "configurePreset": "release-sm90a" },
+    { "name": "release-sm100a", "configurePreset": "release-sm100a" },
+    { "name": "ci-sm86", "configurePreset": "ci-sm86" },
+    { "name": "ci-sm90a", "configurePreset": "ci-sm90a" },
+    { "name": "ci-sm100a", "configurePreset": "ci-sm100a" },
+    { "name": "ci-sm120a", "configurePreset": "ci-sm120a" }
+  ],
+  "testPresets": [
+    {
+      "name": "dev",
+      "configurePreset": "dev",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-debug",
+      "configurePreset": "dev-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-sm90a",
+      "configurePreset": "dev-sm90a",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-sm100a",
+      "configurePreset": "dev-sm100a",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}
