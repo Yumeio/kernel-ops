@@ -9,6 +9,96 @@
    "status": "numerically_validated",
    "predicates": "block-sorted slots (block == SLOTS_PER_CTA); bf16/fp16 or e4m3 (per-channel, per-expert, 128x128) weights; bias, routed weight; expert id <0 skipped",
    "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "M01.route",
+   "kernel_symbol": "moe_topk_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "fp32/fp16/bf16 logits; all RouterScore; correction bias for selection only; tie -> lower expert; renorm + routed_scaling_factor; EPLB replicas + fused shared pseudo-experts; E <= 1024, topk <= 16",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M01.grouped_topk",
+   "kernel_symbol": "moe_grouped_topk_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "n_group/topk_group; GroupScore kMax/kTop2Sum; constrained top-k inside kept groups; same score/tie rules as route",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M01.route_fused",
+   "kernel_symbol": "moe_fused_router_topk_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "num_tokens <= 64; bf16/bf16, bf16/fp32, fp16/fp16 hidden/weight; optional fp32 logits scratch selects tiled router_gemm + top-k; null scratch uses the single-CTA fallback; bit-equal to router_gemm + route",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M01.hash_route",
+   "kernel_symbol": "moe_hash_route_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "checkpoint hash table [V, topk] or multiplicative fallback; uniform routed_scaling_factor/topk weights; optional expert_map; DeepSeek-V4 gate-scored hash layer not represented",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M02.count_and_offsets",
+   "kernel_symbol": "moe_count_and_offsets_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "expert counts + exclusive int64 offsets padded to align_m; expert_map <0 skipped; deterministic (histogram order independent)",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M02.align_block_size",
+   "kernel_symbol": "moe_align_block_size_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "Triton/Marlin metadata; stable by slot id inside each expert; block padding sentinel numel; expert_ids local (-1 experts produce no blocks); workspace (E+1) int32",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M02.permute",
+   "kernel_symbol": "moe_permute_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "expert-contiguous rows ordered by slot id; optional weight on input; optional fused FP8 e4m3 1x128 group quant (row-major scales); caller-zeroed write_cursor",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M02.unpermute_reduce",
+   "kernel_symbol": "moe_unpermute_reduce_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "fixed top-k order (no atomics); optional shared_out/residual; weights_already_applied; non-local rows contribute 0",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M02.moe_sum",
+   "kernel_symbol": "moe_sum_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "[T, topk, H] -> [T, H]; topk in {1,2,4,8,16}; contiguous fp32/fp16/bf16",
+   "evidence": "test_moe;bench_moe"
+  },
+  {
+   "op_id": "M03.latent_combine_norm",
+   "kernel_symbol": "latent_moe_combine_norm_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "Kimi-K3 latent tail: weighted sum in latent space, fp32 accumulation, RMSNorm weight+epsilon, unquantized output; shared experts added by the caller after the up projection",
+   "evidence": "test_moe;bench_moe"
   }
  ]
 }

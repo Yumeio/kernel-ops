@@ -39,7 +39,7 @@
 // v2: backend-neutral stream/error/graph/tma types, arch_id + wave_size, Fp8Encoding.
 // v3: HybridBranches + merge_hybrid_branches host entry.
 // v4: by-value InvFreqTable and HybridBranchTable kernel parameters.
-#define KOPS_ABI_VERSION 4
+#define KOPS_ABI_VERSION 5
 
 // =============================================================================
 // Backend

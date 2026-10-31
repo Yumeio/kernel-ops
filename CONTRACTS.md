@@ -56,6 +56,38 @@ remain the ABI and shape authority.
 - The indexer split page is `[page_size × head_dim e4m3 | page_size ×
   (head_dim/quant_block) fp32 scales]`; scales follow all keys of the page.
 
+## 1c. Routing, permutation and sampling rules (B6)
+
+- Router selection uses the score (`softmax`, `sigmoid`, `sqrt(softplus)`, raw logits) plus
+  `correction_bias`; the bias never enters the weight. Ties resolve to the lower expert index.
+  `softmax-after-topk` normalizes the selected raw logits, `softmax` normalizes over all experts.
+  `renormalize` divides the selected weights by their sum, then `routed_scaling_factor` is applied.
+- Group-limited routing uses group score `max` or `sum(top-2)` of the biased scores, keeps
+  `topk_groups` groups (ties -> lower group id), and selects the top-k inside the kept groups.
+  There must be at least `topk` experts in the kept groups.
+- EPLB: a selected logical expert maps to replica `token_index % replica_count[e]`; the output id
+  is the physical id. `expert_load` counts logical experts. Fused shared experts are appended in
+  order with weight `shared_weight` and id `num_experts + s`.
+- Hash routing uses the checkpoint table when present (multiplicative fallback otherwise), uniform
+  weights `routed_scaling_factor / topk`, and maps ids through `expert_map` when supplied. The
+  DeepSeek-V4 gate-scored hash layer is not represented by this kernel.
+- `align_block_size` is stable by slot id inside each expert, pads each expert to `block_size` with
+  the sentinel `numel`, and emits local expert ids (`expert_map < 0` produces no blocks). It needs
+  `(num_experts + 1) * 4` bytes of workspace. `permute` reuses the same stable order and requires a
+  caller-zeroed `write_cursor`; the copy phase is order-free.
+- `unpermute_reduce` sums in fixed k order (no atomics): `routed_scale * sum(w * expert) + shared +
+  residual`; rows of non-local experts contribute zero.
+- Sampling truncation order is min-p, then top-k, then top-p (the default); with
+  `joint_topk_topp` the top-k and top-p masks both apply to the original distribution before
+  renormalization. Tokens at a threshold tie are taken in ascending token id. `top_p >= 1`
+  disables top-p, `top_p <= 0` keeps only the largest token, `top_k <= 0` or `>= vocab` disables
+  top-k. Randomness is a pure function of `(seed, request_id, position, draw_index, stream_id)`;
+  the graph replay never advances host state. A row with no admissible mass writes `out_ids = -1`.
+- `sample()` materializes the fp32 probability row in `Workspace::device_scratch`
+  (`batch * vocab * 4` bytes plus the temperature and split-softmax regions reported by
+  `sampling_workspace_requirements`). `gumbel_max_sample()` deliberately rejects top-p
+  (`kNotImplemented`) because it works from logits; use `sample()` for nucleus truncation.
+
 ## 2. Benchmark protocol
 
 - Same GPU, driver, clocks, dtype and shape for kernel-ops and PyTorch.

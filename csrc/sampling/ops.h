@@ -14,8 +14,15 @@ Status sampling_workspace_requirements(int32_t max_batch, int32_t max_vocab, int
 
 /// One-call sampler: (optional processors already applied) -> greedy rows via argmax, others via
 /// top-k/top-p/min-p rejection sampling or Gumbel-max, chosen per capability. Device outputs only.
+/// The workspace holds the fp32 probability row of the call (`num_tokens * vocab * 4` bytes,
+/// plus the optional split-softmax state); sampling_workspace_requirements() reports it. A row
+/// with no admissible token writes `out_ids = -1`.
 Status sample(const Tensor& out_ids, const Tensor& logits, const SamplingParams& params,
               const Workspace& ws, const LaunchContext& ctx);
+/// Gumbel-max sampler: out_ids[b] = argmax(logits[b] / T_b + Gumbel(u_id)) over the top-k/min-p
+/// admissible set. Same counter RNG and tie-break as the other samplers.
+Status gumbel_max_sample(const Tensor& out_ids, const Tensor& logits, const SamplingParams& params,
+                         const LaunchContext& ctx);
 Status softmax(const Tensor& probs, const Tensor& logits, const Tensor& temperature,
                const Workspace& ws, const LaunchContext& ctx);
 Status argmax(const Tensor& out_ids, const Tensor& out_logprob, const Tensor& logits,

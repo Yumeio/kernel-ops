@@ -9,6 +9,15 @@ namespace kops::moe {
 /// M01: routing. Chooses moe_topk / moe_grouped_topk / hash / fused-router kernels.
 Status route(const RouterParams& params, RouterScore score, DType logits_dtype,
              const LaunchContext& ctx);
+/// M01: decode-time fused router GEMM + scoring + (grouped) top-k, num_tokens <= 64.
+/// Same RouterParams semantics as route(). When `params.logits` points at a caller-owned
+/// fp32 [num_tokens, num_experts] scratch (logits_stride >= num_experts), the host uses the
+/// tiled router_gemm kernel plus a small top-k kernel; when it is null the single-CTA fused
+/// fallback computes the logits in shared memory and never touches HBM. Both paths are
+/// bit-equal to gemm::router_gemm followed by route() (identical dot-product reduction order).
+Status route_fused(const RouterParams& params, const Tensor& hidden, const Tensor& router_weight,
+                   const Tensor& router_bias, RouterScore score, DType w_dtype,
+                   const LaunchContext& ctx);
 Status hash_route(const Tensor& topk_weights, const Tensor& topk_ids, const Tensor& token_ids,
                   const Tensor& hash_table, const Tensor& expert_map, float routed_scaling_factor,
                   int32_t num_experts, const LaunchContext& ctx);
@@ -26,6 +35,14 @@ Status unpermute_reduce(const Tensor& out, const Tensor& expert_out,
                         const Tensor& slot_to_permuted_row, const Tensor& topk_weights,
                         const Tensor& shared_out, const Tensor& residual, float routed_scale,
                         bool weights_already_applied, const LaunchContext& ctx);
+/// M02: out[t] = sum_k input[t, k] (vLLM fused_moe "moe_sum"); input is [T, topk, H].
+Status moe_sum(const Tensor& out, const Tensor& input, int32_t topk, const LaunchContext& ctx);
+/// M03 tail: Kimi-K3 Stable LatentMoE combine. z[t] = sum_k w[t,k] * expert_out[row(t,k)],
+/// out[t] = RMSNorm(z[t]) * norm_weight, optionally quantized per `quant`.
+Status latent_combine_norm(const Tensor& out, const Tensor& expert_out,
+                           const Tensor& slot_to_permuted_row, const Tensor& topk_weights,
+                           const Tensor& norm_weight, float routed_scale, float epsilon,
+                           int32_t topk, const ActQuantOut& quant, const LaunchContext& ctx);
 
 /// M03: whole MoE layer (route? -> permute -> W13 -> act/quant -> W2 -> reduce, latent
 /// projections when latent_dim > 0). *num_launches (optional) receives the exact number of

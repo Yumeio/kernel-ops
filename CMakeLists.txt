@@ -163,6 +163,8 @@ add_library(kops_cuda STATIC
   csrc/gemm/gguf_gemm.cu
   csrc/gemm/grouped_gemm.cu
   csrc/moe/fused_moe.cu
+  csrc/moe/routing.cu
+  csrc/moe/permute.cu
   csrc/attention/merge.cu
   csrc/attention/mla.cu
   csrc/kvcache/kvcache.cu
@@ -259,6 +261,12 @@ if(KOPS_BUILD_TESTS)
     set_source_files_properties(tests/unit/test_gemm.cc PROPERTIES LANGUAGE CUDA)
     kops_add_test(kops_test_gemm
       SOURCES tests/unit/test_gemm.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_moe.cc")
+    set_source_files_properties(tests/unit/test_moe.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_moe
+      SOURCES tests/unit/test_moe.cc
       LIBS kops_cuda)
   endif()
 endif()

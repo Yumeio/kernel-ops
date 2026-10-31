@@ -63,6 +63,51 @@
    "status": "benchmarked",
    "predicates": "planned",
    "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.top_k_renorm_probs",
+   "kernel_symbol": "top_k_renorm_probs_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "exact top-k set (radix threshold, ties -> lower id); fp32 probs; k<=0 or k>=V copies the row",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.top_p_renorm_probs",
+   "kernel_symbol": "top_p_renorm_probs_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "exact nucleus (fixed-point 2^40 deterministic accumulation, crossing token included, ties by id); p>=1 copies; p<=0 keeps the single largest",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.top_k_mask_logits",
+   "kernel_symbol": "top_k_mask_logits_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "keeps fp32/fp16/bf16 logits inside top-k, writes -inf outside; exact threshold+id tie handling",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.sample",
+   "kernel_symbol": "top_k_top_p_sampling_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "counter RNG (seed, request, offset, draw, stream); ordered exact prefix scan over the truncated fp32 distribution; top-k then top-p (or joint), min-p; invalid rows write -1; device outputs only",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.gumbel_max_sample",
+   "kernel_symbol": "gumbel_max_sampling_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "argmax(logit/T + Gumbel) with counter RNG; top-k + min-p truncation; top-p rejected with kNotImplemented (use sample()); greedy T<=0",
+   "evidence": "test_sampling;bench_sampling"
   }
  ]
 }

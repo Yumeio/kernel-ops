@@ -1,6 +1,6 @@
 # ayaka-kernel — ROADMAP triển khai (từ dễ đến khó, theo phụ thuộc)
 
-Cập nhật 2026-10-31. Roadmap này liệt kê 233 `__global__` kernel trong 18 bước và 125 nhịp. Checkout này hiện có **93 kernel có thân**: toàn bộ B0 (2/2), B1 (32/32), B2 (20/20), B3 (21/21) và B4 (18/18); 140 kernel còn lại là contract trong header, chưa có định nghĩa. Repo là `ayaka-kernel`; namespace C++ và tiền tố ABI là `kops` (không phải `ayaka`).
+Cập nhật 2026-11-01. Roadmap này liệt kê 233 `__global__` kernel trong 18 bước và 125 nhịp. Checkout này hiện có **124 kernel có thân**: toàn bộ B0 (2/2), B1 (32/32), B2 (20/20), B3 (21/21), B4 (18/18), B5 (16/16) và B6 (15/15); 109 kernel còn lại là contract trong header, chưa có định nghĩa. Repo là `ayaka-kernel`; namespace C++ và tiền tố ABI là `kops` (không phải `ayaka`).
 
 **Chiến lược 2026-10-31, đọc §0.7 và §3 trước.** Roadmap được xây đủ **chỉ với một RTX 3050 Laptop (SM86, 4 GB)**, không thuê GPU, và **không dùng PyTorch, torch binding, CUTLASS/CuTe hay provider adapter**. API duy nhất là `csrc/<family>/ops.h` (`kops::Status` + `Tensor`/`LaunchContext`/`Workspace`); thân kernel và launcher viết ngay trong `csrc/<family>/<stem>.cu`; test và benchmark là C++/ctest. FlashMLA, DeepGEMM, vLLM, SGLang, hpc-ops và attention.rs trong `3rd/` chỉ là **nguồn đọc** (thuật toán, layout, edge case), không được link hay build. §2 nói mỗi ô đạt tới đâu khi chỉ có SM86; §3 nói thứ tự P0–P8 và kỹ thuật K1–K7 (K1/K2/K6 deferred vì cần PyTorch).
 
@@ -9,7 +9,7 @@ Cập nhật 2026-10-31. Roadmap này liệt kê 233 `__global__` kernel trong 1
 - `tools/check_roadmap.py` (đã có; mở rộng theo §1.6) kiểm tra quy tắc trên mỗi khi bảng kernel hoặc file nguồn thay đổi.
 - **Cột Reference** trong mọi bảng kernel trỏ tới code tương tự trong vLLM, SGLang, hpc-ops, attention.rs, FlashMLA và DeepGEMM để đối chiếu khi viết kernel (§0.6).
 - **Nhịp và ngân sách file (§1).** Đơn vị công việc là một hàng của bảng kernel, gọi là *nhịp*, và mọi nhịp theo cùng một vòng năm việc. Số file mới tăng theo family, theo nhóm kernel (một file `.cu`) và theo ô arch (một ô của lưới family × arch), không tăng theo kernel; trần nằm ở Phụ lục E.
-- **Hiện trạng (2026-10-31).** 93/233 kernel có thân: B0 đủ 2/2, B1 đủ 32/32, B2 đủ 20/20, B3 đủ 21/21, B4 đủ 18/18. Các file `csrc/{model_ops,norm,activation,position,embedding,sampling,attention,kvcache,state,quantization}/*.cu` có launcher, test C++ (`test_m1`, `test_model_ops`, `test_norm`, `test_activation`, `test_position`, `test_embedding`, `test_sampling`, `test_merge`, `test_kvcache`, `test_state`, `test_quantization`, `test_gemm`) và benchmark C++ (`bench_model_ops`, `bench_norm`, `bench_activation`, `bench_position`, `bench_embedding`, `bench_sampling`, `bench_merge`, `bench_chains`, `bench_kvcache`, `bench_state`, `bench_quantization`, `bench_gemm`). `KOPS_ABI_VERSION` là 4 do `InvFreqTable`/`HybridBranchTable` được truyền by value; host API không đổi. `tools/check_roadmap.py` đang pass với 233 kernel được gán đúng một bước.
+- **Hiện trạng (2026-11-01).** 124/233 kernel có thân: B0 đủ 2/2, B1 đủ 32/32, B2 đủ 20/20, B3 đủ 21/21, B4 đủ 18/18, B5 đủ 16/16, B6 đủ 15/15. Các file `csrc/{model_ops,norm,activation,position,embedding,sampling,attention,kvcache,state,quantization}/*.cu` có launcher, test C++ (`test_m1`, `test_model_ops`, `test_norm`, `test_activation`, `test_position`, `test_embedding`, `test_sampling`, `test_merge`, `test_kvcache`, `test_state`, `test_quantization`, `test_gemm`, `test_moe`) và benchmark C++ (`bench_model_ops`, `bench_norm`, `bench_activation`, `bench_position`, `bench_embedding`, `bench_sampling`, `bench_merge`, `bench_chains`, `bench_kvcache`, `bench_state`, `bench_quantization`, `bench_gemm`, `bench_moe`). `KOPS_ABI_VERSION` là 5 do bốn host entry B6 (`route_fused`, `moe_sum`, `latent_combine_norm`, `gumbel_max_sample`) được thêm; layout struct không đổi. `tools/check_roadmap.py` đang pass với 233 kernel được gán đúng một bước.
 - **Phần cứng (§2).** Máy dev chỉ có một GPU SM86 (RTX 3050 Laptop, 4 GB VRAM), chạy WSL2 với CUDA 12.9, nên compile được cả 8 exact SM. Kernel nhắm SM khác (SM80, SM89, SM90a, SM100a/103a/120a/121a), nhiều GPU hoặc VRAM lớn vẫn được viết đủ theo vòng năm việc, sau khi đọc code đã chạy thật trong sáu project reference. Chúng không chạy được ở máy dev: ô (kernel, SM) đó dừng ở `authored`/`compiled` kèm evidence twin và SASS (§2.2 mục 6, §3.2). Bộ test C++ viết sẵn thành gói bàn giao cho bất kỳ ai có đúng phần cứng (§2.5, Phụ lục B). Không thêm file: test nằm trong `tests/unit/test_<family>.cc`, benchmark trong `benchmark/bench_<family>.cc`, evidence nằm trong registry.
 
 Bước được đặt tên `B0…B17`, mốc model là `Mốc 1…10`. Cách đặt tên này tránh trùng với nhãn ưu tiên P0/P1/P2 của proposal và với mã catalog (A01, M01, …). Bước mở nhiều việc cùng lúc được chia thành đợt, đặt tên `B0.1…B0.2` và `B1.1…B1.3` (§1.4).
@@ -366,6 +366,8 @@ Một file `.cu` chứa thân kernel, launcher, instantiation và entry point c�
 | `chunk_place_kernel` | moe/permute.cu | `moe_align_block_size_kernel` |
 | `align_pad_kernel` | moe/permute.cu | `moe_align_block_size_kernel` |
 | `moe_fused_router_gemm_tile_kernel` | moe/routing.cu | `moe_fused_router_topk_kernel` |
+| `moe_router_topk_from_logits_kernel` | moe/routing.cu | `moe_fused_router_topk_kernel` |
+| `moe_permute_map_kernel` | moe/permute.cu | `moe_permute_kernel` |
 | `gemm_mma_reduce_kernel` | gemm/gemm_mma.cu | `gemm_mma_sync_kernel` |
 | `marlin_permute_cols_kernel` | gemm/marlin_dense.cu | `marlin_gemm_kernel` |
 | `fused_moe_task_map_kernel` | moe/fused_moe.cu | `fused_moe_gemm_kernel` |
@@ -530,8 +532,8 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B2 | 20 / 20 | 0 |
 | B3 | 21 / 21 | 0 |
 | B4 | 18 / 18 | 0 |
-| B5 | 0 / 16 | 16 |
-| B6 | 0 / 15 | 15 |
+| B5 | 16 / 16 | 0 |
+| B6 | 15 / 15 | 0 |
 | B7 | 0 / 16 | 16 |
 | B8 | 0 / 7 | 7 |
 | B9 | 0 / 20 | 20 |
@@ -543,9 +545,9 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B15 | 0 / 8 | 8 |
 | B16 | 0 / 6 | 6 |
 | B17 | 0 / 5 | 5 |
-| **Tổng** | **93 / 233** | **140** |
+| **Tổng** | **124 / 233** | **109** |
 
-B0, B1, B2, B3 và B4 đã đủ thân. Các launcher B5+ vẫn trả `kNotImplemented`; 233 kernel / 125 nhịp / 112 file không đổi. B0–B4 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
+B0, B1, B2, B3, B4, B5 và B6 đã đủ thân. Các launcher B7+ vẫn trả `kNotImplemented`; 233 kernel / 125 nhịp / 112 file không đổi. B0–B4 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
 
 Không còn "nợ hiệu năng" hay report cũ trong checkout này: mọi số đo sẽ được sinh lại bằng benchmark C++ khi kernel tương ứng có thân.
 
@@ -1028,6 +1030,8 @@ Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn ch�
 **Nhịp.** 9 nhịp · 15 kernel · không mở family hay ô arch · file mới: 2 (2 `.cu`).
 
 **Phần cứng.** Máy dev chạy hết (CUDA-core). Lô `sm80` và `sm90a` chạy lại gate. Kiểm định chi-square ≥ 10^6 mẫu chạy được ở dev; benchmark sampling so với roofline, FlashInfer là tuỳ chọn.
+
+**Hiện trạng (2026-11-01).** 15/15 kernel có thân trong `csrc/moe/routing.cu`, `csrc/moe/permute.cu` và `csrc/sampling/sampling.cu`; `test_moe` + phần B6 của `test_sampling` xanh, `bench_moe` + case B6 của `bench_sampling` chạy được trên SM86. Bốn host entry mới (`route_fused`, `moe_sum`, `latent_combine_norm`, `gumbel_max_sample`) và `KOPS_ABI_VERSION = 5` nằm trong PR contract; `route_fused` dùng scratch `RouterParams::logits` [T, E] khi có, nếu không dùng thân fused một CTA (bit-equal cả hai đường). Alignment/permute deterministic theo slot id; sampling dùng radix + prefix scan chính xác, RNG counter. Benchmark so với PyTorch 2.14.1+cu126 nằm trong `out/b6-summary.txt`: 19 case geomean **3.04x**, 11/19 case ≥3x; suite fusion 17 case (bỏ hai case copy-bound) geomean **3.54x**. Hai case băng thông thuần `moe.permute` bf16 (1.18x) và `moe_sum` (0.58x) báo riêng theo roofline/parity đúng CONTRACTS §2.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|

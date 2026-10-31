@@ -173,6 +173,42 @@ __global__ void moe_gemv_kernel(const __grid_constant__ FusedMoEGemmParams p) {
   }
 }
 
+template <typename scalar_t, ActQuantMode kQuant, int VEC_SIZE>
+__global__ void latent_moe_combine_norm_kernel(
+    void* __restrict__ out, const ActQuantOut quant, const scalar_t* __restrict__ expert_out,
+    const int32_t* __restrict__ slot_to_permuted_row, const float* __restrict__ topk_weights,
+    const scalar_t* __restrict__ norm_weight, const float routed_scale, const float epsilon,
+    const int num_tokens, const int topk, const int latent_dim) {
+  static_assert(kQuant == ActQuantMode::kNone, "latent_moe_combine_norm supports the unquantized tail");
+  (void)quant;
+  extern __shared__ float smem[];
+  float* z = smem;                    // [latent_dim]
+  float* red = smem + latent_dim;     // [8]
+  const int t = blockIdx.x;
+  if (t >= num_tokens) return;
+  const int64_t base = static_cast<int64_t>(t) * topk;
+  for (int col = threadIdx.x; col < latent_dim; col += blockDim.x) {
+    float acc = 0.0f;
+    for (int k = 0; k < topk; ++k) {
+      const int32_t row = slot_to_permuted_row[base + k];
+      if (row < 0) continue;
+      const float w = topk_weights != nullptr ? topk_weights[base + k] : 1.0f;
+      acc = fmaf(w, dev::to_f(expert_out[static_cast<int64_t>(row) * latent_dim + col]), acc);
+    }
+    z[col] = acc * routed_scale;
+  }
+  __syncthreads();
+  float ss = 0.0f;
+  for (int col = threadIdx.x; col < latent_dim; col += blockDim.x) ss += z[col] * z[col];
+  const float mean = block_reduce_sum<float, 8>(ss, red) / static_cast<float>(latent_dim);
+  const float inv = rsqrtf(mean + epsilon);
+  auto* dst = static_cast<scalar_t*>(out);
+  for (int col = threadIdx.x; col < latent_dim; col += blockDim.x) {
+    const float v = z[col] * inv * dev::to_f(norm_weight[col]);
+    dev::from_f(dst[static_cast<int64_t>(t) * latent_dim + col], v);
+  }
+}
+
 namespace {
 
 Status launch_error(const char* what) {
@@ -262,6 +298,79 @@ Status moe_gemv(const FusedMoEGemmParams& p, int32_t num_local_experts, int32_t 
   }
   return a_dtype == DType::kBFloat16 ? launch_moe<__nv_bfloat16, __nv_bfloat16>(p, mb, slots_per_cta, s)
                                      : launch_moe<__half, __half>(p, mb, slots_per_cta, s);
+}
+
+Status latent_combine_norm(const Tensor& out, const Tensor& expert_out,
+                           const Tensor& slot_to_permuted_row, const Tensor& topk_weights,
+                           const Tensor& norm_weight, float routed_scale, float epsilon,
+                           int32_t topk, const ActQuantOut& quant, const LaunchContext& ctx) {
+  if (ctx.backend != BackendKind::kCuda) {
+    return detail::set_error(Status::kUnsupportedBackend, "latent_combine_norm: CUDA backend only");
+  }
+  if (quant.mode != ActQuantMode::kNone) {
+    return detail::set_error(Status::kNotImplemented,
+                             "latent_combine_norm: quantized latent output is not implemented");
+  }
+  Status s = check_tensor(out, out.dtype, 2, 2, "latent_combine_norm.out");
+  if (s != Status::kSuccess) return s;
+  s = check_tensor(expert_out, out.dtype, 2, 2, "latent_combine_norm.expert_out");
+  if (s != Status::kSuccess) return s;
+  s = check_tensor(slot_to_permuted_row, DType::kInt32, 1, 4,
+                   "latent_combine_norm.slot_to_permuted_row");
+  if (s != Status::kSuccess) return s;
+  s = check_tensor(topk_weights, DType::kFloat32, 1, 4, "latent_combine_norm.topk_weights");
+  if (s != Status::kSuccess) return s;
+  s = check_tensor(norm_weight, out.dtype, 1, 2, "latent_combine_norm.norm_weight");
+  if (s != Status::kSuccess) return s;
+  const int num_tokens = static_cast<int>(out.shape[0]);
+  const int latent = static_cast<int>(out.shape[1]);
+  if (latent < 1 || latent > 8192) {
+    return detail::set_error(Status::kUnsupportedShape,
+                             "latent_combine_norm: latent_dim %d not in [1, 8192]", latent);
+  }
+  if (expert_out.shape[1] != latent || norm_weight.shape[0] != latent) {
+    return detail::set_error(Status::kInvalidArgument, "latent_combine_norm: latent dimension mismatch");
+  }
+  if (num_tokens <= 0) return Status::kSuccess;
+  if (topk < 1 || slot_to_permuted_row.shape[0] != static_cast<int64_t>(num_tokens) * topk ||
+      topk_weights.shape[0] != static_cast<int64_t>(num_tokens) * topk) {
+    return detail::set_error(Status::kInvalidArgument,
+                             "latent_combine_norm: slot/weight arrays must be [T, topk]");
+  }
+  if (epsilon < 0.0f) {
+    return detail::set_error(Status::kInvalidArgument, "latent_combine_norm: negative epsilon");
+  }
+  const int smem = (latent + 8) * static_cast<int>(sizeof(float));
+  const cudaStream_t s2 = reinterpret_cast<cudaStream_t>(ctx.stream);
+  if (out.dtype == DType::kBFloat16) {
+    latent_moe_combine_norm_kernel<__nv_bfloat16, ActQuantMode::kNone, 8>
+        <<<num_tokens, 256, smem, s2>>>(out.data, quant,
+                                        static_cast<const __nv_bfloat16*>(expert_out.data),
+                                        static_cast<const int32_t*>(slot_to_permuted_row.data),
+                                        static_cast<const float*>(topk_weights.data),
+                                        static_cast<const __nv_bfloat16*>(norm_weight.data),
+                                        routed_scale, epsilon, num_tokens, topk, latent);
+  } else if (out.dtype == DType::kFloat16) {
+    latent_moe_combine_norm_kernel<__half, ActQuantMode::kNone, 8>
+        <<<num_tokens, 256, smem, s2>>>(out.data, quant,
+                                        static_cast<const __half*>(expert_out.data),
+                                        static_cast<const int32_t*>(slot_to_permuted_row.data),
+                                        static_cast<const float*>(topk_weights.data),
+                                        static_cast<const __half*>(norm_weight.data), routed_scale,
+                                        epsilon, num_tokens, topk, latent);
+  } else if (out.dtype == DType::kFloat32) {
+    latent_moe_combine_norm_kernel<float, ActQuantMode::kNone, 4>
+        <<<num_tokens, 256, smem, s2>>>(out.data, quant,
+                                        static_cast<const float*>(expert_out.data),
+                                        static_cast<const int32_t*>(slot_to_permuted_row.data),
+                                        static_cast<const float*>(topk_weights.data),
+                                        static_cast<const float*>(norm_weight.data), routed_scale,
+                                        epsilon, num_tokens, topk, latent);
+  } else {
+    return detail::set_error(Status::kUnsupportedDtype, "latent_combine_norm: %s",
+                             dtype_name(out.dtype));
+  }
+  return launch_error("latent_moe_combine_norm_kernel");
 }
 
 }  // namespace kops::moe

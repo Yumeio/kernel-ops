@@ -97,6 +97,25 @@ std::vector<Case> make_cases() {
   bias_case("sampling.bias.bf16.v131072.b128.nnz8", kops::DType::kBFloat16, 128, 131072, 8);
   bias_case("sampling.bias.fp32.v32768.b256.nnz8", kops::DType::kFloat32, 256, 32768, 8);
 
+
+  auto sample_case = [&](const char* id, const char* op, kops::DType dt, int64_t rows, int64_t cols,
+                         int64_t extra) {
+    const int es = dtype_size(dt);
+    add_case(&cases, id, op, dt, rows, cols, rows * cols * es + rows * extra);
+  };
+  sample_case("sampling.topk_topp.bf16.v131072.b32.k50.p0.9", "sample", kops::DType::kBFloat16, 32,
+              131072, 16);
+  sample_case("sampling.topk_topp.bf16.v32768.b256.k20.p0.95", "sample", kops::DType::kBFloat16,
+              256, 32768, 16);
+  sample_case("sampling.gumbel.bf16.v131072.b32.k50", "gumbel", kops::DType::kBFloat16, 32, 131072,
+              16);
+  sample_case("sampling.topk_renorm.fp32.v131072.b128.k50", "topk_renorm", kops::DType::kFloat32,
+              128, 131072, 16);
+  sample_case("sampling.topp_renorm.fp32.v131072.b128.p0.9", "topp_renorm", kops::DType::kFloat32,
+              128, 131072, 16);
+  sample_case("sampling.topk_mask.bf16.v131072.b128.k50", "topk_mask", kops::DType::kBFloat16, 128,
+              131072, 16);
+
   return cases;
 }
 
@@ -399,8 +418,25 @@ bool run_bias(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   return ok;
 }
 
+template <typename T>
+bool run_sample(const Case& c, const kops::LaunchContext& ctx, Stats* st);
+bool run_renorm(const Case& c, const kops::LaunchContext& ctx, Stats* st);
+template <typename T>
+bool run_topk_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st);
+
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   if (c.op == "token_bincount") return run_bincount(c, ctx, st);
+  if (c.op == "sample" || c.op == "gumbel") {
+    if (c.dtype == kops::DType::kBFloat16) return run_sample<__nv_bfloat16>(c, ctx, st);
+    if (c.dtype == kops::DType::kFloat16) return run_sample<__half>(c, ctx, st);
+    return run_sample<float>(c, ctx, st);
+  }
+  if (c.op == "topk_renorm" || c.op == "topp_renorm") return run_renorm(c, ctx, st);
+  if (c.op == "topk_mask") {
+    if (c.dtype == kops::DType::kBFloat16) return run_topk_mask<__nv_bfloat16>(c, ctx, st);
+    if (c.dtype == kops::DType::kFloat16) return run_topk_mask<__half>(c, ctx, st);
+    return run_topk_mask<float>(c, ctx, st);
+  }
   if (c.dtype == kops::DType::kFloat32) {
     if (c.op == "softmax") return run_softmax<float>(c, ctx, st);
     if (c.op == "argmax") return run_argmax<float>(c, ctx, st);
@@ -425,7 +461,96 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   return false;
 }
 
-}  // namespace
+
+template <typename T>
+bool run_sample(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const size_t n = static_cast<size_t>(c.rows * c.cols);
+  T* logits = nullptr;
+  int32_t* ids = nullptr;
+  if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&logits), n * sizeof(T)), "logits") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&ids), static_cast<size_t>(c.rows) * 4), "ids")) {
+    return false;
+  }
+  cudaMemset(logits, 0, n * sizeof(T));
+  const kops::Tensor t_logits = tensor2d(logits, c.dtype, c.rows, c.cols);
+  const kops::Tensor t_ids = tensor1d(ids, kops::DType::kInt32, c.rows);
+  kops::sample::SamplingParams params{};
+  params.default_temperature = 1.0f;
+  const bool k20 = c.id.find("k20") != std::string::npos;
+  const bool p95 = c.id.find("p0.95") != std::string::npos;
+  params.default_top_k = c.op == "sample" ? (k20 ? 20 : 50) : 0;
+  params.default_top_p = c.op == "sample" ? (p95 ? 0.95f : 0.9f) : 1.0f;
+  params.default_min_p = 0.0f;
+  params.rng.global_seed = 7u;
+  kops::WorkspaceRequirements req{};
+  if (!status_ok(kops::sample::sampling_workspace_requirements(
+                     static_cast<int32_t>(c.rows), static_cast<int32_t>(c.cols), 0, &req),
+                 "sample workspace")) {
+    return false;
+  }
+  void* scratch = nullptr;
+  if (!cuda_ok(cudaMalloc(&scratch, req.device_scratch_bytes), "sample scratch")) return false;
+  kops::Workspace ws{};
+  ws.device_scratch = scratch;
+  ws.device_scratch_bytes = req.device_scratch_bytes;
+  const bool gumbel = c.op == "gumbel";
+  const auto call = [&] {
+    if (gumbel) {
+      (void)kops::sample::gumbel_max_sample(t_ids, t_logits, params, ctx);
+    } else {
+      (void)kops::sample::sample(t_ids, t_logits, params, ws, ctx);
+    }
+  };
+  const bool ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+  cudaFree(scratch);
+  cudaFree(logits);
+  cudaFree(ids);
+  return ok;
+}
+
+bool run_renorm(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const size_t n = static_cast<size_t>(c.rows * c.cols);
+  float* probs = nullptr;
+  float* out = nullptr;
+  if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&probs), n * 4), "probs") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&out), n * 4), "out")) {
+    return false;
+  }
+  cudaMemset(probs, 0, n * 4);
+  const kops::Tensor t_p = tensor2d(probs, kops::DType::kFloat32, c.rows, c.cols);
+  const kops::Tensor t_o = tensor2d(out, kops::DType::kFloat32, c.rows, c.cols);
+  bool ok = false;
+  if (c.op == "topk_renorm") {
+    const auto call = [&] { (void)kops::sample::top_k_renorm_probs(t_o, t_p, kops::Tensor{}, 50, ctx); };
+    ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+  } else {
+    const auto call = [&] { (void)kops::sample::top_p_renorm_probs(t_o, t_p, kops::Tensor{}, 0.9f, ctx); };
+    ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+  }
+  cudaFree(probs);
+  cudaFree(out);
+  return ok;
+}
+
+template <typename T>
+bool run_topk_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const size_t n = static_cast<size_t>(c.rows * c.cols);
+  T* logits = nullptr;
+  T* out = nullptr;
+  if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&logits), n * sizeof(T)), "logits") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&out), n * sizeof(T)), "out")) {
+    return false;
+  }
+  cudaMemset(logits, 0, n * sizeof(T));
+  const kops::Tensor t_l = tensor2d(logits, c.dtype, c.rows, c.cols);
+  const kops::Tensor t_o = tensor2d(out, c.dtype, c.rows, c.cols);
+  const auto call = [&] { (void)kops::sample::top_k_mask_logits(t_o, t_l, kops::Tensor{}, 50, ctx); };
+  const bool ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+  cudaFree(logits);
+  cudaFree(out);
+  return ok;
+}
+}
 
 int main(int argc, char** argv) {
   using namespace kops_bench;

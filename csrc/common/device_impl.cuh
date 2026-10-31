@@ -397,4 +397,60 @@ __device__ __forceinline__ float gemm_epilogue(float acc, const EP& e, int64_t m
 
 }  // namespace dev
 
+// ---- Counter RNG (declared in common/rng.cuh) -------------------------------
+// Philox-4x32-10, the reference block PRNG. The counter is a pure function of
+// (seed, request_id, position, draw_index, stream_id), so replaying a graph with
+// the same inputs reproduces the same draws without host state.
+KOPS_DEVICE uint4 philox4x32_10(uint2 key, uint4 ctr) {
+  uint32_t k0 = key.x;
+  uint32_t k1 = key.y;
+  const uint32_t m0 = 0xD2511F53u;
+  const uint32_t m1 = 0xCD9E8D57u;
+  const uint32_t w0 = 0x9E3779B9u;
+  const uint32_t w1 = 0xBB67AE85u;
+  uint32_t c0 = ctr.x;
+  uint32_t c1 = ctr.y;
+  uint32_t c2 = ctr.z;
+  uint32_t c3 = ctr.w;
+#pragma unroll
+  for (int i = 0; i < 10; ++i) {
+    const uint64_t p0 = static_cast<uint64_t>(m0) * c0;
+    const uint64_t p1 = static_cast<uint64_t>(m1) * c2;
+    const uint32_t hi0 = static_cast<uint32_t>(p0 >> 32);
+    const uint32_t lo0 = static_cast<uint32_t>(p0);
+    const uint32_t hi1 = static_cast<uint32_t>(p1 >> 32);
+    const uint32_t lo1 = static_cast<uint32_t>(p1);
+    c0 = hi1 ^ c1 ^ k0;
+    c1 = lo1;
+    c2 = hi0 ^ c3 ^ k1;
+    c3 = lo0;
+    k0 += w0;
+    k1 += w1;
+  }
+  return make_uint4(c0, c1, c2, c3);
+}
+
+KOPS_DEVICE float uniform_from_counter(uint64_t seed, uint64_t request_id, uint64_t position,
+                                       uint32_t draw_index, uint32_t stream_id) {
+  const uint2 key = make_uint2(static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32));
+  const uint4 ctr = make_uint4(static_cast<uint32_t>(request_id),
+                               static_cast<uint32_t>(request_id >> 32) ^ stream_id,
+                               static_cast<uint32_t>(position),
+                               static_cast<uint32_t>(position >> 32) ^ draw_index);
+  const uint4 r = philox4x32_10(key, ctr);
+  // 24 random bits plus one maps to (0, 1] with a resolution of 2^-24.
+  return static_cast<float>((r.x >> 8) + 1u) * (1.0f / 16777216.0f);
+}
+
+KOPS_DEVICE float gumbel_from_counter(uint64_t seed, uint64_t request_id, uint64_t position,
+                                      uint32_t draw_index, uint32_t stream_id) {
+  const float u = uniform_from_counter(seed, request_id, position, draw_index, stream_id);
+  return -logf(-logf(u));
+}
+
+KOPS_DEVICE float exponential_from_counter(uint64_t seed, uint64_t request_id, uint64_t position,
+                                           uint32_t draw_index, uint32_t stream_id) {
+  return -logf(uniform_from_counter(seed, request_id, position, draw_index, stream_id));
+}
+
 }  // namespace kops

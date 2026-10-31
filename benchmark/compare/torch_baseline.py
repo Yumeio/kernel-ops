@@ -210,6 +210,27 @@ def make_chain(case: dict, op: str, device: torch.device):
 
         return run
 
+    if op == "chain_moe_route_permute":
+        T, E, H, k = rows, 256, cols, 8
+        x = torch.randn(T, E, device=device)
+        b = torch.randn(E, device=device) * 0.1
+        hidden = torch.randn(T, H, device=device, dtype=torch.bfloat16)
+
+        def run():
+            s = torch.sigmoid(x)
+            sel = s + b
+            w, ids = torch.topk(sel, k, dim=-1)
+            ww = torch.gather(s, 1, ids)
+            ww = ww / ww.sum(-1, keepdim=True)
+            flat = ids.reshape(-1)
+            order = torch.sort(flat).values
+            cnt = torch.bincount(order, minlength=E)
+            pad = ((cnt + k - 1) // k) * k
+            torch.cumsum(pad, 0)
+            return hidden[flat // k]
+
+        return run
+
     raise SystemExit(f"unsupported chain op: {op}")
 
 
@@ -654,6 +675,10 @@ def make_op(case: dict, device: torch.device):
     b5 = make_b5_op(case, device)
     if b5 is not None:
         return b5
+
+    b6 = make_b6_op(case, device)
+    if b6 is not None:
+        return b6
 
     raise SystemExit(f"unsupported op: {op}")
 
@@ -1147,6 +1172,226 @@ def bench(fn, warmup: int, iters: int) -> dict:
         "p90_ms": samples[min(n - 1, (n * 9) // 10)],
         "min_ms": samples[0],
     }
+
+
+
+# ---- B6 routing / metadata / sampling baselines ---------------------------------------
+def make_b6_op(case: dict, device: torch.device):
+    op = case["op"]
+    rows = int(case["rows"])
+    cols = int(case["cols"])
+    T, E, k = rows, 256, 8
+
+    if op == "moe_route":
+        x = torch.randn(T, E, device=device)
+        b = torch.randn(E, device=device) * 0.1
+
+        def run():
+            s = torch.sigmoid(x)
+            sel = s + b
+            w, ids = torch.topk(sel, k, dim=-1)
+            ww = torch.gather(s, 1, ids)
+            ww = ww / ww.sum(-1, keepdim=True)
+            return ww * 2.5, ids
+
+        return run
+
+    if op == "moe_grouped":
+        G, TG = 8, 4
+        x = torch.randn(T, E, device=device)
+        b = torch.randn(E, device=device) * 0.1
+
+        def run():
+            s = torch.sigmoid(x)
+            sel = s + b
+            gs = sel.view(T, G, E // G)
+            g2 = gs.topk(2, dim=-1).values.sum(-1)
+            gi = torch.topk(g2, TG, dim=-1).indices
+            mask = torch.zeros(T, G, device=device, dtype=torch.bool).scatter_(1, gi, True)
+            sel = sel.view(T, G, E // G).masked_fill(~mask[:, :, None], float("-inf")).view(T, E)
+            w, ids = torch.topk(sel, k, dim=-1)
+            ww = torch.gather(s, 1, ids)
+            ww = ww / ww.sum(-1, keepdim=True)
+            return ww * 2.5, ids
+
+        return run
+
+    if op == "moe_fused_router":
+        H = cols
+        x = torch.randn(T, H, device=device, dtype=torch.bfloat16)
+        w = torch.randn(E, H, device=device, dtype=torch.bfloat16)
+        b = torch.randn(E, device=device, dtype=torch.bfloat16)
+
+        def run():
+            logits = torch.nn.functional.linear(x, w, b).float()
+            s = torch.sigmoid(logits)
+            ww, ids = torch.topk(s, 8, dim=-1)
+            ww = ww / ww.sum(-1, keepdim=True)
+            return ww * 2.5, ids
+
+        return run
+
+    if op == "moe_hash":
+        tok = torch.randint(0, 32000, (T,), device=device, dtype=torch.int64)
+        tab = torch.randint(0, E, (32000, k), device=device, dtype=torch.int32)
+        return lambda: (torch.nn.functional.embedding(tok, tab), torch.full((T, k), 2.0 / k, device=device))
+
+    if op == "moe_count_offsets":
+        ids = torch.randint(0, E, (rows,), device=device)
+
+        def run():
+            c = torch.bincount(ids, minlength=E)
+            return torch.cumsum(c, 0)
+
+        return run
+
+    if op == "moe_align":
+        block = 128
+        slots = rows
+        ids = torch.randint(0, E, (slots,), device=device)
+
+        def run():
+            s = torch.sort(ids).values
+            cnt = torch.bincount(s, minlength=E)
+            pad = ((cnt + block - 1) // block) * block
+            off = torch.cumsum(pad, 0) - pad
+            eids = torch.repeat_interleave(torch.arange(E, device=device), pad // block)
+            return s, eids, int(pad.sum())
+
+        return run
+
+    if op in ("moe_permute", "moe_permute_fp8"):
+        H = cols
+        x = torch.randn(T, H, device=device, dtype=torch.bfloat16)
+        idx = torch.randint(0, T, (T * k,), device=device)
+        if op == "moe_permute":
+            return lambda: x[idx]
+
+        def run_quant():
+            y = x[idx].float().view(T * k, H // 128, 128)
+            amax = y.abs().amax(-1, keepdim=True)
+            scale = amax.clamp_min(1e-4) / 448.0
+            q = (y / scale).to(torch.float8_e4m3fn)
+            return q, scale
+
+        return run_quant
+
+    if op == "moe_unpermute":
+        H = cols
+        eo = torch.randn(T * k, H, device=device, dtype=torch.bfloat16)
+        slot = torch.arange(T * k, device=device).view(T, k)
+        w = torch.randn(T, k, device=device)
+        sh = torch.randn(T, H, device=device, dtype=torch.bfloat16)
+        res = torch.randn(T, H, device=device, dtype=torch.bfloat16)
+
+        def run():
+            g = eo[slot]
+            return (g * w[..., None]).sum(1) + sh + res
+
+        return run
+
+    if op == "moe_sum":
+        H = cols
+        x = torch.randn(T, k, H, device=device, dtype=torch.bfloat16)
+        return lambda: x.sum(1)
+
+    if op == "moe_latent":
+        L = cols
+        eo = torch.randn(T * k, L, device=device, dtype=torch.bfloat16)
+        slot = torch.arange(T * k, device=device).view(T, k)
+        w = torch.randn(T, k, device=device)
+        nw = torch.ones(L, device=device, dtype=torch.bfloat16)
+
+        def run():
+            z = (eo[slot] * w[..., None]).sum(1)
+            return torch.nn.functional.rms_norm(z, (L,), nw, 1e-5)
+
+        return run
+
+    if op == "chain_moe_route_permute":
+        H = cols
+        x = torch.randn(T, E, device=device)
+        b = torch.randn(E, device=device) * 0.1
+        hidden = torch.randn(T, H, device=device, dtype=torch.bfloat16)
+        block = 8
+
+        def run():
+            s = torch.sigmoid(x)
+            sel = s + b
+            w, ids = torch.topk(sel, k, dim=-1)
+            ww = torch.gather(s, 1, ids)
+            ww = ww / ww.sum(-1, keepdim=True)
+            flat = ids.reshape(-1)
+            order = torch.sort(flat).values
+            cnt = torch.bincount(order, minlength=E)
+            pad = ((cnt + block - 1) // block) * block
+            torch.cumsum(pad, 0)
+            return hidden[flat // k]
+
+        return run
+
+    if op == "sample":
+        kk = 20 if "k20" in case["id"] else 50
+        p = 0.95 if "p0.95" in case["id"] else 0.9
+        x = torch.randn(T, cols, device=device)
+
+        def run():
+            probs = torch.softmax(x, dim=-1)
+            w, ids = torch.topk(probs, kk, dim=-1)
+            m = torch.zeros_like(probs).scatter_(1, ids, w)
+            m = m / m.sum(-1, keepdim=True)
+            sp, si = torch.sort(m, dim=-1, descending=True)
+            cs = torch.cumsum(sp, dim=-1)
+            keep = (cs <= p) | (cs - sp < p)
+            m2 = torch.zeros_like(m).scatter_(1, si, sp * keep)
+            m2 = m2 / m2.sum(-1, keepdim=True)
+            return torch.multinomial(m2, 1)
+
+        return run
+
+    if op == "gumbel":
+        x = torch.randn(T, cols, device=device)
+
+        def run():
+            probs = torch.softmax(x, dim=-1)
+            return torch.multinomial(probs, 1)
+
+        return run
+
+    if op == "topk_renorm":
+        probs = torch.rand(T, cols, device=device)
+        probs = probs / probs.sum(-1, keepdim=True)
+
+        def run():
+            w, ids = torch.topk(probs, 50, dim=-1)
+            out = torch.zeros_like(probs).scatter_(1, ids, w)
+            return out / out.sum(-1, keepdim=True)
+
+        return run
+
+    if op == "topp_renorm":
+        probs = torch.rand(T, cols, device=device)
+        probs = probs / probs.sum(-1, keepdim=True)
+
+        def run():
+            sp, si = torch.sort(probs, dim=-1, descending=True)
+            cs = torch.cumsum(sp, dim=-1)
+            keep = (cs <= 0.9) | (cs - sp < 0.9)
+            out = torch.zeros_like(probs).scatter_(1, si, sp * keep)
+            return out / out.sum(-1, keepdim=True)
+
+        return run
+
+    if op == "topk_mask":
+        x = torch.randn(T, cols, device=device)
+
+        def run():
+            w, ids = torch.topk(x, 50, dim=-1)
+            return torch.full_like(x, float("-inf")).scatter_(1, ids, w)
+
+        return run
+
+    return None
 
 
 def main() -> int:
