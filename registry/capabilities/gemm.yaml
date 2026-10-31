@@ -1,0 +1,68 @@
+{
+ "family": "gemm",
+ "rows": [
+  {
+   "op_id": "G04.weight_transpose",
+   "kernel_symbol": "weight_transpose_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "[K,N] -> [N,K]; 1/2/4/8-byte and packed 4-bit; row strides; generic",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G04.glu_weight_interleave",
+   "kernel_symbol": "glu_weight_interleave_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "[E,2I,K] weight + per-row scales + bias; halves <-> blocks of d rows",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G02.router_weight_split_bf16x2",
+   "kernel_symbol": "router_weight_split_bf16x2_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "fp32 -> bf16 hi + bf16 lo*256; 16 B aligned",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G03.int8_weight_colsum",
+   "kernel_symbol": "int8_weight_colsum_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "int8 [N,K] -> int32 row sums; dp4a",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G05.block_scale_swizzle",
+   "kernel_symbol": "block_scale_swizzle_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "1-byte scales; 128x4 tiles; zero padded; both directions; batched",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G03.fp8_scale_to_tma_layout",
+   "kernel_symbol": "fp8_scale_to_tma_layout_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "fp32 [M,K/128] -> [K/128,M_pad] or packed UE8M0 int32; rows past expert_offsets[G] zeroed",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G03.fp8_block2d_quant_weight",
+   "kernel_symbol": "fp8_block2d_quant_weight_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16/fp32 [N,K] -> e4m3 + fp32 block scales; any block size <= 1024; optional UE8M0",
+   "evidence": "test_gemm;bench_gemm"
+  }
+ ]
+}

@@ -24,6 +24,9 @@ DTYPES = {
     "int32": torch.int32,
     "uint32": torch.int32,
     "int64": torch.int64,
+    "int8": torch.int8,
+    "uint8": torch.uint8,
+    "float8_e4m3fn": torch.float8_e4m3fn,
 }
 EPS = 1e-5
 STYLE = "builtin"
@@ -644,7 +647,311 @@ def make_op(case: dict, device: torch.device):
         h = h / (n ** 0.5)
         return lambda: x @ h.t()
 
+    b4 = make_b4_op(case, device)
+    if b4 is not None:
+        return b4
+
     raise SystemExit(f"unsupported op: {op}")
+
+
+# ---- B4 weight preparation baselines ---------------------------------------------------
+# What a Python checkpoint loader does today: the vLLM `marlin_utils_test` formulation of the
+# Marlin repack (tile permutation + column packing), `awq_dequantize_pytorch`, the DeepGEMM
+# `per_block_cast_to_fp8` / `ceil_to_ue8m0` helpers, torchao `to_blocked`, and plain
+# `.t().contiguous()` / `.sum()` / in-place broadcast ops.  Where PyTorch has a single fused
+# primitive the baseline uses it, so these ratios are not inflated by a weak reference.
+_MARLIN_CACHE = {}
+AWQ_REV = [0, 4, 1, 5, 2, 6, 3, 7]  # column c of an 8-column AWQ word sits at nibble AWQ_REV[c]
+
+
+def _marlin_perm(num_bits: int, device):
+    key = ("perm", num_bits, str(device))
+    if key not in _MARLIN_CACHE:
+        base = []
+        for i in range(32):
+            perm1 = []
+            col = i // 4
+            for block in (0, 1):
+                for row in (2 * (i % 4), 2 * (i % 4) + 1, 2 * (i % 4 + 4), 2 * (i % 4 + 4) + 1):
+                    perm1.append(16 * row + col + 8 * block)
+            for j in range(4):
+                base.extend(p + 256 * j for p in perm1)
+        interleave = [0, 2, 4, 6, 1, 3, 5, 7] if num_bits == 4 else [0, 2, 1, 3]
+        perm = torch.tensor(base, dtype=torch.int64).reshape(-1, len(interleave))[:, interleave].ravel()
+        _MARLIN_CACHE[key] = perm.to(device)
+    return _MARLIN_CACHE[key]
+
+
+def _scale_perm(device, single: bool = False):
+    key = ("sperm", single, str(device))
+    if key not in _MARLIN_CACHE:
+        if single:
+            perm = [2 * i + j for i in range(4) for j in (0, 1, 8, 9, 16, 17, 24, 25)]
+        else:
+            perm = [i + 8 * j for i in range(8) for j in range(8)]
+        _MARLIN_CACHE[key] = torch.tensor(perm, dtype=torch.int64, device=device)
+    return _MARLIN_CACHE[key]
+
+
+def _marlin_pack(q: torch.Tensor, bits: int) -> torch.Tensor:
+    """q: int32 [K, N] with values in [0, 2^bits) -> Marlin words [K/16, N*16/pack]."""
+    k, n = q.shape
+    pack = 32 // bits
+    perm = _marlin_perm(bits, q.device)
+    q = q.reshape(k // 16, 16, n // 16, 16).permute(0, 2, 1, 3).reshape(k // 16, n * 16)
+    q = q.reshape(-1, perm.numel())[:, perm].reshape(k // 16, n * 16)
+    out = torch.zeros(k // 16, n * 16 // pack, dtype=torch.int32, device=q.device)
+    for i in range(pack):
+        out |= q[:, i::pack] << (bits * i)
+    return out
+
+
+def _unpack_nibbles(words: torch.Tensor) -> torch.Tensor:
+    shifts = torch.arange(0, 32, 4, device=words.device, dtype=torch.int32)
+    return (words.unsqueeze(-1) >> shifts) & 0xF
+
+
+def _unpack_awq(words: torch.Tensor) -> torch.Tensor:
+    return _unpack_nibbles(words)[..., AWQ_REV].reshape(words.shape[0], -1)
+
+
+def _make_scale_perm_op(scales: torch.Tensor):
+    n = scales.shape[-1]
+    sp = _scale_perm(scales.device)
+    return lambda: scales.reshape(-1, 64)[:, sp].reshape(-1, n)
+
+
+def _q4k_scale_min(s12: torch.Tensor):
+    """get_scale_min_k4 for all eight sub-blocks: s12 is [nb, 12] uint8 -> ([nb, 8], [nb, 8]) int32."""
+    s12 = s12.to(torch.int32)
+    sc = torch.empty(s12.shape[0], 8, dtype=torch.int32, device=s12.device)
+    mn = torch.empty_like(sc)
+    sc[:, :4] = s12[:, 0:4] & 63
+    mn[:, :4] = s12[:, 4:8] & 63
+    sc[:, 4:] = (s12[:, 8:12] & 0xF) | ((s12[:, 0:4] >> 6) << 4)
+    mn[:, 4:] = (s12[:, 8:12] >> 4) | ((s12[:, 4:8] >> 6) << 4)
+    return sc, mn
+
+
+def _ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
+    bits = x.abs().float().view(torch.int)
+    exp = ((bits >> 23) & 0xFF) + (bits & 0x7FFFFF).bool().int()
+    return (exp.clamp(1, 254) << 23).view(torch.float)
+
+
+def _per_block_cast_to_fp8(x: torch.Tensor, use_ue8m0: bool):
+    """DeepGEMM `per_block_cast_to_fp8` (128x128 blocks); skips the padding copy when aligned."""
+    m, n = x.shape
+    if m % 128 == 0 and n % 128 == 0:
+        x_padded = x
+    else:
+        x_padded = torch.zeros((m + 127) // 128 * 128, (n + 127) // 128 * 128, dtype=x.dtype, device=x.device)
+        x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = x_amax / 448.0
+    sf = _ceil_to_ue8m0(sf) if use_ue8m0 else sf
+    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(x_view.size(0), x_view.size(2))
+
+
+def _to_blocked(m: torch.Tensor) -> torch.Tensor:
+    """torchao / FlashInfer 128x4 scale swizzle."""
+    rows, cols = m.shape
+    n_row_blocks = (rows + 127) // 128
+    n_col_blocks = (cols + 3) // 4
+    padded = m
+    if (rows, cols) != (n_row_blocks * 128, n_col_blocks * 4):
+        padded = torch.zeros((n_row_blocks * 128, n_col_blocks * 4), device=m.device, dtype=m.dtype)
+        padded[:rows, :cols] = m
+    blocks = padded.view(n_row_blocks, 128, n_col_blocks, 4).permute(0, 2, 1, 3)
+    return blocks.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(-1, 32, 16).flatten()
+
+
+def make_b4_op(case: dict, device: torch.device):
+    op = case["op"]
+    rows = int(case["rows"])
+    cols = int(case["cols"])
+    k, n = rows, cols
+    g = 128
+
+    if op in ("gptq_to_marlin", "gptq_to_marlin_actorder"):
+        qweight = torch.randint(-2**31, 2**31 - 1, (k // 8, n), device=device, dtype=torch.int32)
+        scales = torch.randn(k // g, n, device=device).half()
+        g_idx = (torch.arange(k, device=device, dtype=torch.int64) * 2654435761 % (k // g)).to(torch.int32)
+        sperm = _make_scale_perm_op(scales)
+
+        def run_gptq():
+            shifts = torch.arange(0, 32, 4, device=device, dtype=torch.int32).view(1, 8, 1)
+            q = ((qweight.unsqueeze(1) >> shifts) & 0xF).reshape(k, n)
+            if op.endswith("actorder"):
+                perm = torch.argsort(g_idx, stable=True)
+                q = q[perm]
+            return _marlin_pack(q, 4), sperm()
+
+        return run_gptq
+
+    if op == "awq_to_marlin":
+        qweight = torch.randint(-2**31, 2**31 - 1, (k, n // 8), device=device, dtype=torch.int32)
+        qzeros = torch.randint(-2**31, 2**31 - 1, (k // g, n // 8), device=device, dtype=torch.int32)
+        scales = torch.randn(k // g, n, device=device).half()
+        sperm = _make_scale_perm_op(scales)
+        zperm = _scale_perm(device)
+        interleave = torch.tensor([0, 2, 4, 6, 1, 3, 5, 7], device=device)
+
+        def run_awq():
+            qw = _marlin_pack(_unpack_awq(qweight), 4)
+            z = _unpack_awq(qzeros)                                   # [G, N] natural column order
+            z = z.reshape(-1, 64)[:, zperm].reshape(-1, 8)[:, interleave].reshape(k // g, n)
+            zp = torch.zeros(k // g, n // 8, dtype=torch.int32, device=device)
+            for i in range(8):
+                zp |= z[:, i::8] << (4 * i)
+            return qw, sperm(), zp
+
+        return run_awq
+
+    if op == "awq_dequantize":
+        qweight = torch.randint(-2**31, 2**31 - 1, (k, n // 8), device=device, dtype=torch.int32)
+        qzeros = torch.randint(-2**31, 2**31 - 1, (k // g, n // 8), device=device, dtype=torch.int32)
+        scales = (torch.rand(k // g, n, device=device) * 0.2 + 0.001).half()
+
+        def run_awq_dq():
+            iw = _unpack_awq(qweight)
+            iz = _unpack_awq(qzeros).repeat_interleave(g, dim=0)
+            return (iw - iz) * scales.repeat_interleave(g, dim=0)
+
+        return run_awq_dq
+
+    if op == "gguf_dequantize_q4_k":
+        nb = k * n // 256
+        raw = torch.randint(0, 256, (nb * 144,), device=device, dtype=torch.uint8).view(nb, 144)
+        raw[:, 0:4] = torch.tensor([0x00, 0x3C, 0x00, 0x34], device=device, dtype=torch.uint8)  # d = 1.0, dmin = 0.25
+
+        def run_q4k():
+            d = raw[:, 0:2].contiguous().view(torch.float16).float()
+            dmin = raw[:, 2:4].contiguous().view(torch.float16).float()
+            sc, mn = _q4k_scale_min(raw[:, 4:16])
+            qs = raw[:, 16:144].view(nb, 4, 32)
+            q = torch.stack([qs & 0xF, qs >> 4], dim=2)               # [nb, 4, 2, 32]
+            d1 = (d * sc.float()).view(nb, 4, 2, 1)
+            m1 = (dmin * mn.float()).view(nb, 4, 2, 1)
+            return (d1 * q.float() - m1).reshape(k, n).half()
+
+        return run_q4k
+
+    if op == "gguf_dequantize_q8_0":
+        nb = k * n // 32
+        raw = torch.randint(0, 256, (nb * 34,), device=device, dtype=torch.uint8).view(nb, 34)
+
+        def run_q80():
+            d = raw[:, 0:2].contiguous().view(torch.float16).float()
+            q = raw[:, 2:].contiguous().view(torch.int8).float()
+            return (q * d).reshape(k, n).half()
+
+        return run_q80
+
+    if op == "fp4_to_marlin":
+        weight = torch.randint(0, 256, (n, k // 2), device=device, dtype=torch.uint8)
+        scales = torch.randint(0, 256, (n, k // 32), device=device, dtype=torch.uint8)
+        sperm = _scale_perm(device)
+
+        def run_fp4():
+            nib = torch.stack([weight & 0xF, weight >> 4], dim=-1).reshape(n, k)
+            qw = _marlin_pack(nib.t().to(torch.int32), 4)
+            s = scales.t().contiguous().reshape(-1, 64)[:, sperm].reshape(-1, n)
+            return qw, s
+
+        return run_fp4
+
+    if op == "fp8_block_scale_to_ue8m0":
+        sn, sk = k // 128, n // 128
+        w_q = torch.randint(0, 0x7F, (k, n), device=device, dtype=torch.uint8).view(torch.float8_e4m3fn)
+        s_old = torch.full((sn, sk), 0.0137, device=device)
+
+        def run_ue():
+            bits = s_old.view(torch.int32) & 0x7FFFFFFF
+            e = ((bits >> 23) + ((bits & 0x7FFFFF) != 0).to(torch.int32)).clamp(1, 254)
+            s_new = (e << 23).view(torch.float32)
+            ratio = s_old / s_new
+            q = (w_q.view(sn, 128, sk, 128).float() * ratio.view(sn, 1, sk, 1)).to(torch.float8_e4m3fn)
+            return q.view(k, n), s_new, e.to(torch.uint8)
+
+        return run_ue
+
+    if op == "smoothquant_fold":
+        w = torch.randn(k, n, device=device, dtype=torch.bfloat16)
+        nw = torch.ones(n, device=device, dtype=torch.bfloat16)
+        sm = torch.ones(n, device=device)
+
+        def run_fold():
+            w.mul_(sm)
+            nw.div_(sm)
+
+        return run_fold
+
+    # ---- gemm preparation ---------------------------------------------------------
+    if op == "weight_transpose":
+        dt = DTYPES[case["dtype"]]
+        x = torch.randn(rows, cols, device=device).to(dt)
+        return lambda: x.t().contiguous()
+
+    if op == "weight_transpose_int4":
+        x = torch.randint(0, 256, (rows, cols // 2), device=device, dtype=torch.uint8)
+
+        def run_t4():
+            u = torch.stack([x & 0xF, x >> 4], dim=-1).reshape(rows, cols)
+            t = u.t().contiguous()
+            return t[:, 0::2] | (t[:, 1::2] << 4)
+
+        return run_t4
+
+    if op == "glu_interleave":
+        x = torch.randn(rows, cols, device=device, dtype=torch.bfloat16)
+        inter = rows // 2
+        d = 64
+
+        def run_glu():
+            return torch.stack([x[:inter].view(inter // d, d, cols), x[inter:].view(inter // d, d, cols)],
+                               dim=1).reshape(rows, cols)
+
+        return run_glu
+
+    if op == "router_split":
+        w = torch.randn(rows, cols, device=device)
+
+        def run_split():
+            hi = w.to(torch.bfloat16)
+            return hi, ((w - hi.float()) * 256.0).to(torch.bfloat16)
+
+        return run_split
+
+    if op == "int8_colsum":
+        w = torch.randint(-128, 128, (rows, cols), device=device, dtype=torch.int8)
+        return lambda: w.sum(dim=1, dtype=torch.int32)
+
+    if op == "block_scale_swizzle":
+        x = torch.randint(0, 256, (rows, cols), device=device, dtype=torch.uint8)
+        return lambda: _to_blocked(x)
+
+    if op == "fp8_scale_to_tma":
+        x = torch.rand(rows, cols, device=device) + 0.5
+        return lambda: x.t().contiguous()
+
+    if op == "fp8_scale_to_tma_ue8m0":
+        x = torch.exp2(torch.randint(-10, 10, (rows, cols), device=device).float())
+
+        def run_pack():
+            packed = ((x.view(torch.int32) >> 23) & 0xFF).to(torch.uint8).view(torch.int32)
+            return packed.t().contiguous()
+
+        return run_pack
+
+    if op in ("fp8_block_quant", "fp8_block_quant_ue8m0"):
+        x = torch.randn(rows, cols, device=device, dtype=torch.bfloat16)
+        ue = op.endswith("ue8m0")
+        return lambda: _per_block_cast_to_fp8(x, ue)
+
+    return None
 
 
 def bench(fn, warmup: int, iters: int) -> dict:

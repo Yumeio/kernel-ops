@@ -1,6 +1,6 @@
 # ayaka-kernel — ROADMAP triển khai (từ dễ đến khó, theo phụ thuộc)
 
-Cập nhật 2026-10-31. Roadmap này liệt kê 233 `__global__` kernel trong 18 bước và 125 nhịp. Checkout này hiện có **75 kernel có thân**: toàn bộ B0 (2/2), B1 (32/32), B2 (20/20) và B3 (21/21); 158 kernel còn lại là contract trong header, chưa có định nghĩa. Repo là `ayaka-kernel`; namespace C++ và tiền tố ABI là `kops` (không phải `ayaka`).
+Cập nhật 2026-10-31. Roadmap này liệt kê 233 `__global__` kernel trong 18 bước và 125 nhịp. Checkout này hiện có **93 kernel có thân**: toàn bộ B0 (2/2), B1 (32/32), B2 (20/20), B3 (21/21) và B4 (18/18); 140 kernel còn lại là contract trong header, chưa có định nghĩa. Repo là `ayaka-kernel`; namespace C++ và tiền tố ABI là `kops` (không phải `ayaka`).
 
 **Chiến lược 2026-10-31, đọc §0.7 và §3 trước.** Roadmap được xây đủ **chỉ với một RTX 3050 Laptop (SM86, 4 GB)**, không thuê GPU, và **không dùng PyTorch, torch binding, CUTLASS/CuTe hay provider adapter**. API duy nhất là `csrc/<family>/ops.h` (`kops::Status` + `Tensor`/`LaunchContext`/`Workspace`); thân kernel và launcher viết ngay trong `csrc/<family>/<stem>.cu`; test và benchmark là C++/ctest. FlashMLA, DeepGEMM, vLLM, SGLang, hpc-ops và attention.rs trong `3rd/` chỉ là **nguồn đọc** (thuật toán, layout, edge case), không được link hay build. §2 nói mỗi ô đạt tới đâu khi chỉ có SM86; §3 nói thứ tự P0–P8 và kỹ thuật K1–K7 (K1/K2/K6 deferred vì cần PyTorch).
 
@@ -9,7 +9,7 @@ Cập nhật 2026-10-31. Roadmap này liệt kê 233 `__global__` kernel trong 1
 - `tools/check_roadmap.py` (đã có; mở rộng theo §1.6) kiểm tra quy tắc trên mỗi khi bảng kernel hoặc file nguồn thay đổi.
 - **Cột Reference** trong mọi bảng kernel trỏ tới code tương tự trong vLLM, SGLang, hpc-ops, attention.rs, FlashMLA và DeepGEMM để đối chiếu khi viết kernel (§0.6).
 - **Nhịp và ngân sách file (§1).** Đơn vị công việc là một hàng của bảng kernel, gọi là *nhịp*, và mọi nhịp theo cùng một vòng năm việc. Số file mới tăng theo family, theo nhóm kernel (một file `.cu`) và theo ô arch (một ô của lưới family × arch), không tăng theo kernel; trần nằm ở Phụ lục E.
-- **Hiện trạng (2026-10-31).** 75/233 kernel có thân: B0 đủ 2/2, B1 đủ 32/32, B2 đủ 20/20, B3 đủ 21/21. Các file `csrc/{model_ops,norm,activation,position,embedding,sampling,attention,kvcache,state,quantization}/*.cu` có launcher, test C++ (`test_m1`, `test_model_ops`, `test_norm`, `test_activation`, `test_position`, `test_embedding`, `test_sampling`, `test_merge`, `test_kvcache`, `test_state`, `test_quantization`) và benchmark C++ (`bench_model_ops`, `bench_norm`, `bench_activation`, `bench_position`, `bench_embedding`, `bench_sampling`, `bench_merge`, `bench_chains`, `bench_kvcache`, `bench_state`, `bench_quantization`). `KOPS_ABI_VERSION` là 4 do `InvFreqTable`/`HybridBranchTable` được truyền by value; host API không đổi. `tools/check_roadmap.py` đang pass với 233 kernel được gán đúng một bước.
+- **Hiện trạng (2026-10-31).** 93/233 kernel có thân: B0 đủ 2/2, B1 đủ 32/32, B2 đủ 20/20, B3 đủ 21/21, B4 đủ 18/18. Các file `csrc/{model_ops,norm,activation,position,embedding,sampling,attention,kvcache,state,quantization}/*.cu` có launcher, test C++ (`test_m1`, `test_model_ops`, `test_norm`, `test_activation`, `test_position`, `test_embedding`, `test_sampling`, `test_merge`, `test_kvcache`, `test_state`, `test_quantization`, `test_gemm`) và benchmark C++ (`bench_model_ops`, `bench_norm`, `bench_activation`, `bench_position`, `bench_embedding`, `bench_sampling`, `bench_merge`, `bench_chains`, `bench_kvcache`, `bench_state`, `bench_quantization`, `bench_gemm`). `KOPS_ABI_VERSION` là 4 do `InvFreqTable`/`HybridBranchTable` được truyền by value; host API không đổi. `tools/check_roadmap.py` đang pass với 233 kernel được gán đúng một bước.
 - **Phần cứng (§2).** Máy dev chỉ có một GPU SM86 (RTX 3050 Laptop, 4 GB VRAM), chạy WSL2 với CUDA 12.9, nên compile được cả 8 exact SM. Kernel nhắm SM khác (SM80, SM89, SM90a, SM100a/103a/120a/121a), nhiều GPU hoặc VRAM lớn vẫn được viết đủ theo vòng năm việc, sau khi đọc code đã chạy thật trong sáu project reference. Chúng không chạy được ở máy dev: ô (kernel, SM) đó dừng ở `authored`/`compiled` kèm evidence twin và SASS (§2.2 mục 6, §3.2). Bộ test C++ viết sẵn thành gói bàn giao cho bất kỳ ai có đúng phần cứng (§2.5, Phụ lục B). Không thêm file: test nằm trong `tests/unit/test_<family>.cc`, benchmark trong `benchmark/bench_<family>.cc`, evidence nằm trong registry.
 
 Bước được đặt tên `B0…B17`, mốc model là `Mốc 1…10`. Cách đặt tên này tránh trùng với nhãn ưu tiên P0/P1/P2 của proposal và với mã catalog (A01, M01, …). Bước mở nhiều việc cùng lúc được chia thành đợt, đặt tên `B0.1…B0.2` và `B1.1…B1.3` (§1.4).
@@ -341,6 +341,25 @@ Một file `.cu` chứa thân kernel, launcher, instantiation và entry point c�
 | `weight_transpose_nibble_kernel` | gemm/gemm_prep.cu | `weight_transpose_kernel` |
 | `weight_transpose_bytes_kernel` | gemm/gemm_prep.cu | `weight_transpose_kernel` |
 | `fp8_block2d_quant_weight_vec_kernel` | gemm/gemm_prep.cu | `fp8_block2d_quant_weight_kernel` |
+| `glu_weight_interleave_rows_kernel` | gemm/gemm_prep.cu | `glu_weight_interleave_kernel` |
+| `router_weight_split_vec_kernel` | gemm/gemm_prep.cu | `router_weight_split_bf16x2_kernel` |
+| `int8_weight_colsum_rows_kernel` | gemm/gemm_prep.cu | `int8_weight_colsum_kernel` |
+| `block_scale_swizzle_tiles_kernel` | gemm/gemm_prep.cu | `block_scale_swizzle_kernel` |
+| `fp8_scale_transpose_kernel` | gemm/gemm_prep.cu | `fp8_scale_to_tma_layout_kernel` |
+| `fp8_scale_pack_ue8m0_kernel` | gemm/gemm_prep.cu | `fp8_scale_to_tma_layout_kernel` |
+| `marlin_repack_tiles_kernel` | quantization/weight_repack.cu | `gptq_marlin_repack_kernel` |
+| `gptq_stable_argsort_kernel` | quantization/weight_repack.cu | `gptq_marlin_repack_kernel` |
+| `identity_perm_kernel` | quantization/weight_repack.cu | `gptq_marlin_repack_kernel` |
+| `marlin_awq_zero_points_words_kernel` | quantization/weight_repack.cu | `marlin_awq_zero_points_kernel` |
+| `awq_dequantize_words_kernel` | quantization/weight_repack.cu | `awq_dequantize_kernel` |
+| `gguf_dequantize_blocks_kernel` | quantization/weight_repack.cu | `gguf_dequantize_kernel` |
+| `fp4_marlin_scales_kernel` | quantization/weight_repack.cu | `fp4_marlin_repack_kernel` |
+| `copy_bytes_kernel` | quantization/weight_repack.cu | `fp4_backend_shuffle_kernel` |
+| `fp8_block_scale_to_ue8m0_blocks_kernel` | quantization/weight_repack.cu | `fp8_block_scale_to_ue8m0_kernel` |
+| `smoothquant_compute_scales_elems_kernel` | quantization/weight_repack.cu | `smoothquant_compute_scales_kernel` |
+| `smoothquant_scale_rows_kernel` | quantization/weight_repack.cu | `smoothquant_fold_kernel` |
+| `smoothquant_scale_rows_scalar_kernel` | quantization/weight_repack.cu | `smoothquant_fold_kernel` |
+| `smoothquant_fold_norm_kernel` | quantization/weight_repack.cu | `smoothquant_fold_kernel` |
 | `chunk_histogram_kernel` | moe/permute.cu | `moe_align_block_size_kernel` |
 | `chunk_scan_kernel` | moe/permute.cu | `moe_align_block_size_kernel` |
 | `expert_begin_kernel` | moe/permute.cu | `moe_align_block_size_kernel` |
@@ -510,7 +529,7 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B1 | 32 / 32 | 0 |
 | B2 | 20 / 20 | 0 |
 | B3 | 21 / 21 | 0 |
-| B4 | 0 / 18 | 18 |
+| B4 | 18 / 18 | 0 |
 | B5 | 0 / 16 | 16 |
 | B6 | 0 / 15 | 15 |
 | B7 | 0 / 16 | 16 |
@@ -524,9 +543,9 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B15 | 0 / 8 | 8 |
 | B16 | 0 / 6 | 6 |
 | B17 | 0 / 5 | 5 |
-| **Tổng** | **75 / 233** | **158** |
+| **Tổng** | **93 / 233** | **140** |
 
-B0, B1, B2 và B3 đã đủ thân. Các launcher B4+ vẫn trả `kNotImplemented`; 233 kernel / 125 nhịp / 112 file không đổi. B0–B3 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
+B0, B1, B2, B3 và B4 đã đủ thân. Các launcher B5+ vẫn trả `kNotImplemented`; 233 kernel / 125 nhịp / 112 file không đổi. B0–B4 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
 
 Không còn "nợ hiệu năng" hay report cũ trong checkout này: mọi số đo sẽ được sinh lại bằng benchmark C++ khi kernel tương ứng có thân.
 
@@ -902,6 +921,39 @@ Hạ tầng gồm 17 file (Phụ lục E.2): 14 file dựng ở đợt B0.1, 3 f
 - Bit-exact với golden vector của layout (sinh offline từ công thức/tài liệu); vLLM repack và CUTLASS util chỉ là provenance.
 - Đường ống load chạy ngoài graph và không giữ lại workspace.
 - Benchmark ghi "prep time" riêng cho từng recipe.
+
+**Hiện trạng B4 (2026-10-31).** 18/18 kernel có thân: 11 kernel trong `csrc/quantization/weight_repack.cu` (hàng 1–4) và 7 kernel trong `csrc/gemm/gemm_prep.cu` (hàng 5–6). Lần cài đầu để hai kernel hẹp hơn hàng bảng; cùng ngày cả hai đã được hoàn thiện:
+- `fp4_backend_shuffle_kernel` cài cả hai đích. `WeightPacking::kFP4E2M1` (CUTLASS SM100/SM120): weight chép nguyên, scale xếp 128x4 theo từng expert (có đệm). `WeightPacking::kTrtllmShuffled` (TRT-LLM-gen): hàng weight xáo trong từng khối 32 hàng (hàng `i` sang hàng `(i % 4) * 8 + i / 4`), scale xáo cùng cách rồi xếp 128x4 trong một lượt gather; đây là `shuffle_matrix_a` với `epilogue_tile_m = 128` cộng `block_scale_interleave` của TensorRT-LLM `09198b7` (`fp4_utils.py`, `fp4BlockScaleMoe.cpp`, `quantization.cu`). Đích TRT-LLM đòi `N % 128 == 0` và `K / block % 4 == 0` (đúng các assert của `get_shuffle_matrix_sf_a_row_indices`) và chạy ngoài chỗ. Weight gate/up hợp nhất của TRT-LLM còn qua `reorder_rows_for_gated_act_gemm` trước khi xáo; bước đó chính là `gemm::glu_weight_interleave` (halves sang xen kẽ từng hàng). Hợp đồng `fp4_backend_shuffle` không có cờ gated nên hai bước là hai lời gọi liên tiếp, và test chạy đúng chuỗi đó.
+- `gguf_dequantize_kernel` phủ 20 định dạng: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ4_XS và các định dạng tra lưới IQ1_S, IQ1_M, IQ2_XXS/XS/S, IQ3_XXS/S. Sáu bảng codebook (4 608 từ) được port máy móc từ llama.cpp `ggml/src/ggml-common.h` @ `0ec4027` (MIT) vào khối `adapted-from-llama.cpp` của `weight_repack.cu` thay vì một header mới, vì trần 112 file (§1.2) chỉ tăng khi chủ repo duyệt và file vẫn dưới ngưỡng 2 500 dòng. Nguồn, giấy phép và cách port ghi ở `THIRD_PARTY_NOTICES.md` (mục "Ported code") và `third_party/licenses/llama.cpp.txt`. `F32`/`F16`/`BF16`/`Q8_1` không phải định dạng block lượng tử nên trả `kNotImplemented`. Công thức tính bằng fp32 theo `ggml-quants.c`, không lặp lại phép làm tròn half trung gian của kernel vLLM/SGLang.
+
+Quy ước đã chọn khi hàng bảng để mở: `fp8_block2d_quant_weight` dùng sàn amax 1e-4 theo `per_block_cast_to_fp8` của DeepGEMM (B3 dùng 1e-10 cho activation) và chia thật (`__fdiv_rn`) như B3, trong khi DeepGEMM nhân với nghịch đảo (kết quả có thể lệch 1 ulp e4m3 ở các điểm sát ranh giới làm tròn); `fp8_block_scale_to_ue8m0` làm tròn lên scale cũ rồi requantize payload theo `s_old / s_new` (không tính lại amax như đường requant của vLLM); `fp4_marlin_repack` trả scale đã hoán vị ở dạng byte thô, chưa có bước hậu xử lý riêng của kernel Marlin tiêu thụ; act-order dùng argsort ổn định (hòa theo chỉ số tăng dần).
+
+**Bằng chứng B4 dev (2026-10-31).** `test_gemm` (mới) phủ transpose (1/2/4/8 byte, nibble, stride), GLU interleave (halves, khối, nhiều expert, scale và bias), router split, colsum, swizzle 128x4 hai chiều (oracle `to_blocked` của torchao), `fp8_scale_to_tma_layout` (fp32, UE8M0 đóng gói, `expert_offsets`), FP8 block quant (bf16/fp16/fp32, block lẻ, stride) và các lỗi hợp đồng. `test_quantization` phủ thêm Marlin 4/8-bit từ GPTQ (có và không act-order), AWQ và FP4 (oracle tái dẫn xuất theo công thức numpy `get_perms`/`marlin_weights` của vLLM, độc lập với công thức theo lane trong kernel), hoán vị scale và zero point, AWQ dequantize, 13 định dạng GGUF (oracle theo vòng lặp `dequantize_row_*`), FP8→UE8M0, SmoothQuant. Cả 20 định dạng GGUF còn được so với chính llama.cpp: `dequantize_row_*` của `ggml-quants.c` @ `0ec4027` (gcc 13, `-O2 -ffp-contract=off`) chạy trên 1 024 block giả ngẫu nhiên mỗi loại (đủ để mọi mục của sáu bảng codebook được tham chiếu), kops cho kết quả giống từng bit, và test ghim hash FNV-1a-64 của đầu ra đó (đầu ra fp16/bf16 phải bằng đầu ra fp32 làm tròn một lần). Đích `kTrtllmShuffled` được so (9 cấu hình: gated hay không, MXFP4/NVFP4, nhiều expert, nhiều tile) với kết quả của chính các hàm Python `get_shuffle_matrix_a_row_indices`, `get_reorder_rows_for_gated_act_gemm_row_indices` và `get_shuffle_matrix_sf_a_row_indices` nạp thẳng từ `3rd/TensorRT-LLM`; hai CUDA op mà chúng gọi được thay bằng định nghĩa trong mã C++ của TensorRT-LLM (`shuffle_matrix` là `index_select`, `block_scale_interleave` là `computeSFIndex`/`get_sf_out_offset_128x4`, hai công thức này được kiểm là một) vì TensorRT-LLM không được build ở đây; test C++ dùng oracle độc lập là bảng `srcToDstBlk32RowMap` và `computeSFIndex` chép lại. Bộ mã hóa e4m3 dùng chung `dev::e4m3_from_float_sat` được so với intrinsic trên toàn bộ 2^32 mẫu fp32, bộ giải mã trên 256 mã. 60 lần đột biến một dòng trong kernel đều làm test đỏ: 39 lần cho lần cài đầu (bảng offset lane, thứ tự nibble, hoán vị scale, tie-break argsort, làm tròn UE8M0, ánh xạ swizzle, …) và 21 lần cho phần thêm (mục bảng codebook đầu và cuối, hằng số scale, dịch bit dấu, chỉ số cao, delta của IQ1, ánh xạ hàng TRT-LLM, kích thước tile scale, ràng buộc hình dạng, chồng lấn con trỏ). `ctest` xanh 12/12.
+
+**So với PyTorch 2.13.0+cu129 (WSL2) trên RTX 3050 Laptop (SM86).** Ba vòng xen kẽ C++ (Windows, Release) và PyTorch trong cùng phiên, lấy trung vị: `bench_gemm` + các case B4 của `bench_quantization` đạt **geometric mean 8.23x qua 20 case** (gemm 4.94x/11 case, quantization 15.37x/9 case; mỗi vòng 8.31x, 8.24x, 8.19x). Bỏ bốn case repack Marlin còn **5.14x qua 16 case**: baseline PyTorch của Marlin là công thức numpy của vLLM (giải nén sang int32, hoán vị, đóng gói lại), nên 34–68x không phải so với CUDA op `gptq_marlin_repack` của vLLM. 18/20 case ≥3x; prep time cho một weight 4096x4096 ở dưới.
+
+| Case | kops (ms) | PyTorch (ms) | Tỉ lệ | GB/s kops |
+|---|---|---|---|---|
+| `gptq_to_marlin` 4-bit g128 | 0.106 | 7.26 | 68.5x | 163 |
+| `gptq_to_marlin` act-order | 0.235 | 8.03 | 34.2x | 74 |
+| `awq_to_marlin` 4-bit g128 | 0.128 | 8.55 | 67.0x | 140 |
+| `fp4_to_marlin` MXFP4 | 0.141 | 7.63 | 54.1x | 126 |
+| `awq_dequantize` fp16 | 0.388 | 4.95 | 12.8x | 109 |
+| `gguf_dequantize` Q4_K → fp16 | 0.667 | 3.81 | 5.70x | 64 |
+| `gguf_dequantize` Q8_0 → fp16 | 0.495 | 2.48 | 5.02x | 104 |
+| `fp8_block_scale_to_ue8m0` | 0.301 | 2.04 | 6.78x | 112 |
+| `smoothquant_fold` bf16 | 0.375 | 0.854 | 2.28x | 179 |
+| `weight_transpose` bf16 / fp8 / int4 | 0.396 / 0.196 / 0.186 | 1.46 / 1.31 / 2.42 | 3.68x / 6.66x / 13.0x | 169 / 171 / 90 |
+| `glu_weight_interleave` bf16 | 0.735 | 0.739 | 1.01x | 183 |
+| `router_weight_split_bf16x2` | 0.737 | 3.59 | 4.86x | 182 |
+| `int8_weight_colsum` | 0.093 | 0.836 | 8.96x | 180 |
+| `block_scale_swizzle` 14336x256 | 0.046 | 0.251 | 5.44x | 159 |
+| `fp8_scale_to_tma_layout` fp32 / UE8M0 | 0.084 / 0.093 | 0.366 / 0.310 | 4.38x / 3.34x | 176 / 99 |
+| `fp8_block2d_quant_weight` (và UE8M0) | 0.472 | 2.90 | 6.15x (6.19x) | 107 |
+
+Hai case dưới 3x đã chạm trần đo được của máy, nên không còn chỗ để hơn. Đỉnh lý thuyết là 192 GB/s nhưng `cudaMemcpyAsync` D2D, đường chép tốt nhất của driver, chỉ đạt 183.1 GB/s (R+W) và mọi biến thể kernel chép hoặc đọc-sửa-ghi tự viết (grid-stride 4 đến 32 block/SM, `ldcs`/`stcs`, giữ `s` trong thanh ghi, 1 đến 4 hàng mỗi lượt) nằm trong 181–183 GB/s; kernel hiện tại đạt 183 GB/s với `glu_weight_interleave` và 179–181 GB/s với `smoothquant_fold`. `glu_weight_interleave` 1.01x vì mọi cách viết một lượt trong PyTorch (`torch.stack`, `index_select`, `index_select(out=)`) mất 0.737–0.740 ms, bằng `cudaMemcpyAsync` cùng dữ liệu (0.733 ms). `smoothquant_fold` 2.28x vì baseline `w.mul_(s)` mất 0.854 ms còn một lượt đọc-ghi tại chỗ 32 MiB không thể dưới 0.368 ms (`cudaMemcpyAsync` cùng kích thước), tức trần 0.854 / 0.368 ≈ 2.32x; 2.4x cần 188 GB/s, cao hơn cả `cudaMemcpyAsync`. Cách TensorRT-LLM nạp trọng số (`index_select` rồi `dst.copy_(...)`, `quantization.py` `_shuffle_w3_w1_weight`) là hai lượt và mất 1.474 ms, nên so với đúng idiom đó kernel đạt 2.0x; số này không nằm trong bảng vì đổi baseline là đổi câu hỏi so sánh. `smoothquant_compute_scales_kernel` chỉ có test (độ dài K, bị giới hạn bởi launch). Các kernel còn xa băng thông và chưa được profile: GGUF Q4_K (64 GB/s), FP8 block quant (107 GB/s) và `gptq_to_marlin` act-order (74 GB/s; sắp lại thứ tự duyệt tile đã kéo nó từ 0.49 xuống 0.24 ms, nên nhiều khả năng còn bị chi phối bởi việc đọc hàng ngẫu nhiên của qweight).
+
+Lưu ý khi đọc số: (1) cây làm việc chưa commit (`git.dirty = 1`), nên mọi số trên là `diagnostic_only` (§2.2); (2) C++ chạy trên Windows còn PyTorch chạy trong WSL2, độ trễ launch của WSL2 cao hơn nên các case ngắn (`block_scale_swizzle`, `fp8_scale_to_tma_layout`) được lợi một phần; (3) harness C++ đo 20 launch giữa hai event, còn `torch_baseline.py` đo từng lần gọi, cùng cách đo với B1 và B3; (4) torch 2.13.0+cu129 khác bản ghim 2.14.1+cu126 trong `pyproject.toml`; (5) các baseline PyTorch được đối chiếu với vòng lặp Python theo công thức (14 kiểm tra) trước khi đo.
 
 ---
 

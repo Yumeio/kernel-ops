@@ -153,6 +153,8 @@ add_library(kops_cuda STATIC
   csrc/sampling/sampling.cu
   csrc/sampling/logits_processor.cu
   csrc/quantization/quant.cu
+  csrc/quantization/weight_repack.cu
+  csrc/gemm/gemm_prep.cu
   csrc/attention/merge.cu
   csrc/attention/mla.cu
   csrc/kvcache/kvcache.cu
@@ -243,6 +245,12 @@ if(KOPS_BUILD_TESTS)
     set_source_files_properties(tests/unit/test_quantization.cc PROPERTIES LANGUAGE CUDA)
     kops_add_test(kops_test_quantization
       SOURCES tests/unit/test_quantization.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_gemm.cc")
+    set_source_files_properties(tests/unit/test_gemm.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_gemm
+      SOURCES tests/unit/test_gemm.cc
       LIBS kops_cuda)
   endif()
 endif()

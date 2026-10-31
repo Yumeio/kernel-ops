@@ -74,5 +74,8 @@ endif()
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_quantization.cu")
   kops_add_bench(bench_quantization bench_quantization.cu)
 endif()
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/bench_gemm.cu")
+  kops_add_bench(bench_gemm bench_gemm.cu)
+endif()
 
 message(STATUS "kernel-ops: benchmark targets -> ${CMAKE_BINARY_DIR}/benchmark")

@@ -49,6 +49,33 @@ chains `chain_pre_norm_quant` / `chain_glu_quant`. MXFP4/NVFP4 baselines cast to
 FP8 because PyTorch has no portable e2m1 cast; that makes their comparison
 conservative for the native FP4 path.
 
+## B4 weight preparation comparison
+
+```bash
+build/bench/benchmark/bench_gemm --dump-cases > out/cases-gemm.json
+build/bench/benchmark/bench_gemm --json out/kops-gemm.json
+python benchmark/compare/torch_baseline.py --cases out/cases-gemm.json     --json out/torch-gemm.json --style hf
+python benchmark/compare/compare_results.py out/kops-gemm.json out/torch-gemm.json
+
+# The B4 cases that live in bench_quantization (the B3 cases are filtered out):
+python benchmark/compare/compare_results.py out/kops-quant.json out/torch-quant.json     --only quant.gptq quant.awq quant.gguf quant.fp4 quant.fp8_to quant.smooth
+```
+
+The baselines are what a Python checkpoint loader runs today, not a strawman:
+
+- Marlin repack (`gptq_to_marlin`, `awq_to_marlin`, `fp4_to_marlin`): the vLLM `marlin_utils_test`
+  formulation (unpack to int32, tile permutation, column packing). vLLM's production path is a CUDA op,
+  so these four ratios (tens of x) are against the pure-PyTorch reference, not against that op.
+- `awq_dequantize`, `fp8_block_quant`, `fp8_block_scale_to_ue8m0`: AWQ / DeepGEMM `per_block_cast_to_fp8`
+  formulas, skipping the padding copy when the shape is already aligned.
+- `weight_transpose`, `glu_interleave`, `int8_colsum`, `smoothquant_fold`: the single PyTorch primitive
+  (`.t().contiguous()`, `torch.stack`, `.sum(dtype=int32)`, in-place `mul_`/`div_`), so cases at DRAM
+  roofline show ~1x.
+- `block_scale_swizzle`: torchao `to_blocked`.
+
+Each baseline was checked against an explicit per-lane / per-block Python loop on small shapes before
+timing. `smoothquant_compute_scales` has no benchmark case (K elements, launch bound).
+
 ## Fairness checklist
 
 - Same GPU, driver, dtype and shape; pre-allocate tensors; `torch.inference_mode()`.

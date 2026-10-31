@@ -46,6 +46,38 @@ __device__ __forceinline__ void store_pack(T* __restrict__ p, const Pack<T, N>& 
   *reinterpret_cast<Pack<T, N>*>(p) = v;
 }
 
+/// fp32 -> e4m3fn bits, round to nearest even, saturating to +-448 (the result of
+/// __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)).  sm_86 has no FP8 convert
+/// instruction, so the toolkit intrinsic expands to ~40 integer instructions; this form is
+/// about a quarter of that.  tests/unit/test_gemm.cc compares it with the intrinsic on all
+/// 2^32 fp32 bit patterns.
+__device__ __forceinline__ uint8_t e4m3_from_float_sat(float x) {
+  const uint32_t u = __float_as_uint(x);
+  const uint32_t sign = (u >> 24) & 0x80u;
+  const uint32_t a = u & 0x7FFFFFFFu;
+  uint32_t code;
+  if (a > 0x7F800000u) {
+    return 0x7Fu;                                   // NaN has no sign
+  } else if (a >= 0x43E80000u) {
+    code = 0x7Eu;                                   // >= 464 (and +-inf): saturate to 448
+  } else if (a < 0x3C800000u) {
+    code = static_cast<uint32_t>(__float2int_rn(__uint_as_float(a) * 512.0f));  // subnormal grid 2^-9
+  } else {
+    const uint32_t r = a + 0x7FFFFu + ((a >> 20) & 1u);  // keep 3 mantissa bits, ties to even
+    code = (r >> 20) - 960u;                        // re-bias the exponent 127 -> 7
+  }
+  return static_cast<uint8_t>(sign | code);
+}
+
+/// e4m3fn bits -> fp32 (exact).  Normal codes rebias the exponent field in place; the
+/// subnormals are m * 2^-9.  Both NaN codes (0x7F, 0xFF) decode to NaN.
+__device__ __forceinline__ float e4m3_to_float_fast(uint8_t b) {
+  const uint32_t m = b & 0x7Fu;
+  float v = m < 8u ? __uint2float_rn(m) * (1.0f / 512.0f) : __uint_as_float((m << 20) + (120u << 23));
+  if (m == 0x7Fu) v = __uint_as_float(0x7FC00000u);
+  return (b & 0x80u) ? -v : v;
+}
+
 }  // namespace dev
 
 // ---- Vector primitives (declared in device.cuh) ----------------------------

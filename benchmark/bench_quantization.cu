@@ -12,6 +12,8 @@
 #include <vector>
 
 #include "csrc/common/quant.cuh"
+#include "csrc/quantization/quant_kernels.cuh"
+#include "csrc/quantization/weight_repack_kernels.cuh"
 #include "csrc/quantization/ops.h"
 
 namespace {
@@ -49,6 +51,27 @@ std::vector<Case> make_cases() {
       r * c);
   add("quant.hadamard.fp32.4096x4096", "hadamard", kops::DType::kFloat32, r, 4096, 2 * r * 4096,
       r * 4096 * 12);
+
+  // ---- B4 weight repack: bytes = compulsory input + output traffic ----------------------
+  const int64_t pk = r * c / 2;  // 4-bit payload bytes
+  add("quant.gptq_marlin.4bit.g128.4096x4096", "gptq_to_marlin", kops::DType::kFloat16, r, c,
+      2 * pk + 4 * (r / 128) * c, 0);
+  add("quant.gptq_marlin.4bit.g128.actorder.4096x4096", "gptq_to_marlin_actorder",
+      kops::DType::kFloat16, r, c, 2 * pk + 4 * (r / 128) * c + 12 * r, 0);
+  add("quant.awq_marlin.4bit.g128.4096x4096", "awq_to_marlin", kops::DType::kFloat16, r, c,
+      2 * pk + 8 * (r / 128) * c, 0);
+  add("quant.awq_dequant.fp16.g128.4096x4096", "awq_dequantize", kops::DType::kFloat16, r, c,
+      pk + 2 * r * c + 3 * (r / 128) * c, r * c);
+  add("quant.gguf_q4_k.fp16.4096x4096", "gguf_dequantize_q4_k", kops::DType::kFloat16, r, c,
+      r * c / 256 * 144 + 2 * r * c, r * c);
+  add("quant.gguf_q8_0.fp16.4096x4096", "gguf_dequantize_q8_0", kops::DType::kFloat16, r, c,
+      r * c / 32 * 34 + 2 * r * c, r * c);
+  add("quant.fp4_marlin.mxfp4.4096x4096", "fp4_to_marlin", kops::DType::kUInt8, r, c,
+      2 * pk + 2 * r * (c / 32), 0);
+  add("quant.fp8_to_ue8m0.4096x4096", "fp8_block_scale_to_ue8m0", kops::DType::kFloat8E4M3, r, c,
+      2 * r * c, r * c);
+  add("quant.smoothquant_fold.bf16.4096x4096", "smoothquant_fold", kops::DType::kBFloat16, r, c,
+      4 * r * c, r * c);
   return cases;
 }
 
@@ -213,7 +236,146 @@ bool run_typed(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   return ok;
 }
 
+struct B4Buf {
+  void* p = nullptr;
+  explicit B4Buf(size_t bytes) {
+    if (!cuda_ok(cudaMalloc(&p, bytes), "cudaMalloc")) p = nullptr;
+    else cudaMemset(p, 0x3C, bytes);
+  }
+  ~B4Buf() { if (p != nullptr) cudaFree(p); }
+  B4Buf(const B4Buf&) = delete;
+  B4Buf& operator=(const B4Buf&) = delete;
+};
+
+bool is_b4_op(const std::string& op) {
+  return op == "gptq_to_marlin" || op == "gptq_to_marlin_actorder" || op == "awq_to_marlin" ||
+         op == "awq_dequantize" || op == "gguf_dequantize_q4_k" || op == "gguf_dequantize_q8_0" ||
+         op == "fp4_to_marlin" || op == "fp8_block_scale_to_ue8m0" || op == "smoothquant_fold";
+}
+
+/// Inputs only need to be well formed: the content never changes the amount of work.
+bool run_b4(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const int64_t k = c.rows;
+  const int64_t n = c.cols;
+  const char* id = c.id.c_str();
+  auto go = [&](auto&& op) {
+    if (!status_ok(op(), id)) return false;
+    return measure(c, [&] { (void)op(); }, st);
+  };
+  const int64_t groups = k / 128;
+  if (c.op == "gptq_to_marlin" || c.op == "gptq_to_marlin_actorder") {
+    const bool act = c.op == "gptq_to_marlin_actorder";
+    B4Buf qw(static_cast<size_t>(k * n / 2)), out(static_cast<size_t>(k * n / 2)),
+        sc(static_cast<size_t>(groups * n * 2)), osc(static_cast<size_t>(groups * n * 2)),
+        gi(static_cast<size_t>(k * 4)), perm(static_cast<size_t>(k * 4));
+    if (qw.p == nullptr || out.p == nullptr || sc.p == nullptr || osc.p == nullptr ||
+        gi.p == nullptr || perm.p == nullptr) {
+      return false;
+    }
+    if (act) {
+      std::vector<int32_t> g(static_cast<size_t>(k));
+      for (int64_t i = 0; i < k; ++i) {
+        g[static_cast<size_t>(i)] = static_cast<int32_t>((static_cast<uint64_t>(i) * 2654435761u) % groups);
+      }
+      cudaMemcpy(gi.p, g.data(), g.size() * 4, cudaMemcpyHostToDevice);
+    }
+    const kops::Tensor tg = act ? tensor1d(gi.p, kops::DType::kInt32, k) : kops::Tensor{};
+    return go([&] {
+      return kops::quant::gptq_to_marlin(tensor2d(out.p, kops::DType::kInt32, k / 16, n * 16 / 8),
+                                         tensor2d(osc.p, kops::DType::kFloat16, groups, n),
+                                         tensor1d(perm.p, kops::DType::kInt32, k),
+                                         tensor2d(qw.p, kops::DType::kInt32, k / 8, n),
+                                         tensor2d(sc.p, kops::DType::kFloat16, groups, n), tg, 4, 128,
+                                         true, ctx);
+    });
+  }
+  if (c.op == "awq_to_marlin") {
+    B4Buf qw(static_cast<size_t>(k * n / 2)), out(static_cast<size_t>(k * n / 2)),
+        sc(static_cast<size_t>(groups * n * 2)), osc(static_cast<size_t>(groups * n * 2)),
+        qz(static_cast<size_t>(groups * n / 2)), oz(static_cast<size_t>(groups * n / 2));
+    if (qw.p == nullptr || out.p == nullptr || sc.p == nullptr || osc.p == nullptr ||
+        qz.p == nullptr || oz.p == nullptr) {
+      return false;
+    }
+    return go([&] {
+      return kops::quant::awq_to_marlin(tensor2d(out.p, kops::DType::kInt32, k / 16, n * 16 / 8),
+                                        tensor2d(osc.p, kops::DType::kFloat16, groups, n),
+                                        tensor2d(oz.p, kops::DType::kInt32, groups, n / 8),
+                                        tensor2d(qw.p, kops::DType::kInt32, k, n / 8),
+                                        tensor2d(sc.p, kops::DType::kFloat16, groups, n),
+                                        tensor2d(qz.p, kops::DType::kInt32, groups, n / 8), 4, 128, ctx);
+    });
+  }
+  if (c.op == "awq_dequantize") {
+    B4Buf qw(static_cast<size_t>(k * n / 2)), out(static_cast<size_t>(k * n * 2)),
+        sc(static_cast<size_t>(groups * n * 2)), qz(static_cast<size_t>(groups * n / 2));
+    if (qw.p == nullptr || out.p == nullptr || sc.p == nullptr || qz.p == nullptr) return false;
+    return go([&] {
+      return kops::quant::awq_dequantize(tensor2d(out.p, kops::DType::kFloat16, k, n),
+                                         tensor2d(qw.p, kops::DType::kInt32, k, n / 8),
+                                         tensor2d(sc.p, kops::DType::kFloat16, groups, n),
+                                         tensor2d(qz.p, kops::DType::kInt32, groups, n / 8), 128, ctx);
+    });
+  }
+  if (c.op == "gguf_dequantize_q4_k" || c.op == "gguf_dequantize_q8_0") {
+    const bool q4k = c.op == "gguf_dequantize_q4_k";
+    const size_t bytes = q4k ? static_cast<size_t>(k * n / 256 * 144) : static_cast<size_t>(k * n / 32 * 34);
+    B4Buf raw(bytes), out(static_cast<size_t>(k * n * 2));
+    if (raw.p == nullptr || out.p == nullptr) return false;
+    return go([&] {
+      return kops::quant::gguf_dequantize(tensor2d(out.p, kops::DType::kFloat16, k, n),
+                                          tensor1d(raw.p, kops::DType::kUInt8, static_cast<int64_t>(bytes)),
+                                          q4k ? kops::GGUFType::kQ4_K : kops::GGUFType::kQ8_0, ctx);
+    });
+  }
+  if (c.op == "fp4_to_marlin") {
+    // n output channels x k reduction; weight [n, k/2] bytes, MXFP4 scales [n, k/32].
+    B4Buf w(static_cast<size_t>(k * n / 2)), out(static_cast<size_t>(k * n / 2)),
+        sc(static_cast<size_t>(n * (k / 32))), osc(static_cast<size_t>(n * (k / 32)));
+    if (w.p == nullptr || out.p == nullptr || sc.p == nullptr || osc.p == nullptr) return false;
+    return go([&] {
+      return kops::quant::fp4_to_marlin(tensor2d(out.p, kops::DType::kInt32, k / 16, n * 2),
+                                        tensor2d(osc.p, kops::DType::kFloat8E8M0, k / 32, n),
+                                        tensor2d(w.p, kops::DType::kUInt8, n, k / 2),
+                                        tensor2d(sc.p, kops::DType::kFloat8E8M0, n, k / 32), 32, true, ctx);
+    });
+  }
+  if (c.op == "fp8_block_scale_to_ue8m0") {
+    // In place: restore the (non power-of-two) scales before every call, otherwise from the
+    // second call on every block is already UE8M0 and the kernel skips the payload.
+    const int64_t sn = k / 128;
+    const int64_t sk = n / 128;
+    B4Buf w(static_cast<size_t>(k * n)), s(static_cast<size_t>(sn * sk * 4)),
+        s0(static_cast<size_t>(sn * sk * 4)), e(static_cast<size_t>(sn * sk));
+    if (w.p == nullptr || s.p == nullptr || s0.p == nullptr || e.p == nullptr) return false;
+    std::vector<float> host(static_cast<size_t>(sn * sk), 0.0137f);
+    cudaMemcpy(s0.p, host.data(), host.size() * 4, cudaMemcpyHostToDevice);
+    const size_t sbytes = host.size() * 4;
+    return go([&] {
+      cudaMemcpyAsync(s.p, s0.p, sbytes, cudaMemcpyDeviceToDevice,
+                      reinterpret_cast<cudaStream_t>(ctx.stream));
+      return kops::quant::fp8_block_scale_to_ue8m0(tensor2d(w.p, kops::DType::kFloat8E4M3, k, n),
+                                                   tensor2d(s.p, kops::DType::kFloat32, sn, sk),
+                                                   tensor2d(e.p, kops::DType::kFloat8E8M0, sn, sk), ctx);
+    });
+  }
+  if (c.op == "smoothquant_fold") {
+    // Smoothing factors of 1 keep the repeated in-place fold finite; the work is the same.
+    B4Buf w(static_cast<size_t>(k * n * 2)), nw(static_cast<size_t>(n * 2)), s(static_cast<size_t>(n * 4));
+    if (w.p == nullptr || nw.p == nullptr || s.p == nullptr) return false;
+    std::vector<float> ones(static_cast<size_t>(n), 1.0f);
+    cudaMemcpy(s.p, ones.data(), ones.size() * 4, cudaMemcpyHostToDevice);
+    return go([&] {
+      return kops::quant::smoothquant_fold(tensor1d(nw.p, kops::DType::kBFloat16, n), kops::Tensor{},
+                                           tensor2d(w.p, kops::DType::kBFloat16, k, n),
+                                           tensor1d(s.p, kops::DType::kFloat32, n), ctx);
+    });
+  }
+  return false;
+}
+
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  if (is_b4_op(c.op)) return run_b4(c, ctx, st);
   if (c.dtype == kops::DType::kFloat32 || c.op == "dequantize_per_token" ||
       c.op == "hadamard") {
     return run_typed<float>(c, ctx, st);

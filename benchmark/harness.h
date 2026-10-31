@@ -98,6 +98,9 @@ inline const char* dtype_label(kops::DType d) {
     case kops::DType::kInt32: return "int32";
     case kops::DType::kUInt32: return "uint32";
     case kops::DType::kInt64: return "int64";
+    case kops::DType::kInt8: return "int8";
+    case kops::DType::kUInt8: return "uint8";
+    case kops::DType::kFloat8E4M3: return "float8_e4m3fn";
     default: return "other";
   }
 }

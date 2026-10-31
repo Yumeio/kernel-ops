@@ -16,11 +16,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("kops", help="results JSON from benchmark/bench_<family>")
     ap.add_argument("torch", help="results JSON from torch_baseline.py")
+    ap.add_argument("--only", nargs="+", metavar="PREFIX",
+                    help="compare only cases whose id starts with one of these prefixes")
     args = ap.parse_args()
 
     kops = load(args.kops)
     torch_ref = load(args.torch)
     ids = sorted(set(kops) | set(torch_ref))
+    if args.only:
+        ids = [i for i in ids if i.startswith(tuple(args.only))]
 
     print(f"{'case':<42} {'kops ms':>10} {'torch ms':>10} {'speedup':>8} "
           f"{'kops GB/s':>10} {'torch GB/s':>11}")

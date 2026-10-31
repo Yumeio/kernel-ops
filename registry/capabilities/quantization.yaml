@@ -90,6 +90,105 @@
    "status": "benchmarked",
    "predicates": "power-of-two n <= 32768; optional signed diagonal; in-place",
    "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q03.gptq_marlin_repack",
+   "kernel_symbol": "gptq_marlin_repack_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "4/8-bit; K%16==0, N%64==0; optional act-order perm (stable argsort of g_idx); sym only",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q02.awq_marlin_repack",
+   "kernel_symbol": "awq_marlin_repack_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "4/8-bit AWQ column order; K%16==0, N%64==0",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q02.marlin_permute_scales",
+   "kernel_symbol": "marlin_permute_scales_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "1/2/4-byte scales; grouped (64-chunk) or per-channel (32-chunk)",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q02.marlin_awq_zero_points",
+   "kernel_symbol": "marlin_awq_zero_points_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "4/8-bit; undo AWQ order, permute, interleave, repack",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q02.awq_dequantize",
+   "kernel_symbol": "awq_dequantize_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "4-bit AWQ; fp16/bf16/fp32 scales and output; group -1 or divisor of K",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q05.gguf_dequantize",
+   "kernel_symbol": "gguf_dequantize_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "Q4_0 Q4_1 Q5_0 Q5_1 Q8_0 Q2_K..Q6_K Q8_K IQ4_NL IQ4_XS IQ1_S IQ1_M IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S (bit-exact vs llama.cpp dequantize_row_*, codebooks ported from llama.cpp, MIT; benchmarked on Q4_K and Q8_0 only); F32/F16/BF16/Q8_1 return kNotImplemented",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "G05.fp4_marlin_repack",
+   "kernel_symbol": "fp4_marlin_repack_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "MXFP4 (UE8M0, block 32) and NVFP4 (E4M3, block 16); raw permuted scales, no consumer post-processing",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "G05.fp4_backend_shuffle",
+   "kernel_symbol": "fp4_backend_shuffle_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "WeightPacking::kFP4E2M1 (weights copied, scales 128x4 swizzled per expert, padded) and kTrtllmShuffled (TRT-LLM-gen: 32-row block row shuffle of weights and scales, scales then 128x4; N % 128 == 0, K/block % 4 == 0, out of place; gate/up weights need gemm::glu_weight_interleave first)",
+   "evidence": "test_quantization"
+  },
+  {
+   "op_id": "G03.fp8_block_scale_to_ue8m0",
+   "kernel_symbol": "fp8_block_scale_to_ue8m0_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "128x128 blocks; s' = 2^ceil(log2 s); payload requantized by s/s'; in place",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q04.smoothquant_compute_scales",
+   "kernel_symbol": "smoothquant_compute_scales_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "s = max(a^alpha / max(w,1e-5)^(1-alpha), 1e-5); K-sized, launch bound, no benchmark case",
+   "evidence": "test_quantization"
+  },
+  {
+   "op_id": "Q04.smoothquant_fold",
+   "kernel_symbol": "smoothquant_fold_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "fp16/bf16/fp32; norm /= s (true division), W *= s; optional norm bias",
+   "evidence": "test_quantization;bench_quantization"
   }
  ]
 }
