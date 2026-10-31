@@ -651,6 +651,10 @@ def make_op(case: dict, device: torch.device):
     if b4 is not None:
         return b4
 
+    b5 = make_b5_op(case, device)
+    if b5 is not None:
+        return b5
+
     raise SystemExit(f"unsupported op: {op}")
 
 
@@ -952,6 +956,172 @@ def make_b4_op(case: dict, device: torch.device):
         return lambda: _per_block_cast_to_fp8(x, ue)
 
     return None
+
+
+# ---- B5 decode GEMV baselines -----------------------------------------------------------
+# rows = N, cols = K, M = flops / (2 N K).  Every quantized case replaces the eager PyTorch
+# "dequantize the weight, then F.linear" sequence an engine without a fused kernel runs:
+# PyTorch has no fused weight-only GEMV for these formats on SM86 (torch._scaled_mm needs SM89,
+# torch._int_mm needs M > 16, the int4 pack op has its own tile layout), so the dequantized
+# weight is materialised in bf16 on every call, exactly as AutoAWQ / GPTQ / bitsandbytes /
+# HF fp8 fallbacks do.  Scales that apply per output channel are applied on the output.
+
+
+def make_b5_op(case: dict, device: torch.device):
+    op = case["op"]
+    if op not in ("w4a16_awq", "w4a16_gptq", "nf4_lut", "fp8_gemv_rowwise", "fp8_gemv_blockwise",
+                  "int8_gemv_w8a8", "int8_gemv_w8a16", "dense_gemv", "fp4_gemv_mx", "fp4_gemv_nv",
+                  "gguf_mmvq_q4_0", "gguf_mmvq_q8_0", "gguf_mmvq_q4_k", "router_gemm", "gemv_argmax",
+                  "grouped_fp8", "moe_gemv_fp8"):
+        return None
+    n = int(case["rows"])
+    k = int(case["cols"])
+    m = int(case["flops"]) // (2 * n * k)
+    bf = torch.bfloat16
+    g = 128
+    x = torch.randn(m, k, device=device, dtype=bf)
+    shifts = torch.arange(0, 32, 4, device=device, dtype=torch.int32)
+
+    if op == "w4a16_awq":
+        qweight = torch.randint(-2**31, 2**31 - 1, (k, n // 8), device=device, dtype=torch.int32)
+        qzeros = torch.randint(-2**31, 2**31 - 1, (k // g, n // 8), device=device, dtype=torch.int32)
+        scales = (torch.rand(k // g, n, device=device) * 0.03 + 0.002).to(bf)
+
+        def run_awq():
+            iw = _unpack_awq(qweight)
+            iz = _unpack_awq(qzeros).repeat_interleave(g, dim=0)
+            w = ((iw - iz) * scales.repeat_interleave(g, dim=0)).to(bf)
+            return x @ w
+
+        return run_awq
+
+    if op == "w4a16_gptq":
+        qweight = torch.randint(-2**31, 2**31 - 1, (k // 8, n), device=device, dtype=torch.int32)
+        qzeros = torch.randint(-2**31, 2**31 - 1, (k // g, n // 8), device=device, dtype=torch.int32)
+        scales = (torch.rand(k // g, n, device=device) * 0.03 + 0.002).to(bf)
+
+        def run_gptq():
+            q = ((qweight.unsqueeze(1) >> shifts.view(1, 8, 1)) & 0xF).reshape(k, n)
+            z = ((qzeros.unsqueeze(-1) >> shifts.view(1, 1, 8)) & 0xF).reshape(k // g, n)
+            w = ((q - z.repeat_interleave(g, dim=0)) * scales.repeat_interleave(g, dim=0)).to(bf)
+            return x @ w
+
+        return run_gptq
+
+    if op == "nf4_lut":
+        qw = torch.randint(0, 256, (n, k // 2), device=device, dtype=torch.uint8)
+        cb = torch.linspace(-1, 1, 16, device=device).to(bf)
+        absmax = torch.rand(n * k // 64, device=device) + 0.1
+
+        def run_nf4():
+            codes = torch.stack([qw & 0xF, qw >> 4], dim=-1).reshape(n, k)
+            w = cb[codes.long()] * absmax.view(n, k // 64).repeat_interleave(64, dim=1).to(bf)
+            return x @ w.t()
+
+        return run_nf4
+
+    if op in ("fp8_gemv_rowwise", "fp8_gemv_blockwise"):
+        w8 = torch.randn(n, k, device=device).to(torch.float8_e4m3fn)
+        if op == "fp8_gemv_rowwise":
+            col_s = torch.rand(n, device=device) + 0.5
+            return lambda: (x @ w8.to(bf).t()) * col_s.to(bf)
+        sb = torch.rand(n // 128, k // 128, device=device) + 0.5
+
+        def run_fp8_block():
+            w = (w8.to(bf).view(n // 128, 128, k // 128, 128) * sb.to(bf).view(n // 128, 1, k // 128, 1)).reshape(n, k)
+            return x @ w.t()
+
+        return run_fp8_block
+
+    if op == "dense_gemv":
+        w = torch.randn(n, k, device=device, dtype=bf)
+        return lambda: F.linear(x, w)
+
+    if op == "router_gemm":
+        # fp32 logits from bf16 hidden/weights with fp32 accumulation: upcast, then an fp32 GEMM.
+        w = torch.randn(n, k, device=device, dtype=bf) * 0.02
+        return lambda: F.linear(x.float(), w.float())
+
+    if op == "gemv_argmax":
+        w = torch.randn(n, k, device=device, dtype=bf) * 0.02
+        return lambda: (x @ w.t()).argmax(dim=-1)
+
+    if op in ("fp4_gemv_mx", "fp4_gemv_nv"):
+        nv = op == "fp4_gemv_nv"
+        blk = 16 if nv else 32
+        packed = torch.randint(0, 256, (n, k // 2), device=device, dtype=torch.uint8)
+        lut = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6], device=device, dtype=bf)
+        if nv:
+            sc = (torch.rand(n, k // blk, device=device) + 0.1).to(torch.float8_e4m3fn)
+        else:
+            sc = torch.randint(110, 130, (n, k // blk), device=device, dtype=torch.uint8)
+
+        def run_fp4_gemv():
+            codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).reshape(n, k)
+            s = sc.to(bf) if nv else torch.exp2(sc.float() - 127).to(bf)
+            w = lut[codes.long()] * s.repeat_interleave(blk, dim=1)
+            return x @ w.t()
+
+        return run_fp4_gemv
+
+    if op.startswith("gguf_mmvq_"):
+        t = op[len("gguf_mmvq_"):]
+        qk, nbytes = {"q4_0": (32, 18), "q8_0": (32, 34), "q4_k": (256, 144)}[t]
+        nb = n * k // qk
+        raw = torch.randint(0, 256, (nb * nbytes,), device=device, dtype=torch.uint8).view(nb, nbytes)
+        raw[:, 0] = 0x3C  # keep the fp16 scales finite
+        raw[:, 1] = 0x20
+        if t == "q4_k":
+            raw[:, 2] = 0x3C
+            raw[:, 3] = 0x20
+
+        def run_gguf():
+            d = raw[:, 0:2].contiguous().view(torch.float16).float()
+            if t == "q4_0":
+                qs = raw[:, 2:]
+                q = torch.cat([qs & 0xF, qs >> 4], dim=1).float() - 8.0
+                w = (q * d).reshape(n, k)
+            elif t == "q8_0":
+                q = raw[:, 2:].contiguous().view(torch.int8).float()
+                w = (q * d).reshape(n, k)
+            else:
+                dmin = raw[:, 2:4].contiguous().view(torch.float16).float()
+                sc_, mn_ = _q4k_scale_min(raw[:, 4:16])
+                qs = raw[:, 16:144].view(nb, 4, 32)
+                q = torch.stack([qs & 0xF, qs >> 4], dim=2)
+                w = ((d * sc_.float()).view(nb, 4, 2, 1) * q.float() - (dmin * mn_.float()).view(nb, 4, 2, 1)).reshape(n, k)
+            return x @ w.to(bf).t()
+
+        return run_gguf
+
+    if op == "grouped_fp8":
+        e = 32
+        xg = torch.randn(e, 2, k, device=device, dtype=bf)
+        w8 = torch.randn(e, n, k, device=device).to(torch.float8_e4m3fn)
+        col_s = torch.rand(e, 1, n, device=device, dtype=bf) + 0.5
+        return lambda: torch.bmm(xg, w8.to(bf).transpose(1, 2)) * col_s
+
+    if op == "moe_gemv_fp8":
+        e = 32
+        xs = torch.randn(4, k, device=device, dtype=bf)
+        w8 = torch.randn(e, n, k, device=device).to(torch.float8_e4m3fn)
+        col_s = torch.rand(e, 1, n, device=device, dtype=bf) + 0.5
+        eids = torch.arange(e, device=device)
+        tok = torch.arange(e, device=device) // 8
+
+        def run_moe():
+            wsel = w8[eids].to(bf)                      # [slots, N, K] gather + cast
+            return torch.bmm(xs[tok].unsqueeze(1), wsel.transpose(1, 2)) * col_s[eids]
+
+        return run_moe
+
+    w8 = torch.randint(-128, 128, (n, k), device=device, dtype=torch.int8)
+    col_s = torch.rand(n, device=device) * 0.01
+    if op == "int8_gemv_w8a16":
+        return lambda: (x @ w8.to(bf).t()) * col_s.to(bf)
+    a8 = torch.randint(-128, 128, (m, k), device=device, dtype=torch.int8)
+    row_s = torch.rand(m, 1, device=device) * 0.01
+    return lambda: ((a8.to(bf) @ w8.to(bf).t()).float() * row_s * col_s).to(bf)
 
 
 def bench(fn, warmup: int, iters: int) -> dict:

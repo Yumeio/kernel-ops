@@ -63,6 +63,141 @@
    "status": "benchmarked",
    "predicates": "bf16/fp16/fp32 [N,K] -> e4m3 + fp32 block scales; any block size <= 1024; optional UE8M0",
    "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G01.gemm_simt",
+   "kernel_symbol": "gemm_simt_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "fp32/bf16/fp16/fp64 SIMT tiles; K- or MN-major B; strided batch; golden for large M; recipe kFP32",
+   "evidence": "test_gemm"
+  },
+  {
+   "op_id": "G01.gemv",
+   "kernel_symbol": "gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16/fp32 GEMV M<=16, K-major B, 16 B aligned; bias/act/residual/scales epilogue; deterministic split-K from (N,K)",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G01.splitk_reduce",
+   "kernel_symbol": "splitk_reduce_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "fp32 partials summed in split order, then epilogue",
+   "evidence": "test_gemm"
+  },
+  {
+   "op_id": "G01.gemv_argmax",
+   "kernel_symbol": "gemv_argmax_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16 LM head, M<=16, scale/softcap/vocab mask, ties to lowest id, counter restored by last CTA",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G02.router_gemm",
+   "kernel_symbol": "router_gemm_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16 hidden x bf16/fp16/fp32 router weight -> fp32 logits, bias, M tiles 4/8/16",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G02.router_gemm_bf16x2",
+   "kernel_symbol": "router_gemm_bf16x2_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "hi + lo_scale*lo bf16 weights, fp32 accumulation (not exact fp32)",
+   "evidence": "test_gemm"
+  },
+  {
+   "op_id": "G03.fp8_gemv",
+   "kernel_symbol": "fp8_gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "e4m3 weights, bf16/fp16/e4m3 acts, M<=16; tensorwise/rowwise (epilogue) and 1x128/128x128 blockwise; software decode (cvt branch compile-only until sm89 handoff)",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G03.int8_gemv",
+   "kernel_symbol": "int8_gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "s8 weights; s8 acts via dp4a (azp) or bf16/fp16 acts; M<=16; exact integer accumulation",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G04.w4a16_gemv",
+   "kernel_symbol": "w4a16_gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "AWQ [K,N/8] and GPTQ [K/8,N] int32; g32/64/128/per-channel; zeros or symmetric; GPTQ act-order; bf16/fp16; M<=16",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G04.lut_gemv",
+   "kernel_symbol": "lut_gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "4-bit codebook (NF4/FP4/custom), block 32..256, fp32 or uint8 double-quant absmax; M<=16",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G05.fp4_gemv",
+   "kernel_symbol": "fp4_gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "MXFP4 (UE8M0/32) and NVFP4 (E4M3/16, global scale) weights x bf16/fp16; row-major or 128x4 scales; M<=8",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G04.gguf_quantize_q8_1",
+   "kernel_symbol": "gguf_quantize_q8_1_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16 -> block_q8_1 (fp16 d, s), byte-exact against the host quantizer",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G04.gguf_mmvq",
+   "kernel_symbol": "gguf_mmvq_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K..Q6_K x q8_1; M<=16; IQ types not implemented",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G04.gguf_moe_mmvq",
+   "kernel_symbol": "gguf_moe_mmvq_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "expert-indexed GGUF GEMV by topk_ids; negative ids skipped",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G06.grouped_gemv",
+   "kernel_symbol": "grouped_gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16 and e4m3 (tensorwise/rowwise) experts; kContiguous/kMasked/kIndexed; empty experts read nothing; bias/act/routing weight",
+   "evidence": "test_gemm;bench_gemm"
   }
  ]
 }

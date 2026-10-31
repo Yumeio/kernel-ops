@@ -30,6 +30,13 @@ Status unpermute_reduce(const Tensor& out, const Tensor& expert_out,
 /// M03: whole MoE layer (route? -> permute -> W13 -> act/quant -> W2 -> reduce, latent
 /// projections when latent_dim > 0). *num_launches (optional) receives the exact number of
 /// device launches issued, so "fused" never hides multi-launch behaviour in benchmarks.
+/// M03 decode GEMV: one expert GEMM stage over block-sorted slots on CUDA cores.  The sorted ids come
+/// from align_block_size with block_size == slots_per_cta (1, 2, 4 or 8); weights are 16-bit (same
+/// dtype as the activations) or OCP e4m3 with fp32 scales (w_quant.granularity per channel, per
+/// expert or 128x128 block).  num_local_experts bounds the number of padded slot blocks.
+Status moe_gemv(const FusedMoEGemmParams& params, int32_t num_local_experts, int32_t slots_per_cta,
+                DType a_dtype, DType w_dtype, const LaunchContext& ctx);
+
 Status moe_workspace_requirements(const MoELayerParams& params, const LaunchContext& ctx,
                                   WorkspaceRequirements* out);
 Status moe_forward(const MoELayerParams& params, const Workspace& ws, const LaunchContext& ctx,

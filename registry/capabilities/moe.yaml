@@ -1,0 +1,14 @@
+{
+ "family": "moe",
+ "rows": [
+  {
+   "op_id": "M03.moe_gemv",
+   "kernel_symbol": "moe_gemv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "block-sorted slots (block == SLOTS_PER_CTA); bf16/fp16 or e4m3 (per-channel, per-expert, 128x128) weights; bias, routed weight; expert id <0 skipped",
+   "evidence": "test_gemm;bench_gemm"
+  }
+ ]
+}

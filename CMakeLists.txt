@@ -155,6 +155,14 @@ add_library(kops_cuda STATIC
   csrc/quantization/quant.cu
   csrc/quantization/weight_repack.cu
   csrc/gemm/gemm_prep.cu
+  csrc/gemm/mixed_input_gemm.cu
+  csrc/gemm/fp8_gemm.cu
+  csrc/gemm/int8_gemm.cu
+  csrc/gemm/fp4_gemm.cu
+  csrc/gemm/dense_gemm.cu
+  csrc/gemm/gguf_gemm.cu
+  csrc/gemm/grouped_gemm.cu
+  csrc/moe/fused_moe.cu
   csrc/attention/merge.cu
   csrc/attention/mla.cu
   csrc/kvcache/kvcache.cu

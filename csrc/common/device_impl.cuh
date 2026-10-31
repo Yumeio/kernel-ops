@@ -240,4 +240,161 @@ KOPS_DEVICE void softmax_state_merge(SoftmaxState& a, const SoftmaxState& b) {
   a.m = m;
 }
 
+// ---- B5: CUDA-core GEMV primitives ----------------------------------------
+namespace dev {
+
+/// Weights are read exactly once per launch: load 16 B / 4 B without allocating in L1.
+__device__ __forceinline__ uint4 ld_stream16(const void* p) {
+  uint4 v;
+  asm("ld.global.nc.L1::no_allocate.v4.u32 {%0, %1, %2, %3}, [%4];"
+      : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
+      : "l"(p));
+  return v;
+}
+
+__device__ __forceinline__ uint32_t ld_stream4(const void* p) {
+  uint32_t v;
+  asm("ld.global.nc.L1::no_allocate.u32 %0, [%1];" : "=r"(v) : "l"(p));
+  return v;
+}
+
+/// Exact float(q) for 0 <= q < 2^23 (two instructions, no int->float convert).
+__device__ __forceinline__ float u23_to_f(uint32_t q) {
+  return __uint_as_float(0x4B000000u | q) - 8388608.0f;
+}
+
+/// Two 16-bit values packed in one word -> two floats (exact).
+template <typename T>
+__device__ __forceinline__ float2 unpack2(uint32_t w);
+template <>
+__device__ __forceinline__ float2 unpack2<__nv_bfloat16>(uint32_t w) {
+  return make_float2(__uint_as_float(w << 16), __uint_as_float(w & 0xFFFF0000u));
+}
+template <>
+__device__ __forceinline__ float2 unpack2<__half>(uint32_t w) {
+  __half2 h;
+  *reinterpret_cast<uint32_t*>(&h) = w;
+  return __half22float2(h);
+}
+
+/// 16 B = eight 16-bit activations -> eight floats.
+template <typename T>
+__device__ __forceinline__ void unpack8(const uint4& v, float (&f)[8]) {
+  float2 t = unpack2<T>(v.x); f[0] = t.x; f[1] = t.y;
+  t = unpack2<T>(v.y); f[2] = t.x; f[3] = t.y;
+  t = unpack2<T>(v.z); f[4] = t.x; f[5] = t.y;
+  t = unpack2<T>(v.w); f[6] = t.x; f[7] = t.y;
+}
+
+/// e4m3fn byte (low 8 bits of b) -> fp32, exact and branch free.  The seven magnitude bits
+/// placed under the fp32 exponent give value * 2^-120 for normals and subnormals alike; the
+/// scaling by 2^120 is exact.  0x7F / 0xFF are the NaN codes.
+__device__ __forceinline__ float e4m3_decode_finite(uint32_t b) {
+  const float v = __uint_as_float((b & 0x7Fu) << 20) * 0x1p120f;
+  return __uint_as_float(__float_as_uint(v) | ((b & 0x80u) << 24));
+}
+
+__device__ __forceinline__ float e4m3_decode(uint32_t b) {
+  return (b & 0x7Fu) == 0x7Fu ? __uint_as_float(0x7FC00000u) : e4m3_decode_finite(b);
+}
+
+/// True when one of the four e4m3 bytes of w is a NaN code (0x7F / 0xFF).
+__device__ __forceinline__ bool e4m3x4_has_nan(uint32_t w) {
+  const uint32_t x = (w & 0x7F7F7F7Fu) ^ 0x7F7F7F7Fu;
+  return ((x - 0x01010101u) & ~x & 0x80808080u) != 0u;
+}
+
+
+/// Two adjacent e4m3 bytes (low 16 bits of w) -> two floats.  Sm89+ uses the hardware
+/// convert; the software form is bit-identical (tests/unit/test_gemm.cc compares the
+/// decoder with the toolkit on all 256 codes, and the sm89 handoff kit runs the cvt path).
+__device__ __forceinline__ float2 e4m3x2_decode(uint32_t w) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+  uint32_t h;
+  asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(h) : "h"(static_cast<unsigned short>(w)));
+  __half2 hh;
+  *reinterpret_cast<uint32_t*>(&hh) = h;
+  return __half22float2(hh);
+#else
+  return make_float2(e4m3_decode(w), e4m3_decode(w >> 8));
+#endif
+}
+
+/// Four packed e4m3 bytes -> four floats, NaN-exact.  Sm89+ converts in hardware; elsewhere the
+/// finite-only decoder runs unless a NaN code is present (rare, taken as a whole-word detour).
+__device__ __forceinline__ void e4m3x4_decode(uint32_t w, float (&o)[4]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+  const float2 lo = e4m3x2_decode(w);
+  const float2 hi = e4m3x2_decode(w >> 16);
+  o[0] = lo.x; o[1] = lo.y; o[2] = hi.x; o[3] = hi.y;
+#else
+  if (e4m3x4_has_nan(w)) {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) o[i] = e4m3_decode(w >> (8 * i));
+  } else {
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) o[i] = e4m3_decode_finite(w >> (8 * i));
+  }
+#endif
+}
+
+/// e2m1 code (low 4 bits of c) -> fp32, exact, no table: code bits (E1 E0 M) placed under the
+/// fp32 exponent give value * 2^-126; the sign goes straight to bit 31.
+__device__ __forceinline__ float e2m1_decode(uint32_t c) {
+  const float v = __uint_as_float((c & 7u) << 22) * 0x1p126f;
+  return __uint_as_float(__float_as_uint(v) | ((c & 8u) << 28));
+}
+
+/// ActFn chosen at run time (the epilogue is not a template parameter of the GEMV kernels).
+__device__ __forceinline__ float act_runtime(ActFn fn, float x, const GluParams& p) {
+  switch (fn) {
+    case ActFn::kSiLU: return apply_act<ActFn::kSiLU>(x, p);
+    case ActFn::kGeLUErf: return apply_act<ActFn::kGeLUErf>(x, p);
+    case ActFn::kGeLUTanh: return apply_act<ActFn::kGeLUTanh>(x, p);
+    case ActFn::kQuickGeLU: return apply_act<ActFn::kQuickGeLU>(x, p);
+    case ActFn::kReLU: return apply_act<ActFn::kReLU>(x, p);
+    case ActFn::kReLU2: return apply_act<ActFn::kReLU2>(x, p);
+    case ActFn::kSigmoid: return apply_act<ActFn::kSigmoid>(x, p);
+    case ActFn::kTanh: return apply_act<ActFn::kTanh>(x, p);
+    case ActFn::kSoftplus: return apply_act<ActFn::kSoftplus>(x, p);
+    case ActFn::kSiTU: return apply_act<ActFn::kSiTU>(x, p);
+    case ActFn::kFatReLU: return apply_act<ActFn::kFatReLU>(x, p);
+    default: return x;
+  }
+}
+
+__device__ __forceinline__ float load_as_float(const void* p, DType t, int64_t i) {
+  switch (t) {
+    case DType::kFloat32: return static_cast<const float*>(p)[i];
+    case DType::kFloat16: return __half2float(static_cast<const __half*>(p)[i]);
+    default: return __bfloat162float(static_cast<const __nv_bfloat16*>(p)[i]);
+  }
+}
+
+/// Scalar GEMM epilogue of the CUDA-core kernels, applied to one fp32 accumulator:
+///   *alpha -> *row_scale[m] -> *col_scale[n] -> +bias[n] -> clamp -> softcap -> act
+///   -> +beta * residual[m, n].
+/// EP is gemm::EpilogueParams (this header precedes gemm_params.cuh, so the EpilogueOp bits
+/// are spelled out: RowScale 1<<0, ColScale 1<<1, Bias 1<<2, Softcap 1<<3, Act 1<<4,
+/// ResidualAdd 1<<8, Clamp 1<<12).  The INT8 azp correction is applied by the INT8 kernels
+/// in the integer domain before the accumulator reaches this function.  Residual is read in
+/// the output dtype OutT.
+template <typename OutT, typename EP>
+__device__ __forceinline__ float gemm_epilogue(float acc, const EP& e, int64_t m, int64_t n) {
+  const uint32_t ops = e.ops;
+  acc *= e.alpha_ptr != nullptr ? *e.alpha_ptr : e.alpha;
+  if (ops & (1u << 0)) acc *= e.row_scale[m];
+  if (ops & (1u << 1)) acc *= e.col_scale[n];
+  if (ops & (1u << 2)) acc += load_as_float(e.bias, e.bias_dtype, n);
+  if (ops & (1u << 12)) acc = fminf(fmaxf(acc, -e.clamp_limit), e.clamp_limit);
+  if (ops & (1u << 3)) acc = softcap(acc, e.softcap);
+  if (ops & (1u << 4)) acc = act_runtime(e.act, acc, e.glu);
+  if (ops & (1u << 8)) {
+    acc = fmaf(e.beta, to_f(static_cast<const OutT*>(e.residual)[m * e.residual_stride + n]), acc);
+  }
+  return acc;
+}
+
+}  // namespace dev
+
 }  // namespace kops

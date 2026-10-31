@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <random>
+#include <type_traits>
 #include <vector>
 
 #include <cuda.h>
@@ -33,6 +34,7 @@
 #include "csrc/common/device_impl.cuh"
 #include "csrc/quantization/quant_kernels.cuh"
 #include "csrc/quantization/weight_repack_kernels.cuh"
+#include "csrc/quantization/ops.h"
 #include "csrc/gemm/gemm_params.cuh"
 #include "csrc/gemm/dense_gemm_kernels.cuh"
 #include "csrc/gemm/fp8_gemm_kernels.cuh"
@@ -43,6 +45,10 @@
 #include "csrc/gemm/grouped_gemm_kernels.cuh"
 #include "csrc/gemm/gemm_prep_kernels.cuh"
 #include "csrc/gemm/ops.h"
+#include "csrc/moe/routing_kernels.cuh"
+#include "csrc/moe/permute_kernels.cuh"
+#include "csrc/moe/fused_moe_kernels.cuh"
+#include "csrc/moe/ops.h"
 
 namespace {
 
@@ -769,11 +775,1441 @@ void test_contracts(const LaunchContext& ctx) {
                      Status::kUnsupportedBackend, "backend");
 }
 
+// =============================================================================
+// B5: CUDA-core GEMV.  Oracle: host fp64 loops over the dequantized weights; inputs are rounded
+// to the activation dtype first, so only the fp32 accumulation and the final rounding differ.
+// =============================================================================
+
+struct Rng {
+  std::mt19937 g;
+  explicit Rng(unsigned seed) : g(seed) {}
+  uint32_t u32() { return g(); }
+  float uni(float lo, float hi) { return lo + (hi - lo) * (static_cast<float>(g() >> 8) / 16777216.0f); }
+  int range(int n) { return static_cast<int>(g() % static_cast<uint32_t>(n)); }
+};
+
+template <typename T>
+T cvt(float x) {
+  T v;
+  kops_test::from_float(v, x);
+  return v;
+}
+
+template <typename T>
+double rel_eps();
+template <>
+double rel_eps<__nv_bfloat16>() { return 0.0078125; }
+template <>
+double rel_eps<__half>() { return 0.0009765625; }
+template <>
+double rel_eps<float>() { return 2e-6; }
+
+/// Element-wise (one output ulp + fp32 accumulation noise) and Frobenius comparison.
+template <typename T>
+void expect_close(const std::vector<T>& got, const std::vector<double>& want, const char* what) {
+  double ss = 0.0;
+  for (double w : want) ss += w * w;
+  const double rms = std::sqrt(ss / static_cast<double>(want.size() ? want.size() : 1));
+  const double eps = rel_eps<T>();
+  size_t bad = 0;
+  double num = 0.0;
+  size_t worst = 0;
+  double worst_err = 0.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    const double g = static_cast<double>(kops_test::to_float(got[i]));
+    const double err = std::fabs(g - want[i]);
+    num += err * err;
+    if (!(err <= eps * std::fabs(want[i]) + 2e-5 * rms)) {
+      ++bad;
+      if (!(err <= worst_err)) { worst_err = err; worst = i; }
+    }
+  }
+  const double frob = ss > 0.0 ? std::sqrt(num / ss) : std::sqrt(num);
+  if (bad != 0 || !(frob <= eps * 0.6)) {
+    char detail[256];
+    std::snprintf(detail, sizeof(detail), "%zu/%zu elements off, frobenius %.3g (limit %.3g), worst #%zu got %.7g want %.7g",
+                  bad, want.size(), frob, eps * 0.6, worst,
+                  bad ? static_cast<double>(kops_test::to_float(got[worst])) : 0.0, bad ? want[worst] : 0.0);
+    kops_test::record_failure(what, detail, __FILE__, __LINE__);
+  }
+}
+
+template <typename T>
+bool same_bits(const std::vector<T>& a, const std::vector<T>& b) {
+  return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(T)) == 0;
+}
+
+int awq_pos(int c) { return ((c & 1) << 2) | (c >> 1); }
+
+template <typename T>
+struct W4Problem {
+  int m, n, k, group;          // group 0 = per channel
+  bool awq, zeros, actorder, bias;
+  std::vector<float> a;        // already rounded to T
+  std::vector<float> scale;    // [ng, n], rounded to T
+  std::vector<float> bias_v;   // [n]
+  std::vector<uint32_t> qw, qz;
+  std::vector<int32_t> g_idx;
+  std::vector<double> ref;     // [m, n]
+};
+
+template <typename T>
+W4Problem<T> make_w4(bool awq, int group, bool zeros, bool actorder, bool bias, int m, int n, int k, unsigned seed) {
+  W4Problem<T> p{};
+  p.m = m; p.n = n; p.k = k; p.group = group; p.awq = awq; p.zeros = zeros; p.actorder = actorder; p.bias = bias;
+  Rng r(seed);
+  const int G = group ? group : k;
+  const int ng = k / G;
+  std::vector<int> q(static_cast<size_t>(k) * n), z(static_cast<size_t>(ng) * n);
+  for (auto& v : q) v = r.range(16);
+  for (auto& v : z) v = r.range(16);
+  p.scale.resize(static_cast<size_t>(ng) * n);
+  for (auto& v : p.scale) v = kops_test::to_float(cvt<T>(r.uni(0.002f, 0.03f)));
+  p.a.resize(static_cast<size_t>(m) * k);
+  for (auto& v : p.a) v = kops_test::to_float(cvt<T>(r.uni(-1.0f, 1.0f)));
+  p.bias_v.resize(n);
+  for (auto& v : p.bias_v) v = kops_test::to_float(cvt<T>(r.uni(-0.5f, 0.5f)));
+  p.g_idx.resize(k);
+  {
+    std::vector<int> order(k);
+    for (int i = 0; i < k; ++i) order[i] = i;
+    for (int i = k - 1; i > 0; --i) std::swap(order[i], order[r.range(i + 1)]);
+    for (int i = 0; i < k; ++i) p.g_idx[order[i]] = i / G;
+    if (!actorder) for (int i = 0; i < k; ++i) p.g_idx[i] = i / G;
+  }
+  if (awq) {
+    p.qw.assign(static_cast<size_t>(k) * (n / 8), 0u);
+    for (int kk = 0; kk < k; ++kk)
+      for (int c = 0; c < n; ++c)
+        p.qw[static_cast<size_t>(kk) * (n / 8) + c / 8] |= static_cast<uint32_t>(q[static_cast<size_t>(kk) * n + c]) << (4 * awq_pos(c & 7));
+    p.qz.assign(static_cast<size_t>(ng) * (n / 8), 0u);
+    for (int g = 0; g < ng; ++g)
+      for (int c = 0; c < n; ++c)
+        p.qz[static_cast<size_t>(g) * (n / 8) + c / 8] |= static_cast<uint32_t>(z[static_cast<size_t>(g) * n + c]) << (4 * awq_pos(c & 7));
+  } else {
+    p.qw.assign(static_cast<size_t>(k / 8) * n, 0u);
+    for (int kk = 0; kk < k; ++kk)
+      for (int c = 0; c < n; ++c)
+        p.qw[static_cast<size_t>(kk / 8) * n + c] |= static_cast<uint32_t>(q[static_cast<size_t>(kk) * n + c]) << (4 * (kk & 7));
+    p.qz.assign(static_cast<size_t>(ng) * (n / 8), 0u);
+    for (int g = 0; g < ng; ++g)
+      for (int c = 0; c < n; ++c)
+        p.qz[static_cast<size_t>(g) * (n / 8) + c / 8] |= static_cast<uint32_t>(z[static_cast<size_t>(g) * n + c]) << (4 * (c & 7));
+  }
+  p.ref.assign(static_cast<size_t>(m) * n, 0.0);
+  for (int row = 0; row < m; ++row) {
+    for (int c = 0; c < n; ++c) {
+      double acc = 0.0;
+      for (int kk = 0; kk < k; ++kk) {
+        const int g = (actorder && !awq) ? p.g_idx[kk] : kk / G;
+        const int zz = zeros ? z[static_cast<size_t>(g) * n + c] : 8;
+        acc += static_cast<double>(p.a[static_cast<size_t>(row) * k + kk]) *
+               (static_cast<double>(q[static_cast<size_t>(kk) * n + c] - zz) * p.scale[static_cast<size_t>(g) * n + c]);
+      }
+      p.ref[static_cast<size_t>(row) * n + c] = acc + (bias ? p.bias_v[c] : 0.0);
+    }
+  }
+  return p;
+}
+
+template <typename T>
+std::vector<T> to_vec(const std::vector<float>& f) {
+  std::vector<T> v(f.size());
+  for (size_t i = 0; i < f.size(); ++i) v[i] = cvt<T>(f[i]);
+  return v;
+}
+
+template <typename T>
+DType dt_of();
+template <>
+DType dt_of<__nv_bfloat16>() { return DType::kBFloat16; }
+template <>
+DType dt_of<__half>() { return DType::kFloat16; }
+template <>
+DType dt_of<float>() { return DType::kFloat32; }
+
+/// Runs the W4A16 GEMV rows [row0, row0 + rows) of p; out receives rows x n values.
+template <typename T>
+Status launch_w4(const LaunchContext& ctx, const W4Problem<T>& p, const T* da, const uint32_t* dqw,
+                 const T* dsc, const uint32_t* dqz, const int32_t* dgi, const T* dbias, T* dout, int rows,
+                 int64_t row0) {
+  kops::gemm::ScaledGemmArgs args{};
+  args.recipe = kops::gemm::GemmRecipe::kW4A16Int;
+  args.a.data = da + row0 * p.k; args.a.ld = p.k; args.a.dtype = dt_of<T>();
+  args.b.data = dqw; args.b.dtype = DType::kUInt32;
+  args.b.packing = p.awq ? kops::WeightPacking::kAWQ : kops::WeightPacking::kGPTQ;
+  args.b.scale = dsc; args.b.scale_dtype = dt_of<T>(); args.b.group_k = static_cast<int16_t>(p.group);
+  args.b.zero_points = p.zeros ? dqz : nullptr; args.b.zero_dtype = DType::kUInt32;
+  args.b.g_idx = (p.actorder && !p.awq) ? dgi : nullptr;
+  if (p.bias) { args.epi.ops = kops::gemm::kEpiBias; args.epi.bias = dbias; args.epi.bias_dtype = dt_of<T>(); }
+  args.d = dout + row0 * p.n; args.ldd = p.n; args.d_dtype = dt_of<T>();
+  args.m = rows; args.n = p.n; args.k = p.k;
+  return kops::gemm::mixed_input_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
+}
+
+template <typename T>
+void run_w4a16(const LaunchContext& ctx, bool awq, int group, bool zeros, bool actorder, bool bias, int m,
+               int n, int k, const char* what, bool invariance = false) {
+  const W4Problem<T> p = make_w4<T>(awq, group, zeros, actorder, bias, m, n, k, 77u + m * 131u + n + k);
+  auto da = upload(to_vec<T>(p.a));
+  auto dsc = upload(to_vec<T>(p.scale));
+  auto dqw = upload(p.qw);
+  auto dqz = upload(p.qz);
+  auto dgi = upload(p.g_idx);
+  auto db = upload(to_vec<T>(p.bias_v));
+  DevBuf<T> dout(static_cast<size_t>(m) * n);
+  KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, dqw.p, dsc.p, dqz.p, dgi.p, db.p, dout.p, m, 0), what);
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, static_cast<size_t>(m) * n);
+  expect_close(got, p.ref, what);
+  if (!invariance) return;
+  // Bit-exactness: 100 repeats, and each row alone == the same row inside the batch.
+  for (int rep = 0; rep < 100; ++rep) {
+    KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, dqw.p, dsc.p, dqz.p, dgi.p, db.p, dout.p, m, 0), what);
+    cudaDeviceSynchronize();
+    if (!same_bits(kops_test::copy_out(dout.p, static_cast<size_t>(m) * n), got)) {
+      kops_test::record_failure(what, "result changed between repeats", __FILE__, __LINE__);
+      break;
+    }
+  }
+  DevBuf<T> one(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row) {
+    KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, dqw.p, dsc.p, dqz.p, dgi.p, db.p, one.p, 1, row), what);
+  }
+  cudaDeviceSynchronize();
+  if (!same_bits(kops_test::copy_out(one.p, static_cast<size_t>(m) * n), got)) {
+    kops_test::record_failure(what, "row alone differs from the same row in a batch", __FILE__, __LINE__);
+  }
+}
+
+void test_w4a16(const LaunchContext& ctx) {
+  for (int m : {1, 2, 3, 5, 8, 13, 16}) {
+    run_w4a16<__nv_bfloat16>(ctx, true, 128, true, false, true, m, 264, 640, "w4a16 awq g128 zeros bias bf16");
+    run_w4a16<__half>(ctx, true, 32, true, false, false, m, 256, 96, "w4a16 awq g32 zeros f16");
+    run_w4a16<__nv_bfloat16>(ctx, true, 64, false, false, false, m, 512, 256, "w4a16 awq g64 sym bf16");
+    run_w4a16<__nv_bfloat16>(ctx, false, 128, true, false, true, m, 200, 512, "w4a16 gptq g128 zeros bias bf16");
+    run_w4a16<__half>(ctx, false, 32, false, false, false, m, 96, 128, "w4a16 gptq g32 sym f16");
+    run_w4a16<__nv_bfloat16>(ctx, false, 128, true, true, false, m, 160, 384, "w4a16 gptq act-order bf16");
+  }
+  run_w4a16<__nv_bfloat16>(ctx, true, 0, true, false, false, 3, 128, 256, "w4a16 awq per-channel");
+  run_w4a16<__nv_bfloat16>(ctx, false, 0, false, false, true, 2, 72, 192, "w4a16 gptq per-channel");
+  run_w4a16<__nv_bfloat16>(ctx, true, 128, true, false, true, 8, 1024, 2048, "w4a16 awq batch invariance", true);
+  run_w4a16<__half>(ctx, false, 128, true, false, true, 8, 1000, 2048, "w4a16 gptq batch invariance", true);
+}
+
+// ---- lut_gemv -----------------------------------------------------------------------------
+
+template <typename T>
+void run_lut(const LaunchContext& ctx, int bs, bool dq, int m, int n, int k, const char* what) {
+  Rng r(900u + m + n);
+  std::vector<float> a(static_cast<size_t>(m) * k);
+  for (auto& v : a) v = kops_test::to_float(cvt<T>(r.uni(-1.0f, 1.0f)));
+  std::vector<float> cbk(16);
+  for (auto& v : cbk) v = r.uni(-1.0f, 1.0f);
+  std::vector<uint8_t> codes(static_cast<size_t>(n) * k);
+  for (auto& v : codes) v = static_cast<uint8_t>(r.range(16));
+  std::vector<uint8_t> packed(static_cast<size_t>(n) * k / 2);
+  for (size_t i = 0; i < packed.size(); ++i) packed[i] = static_cast<uint8_t>(codes[2 * i] | (codes[2 * i + 1] << 4));
+  const size_t nb = static_cast<size_t>(n) * k / bs;
+  std::vector<float> amax_f(nb);
+  std::vector<uint8_t> amax_q(nb);
+  std::vector<float> amax2((nb + 255) / 256);
+  float offset = 0.25f;
+  for (auto& v : amax_f) v = r.uni(0.1f, 2.0f);
+  for (auto& v : amax_q) v = static_cast<uint8_t>(r.range(256));
+  for (auto& v : amax2) v = r.uni(0.001f, 0.01f);
+  std::vector<double> ref(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row) {
+    for (int c = 0; c < n; ++c) {
+      double acc = 0.0;
+      for (int kk = 0; kk < k; ++kk) {
+        const size_t blk = (static_cast<size_t>(c) * k + kk) / bs;
+        const double am = dq ? static_cast<double>(std::fmaf(static_cast<float>(amax_q[blk]), amax2[blk >> 8], offset)) : amax_f[blk];
+        acc += static_cast<double>(a[static_cast<size_t>(row) * k + kk]) *
+               (static_cast<double>(cbk[codes[static_cast<size_t>(c) * k + kk]]) * am);
+      }
+      ref[static_cast<size_t>(row) * n + c] = acc;
+    }
+  }
+  auto da = upload(to_vec<T>(a));
+  auto dq4 = upload(packed);
+  auto dcb = upload(cbk);
+  auto dmf = upload(amax_f);
+  auto dmq = upload(amax_q);
+  auto dm2 = upload(amax2);
+  auto doff = upload(std::vector<float>{offset});
+  DevBuf<T> dout(static_cast<size_t>(m) * n);
+  const Tensor tout = kops_test::tensor2d(dout.p, dt_of<T>(), m, n);
+  const Tensor ta = kops_test::tensor2d(da.p, dt_of<T>(), m, k);
+  const Tensor tq = kops_test::tensor2d(dq4.p, DType::kUInt8, n, k / 2);
+  const Tensor tc = tensor1d(dcb.p, DType::kFloat32, 16);
+  const Tensor tam = dq ? tensor1d(dmq.p, DType::kUInt8, static_cast<int64_t>(nb)) : tensor1d(dmf.p, DType::kFloat32, static_cast<int64_t>(nb));
+  const Tensor tas = dq ? tensor1d(dm2.p, DType::kFloat32, static_cast<int64_t>(amax2.size())) : Tensor{};
+  const Tensor tao = dq ? tensor1d(doff.p, DType::kFloat32, 1) : Tensor{};
+  KOPS_EXPECT_OK(kops::gemm::lut_gemv(tout, ta, tq, tc, tam, tas, tao, bs, ctx), what);
+  cudaDeviceSynchronize();
+  expect_close(kops_test::copy_out(dout.p, static_cast<size_t>(m) * n), ref, what);
+}
+
+void test_lut_gemv(const LaunchContext& ctx) {
+  for (int m : {1, 2, 3, 8, 11}) {
+    run_lut<__nv_bfloat16>(ctx, 64, false, m, 40, 1024, "lut gemv b64 bf16");
+    run_lut<__half>(ctx, 64, true, m, 33, 2048, "lut gemv b64 double-quant f16");
+    run_lut<__nv_bfloat16>(ctx, 32, false, m, 17, 96, "lut gemv b32 ragged k");
+    run_lut<__nv_bfloat16>(ctx, 256, true, m, 9, 768, "lut gemv b256 double-quant");
+  }
+}
+
+void test_w4a16_contracts(const LaunchContext& ctx) {
+  const W4Problem<__nv_bfloat16> p = make_w4<__nv_bfloat16>(true, 128, true, false, false, 2, 64, 256, 5);
+  auto da = upload(to_vec<__nv_bfloat16>(p.a));
+  auto dsc = upload(to_vec<__nv_bfloat16>(p.scale));
+  auto dqw = upload(p.qw);
+  auto dqz = upload(p.qz);
+  auto dgi = upload(p.g_idx);
+  DevBuf<__nv_bfloat16> dout(2 * 64 + 64);
+  auto call = [&](auto&& mutate) {
+    kops::gemm::ScaledGemmArgs args{};
+    args.recipe = kops::gemm::GemmRecipe::kW4A16Int;
+    args.a.data = da.p; args.a.ld = 256; args.a.dtype = DType::kBFloat16;
+    args.b.data = dqw.p; args.b.dtype = DType::kUInt32; args.b.packing = kops::WeightPacking::kAWQ;
+    args.b.scale = dsc.p; args.b.scale_dtype = DType::kBFloat16; args.b.group_k = 128;
+    args.b.zero_points = dqz.p; args.d = dout.p; args.ldd = 64; args.d_dtype = DType::kBFloat16;
+    args.m = 2; args.n = 64; args.k = 256;
+    mutate(args);
+    return kops::gemm::mixed_input_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
+  };
+  KOPS_EXPECT_OK(call([](auto&) {}), "w4a16 baseline call");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.a.dtype = DType::kFloat32; }), Status::kUnsupportedDtype, "w4a16 act dtype");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.d_dtype = DType::kFloat16; }), Status::kUnsupportedDtype, "w4a16 out dtype");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.b.group_k = 48; }), Status::kUnsupportedShape, "w4a16 group");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.n = 60; a.ldd = 60; }), Status::kUnsupportedShape, "w4a16 N % 8");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.k = 250; a.a.ld = 250; }), Status::kUnsupportedShape, "w4a16 K % 32");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.m = 17; }), Status::kNotImplemented, "w4a16 M > 16");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.b.packing = kops::WeightPacking::kMarlin; }), Status::kUnsupportedLayout, "w4a16 packing");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.b.scale = nullptr; }), Status::kInvalidArgument, "w4a16 null scales");
+  KOPS_EXPECT_STATUS(call([&](auto& a) { a.b.g_idx = dgi.p; }), Status::kUnsupportedLayout, "w4a16 awq act-order");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.epi.ops = kops::gemm::kEpiResidualAdd; }), Status::kNotImplemented, "w4a16 epilogue");
+  KOPS_EXPECT_STATUS(call([&](auto& a) { a.a.data = reinterpret_cast<const char*>(da.p) + 2; }), Status::kMisaligned, "w4a16 misaligned A");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.recipe = kops::gemm::GemmRecipe::kW4A8IntInt8; }), Status::kNotImplemented, "w4a16 recipe");
+  LaunchContext hip = ctx;
+  hip.backend = kops::BackendKind::kHip;
+  KOPS_EXPECT_STATUS(call([&](auto&) {}), Status::kSuccess, "w4a16 still ok");
+  kops::gemm::ScaledGemmArgs bad{};
+  KOPS_EXPECT_STATUS(kops::gemm::mixed_input_gemm(bad, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, hip),
+                     Status::kUnsupportedBackend, "w4a16 backend");
+}
+
+// ---- fp8_gemm / int8_gemm ---------------------------------------------------------------
+
+using kops::gemm::GemmRecipe;
+using kops::gemm::ScaledGemmArgs;
+
+float f8(uint8_t b) { return e4m3_to_float(b); }
+
+/// Random e4m3 codes that are not NaN (0x7F / 0xFF).
+std::vector<uint8_t> random_e4m3(size_t n, Rng* r) {
+  std::vector<uint8_t> v(n);
+  for (auto& b : v) {
+    do { b = static_cast<uint8_t>(r->u32()); } while ((b & 0x7F) == 0x7F);
+  }
+  return v;
+}
+
+template <typename T>
+Status call_fp8(const LaunchContext& ctx, ScaledGemmArgs* args, const T* a, const uint8_t* w, void* d) {
+  args->a.data = a; args->a.dtype = dt_of<T>();
+  args->b.data = w; args->b.dtype = DType::kFloat8E4M3;
+  args->d = d;
+  return kops::gemm::fp8_gemm(*args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
+}
+
+template <>
+Status call_fp8<uint8_t>(const LaunchContext& ctx, ScaledGemmArgs* args, const uint8_t* a, const uint8_t* w, void* d) {
+  args->a.data = a; args->a.dtype = DType::kFloat8E4M3;
+  args->b.data = w; args->b.dtype = DType::kFloat8E4M3;
+  args->d = d;
+  return kops::gemm::fp8_gemm(*args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
+}
+
+/// Activation as float (T = bf16/half) or decoded e4m3 (T = uint8_t).
+template <typename T>
+float act_value(const std::vector<T>& a, size_t i);
+template <>
+float act_value<__nv_bfloat16>(const std::vector<__nv_bfloat16>& a, size_t i) { return kops_test::to_float(a[i]); }
+template <>
+float act_value<__half>(const std::vector<__half>& a, size_t i) { return kops_test::to_float(a[i]); }
+template <>
+float act_value<uint8_t>(const std::vector<uint8_t>& a, size_t i) { return f8(a[i]); }
+
+template <typename T>
+std::vector<T> random_acts(size_t n, Rng* r);
+template <>
+std::vector<__nv_bfloat16> random_acts<__nv_bfloat16>(size_t n, Rng* r) {
+  std::vector<__nv_bfloat16> v(n);
+  for (auto& x : v) x = cvt<__nv_bfloat16>(r->uni(-1.0f, 1.0f));
+  return v;
+}
+template <>
+std::vector<__half> random_acts<__half>(size_t n, Rng* r) {
+  std::vector<__half> v(n);
+  for (auto& x : v) x = cvt<__half>(r->uni(-1.0f, 1.0f));
+  return v;
+}
+template <>
+std::vector<uint8_t> random_acts<uint8_t>(size_t n, Rng* r) {
+  std::vector<uint8_t> v(n);
+  for (auto& x : v) x = e4m3_from_float(r->uni(-2.0f, 2.0f));
+  return v;
+}
+
+/// kind: 0 tensorwise (alpha), 1 rowwise (row/col scale + bias), 2 blockwise.
+template <typename T>
+void run_fp8(const LaunchContext& ctx, int kind, int m, int n, int k, bool col_major_sa, const char* what) {
+  Rng r(31u + m * 7u + n + k + kind);
+  const bool a_fp8 = std::is_same<T, uint8_t>::value;
+  const size_t kb = static_cast<size_t>(k) / 128;
+  const auto a = random_acts<T>(static_cast<size_t>(m) * k, &r);
+  const auto w = random_e4m3(static_cast<size_t>(n) * k, &r);
+  // Smaller weights keep rows well scaled: scale them by 2^-6 through the recipe scales.
+  const float alpha = 0.015625f * (kind == 0 ? 1.25f : 1.0f);
+  std::vector<float> row_s(m), col_s(n), bias(n), sa, sb;
+  for (auto& v : row_s) v = r.uni(0.5f, 2.0f);
+  for (auto& v : col_s) v = r.uni(0.5f, 2.0f);
+  for (auto& v : bias) v = kops_test::to_float(cvt<__nv_bfloat16>(r.uni(-1.0f, 1.0f)));
+  const int mp = static_cast<int>(round_up(m, 4));
+  if (kind == 2) {
+    sb.resize(((static_cast<size_t>(n) + 127) / 128) * kb);
+    for (auto& v : sb) v = std::ldexp(1.0f, r.range(5) - 8) * r.uni(1.0f, 1.9f);
+    if (a_fp8) {
+      sa.resize(kb * (col_major_sa ? mp : m));
+      for (auto& v : sa) v = std::ldexp(1.0f, r.range(5) - 3) * r.uni(1.0f, 1.9f);
+    }
+  }
+  std::vector<double> ref(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row) {
+    for (int c = 0; c < n; ++c) {
+      double acc = 0.0;
+      for (int kk = 0; kk < k; ++kk) {
+        double term = static_cast<double>(act_value<T>(a, static_cast<size_t>(row) * k + kk)) *
+                      f8(w[static_cast<size_t>(c) * k + kk]);
+        if (kind == 2) {
+          const size_t blk = kk / 128;
+          const double sav = a_fp8 ? sa[col_major_sa ? blk * mp + row : static_cast<size_t>(row) * kb + blk] : 1.0;
+          term *= sav * sb[(static_cast<size_t>(c) / 128) * kb + blk];
+        }
+        acc += term;
+      }
+      if (kind == 0) acc *= alpha;
+      if (kind == 1) acc = acc * row_s[row] * col_s[c] + bias[c];
+      ref[static_cast<size_t>(row) * n + c] = acc;
+    }
+  }
+  auto da = upload(a);
+  auto dw = upload(w);
+  auto drs = upload(row_s);
+  auto dcs = upload(col_s);
+  auto dbias = upload(to_vec<__nv_bfloat16>(bias));
+  auto dsa = upload(sa.empty() ? std::vector<float>(1) : sa);
+  auto dsb = upload(sb.empty() ? std::vector<float>(1) : sb);
+  DevBuf<__nv_bfloat16> dout(static_cast<size_t>(m) * n);
+  ScaledGemmArgs args{};
+  args.recipe = kind == 0 ? GemmRecipe::kFP8Tensorwise : (kind == 1 ? GemmRecipe::kFP8Rowwise : GemmRecipe::kFP8Blockwise);
+  args.a.ld = k; args.b.ld = k; args.ldd = n; args.d_dtype = DType::kBFloat16;
+  args.m = m; args.n = n; args.k = k;
+  if (kind == 0) args.epi.alpha = alpha;
+  if (kind == 1) {
+    args.epi.ops = kops::gemm::kEpiRowScale | kops::gemm::kEpiColScale | kops::gemm::kEpiBias;
+    args.epi.row_scale = drs.p; args.epi.col_scale = dcs.p; args.epi.bias = dbias.p; args.epi.bias_dtype = DType::kBFloat16;
+  }
+  if (kind == 2) {
+    args.b.scale = dsb.p; args.b.scale_dtype = DType::kFloat32;
+    if (a_fp8) {
+      args.a.scale = dsa.p; args.a.scale_dtype = DType::kFloat32;
+      args.a.scale_layout = col_major_sa ? kops::ScaleLayout::kColMajorTma : kops::ScaleLayout::kRowMajor;
+    }
+  }
+  KOPS_EXPECT_OK(call_fp8<T>(ctx, &args, da.p, dw.p, dout.p), what);
+  cudaDeviceSynchronize();
+  // The reference above carries the bias in bf16 rounding of the input; use the rounded bias.
+  expect_close(kops_test::copy_out(dout.p, ref.size()), ref, what);
+}
+
+void test_fp8_decode(const LaunchContext& ctx) {
+  // 256 rows, row c holds code c in all 16 positions; A = ones -> out[c] = 16 * decode(c).
+  std::vector<uint8_t> w(256 * 16);
+  for (int c = 0; c < 256; ++c) for (int i = 0; i < 16; ++i) w[c * 16 + i] = static_cast<uint8_t>(c);
+  std::vector<__nv_bfloat16> a(16, cvt<__nv_bfloat16>(1.0f));
+  auto da = upload(a);
+  auto dw = upload(w);
+  DevBuf<float> dout(256);
+  ScaledGemmArgs args{};
+  args.recipe = GemmRecipe::kFP8Tensorwise;
+  args.a.ld = 16; args.b.ld = 16; args.ldd = 256; args.d_dtype = DType::kFloat32;
+  args.epi.ops = kops::gemm::kEpiOutFp32;
+  args.m = 1; args.n = 256; args.k = 16;
+  KOPS_EXPECT_OK(call_fp8<__nv_bfloat16>(ctx, &args, da.p, dw.p, dout.p), "fp8 decode all codes");
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, 256);
+  int bad = 0;
+  for (int c = 0; c < 256; ++c) {
+    const bool nan_code = (c & 0x7F) == 0x7F;
+    if (nan_code) { bad += !std::isnan(got[c]); continue; }
+    bad += got[c] != 16.0f * f8(static_cast<uint8_t>(c));
+  }
+  if (bad != 0) kops_test::record_failure("fp8 decode all codes", "decoded value differs from the toolkit", __FILE__, __LINE__);
+}
+
+void test_fp8_gemv(const LaunchContext& ctx) {
+  for (int m : {1, 2, 3, 5, 8, 9, 16}) {
+    run_fp8<__nv_bfloat16>(ctx, 0, m, 200, 384, false, "fp8 tensorwise bf16");
+    run_fp8<__half>(ctx, 1, m, 130, 640, false, "fp8 rowwise f16 bias");
+    run_fp8<__nv_bfloat16>(ctx, 2, m, 300, 384, false, "fp8 blockwise bf16 acts");
+    run_fp8<uint8_t>(ctx, 2, m, 129, 256, false, "fp8 blockwise e4m3 acts row-major");
+    run_fp8<uint8_t>(ctx, 2, m, 129, 256, true, "fp8 blockwise e4m3 acts tma");
+    run_fp8<uint8_t>(ctx, 0, m, 64, 512, false, "fp8 tensorwise e4m3 acts");
+  }
+}
+
+void test_fp8_invariance(const LaunchContext& ctx) {
+  Rng r(5);
+  const int n = 1000, k = 2048, m = 8;
+  const auto a = random_acts<__nv_bfloat16>(static_cast<size_t>(m) * k, &r);
+  const auto w = random_e4m3(static_cast<size_t>(n) * k, &r);
+  auto da = upload(a);
+  auto dw = upload(w);
+  DevBuf<__nv_bfloat16> full(static_cast<size_t>(m) * n), one(static_cast<size_t>(m) * n);
+  auto run = [&](int rows, int row0, __nv_bfloat16* out) {
+    ScaledGemmArgs args{};
+    args.recipe = GemmRecipe::kFP8Tensorwise;
+    args.a.ld = k; args.b.ld = k; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.epi.alpha = 0.01f;
+    args.m = rows; args.n = n; args.k = k;
+    return call_fp8<__nv_bfloat16>(ctx, &args, da.p + static_cast<size_t>(row0) * k, dw.p, out + static_cast<size_t>(row0) * n);
+  };
+  KOPS_EXPECT_OK(run(m, 0, full.p), "fp8 batch");
+  cudaDeviceSynchronize();
+  const auto ref = kops_test::copy_out(full.p, static_cast<size_t>(m) * n);
+  for (int rep = 0; rep < 100; ++rep) {
+    KOPS_EXPECT_OK(run(m, 0, full.p), "fp8 repeat");
+    cudaDeviceSynchronize();
+    if (!same_bits(kops_test::copy_out(full.p, static_cast<size_t>(m) * n), ref)) {
+      kops_test::record_failure("fp8 batch", "result changed between repeats", __FILE__, __LINE__);
+      break;
+    }
+  }
+  for (int row = 0; row < m; ++row) KOPS_EXPECT_OK(run(1, row, one.p), "fp8 row alone");
+  cudaDeviceSynchronize();
+  if (!same_bits(kops_test::copy_out(one.p, static_cast<size_t>(m) * n), ref)) {
+    kops_test::record_failure("fp8 batch", "row alone differs from the same row in a batch", __FILE__, __LINE__);
+  }
+}
+
+// ---- int8 -----------------------------------------------------------------------------------
+
+/// mode 0: W8A8 symmetric, 1: W8A8 asymmetric (azp), 2: W8A16 (bf16 acts) with column scale.
+void run_int8(const LaunchContext& ctx, int mode, int m, int n, int k, bool fp32_out, const char* what) {
+  Rng r(77u + m + n + mode);
+  std::vector<int8_t> a8(static_cast<size_t>(m) * k), w(static_cast<size_t>(n) * k);
+  for (auto& v : a8) v = static_cast<int8_t>(static_cast<int>(r.u32() % 256) - 128);
+  for (auto& v : w) v = static_cast<int8_t>(static_cast<int>(r.u32() % 256) - 128);
+  std::vector<__nv_bfloat16> a16(static_cast<size_t>(m) * k);
+  for (auto& v : a16) v = cvt<__nv_bfloat16>(r.uni(-1.0f, 1.0f));
+  std::vector<int32_t> azp(m), colsum(n, 0);
+  for (auto& v : azp) v = static_cast<int>(r.u32() % 256) - 128;
+  for (int c = 0; c < n; ++c) for (int kk = 0; kk < k; ++kk) colsum[c] += w[static_cast<size_t>(c) * k + kk];
+  std::vector<float> row_s(m), col_s(n);
+  for (auto& v : row_s) v = r.uni(0.001f, 0.01f);
+  for (auto& v : col_s) v = r.uni(0.001f, 0.01f);
+  std::vector<double> ref(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row) {
+    for (int c = 0; c < n; ++c) {
+      if (mode == 2) {
+        double acc = 0.0;
+        for (int kk = 0; kk < k; ++kk) acc += static_cast<double>(kops_test::to_float(a16[static_cast<size_t>(row) * k + kk])) * w[static_cast<size_t>(c) * k + kk];
+        ref[static_cast<size_t>(row) * n + c] = acc * col_s[c];
+      } else {
+        int64_t acc = 0;
+        for (int kk = 0; kk < k; ++kk) acc += static_cast<int64_t>(a8[static_cast<size_t>(row) * k + kk]) * w[static_cast<size_t>(c) * k + kk];
+        if (mode == 1) acc -= static_cast<int64_t>(azp[row]) * colsum[c];
+        ref[static_cast<size_t>(row) * n + c] = static_cast<double>(acc) * row_s[row] * col_s[c];
+      }
+    }
+  }
+  auto d8 = upload(a8);
+  auto d16 = upload(a16);
+  auto dw = upload(w);
+  auto dazp = upload(azp);
+  auto dcs = upload(colsum);
+  auto drs = upload(row_s);
+  auto dcl = upload(col_s);
+  DevBuf<float> out32(static_cast<size_t>(m) * n);
+  DevBuf<__nv_bfloat16> out16(static_cast<size_t>(m) * n);
+  ScaledGemmArgs args{};
+  args.recipe = GemmRecipe::kINT8Rowwise;
+  args.a.ld = k; args.b.ld = k; args.ldd = n;
+  args.a.data = mode == 2 ? static_cast<const void*>(d16.p) : static_cast<const void*>(d8.p);
+  args.a.dtype = mode == 2 ? DType::kBFloat16 : DType::kInt8;
+  args.b.data = dw.p; args.b.dtype = DType::kInt8;
+  args.d = fp32_out ? static_cast<void*>(out32.p) : static_cast<void*>(out16.p);
+  args.d_dtype = fp32_out ? DType::kFloat32 : DType::kBFloat16;
+  args.epi.ops = kops::gemm::kEpiColScale | (mode == 2 ? 0u : kops::gemm::kEpiRowScale) |
+                 (mode == 1 ? kops::gemm::kEpiAzpCorrection : 0u) | (fp32_out ? kops::gemm::kEpiOutFp32 : 0u);
+  args.epi.row_scale = drs.p; args.epi.col_scale = dcl.p; args.epi.azp = dazp.p; args.epi.colsum_b = dcs.p;
+  args.m = m; args.n = n; args.k = k;
+  KOPS_EXPECT_OK(kops::gemm::int8_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx), what);
+  cudaDeviceSynchronize();
+  if (fp32_out) {
+    expect_close(kops_test::copy_out(out32.p, ref.size()), ref, what);
+  } else {
+    expect_close(kops_test::copy_out(out16.p, ref.size()), ref, what);
+  }
+}
+
+void test_int8_gemv(const LaunchContext& ctx) {
+  for (int m : {1, 2, 3, 5, 8, 12, 16}) {
+    run_int8(ctx, 0, m, 130, 512, true, "int8 w8a8 fp32 out");
+    run_int8(ctx, 0, m, 77, 144, false, "int8 w8a8 bf16 out");
+    run_int8(ctx, 1, m, 130, 512, true, "int8 w8a8 azp");
+    run_int8(ctx, 2, m, 99, 320, false, "int8 w8a16 bf16 acts");
+  }
+}
+
+void test_fp8_int8_contracts(const LaunchContext& ctx) {
+  DevBuf<uint8_t> a(1 << 16), w(1 << 16);
+  DevBuf<__nv_bfloat16> d(1 << 14);
+  auto base = [&] {
+    ScaledGemmArgs args{};
+    args.recipe = GemmRecipe::kFP8Tensorwise;
+    args.a.data = a.p; args.a.ld = 256; args.a.dtype = DType::kBFloat16;
+    args.b.data = w.p; args.b.ld = 256; args.b.dtype = DType::kFloat8E4M3;
+    args.d = d.p; args.ldd = 64; args.d_dtype = DType::kBFloat16;
+    args.m = 2; args.n = 64; args.k = 256;
+    return args;
+  };
+  auto run8 = [&](ScaledGemmArgs args) {
+    return kops::gemm::fp8_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
+  };
+  KOPS_EXPECT_OK(run8(base()), "fp8 baseline call");
+  { auto x = base(); x.b.dtype = DType::kInt8; KOPS_EXPECT_STATUS(run8(x), Status::kUnsupportedDtype, "fp8 weight dtype"); }
+  { auto x = base(); x.a.dtype = DType::kFloat32; KOPS_EXPECT_STATUS(run8(x), Status::kUnsupportedDtype, "fp8 act dtype"); }
+  { auto x = base(); x.m = 17; KOPS_EXPECT_STATUS(run8(x), Status::kNotImplemented, "fp8 M > 16"); }
+  { auto x = base(); x.k = 250; x.a.ld = 250; x.b.ld = 250; KOPS_EXPECT_STATUS(run8(x), Status::kUnsupportedShape, "fp8 K % 16"); }
+  { auto x = base(); x.recipe = GemmRecipe::kMXFP8; KOPS_EXPECT_STATUS(run8(x), Status::kNotImplemented, "fp8 recipe"); }
+  { auto x = base(); x.recipe = GemmRecipe::kFP8Blockwise; KOPS_EXPECT_STATUS(run8(x), Status::kInvalidArgument, "fp8 blockwise needs scales"); }
+  { auto x = base(); x.b.ld = 264; KOPS_EXPECT_STATUS(run8(x), Status::kMisaligned, "fp8 pitch"); }
+  { auto x = base(); x.b.major = kops::gemm::MajorOrder::kMNMajor; KOPS_EXPECT_STATUS(run8(x), Status::kUnsupportedLayout, "fp8 mn-major"); }
+  { auto x = base(); x.epi.ops = kops::gemm::kEpiGLU; KOPS_EXPECT_STATUS(run8(x), Status::kNotImplemented, "fp8 GLU epilogue"); }
+  { auto x = base(); x.epi.ops = kops::gemm::kEpiRowScale; KOPS_EXPECT_STATUS(run8(x), Status::kInvalidArgument, "fp8 row scale missing"); }
+  { auto x = base(); x.d_dtype = DType::kInt8; KOPS_EXPECT_STATUS(run8(x), Status::kUnsupportedDtype, "fp8 out dtype"); }
+  {
+    LaunchContext hip = ctx;
+    hip.backend = kops::BackendKind::kHip;
+    KOPS_EXPECT_STATUS(kops::gemm::fp8_gemm(base(), nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, hip),
+                       Status::kUnsupportedBackend, "fp8 backend");
+  }
+  auto run_i8 = [&](ScaledGemmArgs args) {
+    return kops::gemm::int8_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
+  };
+  auto ibase = [&] {
+    auto x = base();
+    x.recipe = GemmRecipe::kINT8Rowwise;
+    x.a.dtype = DType::kInt8; x.b.dtype = DType::kInt8;
+    return x;
+  };
+  KOPS_EXPECT_OK(run_i8(ibase()), "int8 baseline call");
+  { auto x = ibase(); x.b.dtype = DType::kFloat8E4M3; KOPS_EXPECT_STATUS(run_i8(x), Status::kUnsupportedDtype, "int8 weight dtype"); }
+  { auto x = ibase(); x.epi.ops = kops::gemm::kEpiAzpCorrection; KOPS_EXPECT_STATUS(run_i8(x), Status::kInvalidArgument, "int8 azp operands"); }
+  { auto x = ibase(); x.a.dtype = DType::kBFloat16; x.epi.ops = kops::gemm::kEpiAzpCorrection;
+    KOPS_EXPECT_STATUS(run_i8(x), Status::kInvalidArgument, "int8 azp with float acts"); }
+  { auto x = ibase(); x.m = 40; KOPS_EXPECT_STATUS(run_i8(x), Status::kNotImplemented, "int8 M > 16"); }
+  { auto x = ibase(); x.recipe = GemmRecipe::kFP8Rowwise; KOPS_EXPECT_STATUS(run_i8(x), Status::kNotImplemented, "int8 recipe"); }
+}
+
+// ---- dense gemv / simt / split-K -----------------------------------------------------------
+
+template <typename T>
+std::vector<T> random_t(size_t n, Rng* r, float lo, float hi) {
+  std::vector<T> v(n);
+  for (auto& x : v) x = cvt<T>(r->uni(lo, hi));
+  return v;
+}
+
+template <typename T>
+double dval(const std::vector<T>& v, size_t i) { return static_cast<double>(kops_test::to_float(v[i])); }
+
+GemmRecipe recipe_of(DType t) {
+  return t == DType::kBFloat16 ? GemmRecipe::kBF16 : (t == DType::kFloat16 ? GemmRecipe::kFP16 : GemmRecipe::kFP32);
+}
+
+/// D = epilogue(A . B^T) through scaled_gemm.  epi: bias + SiLU + residual.  split 0 = automatic.
+template <typename T, typename D>
+void run_dense(const LaunchContext& ctx, int m, int n, int k, bool epi, bool fp32_out, const char* what,
+               bool invariance = false) {
+  Rng r(4242u + m * 17u + n + k);
+  const auto a = random_t<T>(static_cast<size_t>(m) * k, &r, -1.0f, 1.0f);
+  const auto b = random_t<T>(static_cast<size_t>(n) * k, &r, -0.5f, 0.5f);
+  const auto bias = random_t<D>(n, &r, -1.0f, 1.0f);
+  const auto res = random_t<D>(static_cast<size_t>(m) * n, &r, -1.0f, 1.0f);
+  std::vector<double> ref(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row) {
+    for (int c = 0; c < n; ++c) {
+      double acc = 0.0;
+      for (int kk = 0; kk < k; ++kk) acc += dval(a, static_cast<size_t>(row) * k + kk) * dval(b, static_cast<size_t>(c) * k + kk);
+      if (epi) {
+        acc += dval(bias, c);
+        acc = acc / (1.0 + std::exp(-acc));
+        acc += dval(res, static_cast<size_t>(row) * n + c);
+      }
+      ref[static_cast<size_t>(row) * n + c] = acc;
+    }
+  }
+  auto da = upload(a);
+  auto db = upload(b);
+  auto dbias = upload(bias);
+  auto dres = upload(res);
+  DevBuf<D> dout(static_cast<size_t>(m) * n);
+  ScaledGemmArgs args{};
+  args.recipe = recipe_of(dt_of<T>());
+  args.a.data = da.p; args.a.ld = k; args.a.dtype = dt_of<T>();
+  args.b.data = db.p; args.b.ld = k; args.b.dtype = dt_of<T>();
+  args.d = dout.p; args.ldd = n; args.d_dtype = dt_of<D>();
+  args.m = m; args.n = n; args.k = k;
+  if (epi) {
+    args.epi.ops = kops::gemm::kEpiBias | kops::gemm::kEpiAct | kops::gemm::kEpiResidualAdd;
+    args.epi.bias = dbias.p; args.epi.bias_dtype = dt_of<D>();
+    args.epi.act = kops::ActFn::kSiLU;
+    args.epi.residual = dres.p; args.epi.residual_stride = n;
+  }
+  kops::gemm::GemmProblem prob{};
+  prob.m = m; prob.n = n; prob.k = k; prob.recipe = args.recipe;
+  kops::WorkspaceRequirements req{};
+  KOPS_EXPECT_OK(kops::gemm::gemm_workspace_requirements(prob, nullptr, kops::gemm::GemmBackend::kNative, ctx, &req), what);
+  DevBuf<uint8_t> scratch(req.device_scratch_bytes + 256);
+  kops::Workspace ws{};
+  ws.device_scratch = scratch.p; ws.device_scratch_bytes = req.device_scratch_bytes;
+  if (req.device_scratch_bytes != 0) {
+    KOPS_EXPECT_STATUS(kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx),
+                       Status::kWorkspaceTooSmall, "split-K without workspace");
+  }
+  KOPS_EXPECT_OK(kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, ws, ctx), what);
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, ref.size());
+  expect_close(got, ref, what);
+  if (!invariance) return;
+  for (int rep = 0; rep < 100; ++rep) {
+    KOPS_EXPECT_OK(kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, ws, ctx), what);
+    cudaDeviceSynchronize();
+    if (!same_bits(kops_test::copy_out(dout.p, ref.size()), got)) {
+      kops_test::record_failure(what, "result changed between repeats", __FILE__, __LINE__);
+      break;
+    }
+  }
+  // Row alone == row in the batch (the split is a function of N, K only).
+  DevBuf<D> one(ref.size());
+  for (int row = 0; row < m; ++row) {
+    ScaledGemmArgs x = args;
+    x.a.data = da.p + static_cast<size_t>(row) * k; x.d = one.p + static_cast<size_t>(row) * n; x.m = 1;
+    x.epi.residual = dres.p + static_cast<size_t>(row) * n;
+    x.epi.ops &= ~kops::gemm::kEpiResidualAdd;
+    if (epi) x.epi.ops |= kops::gemm::kEpiResidualAdd;
+    KOPS_EXPECT_OK(kops::gemm::scaled_gemm(x, nullptr, kops::gemm::GemmBackend::kNative, ws, ctx), what);
+  }
+  cudaDeviceSynchronize();
+  if (!same_bits(kops_test::copy_out(one.p, ref.size()), got)) {
+    kops_test::record_failure(what, "row alone differs from the same row in a batch", __FILE__, __LINE__);
+  }
+}
+
+void test_dense_gemv(const LaunchContext& ctx) {
+  for (int m : {1, 2, 3, 5, 8, 11, 16}) {
+    run_dense<__nv_bfloat16, __nv_bfloat16>(ctx, m, 512, 1024, false, false, "dense gemv bf16");
+    run_dense<__half, __half>(ctx, m, 333, 768, true, false, "dense gemv f16 epilogue");
+    run_dense<float, float>(ctx, m, 257, 640, false, true, "dense gemv f32");
+    run_dense<__nv_bfloat16, float>(ctx, m, 300, 4096, true, true, "dense gemv bf16 -> f32 split-K");
+  }
+  run_dense<__nv_bfloat16, __nv_bfloat16>(ctx, 8, 5000, 512, false, false, "dense gemv large N");
+  run_dense<__nv_bfloat16, __nv_bfloat16>(ctx, 8, 300, 4096, true, false, "dense gemv split-K invariance", true);
+  run_dense<__half, __half>(ctx, 8, 1000, 2048, true, false, "dense gemv invariance", true);
+}
+
+template <typename A, typename B, typename D>
+void run_simt(const LaunchContext& ctx, int batch, int m, int n, int k, bool b_mn_major, const char* what) {
+  Rng r(99u + m + n + k);
+  const auto a = random_t<A>(static_cast<size_t>(batch) * m * k, &r, -1.0f, 1.0f);
+  const auto b = random_t<B>(static_cast<size_t>(batch) * n * k, &r, -1.0f, 1.0f);
+  std::vector<double> ref(static_cast<size_t>(batch) * m * n);
+  for (int z = 0; z < batch; ++z) {
+    for (int row = 0; row < m; ++row) {
+      for (int c = 0; c < n; ++c) {
+        double acc = 0.0;
+        for (int kk = 0; kk < k; ++kk) {
+          const size_t bi = static_cast<size_t>(z) * n * k + (b_mn_major ? static_cast<size_t>(kk) * n + c : static_cast<size_t>(c) * k + kk);
+          acc += dval(a, static_cast<size_t>(z) * m * k + static_cast<size_t>(row) * k + kk) * dval(b, bi);
+        }
+        ref[(static_cast<size_t>(z) * m + row) * n + c] = acc * 0.5;
+      }
+    }
+  }
+  auto da = upload(a);
+  auto db = upload(b);
+  DevBuf<D> dout(ref.size());
+  ScaledGemmArgs args{};
+  args.recipe = GemmRecipe::kFP32;
+  args.a.data = da.p; args.a.ld = k; args.a.batch_stride = static_cast<int64_t>(m) * k; args.a.dtype = dt_of<A>();
+  args.b.data = db.p; args.b.ld = b_mn_major ? n : k; args.b.batch_stride = static_cast<int64_t>(n) * k; args.b.dtype = dt_of<B>();
+  args.b.major = b_mn_major ? kops::gemm::MajorOrder::kMNMajor : kops::gemm::MajorOrder::kKMajor;
+  args.d = dout.p; args.ldd = n; args.batch_stride_d = static_cast<int64_t>(m) * n; args.d_dtype = dt_of<D>();
+  args.m = m; args.n = n; args.k = k; args.batch = batch;
+  args.epi.alpha = 0.5f;
+  KOPS_EXPECT_OK(kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx), what);
+  cudaDeviceSynchronize();
+  expect_close(kops_test::copy_out(dout.p, ref.size()), ref, what);
+}
+
+void run_simt_f64(const LaunchContext& ctx) {
+  Rng r(12);
+  const int m = 21, n = 35, k = 90;
+  std::vector<double> a(m * k), b(n * k), ref(m * n);
+  for (auto& v : a) v = r.uni(-1, 1);
+  for (auto& v : b) v = r.uni(-1, 1);
+  for (int i = 0; i < m; ++i) for (int j = 0; j < n; ++j) { double s = 0; for (int kk = 0; kk < k; ++kk) s += a[i * k + kk] * b[j * k + kk]; ref[i * n + j] = s; }
+  auto da = upload(a);
+  auto db = upload(b);
+  DevBuf<double> dout(ref.size());
+  ScaledGemmArgs args{};
+  args.recipe = GemmRecipe::kFP32;
+  args.a.data = da.p; args.a.ld = k; args.a.dtype = DType::kFloat64;
+  args.b.data = db.p; args.b.ld = k; args.b.dtype = DType::kFloat64;
+  args.d = dout.p; args.ldd = n; args.d_dtype = DType::kFloat64;
+  args.m = m; args.n = n; args.k = k;
+  KOPS_EXPECT_OK(kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx), "simt fp64");
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, ref.size());
+  double worst = 0;
+  for (size_t i = 0; i < ref.size(); ++i) worst = std::max(worst, std::fabs(got[i] - ref[i]));
+  if (worst > 1e-12) kops_test::record_failure("simt fp64", "error above 1e-12", __FILE__, __LINE__);
+}
+
+void test_simt(const LaunchContext& ctx) {
+  run_simt<float, float, float>(ctx, 1, 37, 53, 70, false, "simt f32 odd");
+  run_simt<float, float, float>(ctx, 3, 64, 64, 128, false, "simt f32 batched");
+  run_simt<float, float, float>(ctx, 1, 100, 70, 33, true, "simt f32 mn-major B");
+  run_simt<__nv_bfloat16, __nv_bfloat16, float>(ctx, 1, 130, 90, 257, false, "simt bf16 golden");
+  run_simt<__half, __half, __half>(ctx, 1, 40, 40, 64, false, "simt f16");
+  run_simt<__nv_bfloat16, float, float>(ctx, 1, 33, 31, 65, false, "simt mixed bf16 x f32");
+  run_simt_f64(ctx);
+}
+
+// ---- gemv_argmax ----------------------------------------------------------------------------
+
+template <typename T>
+void run_argmax(const LaunchContext& ctx, int m, int hidden, int v_shard, int64_t vocab_start, int64_t vocab_size,
+                float logit_scale, float softcap, bool ties, const char* what) {
+  Rng r(8080u + m + v_shard);
+  auto h = random_t<T>(static_cast<size_t>(m) * hidden, &r, -1.0f, 1.0f);
+  auto w = random_t<T>(static_cast<size_t>(v_shard) * hidden, &r, -0.3f, 0.3f);
+  if (ties) {
+    // Rows 5 and 9 (and 70) become copies of the row 3 and a very large positive pattern for the
+    // first token: the lowest id of the tied maximum must win.
+    for (int j = 0; j < hidden; ++j) w[static_cast<size_t>(3) * hidden + j] = cvt<T>(0.9f * kops_test::to_float(h[j]) > 0 ? 0.3f : -0.3f);
+    for (int row : {5, 9, 70}) {
+      if (row < v_shard) for (int j = 0; j < hidden; ++j) w[static_cast<size_t>(row) * hidden + j] = w[static_cast<size_t>(3) * hidden + j];
+    }
+  }
+  std::vector<int32_t> want_id(m);
+  std::vector<double> want_lp(m);
+  for (int row = 0; row < m; ++row) {
+    double best = -1e300;
+    int64_t bi = -1;
+    std::vector<double> lg(v_shard);
+    for (int c = 0; c < v_shard; ++c) {
+      double acc = 0;
+      for (int j = 0; j < hidden; ++j) acc += dval(h, static_cast<size_t>(row) * hidden + j) * dval(w, static_cast<size_t>(c) * hidden + j);
+      acc *= logit_scale;
+      if (softcap > 0) acc = softcap * std::tanh(acc / softcap);
+      lg[c] = (vocab_start + c < vocab_size) ? acc : -1e300;
+      if (lg[c] > best) { best = lg[c]; bi = vocab_start + c; }
+    }
+    double sum = 0;
+    for (int c = 0; c < v_shard; ++c) if (lg[c] > -1e299) sum += std::exp(lg[c] - best);
+    want_id[row] = static_cast<int32_t>(bi);
+    want_lp[row] = -std::log(sum);
+  }
+  const int ncta = kops::gemm::gemv_argmax_num_ctas(v_shard);
+  auto dh = upload(h);
+  auto dw = upload(w);
+  DevBuf<float> pmax(static_cast<size_t>(m) * ncta), psum(static_cast<size_t>(m) * ncta), lp(m);
+  DevBuf<int32_t> pidx(static_cast<size_t>(m) * ncta), ids(m);
+  auto counter = upload(std::vector<uint32_t>(1, 0u));
+  kops::gemm::GemvArgmaxParams p{};
+  p.hidden = dh.p; p.ld_hidden = hidden; p.lm_head = dw.p; p.ld_lm_head = hidden;
+  p.logit_scale = logit_scale; p.final_softcap = softcap; p.vocab_start = vocab_start; p.vocab_size = vocab_size;
+  p.partial_max = pmax.p; p.partial_idx = pidx.p; p.partial_sumexp = psum.p; p.out_ids = ids.p; p.out_logprob = lp.p;
+  p.done_counter = counter.p; p.m = m; p.hidden_size = hidden; p.v_shard = v_shard;
+  for (int rep = 0; rep < 3; ++rep) {   // the counter must be reusable without a reset
+    KOPS_EXPECT_OK(kops::gemm::gemv_argmax(p, dt_of<T>(), dt_of<T>(), ctx), what);
+    cudaDeviceSynchronize();
+    const auto got = kops_test::copy_out(ids.p, m);
+    const auto glp = kops_test::copy_out(lp.p, m);
+    for (int row = 0; row < m; ++row) {
+      if (got[row] != want_id[row]) {
+        char d[96];
+        std::snprintf(d, sizeof(d), "row %d: id %d, want %d", row, got[row], want_id[row]);
+        kops_test::record_failure(what, d, __FILE__, __LINE__);
+      }
+      if (std::fabs(glp[row] - want_lp[row]) > 1e-4 * (1.0 + std::fabs(want_lp[row]))) {
+        char d[96];
+        std::snprintf(d, sizeof(d), "row %d: logprob %.6f, want %.6f", row, glp[row], want_lp[row]);
+        kops_test::record_failure(what, d, __FILE__, __LINE__);
+      }
+    }
+  }
+}
+
+void test_gemv_argmax(const LaunchContext& ctx) {
+  for (int m : {1, 3, 8, 16}) {
+    run_argmax<__nv_bfloat16>(ctx, m, 256, 1000, 0, 1000, 1.0f, 0.0f, false, "argmax bf16");
+    run_argmax<__half>(ctx, m, 128, 777, 1000, 1000 + 700, 0.5f, 30.0f, false, "argmax f16 padded vocab + softcap");
+  }
+  run_argmax<__nv_bfloat16>(ctx, 2, 64, 300, 0, 300, 1.0f, 0.0f, true, "argmax ties go to the lowest id");
+  run_argmax<__nv_bfloat16>(ctx, 4, 512, 20000, 0, 20000, 1.0f, 0.0f, false, "argmax many CTAs");
+}
+
+// ---- router_gemm ----------------------------------------------------------------------------
+
+template <typename W>
+void run_router(const LaunchContext& ctx, int m, int e, int h, bool bias, bool two_term, const char* what) {
+  Rng r(31337u + m + e);
+  const auto x = random_t<__nv_bfloat16>(static_cast<size_t>(m) * h, &r, -1.0f, 1.0f);
+  std::vector<float> w32(static_cast<size_t>(e) * h);
+  for (auto& v : w32) v = r.uni(-0.2f, 0.2f);
+  std::vector<float> bs(e);
+  for (auto& v : bs) v = r.uni(-1.0f, 1.0f);
+  // Two-term: W ~ hi + lo / 256 with both parts rounded to bf16.
+  std::vector<__nv_bfloat16> hi(w32.size()), lo(w32.size());
+  std::vector<double> weff(w32.size());
+  for (size_t i = 0; i < w32.size(); ++i) {
+    hi[i] = cvt<__nv_bfloat16>(w32[i]);
+    lo[i] = cvt<__nv_bfloat16>((w32[i] - kops_test::to_float(hi[i])) * 256.0f);
+    weff[i] = two_term ? static_cast<double>(kops_test::to_float(hi[i])) + static_cast<double>(kops_test::to_float(lo[i])) / 256.0
+                       : (std::is_same<W, float>::value ? static_cast<double>(w32[i]) : static_cast<double>(kops_test::to_float(hi[i])));
+  }
+  std::vector<double> ref(static_cast<size_t>(m) * e);
+  for (int row = 0; row < m; ++row)
+    for (int c = 0; c < e; ++c) {
+      double acc = 0;
+      for (int j = 0; j < h; ++j) acc += dval(x, static_cast<size_t>(row) * h + j) * weff[static_cast<size_t>(c) * h + j];
+      ref[static_cast<size_t>(row) * e + c] = acc + (bias ? bs[c] : 0.0);
+    }
+  auto dx = upload(x);
+  auto dw32 = upload(w32);
+  auto dhi = upload(hi);
+  auto dlo = upload(lo);
+  auto db = upload(bs);
+  DevBuf<float> dout(ref.size());
+  kops::gemm::RouterGemmParams p{};
+  p.x = dx.p; p.ldx = h;
+  p.w = std::is_same<W, float>::value ? static_cast<const void*>(dw32.p) : static_cast<const void*>(dhi.p);
+  p.w_hi = dhi.p; p.w_lo = dlo.p; p.bias = bias ? db.p : nullptr;
+  p.logits = dout.p; p.ld_logits = e; p.m = m; p.num_experts = e; p.hidden = h; p.lo_scale = 1.0f / 256.0f;
+  KOPS_EXPECT_OK(kops::gemm::router_gemm(p, two_term, DType::kBFloat16, two_term ? DType::kBFloat16 : dt_of<W>(), ctx), what);
+  cudaDeviceSynchronize();
+  expect_close(kops_test::copy_out(dout.p, ref.size()), ref, what);
+}
+
+void test_router(const LaunchContext& ctx) {
+  for (int m : {1, 3, 4, 7, 16, 40}) {
+    run_router<float>(ctx, m, 256, 1024, false, false, "router fp32 weights");
+    run_router<__nv_bfloat16>(ctx, m, 37, 512, true, false, "router bf16 weights + bias");
+    run_router<__nv_bfloat16>(ctx, m, 130, 768, true, true, "router two-term");
+  }
+}
+
+// ---- fp4 gemv -------------------------------------------------------------------------------
+
+const float kE2m1[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+
+int64_t swizzle_offset(int64_t row, int64_t blk, int64_t blocks) {
+  const int64_t tile = (row >> 7) * ((blocks + 3) >> 2) + (blk >> 2);
+  return tile * 512 + (row & 31) * 16 + ((row >> 5) & 3) * 4 + (blk & 3);
+}
+
+template <typename T>
+void run_fp4(const LaunchContext& ctx, bool nv, bool swizzled, int m, int n, int k, bool global, const char* what) {
+  Rng r(2024u + m + n + nv);
+  const int blk = nv ? 16 : 32;
+  const int blocks = k / blk;
+  const auto a = random_t<T>(static_cast<size_t>(m) * k, &r, -1.0f, 1.0f);
+  std::vector<uint8_t> codes(static_cast<size_t>(n) * k), packed(static_cast<size_t>(n) * k / 2);
+  for (auto& c : codes) c = static_cast<uint8_t>(r.range(16));
+  for (size_t i = 0; i < packed.size(); ++i) packed[i] = static_cast<uint8_t>(codes[2 * i] | (codes[2 * i + 1] << 4));
+  const size_t sc_elems = swizzled ? static_cast<size_t>((n + 127) / 128) * 128 * ((blocks + 3) / 4) * 4 : static_cast<size_t>(n) * blocks;
+  std::vector<uint8_t> sc(sc_elems, 0);
+  std::vector<double> sval(static_cast<size_t>(n) * blocks);
+  for (int row = 0; row < n; ++row) {
+    for (int b = 0; b < blocks; ++b) {
+      uint8_t byte;
+      double v;
+      if (nv) {
+        do { byte = e4m3_from_float(r.uni(0.05f, 2.0f)); } while (byte == 0);
+        v = f8(byte);
+      } else {
+        byte = static_cast<uint8_t>(120 + r.range(12));
+        v = std::ldexp(1.0, static_cast<int>(byte) - 127);
+      }
+      sval[static_cast<size_t>(row) * blocks + b] = v;
+      sc[swizzled ? static_cast<size_t>(swizzle_offset(row, b, blocks)) : static_cast<size_t>(row) * blocks + b] = byte;
+    }
+  }
+  const float gscale = global ? 7.5f : 1.0f;
+  std::vector<double> ref(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row)
+    for (int c = 0; c < n; ++c) {
+      double acc = 0;
+      for (int kk = 0; kk < k; ++kk) {
+        const uint8_t code = codes[static_cast<size_t>(c) * k + kk];
+        const double w = (code & 8 ? -1.0 : 1.0) * kE2m1[code & 7] * sval[static_cast<size_t>(c) * blocks + kk / blk];
+        acc += dval(a, static_cast<size_t>(row) * k + kk) * w;
+      }
+      ref[static_cast<size_t>(row) * n + c] = acc / gscale;
+    }
+  auto da = upload(a);
+  auto dw = upload(packed);
+  auto dsc = upload(sc);
+  auto dg = upload(std::vector<float>(1, gscale));
+  DevBuf<T> dout(ref.size());
+  ScaledGemmArgs args{};
+  args.recipe = nv ? GemmRecipe::kW4A16NVFP4 : GemmRecipe::kW4A16MXFP4;
+  args.a.data = da.p; args.a.ld = k; args.a.dtype = dt_of<T>();
+  args.b.data = dw.p; args.b.ld = k / 2; args.b.dtype = DType::kFloat4E2M1x2;
+  args.b.packing = kops::WeightPacking::kFP4E2M1;
+  args.b.scale = dsc.p; args.b.scale_dtype = nv ? DType::kFloat8E4M3 : DType::kFloat8E8M0; args.b.group_k = static_cast<int16_t>(blk);
+  args.b.scale_layout = swizzled ? kops::ScaleLayout::kSwizzled128x4 : kops::ScaleLayout::kRowMajor;
+  if (global) args.b.global_scale = dg.p;
+  args.d = dout.p; args.ldd = n; args.d_dtype = dt_of<T>();
+  args.m = m; args.n = n; args.k = k;
+  KOPS_EXPECT_OK(kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx), what);
+  cudaDeviceSynchronize();
+  expect_close(kops_test::copy_out(dout.p, ref.size()), ref, what);
+}
+
+void test_fp4_gemv(const LaunchContext& ctx) {
+  for (int m : {1, 2, 3, 5, 8}) {
+    run_fp4<__nv_bfloat16>(ctx, false, false, m, 130, 256, false, "mxfp4 row-major bf16");
+    run_fp4<__half>(ctx, false, true, m, 200, 512, false, "mxfp4 swizzled f16");
+    run_fp4<__nv_bfloat16>(ctx, true, false, m, 77, 320, true, "nvfp4 row-major + global scale");
+    run_fp4<__half>(ctx, true, true, m, 260, 1024, true, "nvfp4 swizzled + global scale");
+  }
+}
+
+// ---- GGUF mmvq -----------------------------------------------------------------------------
+
+using kops::GGUFType;
+
+struct GgufFormat {
+  kops::GGUFType type;
+  int elems, bytes;
+  std::vector<int> halves;   // byte offsets of the fp16 scale fields
+  const char* name;
+};
+
+const GgufFormat kGguf[] = {
+    {kops::GGUFType::kQ4_0, 32, 18, {0}, "Q4_0"},          {kops::GGUFType::kQ4_1, 32, 20, {0, 2}, "Q4_1"},
+    {kops::GGUFType::kQ5_0, 32, 22, {0}, "Q5_0"},          {kops::GGUFType::kQ5_1, 32, 24, {0, 2}, "Q5_1"},
+    {kops::GGUFType::kQ8_0, 32, 34, {0}, "Q8_0"},          {kops::GGUFType::kQ2_K, 256, 84, {80, 82}, "Q2_K"},
+    {kops::GGUFType::kQ3_K, 256, 110, {108}, "Q3_K"},      {kops::GGUFType::kQ4_K, 256, 144, {0, 2}, "Q4_K"},
+    {kops::GGUFType::kQ5_K, 256, 176, {0, 2}, "Q5_K"},     {kops::GGUFType::kQ6_K, 256, 210, {208}, "Q6_K"},
+};
+
+std::vector<uint8_t> random_gguf(const GgufFormat& f, size_t blocks, Rng* r) {
+  std::vector<uint8_t> raw(blocks * f.bytes);
+  for (auto& b : raw) b = static_cast<uint8_t>(r->u32());
+  for (size_t b = 0; b < blocks; ++b) {
+    for (int off : f.halves) {
+      const __half h = __float2half_rn((r->range(2) ? 1.0f : -1.0f) * r->uni(0.002f, 0.03f));
+      std::memcpy(&raw[b * f.bytes + off], &h, 2);
+    }
+  }
+  return raw;
+}
+
+struct Q81Host {
+  std::vector<double> deq;      // d_h * q
+  std::vector<uint8_t> bytes;   // the 36-byte blocks exactly as the kernel must write them
+};
+
+template <typename T>
+Q81Host quantize_q81_host(const std::vector<T>& a, int rows, int k) {
+  Q81Host o;
+  o.deq.resize(static_cast<size_t>(rows) * k);
+  o.bytes.assign(static_cast<size_t>(rows) * (k / 32) * 36, 0);
+  for (int row = 0; row < rows; ++row) {
+    for (int b = 0; b < k / 32; ++b) {
+      float amax = 0.0f;
+      for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(kops_test::to_float(a[static_cast<size_t>(row) * k + b * 32 + i])));
+      const float d = amax / 127.0f;
+      uint8_t* blk = &o.bytes[(static_cast<size_t>(row) * (k / 32) + b) * 36];
+      int sum = 0;
+      const __half dh = __float2half_rn(d);
+      for (int i = 0; i < 32; ++i) {
+        const float x = kops_test::to_float(a[static_cast<size_t>(row) * k + b * 32 + i]);
+        const int q = amax == 0.0f ? 0 : static_cast<int>(std::round(x / d));
+        sum += q;
+        blk[4 + i] = static_cast<uint8_t>(static_cast<int8_t>(q));
+        o.deq[static_cast<size_t>(row) * k + b * 32 + i] = static_cast<double>(__half2float(dh)) * q;
+      }
+      const __half sh = __float2half_rn(d * static_cast<float>(sum));
+      std::memcpy(blk, &dh, 2);
+      std::memcpy(blk + 2, &sh, 2);
+    }
+  }
+  return o;
+}
+
+template <typename T>
+void run_gguf(const LaunchContext& ctx, const GgufFormat& f, int m, int n, int k, const char* what) {
+  Rng r(606u + m + n + f.bytes);
+  const auto a = random_t<T>(static_cast<size_t>(m) * k, &r, -2.0f, 2.0f);
+  const size_t blocks = static_cast<size_t>(n) * (k / f.elems);
+  const auto raw = random_gguf(f, blocks, &r);
+  auto dq = upload(raw);
+  DevBuf<float> wdeq(static_cast<size_t>(n) * k);
+  KOPS_EXPECT_OK(kops::quant::gguf_dequantize(kops_test::tensor2d(wdeq.p, DType::kFloat32, n, k),
+                                              tensor1d(dq.p, DType::kUInt8, static_cast<int64_t>(raw.size())), f.type, ctx), what);
+  cudaDeviceSynchronize();
+  const auto w = kops_test::copy_out(wdeq.p, static_cast<size_t>(n) * k);
+  const Q81Host q = quantize_q81_host(a, m, k);
+  std::vector<double> ref(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row)
+    for (int c = 0; c < n; ++c) {
+      double acc = 0.0;
+      for (int kk = 0; kk < k; ++kk) acc += static_cast<double>(w[static_cast<size_t>(c) * k + kk]) * q.deq[static_cast<size_t>(row) * k + kk];
+      ref[static_cast<size_t>(row) * n + c] = acc;
+    }
+  auto da = upload(a);
+  DevBuf<uint8_t> ws(q.bytes.size());
+  DevBuf<T> dout(ref.size());
+  KOPS_EXPECT_OK(kops::gemm::gguf_gemm(kops_test::tensor2d(dout.p, dt_of<T>(), m, n), kops_test::tensor2d(da.p, dt_of<T>(), m, k),
+                                       tensor1d(dq.p, DType::kUInt8, static_cast<int64_t>(raw.size())), f.type,
+                                       tensor1d(ws.p, DType::kUInt8, static_cast<int64_t>(q.bytes.size())), ctx), what);
+  cudaDeviceSynchronize();
+  if (kops_test::copy_out(ws.p, q.bytes.size()) != q.bytes) {
+    kops_test::record_failure(what, "q8_1 activation blocks differ from the host quantizer", __FILE__, __LINE__);
+  }
+  expect_close(kops_test::copy_out(dout.p, ref.size()), ref, what);
+}
+
+void test_gguf_gemv(const LaunchContext& ctx) {
+  for (const GgufFormat& f : kGguf) {
+    for (int m : {1, 2, 3, 8, 11}) {
+      run_gguf<__nv_bfloat16>(ctx, f, m, 37, 512, f.name);
+    }
+    run_gguf<__half>(ctx, f, 1, 130, 1024, f.name);
+  }
+}
+
+void test_gguf_moe(const LaunchContext& ctx) {
+  const GgufFormat& f = kGguf[7];   // Q4_K
+  const int experts = 4, tokens = 3, topk = 2, n = 40, k = 512;
+  Rng r(77);
+  const auto a = random_t<__nv_bfloat16>(static_cast<size_t>(tokens) * k, &r, -2.0f, 2.0f);
+  const size_t per_expert = static_cast<size_t>(n) * (k / f.elems);
+  const auto raw = random_gguf(f, per_expert * experts, &r);
+  const int32_t ids_h[tokens * topk] = {2, 0, 3, -1, 1, 2};
+  auto dq = upload(raw);
+  DevBuf<float> wdeq(static_cast<size_t>(experts) * n * k);
+  KOPS_EXPECT_OK(kops::quant::gguf_dequantize(kops_test::tensor2d(wdeq.p, DType::kFloat32, experts * n, k),
+                                              tensor1d(dq.p, DType::kUInt8, static_cast<int64_t>(raw.size())), f.type, ctx), "moe dequant");
+  cudaDeviceSynchronize();
+  const auto w = kops_test::copy_out(wdeq.p, static_cast<size_t>(experts) * n * k);
+  const Q81Host q = quantize_q81_host(a, tokens, k);
+  std::vector<double> ref(static_cast<size_t>(tokens) * topk * n, 0.0);
+  for (int t = 0; t < tokens; ++t)
+    for (int j = 0; j < topk; ++j) {
+      const int e = ids_h[t * topk + j];
+      if (e < 0) continue;
+      for (int c = 0; c < n; ++c) {
+        double acc = 0.0;
+        for (int kk = 0; kk < k; ++kk) acc += static_cast<double>(w[(static_cast<size_t>(e) * n + c) * k + kk]) * q.deq[static_cast<size_t>(t) * k + kk];
+        ref[(static_cast<size_t>(t) * topk + j) * n + c] = acc;
+      }
+    }
+  auto da = upload(a);
+  auto dids = upload(std::vector<int32_t>(ids_h, ids_h + tokens * topk));
+  DevBuf<uint8_t> ws(q.bytes.size());
+  KOPS_EXPECT_OK(kops::gemm::gguf_quantize_q8_1(tensor1d(ws.p, DType::kUInt8, static_cast<int64_t>(q.bytes.size())),
+                                                kops_test::tensor2d(da.p, DType::kBFloat16, tokens, k), ctx), "moe quantize");
+  DevBuf<__nv_bfloat16> dout(ref.size());
+  std::vector<__nv_bfloat16> zero(ref.size(), cvt<__nv_bfloat16>(0.0f));
+  kops_test::copy_in(dout.p, zero);
+  KOPS_EXPECT_OK(kops::gemm::gguf_moe_gemm(kops_test::tensor2d(dout.p, DType::kBFloat16, tokens * topk, n),
+                                           tensor1d(ws.p, DType::kUInt8, static_cast<int64_t>(q.bytes.size())),
+                                           tensor1d(dq.p, DType::kUInt8, static_cast<int64_t>(raw.size())),
+                                           static_cast<int64_t>(per_expert) * f.bytes, kops_test::tensor2d(dids.p, DType::kInt32, tokens, topk),
+                                           f.type, ctx), "moe gemv");
+  cudaDeviceSynchronize();
+  expect_close(kops_test::copy_out(dout.p, ref.size()), ref, "gguf moe gemv (dropped slot stays zero)");
+}
+
+void test_gguf_contracts(const LaunchContext& ctx) {
+  DevBuf<uint8_t> w(1 << 16), ws(1 << 16);
+  DevBuf<__nv_bfloat16> a(1 << 12), o(1 << 12);
+  auto call = [&](GGUFType t, int m, int n, int k, DType odt) {
+    return kops::gemm::gguf_gemm(kops_test::tensor2d(o.p, odt, m, n), kops_test::tensor2d(a.p, DType::kBFloat16, m, k),
+                                 tensor1d(w.p, DType::kUInt8, static_cast<int64_t>(n) * (k / 32) * 18), t,
+                                 tensor1d(ws.p, DType::kUInt8, 1 << 16), ctx);
+  };
+  KOPS_EXPECT_OK(call(GGUFType::kQ4_0, 2, 16, 64, DType::kBFloat16), "gguf baseline");
+  KOPS_EXPECT_STATUS(call(GGUFType::kIQ4_NL, 2, 16, 64, DType::kBFloat16), Status::kNotImplemented, "gguf IQ type");
+  KOPS_EXPECT_STATUS(call(GGUFType::kQ4_K, 2, 16, 64, DType::kBFloat16), Status::kUnsupportedShape, "gguf K-quant block");
+  KOPS_EXPECT_STATUS(call(GGUFType::kQ4_0, 2, 16, 64, DType::kFloat16), Status::kUnsupportedDtype, "gguf output dtype");
+  KOPS_EXPECT_STATUS(call(GGUFType::kQ4_0, 17, 16, 64, DType::kBFloat16), Status::kNotImplemented, "gguf M > 16");
+  KOPS_EXPECT_STATUS(kops::gemm::gguf_gemm(kops_test::tensor2d(o.p, DType::kBFloat16, 2, 16), kops_test::tensor2d(a.p, DType::kBFloat16, 2, 64),
+                                           tensor1d(w.p, DType::kUInt8, 100), GGUFType::kQ4_0,
+                                           tensor1d(ws.p, DType::kUInt8, 1 << 16), ctx),
+                     Status::kInvalidArgument, "gguf weight size");
+  KOPS_EXPECT_STATUS(kops::gemm::gguf_gemm(kops_test::tensor2d(o.p, DType::kBFloat16, 2, 16), kops_test::tensor2d(a.p, DType::kBFloat16, 2, 64),
+                                           tensor1d(w.p, DType::kUInt8, 16 * 2 * 18), GGUFType::kQ4_0,
+                                           tensor1d(ws.p, DType::kUInt8, 10), ctx),
+                     Status::kWorkspaceTooSmall, "gguf q8_1 workspace");
+}
+
+// ---- grouped gemv ---------------------------------------------------------------------------
+
+using kops::gemm::GroupedLayout;
+
+/// recipe: 0 bf16, 1 fp16, 2 fp8 tensorwise, 3 fp8 rowwise.  layout: 0 contiguous, 1 masked, 2 indexed.
+template <typename T>
+void run_grouped(const LaunchContext& ctx, int recipe, int layout, const char* what) {
+  const int G = 5, N = 70, K = 256;
+  Rng r(515u + recipe * 7 + layout);
+  const bool fp8 = recipe >= 2;
+  std::vector<int> rows_of = {3, 0, 6, 1, 2};
+  if (layout == 0 || layout == 2) rows_of = {2, 0, 5, 1, 4};   // expert 2 has 5 rows: two weight passes
+  int total = 0;
+  std::vector<int64_t> offs(G + 1, 0);
+  for (int g = 0; g < G; ++g) { offs[g + 1] = offs[g] + rows_of[g]; total += rows_of[g]; }
+  const int max_m = 6;
+  const int a_rows = layout == 1 ? G * max_m : total + 3;
+  const int d_rows = layout == 1 ? G * max_m : total;
+  const auto a = random_t<T>(static_cast<size_t>(a_rows) * K, &r, -1.0f, 1.0f);
+  std::vector<uint8_t> w8;
+  std::vector<T> w16;
+  if (fp8) w8 = random_e4m3(static_cast<size_t>(G) * N * K, &r);
+  else w16 = random_t<T>(static_cast<size_t>(G) * N * K, &r, -0.5f, 0.5f);
+  std::vector<float> bscale(recipe == 2 ? G : G * N);
+  for (auto& v : bscale) v = r.uni(0.005f, 0.02f);
+  const auto bias = random_t<__nv_bfloat16>(static_cast<size_t>(G) * N, &r, -1.0f, 1.0f);
+  std::vector<float> rw(d_rows);
+  for (auto& v : rw) v = r.uni(0.2f, 1.5f);
+  std::vector<int32_t> gather(total);
+  for (int i = 0; i < total; ++i) gather[i] = (i * 5 + 1) % (a_rows);
+  const float alpha = 0.75f;
+  // Reference.
+  const T sentinel = cvt<T>(7.0f);
+  std::vector<double> ref(static_cast<size_t>(d_rows) * N, 7.0);
+  std::vector<char> written(static_cast<size_t>(d_rows) * N, 0);
+  for (int g = 0; g < G; ++g) {
+    for (int i = 0; i < rows_of[g]; ++i) {
+      const int64_t row = layout == 1 ? static_cast<int64_t>(g) * max_m + i : offs[g] + i;
+      const int64_t src = layout == 2 ? gather[offs[g] + i] : row;
+      for (int c = 0; c < N; ++c) {
+        double acc = 0;
+        for (int kk = 0; kk < K; ++kk) {
+          const size_t wi = (static_cast<size_t>(g) * N + c) * K + kk;
+          const double wv = fp8 ? f8(w8[wi]) : dval(w16, wi);
+          acc += dval(a, static_cast<size_t>(src) * K + kk) * wv;
+        }
+        acc *= alpha;
+        if (recipe == 2) acc *= bscale[g];
+        if (recipe == 3) acc *= bscale[static_cast<size_t>(g) * N + c];
+        acc += dval(bias, static_cast<size_t>(g) * N + c);
+        acc *= rw[row];
+        ref[static_cast<size_t>(row) * N + c] = acc;
+        written[static_cast<size_t>(row) * N + c] = 1;
+      }
+    }
+  }
+  auto da = upload(a);
+  auto dw8 = upload(w8.empty() ? std::vector<uint8_t>(16) : w8);
+  auto dw16 = upload(w16.empty() ? std::vector<T>(8) : w16);
+  auto dbs = upload(bscale);
+  auto db = upload(bias);
+  auto drw = upload(rw);
+  auto dgi = upload(gather);
+  auto doff = upload(offs);
+  auto dmm = upload(std::vector<int32_t>(rows_of.begin(), rows_of.end()));
+  DevBuf<T> dout(static_cast<size_t>(d_rows) * N);
+  kops_test::copy_in(dout.p, std::vector<T>(static_cast<size_t>(d_rows) * N, sentinel));
+  kops::gemm::GroupedGemmParams p{};
+  p.layout = layout == 0 ? GroupedLayout::kContiguous : (layout == 1 ? GroupedLayout::kMasked : GroupedLayout::kIndexed);
+  p.recipe = recipe == 0 ? GemmRecipe::kBF16 : (recipe == 1 ? GemmRecipe::kFP16 : (recipe == 2 ? GemmRecipe::kFP8Tensorwise : GemmRecipe::kFP8Rowwise));
+  p.num_groups = G;
+  p.a = da.p; p.lda = K;
+  p.expert_offsets = doff.p; p.masked_m = dmm.p; p.max_m = max_m; p.gather_idx = dgi.p;
+  p.b = fp8 ? static_cast<const void*>(dw8.p) : static_cast<const void*>(dw16.p);
+  p.ldb = K; p.b_group_stride = static_cast<int64_t>(N) * K;
+  p.b_scale = fp8 ? dbs.p : nullptr; p.b_scale_group_stride = N;
+  p.d = dout.p; p.ldd = N;
+  p.n = N; p.k = K;
+  p.epi.ops = kops::gemm::kEpiBias | kops::gemm::kEpiRoutingWeight;
+  p.epi.alpha = alpha;
+  p.epi.bias = db.p; p.epi.bias_dtype = DType::kBFloat16; p.epi.bias_group_stride = N;
+  p.epi.routing_weight = drw.p;
+  KOPS_EXPECT_OK(kops::gemm::grouped_gemm(p, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx), what);
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, ref.size());
+  // Unrouted rows must still hold the sentinel; routed rows must match the oracle.
+  std::vector<T> got_routed;
+  std::vector<double> want_routed;
+  size_t untouched_bad = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    if (written[i]) { got_routed.push_back(got[i]); want_routed.push_back(ref[i]); }
+    else untouched_bad += kops_test::to_float(got[i]) != 7.0f;
+  }
+  if (untouched_bad != 0) kops_test::record_failure(what, "rows of empty experts / masked padding were written", __FILE__, __LINE__);
+  expect_close(got_routed, want_routed, what);
+}
+
+void test_grouped_gemv(const LaunchContext& ctx) {
+  for (int layout : {0, 1, 2}) {
+    run_grouped<__nv_bfloat16>(ctx, 0, layout, "grouped gemv bf16");
+    run_grouped<__half>(ctx, 1, layout, "grouped gemv fp16");
+    run_grouped<__nv_bfloat16>(ctx, 2, layout, "grouped gemv fp8 tensorwise");
+    run_grouped<__nv_bfloat16>(ctx, 3, layout, "grouped gemv fp8 rowwise");
+  }
+}
+
+// ---- moe_gemv -------------------------------------------------------------------------------
+
+/// wmode: 0 16-bit, 1 e4m3 per channel, 2 e4m3 per expert, 3 e4m3 128x128 blocks.
+template <typename T>
+void run_moe_gemv(const LaunchContext& ctx, int slots_per_cta, int wmode, bool w2_stage, bool drop_expert, const char* what) {
+  const int E = 4, top_k = 2, tokens = 5, N = 130, K = 256;
+  const int num_valid = tokens * top_k;
+  Rng r(2468u + slots_per_cta * 3 + wmode);
+  std::vector<int> expert_of(num_valid);
+  for (auto& e : expert_of) e = r.range(E);
+  expert_of[0] = expert_of[1] = 3;   // make sure expert 3 is used (dropped-expert case)
+  // Block-sorted layout (what align_block_size produces with block_size == slots_per_cta).
+  std::vector<int32_t> sorted, block_expert;
+  for (int e = 0; e < E; ++e) {
+    int cnt = 0;
+    for (int s = 0; s < num_valid; ++s) if (expert_of[s] == e) { sorted.push_back(s); ++cnt; }
+    while (cnt % slots_per_cta != 0) { sorted.push_back(num_valid); ++cnt; }
+    for (int b = 0; b < cnt / slots_per_cta; ++b) block_expert.push_back(drop_expert && e == 3 ? -1 : e);
+  }
+  const int post_pad = static_cast<int>(sorted.size());
+  const int a_rows = w2_stage ? num_valid : tokens;
+  const auto a = random_t<T>(static_cast<size_t>(a_rows) * K, &r, -1.0f, 1.0f);
+  const bool fp8 = wmode != 0;
+  std::vector<uint8_t> w8;
+  std::vector<T> w16;
+  if (fp8) w8 = random_e4m3(static_cast<size_t>(E) * N * K, &r);
+  else w16 = random_t<T>(static_cast<size_t>(E) * N * K, &r, -0.5f, 0.5f);
+  const int nb = (N + 127) / 128, kb = K / 128;
+  std::vector<float> sc(wmode == 1 ? E * N : (wmode == 2 ? E : E * nb * kb));
+  for (auto& v : sc) v = r.uni(0.004f, 0.02f);
+  const auto bias = random_t<T>(static_cast<size_t>(E) * N, &r, -1.0f, 1.0f);
+  std::vector<float> tw(num_valid);
+  for (auto& v : tw) v = r.uni(0.2f, 1.2f);
+  std::vector<double> ref(static_cast<size_t>(num_valid) * N, 7.0);
+  std::vector<char> written(ref.size(), 0);
+  for (int s = 0; s < num_valid; ++s) {
+    const int e = expert_of[s];
+    if (drop_expert && e == 3) continue;
+    const int src = w2_stage ? s : s / top_k;
+    for (int c = 0; c < N; ++c) {
+      double acc = 0;
+      for (int kk = 0; kk < K; ++kk) {
+        const size_t wi = (static_cast<size_t>(e) * N + c) * K + kk;
+        double wv = fp8 ? f8(w8[wi]) : dval(w16, wi);
+        if (wmode == 3) wv *= sc[(static_cast<size_t>(e) * nb + c / 128) * kb + kk / 128];
+        acc += dval(a, static_cast<size_t>(src) * K + kk) * wv;
+      }
+      if (wmode == 1) acc *= sc[static_cast<size_t>(e) * N + c];
+      if (wmode == 2) acc *= sc[e];
+      acc += dval(bias, static_cast<size_t>(e) * N + c);
+      acc *= tw[s];
+      ref[static_cast<size_t>(s) * N + c] = acc;
+      written[static_cast<size_t>(s) * N + c] = 1;
+    }
+  }
+  auto da = upload(a);
+  auto dw8 = upload(w8.empty() ? std::vector<uint8_t>(16) : w8);
+  auto dw16 = upload(w16.empty() ? std::vector<T>(8) : w16);
+  auto dsc = upload(sc);
+  auto db = upload(bias);
+  auto dtw = upload(tw);
+  auto dsorted = upload(sorted);
+  auto dbe = upload(block_expert);
+  auto dpp = upload(std::vector<int32_t>(1, post_pad));
+  DevBuf<T> dout(ref.size());
+  kops_test::copy_in(dout.p, std::vector<T>(ref.size(), cvt<T>(7.0f)));
+  kops::moe::FusedMoEGemmParams p{};
+  p.a = da.p; p.lda = K; p.a_rows_are_slots = w2_stage;
+  p.w = fp8 ? static_cast<const void*>(dw8.p) : static_cast<const void*>(dw16.p);
+  p.w_expert_stride = static_cast<int64_t>(N) * K;
+  p.w_scale = fp8 ? dsc.p : nullptr;
+  p.w_scale_expert_stride = wmode == 1 ? N : (wmode == 3 ? nb * kb : 0);
+  p.bias = db.p; p.c = dout.p; p.ldc = N;
+  p.sorted_token_ids = dsorted.p; p.expert_ids = dbe.p; p.num_tokens_post_pad = dpp.p;
+  p.topk_weights = dtw.p; p.mul_routed_weight = true; p.top_k = top_k; p.n = N; p.k = K;
+  p.num_valid_slots = num_valid;
+  if (fp8) {
+    p.w_quant.storage_dtype = DType::kFloat8E4M3;
+    p.w_quant.granularity = wmode == 1 ? kops::ScaleGranularity::kPerChannel : (wmode == 2 ? kops::ScaleGranularity::kPerTensor : kops::ScaleGranularity::kPerBlock2D);
+    if (wmode == 3) { p.w_quant.group_m = 128; p.w_quant.group_k = 128; }
+  }
+  KOPS_EXPECT_OK(kops::moe::moe_gemv(p, E, slots_per_cta, dt_of<T>(), fp8 ? DType::kFloat8E4M3 : dt_of<T>(), ctx), what);
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, ref.size());
+  std::vector<T> got_w;
+  std::vector<double> want_w;
+  size_t untouched_bad = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    if (written[i]) { got_w.push_back(got[i]); want_w.push_back(ref[i]); }
+    else untouched_bad += kops_test::to_float(got[i]) != 7.0f;
+  }
+  if (untouched_bad != 0) kops_test::record_failure(what, "rows of dropped experts were written", __FILE__, __LINE__);
+  expect_close(got_w, want_w, what);
+}
+
+void test_moe_gemv(const LaunchContext& ctx) {
+  for (int s : {1, 2, 4, 8}) {
+    run_moe_gemv<__nv_bfloat16>(ctx, s, 0, false, false, "moe gemv bf16 W13");
+    run_moe_gemv<__half>(ctx, s, 0, true, false, "moe gemv fp16 W2");
+    run_moe_gemv<__nv_bfloat16>(ctx, s, 1, false, false, "moe gemv fp8 per-channel");
+    run_moe_gemv<__nv_bfloat16>(ctx, s, 2, true, false, "moe gemv fp8 per-expert");
+    run_moe_gemv<__nv_bfloat16>(ctx, s, 3, false, false, "moe gemv fp8 block 128x128");
+  }
+  run_moe_gemv<__nv_bfloat16>(ctx, 2, 0, false, true, "moe gemv dropped expert");
+}
+
 }  // namespace
 
 int main() {
   LaunchContext ctx{};
   if (!kops_test::make_context(&ctx)) return 77;
+  test_grouped_gemv(ctx);
+  test_moe_gemv(ctx);
+  test_gguf_gemv(ctx);
+  test_gguf_moe(ctx);
+  test_gguf_contracts(ctx);
+  test_dense_gemv(ctx);
+  test_simt(ctx);
+  test_gemv_argmax(ctx);
+  test_router(ctx);
+  test_fp4_gemv(ctx);
+  test_w4a16(ctx);
+  test_lut_gemv(ctx);
+  test_w4a16_contracts(ctx);
+  test_fp8_decode(ctx);
+  test_fp8_gemv(ctx);
+  test_fp8_invariance(ctx);
+  test_int8_gemv(ctx);
+  test_fp8_int8_contracts(ctx);
   test_weight_transpose(ctx);
   test_glu_interleave(ctx);
   test_router_split(ctx);

@@ -965,7 +965,7 @@ Lưu ý khi đọc số: (1) cây làm việc chưa commit (`git.dirty = 1`), n�
 
 **SM.** CUDA-core generic; validate SM80, SM89, SM90a.
 
-**Nhịp.** 7 nhịp · 16 kernel · mở family `moe` · file mới: 11 (3 file family, 8 `.cu`). Hiện trạng (2026-10-31): 0/16 kernel có thân; toàn bộ là declaration.
+**Nhịp.** 7 nhịp · 16 kernel · mở family `moe` · file mới: 11 (3 file family, 8 `.cu`). Hiện trạng (2026-11-01): 16/16 kernel có thân trong 8 `.cu` mới (`csrc/gemm/{dense_gemm,fp8_gemm,int8_gemm,fp4_gemm,mixed_input_gemm,gguf_gemm,grouped_gemm}.cu`, `csrc/moe/fused_moe.cu`) và `registry/capabilities/moe.yaml`; test và benchmark của `moe_gemv` nằm trong `test_gemm.cc` / `bench_gemm.cu`, còn `test_moe.cc` và `bench_moe.cu` mở ở B6. Xem "Bằng chứng B5 dev" cho phạm vi chính xác và các gate còn mở.
 
 **Phần cứng.** Máy dev chạy các GEMV CUDA-core (fp32, bf16, int8, W4A16, E2M1 LUT, GGUF, grouped/MoE GEMV). `fp8_gemv_kernel` có hai đường (`cvt` từ SM89, LUT ở SM80): SM86 chạy LUT, đường `cvt` chạy ở handoff kit `sm89` và phải khớp LUT từng bit. Mục tiêu ≥ 85% băng thông đọc weight là số theo từng GPU (handoff kit `sm80`, `sm89`, `sm90a`); baseline Marlin/vLLM là tuỳ chọn, mục tiêu chính là roofline. Shape MoE đủ 256 expert của DeepSeek-V3 (khoảng 11 GB ở FP8) không vừa 4 GB: gắn `mem_gb`.
 
@@ -986,6 +986,36 @@ Lưu ý khi đọc số: (1) cây làm việc chưa commit (`git.dirty = 1`), n�
 - Benchmark ở M = 1 với shape thật (Llama-3-8B/70B, Qwen3, DeepSeek-V3).
   - Mục tiêu ≥ 85% băng thông đọc weight.
   - Baseline: roofline băng thông và kernel copy; so sánh cuBLASLt/Marlin/vLLM là tuỳ chọn.
+
+**Bằng chứng B5 dev (2026-11-01).** 16/16 kernel có thân. `test_gemm` (mở rộng từ B4) phủ: GEMV dense bf16/fp16/fp32 (M = 1…16, split-K tự chọn theo (N, K), epilogue Bias + SiLU + Residual), SIMT fp32/bf16/fp16/fp64 (B K-major và MN-major, batch), `gemv_argmax` (hòa lấy id nhỏ nhất, softcap, vocab padding, counter dùng lại không cần reset), router fp32/bf16 + bias và chế độ hai số hạng, W4A16 AWQ/GPTQ (g32/64/128/per-channel, có/không zero, act-order), NF4 LUT (absmax fp32 và double-quant), FP8 (giải mã đủ 256 mã kể cả NaN; tensorwise, rowwise, blockwise 1x128 × 128x128 với act bf16/fp16/e4m3, scale A row-major và TMA), INT8 (W8A8 tích lũy s32 so với oracle số nguyên, kể cả azp; W8A16), FP4 MXFP4/NVFP4 (scale row-major và swizzle 128x4, scale toàn cục), GGUF 10 kiểu (oracle trọng số là `quant::gguf_dequantize` của B4, đã khớp bit với llama.cpp; khối q8_1 khớp byte với bộ lượng tử viết lại trên host theo `quantize_q8_1` của ggml-cuda), GGUF MoE, grouped GEMV (3 layout × 4 recipe, expert rỗng và hàng padding không bị ghi) và MoE GEMV (block 1/2/4/8 × 5 chế độ trọng số, expert bị bỏ qua), cộng bảng lỗi hợp đồng cho W4A16, FP8, INT8 và GGUF. Oracle là vòng lặp fp64 trên host trên dữ liệu đã làm tròn về dtype activation. Bất biến batch (lặp 100 lần bit-exact và hàng đứng một mình == hàng trong batch) được kiểm cho GEMV dense, FP8 và W4A16; các kernel còn lại có cùng cấu trúc cộng (chuỗi FMA theo lane + xor-butterfly, không atomic) nhưng chưa có test riêng. Đột biến một dòng (thứ tự nibble AWQ, hằng e2m1, tie-break của argmax) đều làm test đỏ. `ctest` xanh 12/12; header check 74/74. Compile sạch cho `sm_80;sm_89;sm_90a` (nhánh `cvt` e4m3 của sm89 chỉ được compile ở đây, chưa chạy).
+
+**So với PyTorch 2.13.0+cu129 (WSL2) trên RTX 3050 Laptop (SM86).** Ba vòng xen kẽ C++ (Windows, Release) và PyTorch trong cùng phiên, lấy trung vị: 43 case B5 đạt **geometric mean 17.74x** (từng vòng 18.03x, 17.71x, 17.50x), **40/43 case ≥3x**. Baseline của mọi case lượng tử hóa là chuỗi eager mà một engine không có kernel fused phải chạy: dequant ra bf16 rồi `F.linear` hoặc `bmm` (PyTorch không có GEMV weight-only fused cho các format này trên SM86: `torch._scaled_mm` cần SM89, `torch._int_mm` cần M > 16); chưa đo `torch._weight_int4pack_mm` (tinygemm) nên tỉ lệ W4A16 là so với chuỗi eager, không phải so với tinygemm. M = 1, shape Llama-3-8B:
+
+| Case (N × K) | kops (ms) | PyTorch (ms) | Tỉ lệ | GB/s kops |
+|---|---|---|---|---|
+| W4A16 AWQ g128 4096x4096 | 0.054 | 5.19 | 95.4x | 161 |
+| W4A16 GPTQ g128 4096x4096 | 0.054 | 4.26 | 78.8x | 162 |
+| NF4 LUT block 64 4096x4096 | 0.108 | 4.19 | 38.9x | 88 |
+| FP8 rowwise 4096x4096 | 0.102 | 0.880 | 8.62x | 165 |
+| FP8 blockwise 128 4096x4096 | 0.102 | 1.545 | 15.2x | 165 |
+| INT8 W8A8 4096x4096 | 0.095 | 0.761 | 8.01x | 177 |
+| INT8 W8A16 4096x4096 | 0.096 | 0.764 | 7.95x | 175 |
+| MXFP4 W4A16 4096x4096 | 0.069 | 3.61 | 52.4x | 130 |
+| NVFP4 W4A16 4096x4096 | 0.076 | 3.60 | 47.2x | 124 |
+| GGUF Q4_0 / Q8_0 / Q4_K 4096x4096 | 0.059 / 0.105 / 0.074 | 3.66 / 2.72 / 4.07 | 62.0x / 25.8x / 55.4x | 160 / 169 / 129 |
+| Router fp32 logits, M = 8, 256 × 7168 | 0.0365 | 0.161 | 4.40x | 104 |
+| Grouped GEMV FP8, 32 expert × 2 hàng, 2048x2048 | 1.39 | 7.33 | 5.27x | 97 |
+| MoE GEMV FP8, 32 slot, 2048x2048 | 0.92 | 8.60 | 9.33x | 146 |
+| Dense bf16 GEMV 4096x4096 / 14336x4096 | 0.185 / 0.631 | 0.186 / 0.683 | 1.01x / 1.08x | 182 / 186 |
+| `gemv_argmax` 32000 × 4096 | 1.41 | 1.58 | 1.12x | 186 |
+
+Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn chỗ để hơn: cuBLAS GEMV của PyTorch đã đọc weight đúng một lần ở 166–180 GB/s, sát trần đo được 183 GB/s của máy (xem B4), nên kernel tự viết chỉ có thể ngang. Mục tiêu "≥3x so với PyTorch" chỉ có nghĩa với các format mà PyTorch phải dựng lại weight bf16 ở mỗi lần gọi; với bf16/fp16 dense, mục tiêu đúng là roofline.
+
+**Gate còn mở (trung thực).**
+- ≥85% băng thông đọc weight (≥156 GB/s trên trần 183): đạt ở GEMV dense, `gemv_argmax`, INT8, FP8 (M = 1), GGUF Q4_0/Q8_0 và W4A16 AWQ/GPTQ shape 4096x4096. Chưa đạt: W4A16 AWQ/GPTQ shape lớn (119–127 GB/s) và AWQ M = 4 (72–79), NF4 (87–94), FP4 (118–130), GGUF Q4_K (123–129), FP8 M = 4 (123–126), router (104), grouped GEMV (97), MoE GEMV (146). Chưa profile bằng Nsight; số đo dao động vài phần trăm giữa các lần chạy (GPTQ 14336x4096 từ 124 đến 141 GB/s).
+- Phạm vi chưa phủ: GGUF IQ* (bảng lưới nằm trong `weight_repack.cu`, ngân sách file đã đóng) trả `kNotImplemented`; FP4 chỉ có W4A16 (W4A4/W4A8 cần activation FP4 hoặc tensor core); grouped/MoE GEMV chỉ có trọng số bf16/fp16/e4m3 (chưa có blockwise cho grouped, int4/FP4 expert, scatter/atomic finalize, GLU trong epilogue); split-K chỉ có ở GEMV dense; M > 16 (hoặc M > 8 cho FP4) trả `kNotImplemented` cho tới B7.
+- Quy ước đã chọn khi hàng bảng để mở: GPTQ `qzeros` lưu chính zero point (GPTQ v2 / compressed-tensors; checkpoint v1 lưu z − 1 phải cộng lại khi load); mã NF4 có nibble thấp là phần tử chẵn (bitsandbytes lưu ngược, loader hoán một lần); absmax double-quant tuyến tính (`q * scale + offset`); `NVFP4 global_scale` theo phía quantize nên kết quả nhân 1 / g; `gemv_argmax` trả id toàn cục và ghi max/sum-exp của shard vào slot 0 của `partial_max`/`partial_sumexp` để allgather TP; `moe_gemv` đòi `align_block_size` với block_size bằng `SLOTS_PER_CTA`.
+- Chưa chạy: nhánh `cvt` FP8 của sm89, lô `sm80`/`sm90a`, shape thật Llama-3-70B/DeepSeek-V3; cây làm việc chưa commit nên mọi số trên là `diagnostic_only` và registry chỉ lên `numerically_validated`.
 
 ---
 

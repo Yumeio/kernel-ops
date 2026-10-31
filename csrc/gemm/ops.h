@@ -37,8 +37,14 @@ Status gemm(const GemmProblem& problem, const GemmArgs& args, GemmBackend backen
 Status gemm_with_tactic(const ScaledGemmArgs& args, const GemmTactic& tactic, const Workspace& ws,
                         const LaunchContext& ctx);
 Status dual_gemm(const DualGemmParams& params, DType dtype, const LaunchContext& ctx);
+/// Greedy LM head.  The caller sizes partial_max / partial_idx / partial_sumexp as
+/// [M, gemv_argmax_num_ctas(v_shard)] and keeps done_counter zero between launches (the last CTA
+/// restores it).  Ids are global (vocab_start + row).  After the launch slot 0 of each row of
+/// partial_max / partial_sumexp holds the shard-wide max logit and sum-exp(logit - max), which a
+/// vocab-parallel caller allgathers together with out_ids.
 Status gemv_argmax(const GemvArgmaxParams& params, DType hidden_dtype, DType weight_dtype,
                    const LaunchContext& ctx);
+int32_t gemv_argmax_num_ctas(int32_t v_shard);
 Status bmm(const BmmParams& params, DType a_dtype, DType b_dtype, DType d_dtype,
            const LaunchContext& ctx);
 
@@ -65,8 +71,17 @@ Status mixed_input_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, Ge
                         const Workspace& ws, const LaunchContext& ctx);
 Status marlin_gemm(const MarlinParams& params, quant::MarlinWeightType wtype, DType act_dtype,
                    const LaunchContext& ctx);
+/// GGUF decode GEMV (M <= 16): quantizes `a` into `workspace_q8_1` (uint8, M * K/32 * 36 bytes) and
+/// multiplies by ggml blocks.  qweight is a uint8 vector of N * K/block * block_bytes; Q4_0/1, Q5_0/1,
+/// Q8_0 and the K-quants are native, the IQ types return kNotImplemented.
 Status gguf_gemm(const Tensor& out, const Tensor& a, const Tensor& qweight, GGUFType type,
                  const Tensor& workspace_q8_1, const LaunchContext& ctx);
+/// block_q8_1 activation quantization on its own (so MoE callers quantize once per token).
+Status gguf_quantize_q8_1(const Tensor& out_q8_1, const Tensor& a, const LaunchContext& ctx);
+/// Expert-indexed GGUF GEMV: out[token * topk + j] = W[topk_ids[token, j]] . a_q8_1[token]; negative
+/// ids are skipped (the row is left untouched).
+Status gguf_moe_gemm(const Tensor& out, const Tensor& a_q8_1, const Tensor& qweight, int64_t expert_stride_bytes,
+                     const Tensor& topk_ids, GGUFType type, const LaunchContext& ctx);
 Status lut_gemv(const Tensor& out, const Tensor& a, const Tensor& qweight, const Tensor& codebook,
                 const Tensor& absmax, const Tensor& absmax_scale, const Tensor& absmax_offset,
                 int32_t block_size, const LaunchContext& ctx);

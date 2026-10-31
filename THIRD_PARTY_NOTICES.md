@@ -60,6 +60,17 @@ the upstream format bit for bit.
 GGUF types that are not quantized block formats (`F32`, `F16`, `BF16`, `Q8_1`) return
 `kNotImplemented` from `gguf_dequantize` by design.
 
+## Derived implementations (B5 decode GEMV, 2026-11-01)
+
+Independent CUDA-core bodies; formats and semantics were read from the upstream source and
+re-expressed, no upstream text was copied.
+
+| Area | Derived from | License | Commit | What was taken | kernel-ops files |
+|---|---|---|---|---|---|
+| GGUF mmvq (10 block types x q8_1 activations) | llama.cpp `ggml/src/ggml-common.h` block structs and `ggml-cuda/{vecdotq.cuh,quantize.cu}` (first read through `3rd/sglang/sgl-kernel/csrc/quantization/gguf`) | MIT (ggml) / Apache-2.0 (sglang) | llama.cpp `0ec4027`; sglang `96a04cb` | block layouts, per-type unpacking order, `quantize_q8_1` rounding (`d = amax / 127`, `roundf(x / d)`, fp16 `d`); the weight side of the test oracle is B4's `gguf_dequantize`, itself checked against `dequantize_row_*` | `gemm/gguf_gemm.cu`, `tests/unit/test_gemm.cc` |
+| W4A16 AWQ / GPTQ GEMV | AutoAWQ / llm-awq nibble order `{0,2,4,6,1,3,5,7}`; AutoGPTQ / GPTQModel `qweight [K/8, N]` layout, `g_idx` act-order | MIT | not vendored | packed-word layouts only; the zero-point convention (stored zero, no `-1`) is documented in the file header | `gemm/mixed_input_gemm.cu` |
+| FP4 weights (MXFP4 / NVFP4) | OCP MX v1.0 (UE8M0, block 32) and NVIDIA NVFP4 (E4M3 per 16, fp32 global scale); 128x4 swizzle as in the B4 row above | open spec | n/a | e2m1 value table, scale encodings, swizzle offset | `gemm/fp4_gemm.cu` |
+
 ## Ported code
 
 Unlike the rows above, this data was copied (mechanically) and is therefore redistributed under
