@@ -1,0 +1,23 @@
+{
+ "family": "model_ops",
+ "rows": [
+  {
+   "op_id": "X02.residual_add",
+   "kernel_symbol": "residual_add_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "dtype in {f32,f16,bf16}; 2 or 3 inputs; exact in-place alias",
+   "evidence": "test_model_ops;bench_model_ops"
+  },
+  {
+   "op_id": "X02.cast",
+   "kernel_symbol": "cast_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "dtype in {f32,f16,bf16}; scale multiplier",
+   "evidence": "test_model_ops;bench_model_ops"
+  }
+ ]
+}

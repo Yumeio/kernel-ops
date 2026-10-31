@@ -28,7 +28,9 @@
 #include "csrc/moe/routing_kernels.cuh"
 #include "csrc/moe/fused_moe_kernels.cuh"
 #include "csrc/attention/attention_params.cuh"
+#include "csrc/attention/merge_kernels.cuh"
 #include "csrc/attention/prefill_kernels.cuh"
+#include "csrc/position/rope_kernels.cuh"
 #include "csrc/attention/decode_kernels.cuh"
 #include "csrc/attention/mla_kernels.cuh"
 #include "csrc/communication/allreduce_kernels.cuh"
@@ -84,6 +86,11 @@ KOPS_ABI_STANDARD_LAYOUT(kops::backend::ConformanceCase);
 KOPS_ABI_STANDARD_LAYOUT(kops::backend::ConformanceResult);
 
 // ---- 2. Enum width is ABI ------------------------------------------------
+static_assert(sizeof(kops::rope::InvFreqTable) ==
+                  kops::rope::kMaxRotDim / 2 * sizeof(float),
+              "InvFreqTable is a fixed 1 KB kernel parameter");
+static_assert(sizeof(kops::attn::HybridBranchTable) <= 256,
+              "HybridBranchTable must stay small enough for the kernel parameter space");
 static_assert(sizeof(kops::Status) == 4, "Status is int32 in the C ABI");
 static_assert(sizeof(kops::DType) == 1, "DType is uint8 in the C ABI");
 static_assert(sizeof(kops::Fp8Encoding) == 1, "Fp8Encoding is uint8 in the C ABI");

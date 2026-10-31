@@ -47,6 +47,8 @@ csrc/{memory,load,backends,reference}/
                          host-only service contracts: allocator/sleep/IPC/greenctx,
                          checkpoint routing/repack, provider adapters, fp64 reference
 tools/header_check/      host CUDA shim, canonical include order, Requires checker
+tools/gen_clangd_db.py   clangd database: rewrites nvcc commands for clang and
+                         gives every header a Requires-closure prelude
 docs/TREE.md             actual headers marked `✓`, proposed tree, catalog map,
                          and translation-unit include order
 docs/MODEL_COVERAGE.md   model semantics representable by the headers
@@ -185,6 +187,25 @@ proves the C ABI header is self-contained. The last one checks that every declar
 `__global__` kernel is assigned to exactly one ROADMAP step. `g++` can replace
 `clang++`, and `gcc`/`cc` can replace `clang` for the C check.
 
+### Editor (clangd)
+
+clangd reads a generated database, not CMake's: CMake emits nvcc command lines
+for `.cu` files, and a library header opened on its own has no prerequisites.
+Configure, then generate; `.clangd` points at the result:
+
+```bash
+cmake --preset dev
+python3 tools/gen_clangd_db.py          # -> build-clangd/compile_commands.json
+```
+
+The script rewrites every CUDA command for clang and adds one command per
+header whose force-included prelude is that header's transitive `Requires:`
+closure - the same closure `check_requires.py` verifies, so the header's own
+definitions are parsed once. Re-run it after configuring another preset (or
+pass `--base build/bench/compile_commands.json`) and after adding, moving or
+re-requiring a header. `build-clangd/` and `compile_commands.json` are ignored;
+`--cuda-path`/`--gpu-arch` default to the local toolkit and `sm_86`.
+
 Build and run the implemented kernels (needs CUDA toolkit). Presets live in
 `CMakePresets.json`: `dev` targets the local GPU, `dev-sm90a`/`dev-sm100a`
 target H100/B200, `ci-sm*` are compile-only, `release*` builds without tests.
@@ -212,6 +233,29 @@ explicit `KOPS_CUDA_ARCHS` list for those parts.
 The test exits with the number of failed checks. It compares every implemented
 kernel against `csrc/reference/` on device memory and asserts the `Status`
 contract for bad dtype / shape / alignment.
+
+### Benchmarks
+
+`-DKOPS_BUILD_BENCHMARKS=ON` (preset `bench`) builds the C++ benchmark
+executables under `build/<preset>/benchmark/`. They link `kops_cuda` only.
+`benchmark/compare/` holds the dev-only PyTorch baseline scripts; they are never
+built, tested, or shipped, and they read the same case table the C++ benchmark
+emits with `--dump-cases`:
+
+```bash
+cmake --preset bench
+cmake --build --preset bench
+build/bench/benchmark/bench_norm --dump-cases > out/cases.json
+build/bench/benchmark/bench_norm --json out/kops-norm.json
+python benchmark/compare/torch_baseline.py --cases out/cases.json --json out/torch-norm.json
+python benchmark/compare/compare_results.py out/kops-norm.json out/torch-norm.json
+```
+
+Each result JSON carries the git commit, dirty flag, build-flags hash, CUDA
+architectures and toolkit version, plus per-case median/p10/p90/min and GB/s.
+To add a family: create `benchmark/bench_<family>.cu` with its case table, add
+the matching op mapping in `benchmark/compare/torch_baseline.py`, and wire the
+target in `benchmark/CMakeLists.txt`.
 
 ### Build cache
 

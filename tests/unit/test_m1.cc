@@ -215,6 +215,40 @@ void test_act_and_mul() {
                  "act_and_mul_f64");
   kops_test::compare(out, ref, 2e-2, 2e-2, "act_and_mul bf16");
 
+  // kUpGate: swapping the two halves must give the same result.
+  std::vector<__nv_bfloat16> swapped(in.size());
+  for (int64_t r = 0; r < rows; ++r) {
+    const size_t base = static_cast<size_t>(r * 2 * d);
+    for (int64_t i = 0; i < d; ++i) {
+      swapped[base + i] = in[base + d + i];
+      swapped[base + d + i] = in[base + i];
+    }
+  }
+  kops_test::copy_in(d_in, swapped);
+  KOPS_EXPECT_OK(kops::act::act_and_mul(t_out, t_in, kops::Tensor{}, kops::ActFn::kSiLU,
+                                        kops::GateLayout::kUpGate, params, ctx),
+                 "act_and_mul upgate");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto out_upgate = kops_test::copy_out(d_out, static_cast<size_t>(rows * d));
+  kops_test::compare(out_upgate, ref, 2e-2, 2e-2, "act_and_mul upgate bf16");
+
+  // kInterleaved: gate and up alternate per output element.
+  std::vector<__nv_bfloat16> interleaved(in.size());
+  for (int64_t r = 0; r < rows; ++r) {
+    const size_t base = static_cast<size_t>(r * 2 * d);
+    for (int64_t i = 0; i < d; ++i) {
+      interleaved[base + 2 * i] = in[base + i];
+      interleaved[base + 2 * i + 1] = in[base + d + i];
+    }
+  }
+  kops_test::copy_in(d_in, interleaved);
+  KOPS_EXPECT_OK(kops::act::act_and_mul(t_out, t_in, kops::Tensor{}, kops::ActFn::kSiLU,
+                                        kops::GateLayout::kInterleaved, params, ctx),
+                 "act_and_mul interleaved");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto out_interleaved = kops_test::copy_out(d_out, static_cast<size_t>(rows * d));
+  kops_test::compare(out_interleaved, ref, 2e-2, 2e-2, "act_and_mul interleaved bf16");
+
   kops_test::device_free(d_in);
   kops_test::device_free(d_out);
 }
@@ -329,13 +363,8 @@ void test_contracts() {
   KOPS_EXPECT_STATUS(kops::attn::merge_state(t5_o, t5_l, t5_a, t5_l, t5_a, t5_l, ctx),
                      kops::Status::kUnsupportedDtype, "merge_state partial dtype");
 
-  // declared but not implemented yet
-  KOPS_EXPECT_STATUS(kops::norm::layer_norm(t5_o, t5_o, kops::Tensor{}, kops::Tensor{}, 1e-5f, 0.0f,
-                                            ctx),
-                     kops::Status::kNotImplemented, "layer_norm planned");
-  KOPS_EXPECT_STATUS(kops::attn::merge_states(t5_o, t5_l, t5_o, t5_l, ctx),
-                     kops::Status::kNotImplemented, "merge_states planned");
-
+  // These entries now have bodies; their contract coverage lives in
+  // test_norm.cc / test_merge.cc. Keep the M1 smoke focused on the first five.
   kops_test::device_free(d);
 }
 

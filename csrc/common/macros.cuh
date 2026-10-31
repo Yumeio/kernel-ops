@@ -37,7 +37,9 @@
 #define KOPS_VERSION_PATCH 0
 // Bump on any change to a public struct layout, enum value or kernel/launcher signature.
 // v2: backend-neutral stream/error/graph/tma types, arch_id + wave_size, Fp8Encoding.
-#define KOPS_ABI_VERSION 2
+// v3: HybridBranches + merge_hybrid_branches host entry.
+// v4: by-value InvFreqTable and HybridBranchTable kernel parameters.
+#define KOPS_ABI_VERSION 4
 
 // =============================================================================
 // Backend

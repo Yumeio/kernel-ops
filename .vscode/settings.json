@@ -1,0 +1,14 @@
+{
+  // clangd is the C/C++/CUDA language server for this repository; the
+  // IntelliSense engine of ms-vscode.cpptools would report different (and
+  // nvcc-unaware) diagnostics for the same files.
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "clangd.arguments": [
+    "--background-index",
+    "--header-insertion=never",
+    "--clang-tidy=false"
+  ],
+  "files.associations": {
+    "*.cuh": "cuda-cpp"
+  }
+}

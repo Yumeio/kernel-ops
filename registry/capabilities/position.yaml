@@ -1,0 +1,50 @@
+{
+ "family": "position",
+ "rows": [
+  {
+   "op_id": "R01.build_cos_sin_cache",
+   "kernel_symbol": "build_cos_sin_cache_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_position;bench_position"
+  },
+  {
+   "op_id": "R01.rotary_embedding",
+   "kernel_symbol": "rotary_embedding_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_position;bench_position"
+  },
+  {
+   "op_id": "R01.mrope",
+   "kernel_symbol": "mrope_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_position;bench_position"
+  },
+  {
+   "op_id": "R01.fused_qk_norm_rope",
+   "kernel_symbol": "fused_qk_norm_rope_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_position;bench_position"
+  },
+  {
+   "op_id": "R01.attn_temperature_tuning",
+   "kernel_symbol": "attn_temperature_tuning_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_position;bench_position"
+  }
+ ]
+}

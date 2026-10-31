@@ -12,6 +12,15 @@
 
 namespace kops::rope {
 
+/// Widest rotary window the host table can describe (inv_freq[R/2], R/2 <= 256).
+inline constexpr int kMaxRotDim = 512;
+
+/// Frequency table carried by value in the cache-builder kernel parameter.
+/// At most 256 floats (1 KB), far below the kernel parameter-space limit.
+struct InvFreqTable {
+  float v[kMaxRotDim / 2];
+};
+
 /// Frequency scaling families.
 enum class RopeScaling : uint8_t {
   kNone = 0,
@@ -48,7 +57,7 @@ struct RopeConfig {
 template <typename cache_t>
 __global__ void build_cos_sin_cache_kernel(
     cache_t* __restrict__ cos_sin_cache,    // [max_position, rot_dim]
-    const float* __restrict__ inv_freq,     // [rot_dim / 2]
+    const InvFreqTable inv_freq,            // [rot_dim / 2] by value, no device symbol
     const float mscale,
     const int max_position, const int rot_dim);
 

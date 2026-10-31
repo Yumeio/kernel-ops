@@ -1,0 +1,68 @@
+{
+ "family": "sampling",
+ "rows": [
+  {
+   "op_id": "S01.softmax",
+   "kernel_symbol": "softmax_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.argmax",
+   "kernel_symbol": "argmax_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.compute_logprobs",
+   "kernel_symbol": "compute_logprobs_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S02.token_bincount",
+   "kernel_symbol": "token_bincount_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S02.apply_penalties",
+   "kernel_symbol": "apply_penalties_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S02.apply_token_bitmask",
+   "kernel_symbol": "apply_token_bitmask_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S02.apply_logit_bias",
+   "kernel_symbol": "apply_logit_bias_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  }
+ ]
+}

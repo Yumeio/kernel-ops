@@ -10,6 +10,17 @@
 
 namespace kops::attn {
 
+/// Maximum branches in one hybrid merge. Kept small so the pointer table fits
+/// in the kernel parameter space and is graph-safe without pinned host arrays.
+inline constexpr int kMaxHybridBranches = 8;
+
+/// Branch pointers carried by value in the hybrid-merge kernel parameter.
+struct HybridBranchTable {
+  const float* o[kMaxHybridBranches];    // device pointers to [rows, Hq, D] fp32
+  const float* lse[kMaxHybridBranches];  // device pointers to [rows, Hq] fp32
+  int32_t count;
+};
+
 /**
  * merge_split_kv_kernel — A04: combine split partials into the final output.
  *   For row r: l = logsumexp_s lse_partial[s]; o = sum_s exp(lse_partial[s] - l) * o_partial[s]
@@ -61,18 +72,17 @@ __global__ void merge_states_kernel(
  * branch + sink; Llama-4/Gemma local+global never share a softmax and do not use this).
  * Identical to merge_states but tolerates per-branch head counts mapped by branch_head_map.
  *
- * branch_o / branch_lse are host arrays of device pointers (one per branch). Graph capture
- * requires them to be pinned, at a stable address, and unchanged between capture and replay;
- * a caller that rebuilds the array per step must use the device-pointer variant instead
- * (TODO A14b) or recapture. Anchors are validated by the launcher (null branch = absent).
+ * Branch pointers are packed into HybridBranchTable by value, so the kernel never dereferences
+ * host memory and the caller does not need pinned arrays. The branch buffers themselves must
+ * stay at stable device addresses between graph capture and replay (as with any other pointer
+ * argument); a null o pointer marks an absent branch.
  */
-template <typename DTypeO, int HEAD_DIM, int VEC_SIZE, int MAX_BRANCHES>
+template <typename DTypeO, int HEAD_DIM, int VEC_SIZE>
 __global__ void merge_hybrid_branches_kernel(
     DTypeO* __restrict__ o,                     // [num_rows, Hq, HEAD_DIM]
     float* __restrict__ lse,                    // [num_rows, Hq] or null
-    const float* const* __restrict__ branch_o,  // MAX_BRANCHES x [num_rows, Hq, HEAD_DIM] fp32 (null = absent)
-    const float* const* __restrict__ branch_lse,// MAX_BRANCHES x [num_rows, Hq]
+    const HybridBranchTable branches,           // by value; null o = absent
     const float* __restrict__ sink_logits,      // [Hq] or null
-    const int num_rows, const int num_heads, const int num_branches);
+    const int num_rows, const int num_heads);
 
 }  // namespace kops::attn

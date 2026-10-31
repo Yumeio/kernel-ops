@@ -58,6 +58,14 @@
       }
     },
     {
+      "name": "bench",
+      "displayName": "Dev + C++ benchmark targets",
+      "inherits": "dev",
+      "cacheVariables": {
+        "KOPS_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
       "name": "release",
       "displayName": "Release: multi-arch, no tests",
       "inherits": "base",
@@ -126,6 +134,7 @@
     { "name": "dev-debug", "configurePreset": "dev-debug" },
     { "name": "dev-sm90a", "configurePreset": "dev-sm90a" },
     { "name": "dev-sm100a", "configurePreset": "dev-sm100a" },
+    { "name": "bench", "configurePreset": "bench" },
     { "name": "release", "configurePreset": "release" },
     { "name": "release-sm90a", "configurePreset": "release-sm90a" },
     { "name": "release-sm100a", "configurePreset": "release-sm100a" },

@@ -79,6 +79,7 @@ find_package(CUDAToolkit REQUIRED)
 set(KOPS_NVCC_THREADS "4" CACHE STRING "nvcc --threads for one TU (0 = single-threaded)")
 
 include(cmake/arch.cmake)
+include(cmake/instantiate.cmake)
 kops_set_cuda_archs("${KOPS_CUDA_ARCHS}")
 
 # ---- shared compile settings ------------------------------------------------
@@ -120,14 +121,42 @@ else()
   target_compile_options(kops_host PRIVATE -Wall -Wextra)
 endif()
 
+# The registry table is generated from registry/capabilities/*.yaml at configure
+# time. A build without Python (or without YAML rows) keeps the weak empty table.
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  set(KOPS_REGISTRY_GEN_DIR "${CMAKE_BINARY_DIR}/generated")
+  set(KOPS_REGISTRY_TABLE "${KOPS_REGISTRY_GEN_DIR}/registry_table.inc")
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/tools/gen_registry.py"
+            -o "${KOPS_REGISTRY_TABLE}" --dir "${CMAKE_SOURCE_DIR}/registry/capabilities"
+    RESULT_VARIABLE KOPS_REGISTRY_RESULT
+    OUTPUT_QUIET ERROR_QUIET)
+  if(KOPS_REGISTRY_RESULT EQUAL 0)
+    target_include_directories(kops_host PRIVATE "${KOPS_REGISTRY_GEN_DIR}")
+    target_compile_definitions(kops_host PRIVATE KOPS_REGISTRY_HAS_TABLE=1)
+  endif()
+endif()
+
 # ---- device core ------------------------------------------------------------
 # tensor.cc calls the CUDA runtime but contains no device code, so it is compiled
 # once as C++ instead of once per gencode target.
 add_library(kops_cuda STATIC
   csrc/common/tensor.cc
+  csrc/execution/launch.cc
+  csrc/runtime/trace.cc
+  csrc/model_ops/residual.cu
   csrc/norm/norm.cu
   csrc/activation/activation.cu
-  csrc/attention/merge.cu)
+  csrc/position/rope.cu
+  csrc/embedding/embedding.cu
+  csrc/sampling/sampling.cu
+  csrc/sampling/logits_processor.cu
+  csrc/quantization/quant.cu
+  csrc/attention/merge.cu
+  csrc/attention/mla.cu
+  csrc/kvcache/kvcache.cu
+  csrc/state/state_cache.cu)
 target_link_libraries(kops_cuda PUBLIC kops_host CUDA::cudart)
 target_include_directories(kops_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(kops_cuda PROPERTIES
@@ -148,7 +177,7 @@ function(kops_add_test name)
 endfunction()
 
 if(KOPS_BUILD_BENCHMARKS)
-  message(STATUS "kernel-ops: KOPS_BUILD_BENCHMARKS is on but no benchmark target exists yet")
+  add_subdirectory(benchmark)
 endif()
 
 if(KOPS_BUILD_TESTS)
@@ -160,6 +189,62 @@ if(KOPS_BUILD_TESTS)
   kops_add_test(kops_test_m1
     SOURCES tests/unit/test_m1.cc
     LIBS kops_cuda)
+  set_source_files_properties(tests/unit/test_model_ops.cc PROPERTIES LANGUAGE CUDA)
+  kops_add_test(kops_test_model_ops
+    SOURCES tests/unit/test_model_ops.cc
+    LIBS kops_cuda)
+  set_source_files_properties(tests/unit/test_activation.cc PROPERTIES LANGUAGE CUDA)
+  kops_add_test(kops_test_activation
+    SOURCES tests/unit/test_activation.cc
+    LIBS kops_cuda)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_embedding.cc")
+    set_source_files_properties(tests/unit/test_embedding.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_embedding
+      SOURCES tests/unit/test_embedding.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_position.cc")
+    set_source_files_properties(tests/unit/test_position.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_position
+      SOURCES tests/unit/test_position.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_sampling.cc")
+    set_source_files_properties(tests/unit/test_sampling.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_sampling
+      SOURCES tests/unit/test_sampling.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_merge.cc")
+    set_source_files_properties(tests/unit/test_merge.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_merge
+      SOURCES tests/unit/test_merge.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_norm.cc")
+    set_source_files_properties(tests/unit/test_norm.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_norm
+      SOURCES tests/unit/test_norm.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_kvcache.cc")
+    set_source_files_properties(tests/unit/test_kvcache.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_kvcache
+      SOURCES tests/unit/test_kvcache.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_state.cc")
+    set_source_files_properties(tests/unit/test_state.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_state
+      SOURCES tests/unit/test_state.cc
+      LIBS kops_cuda)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_quantization.cc")
+    set_source_files_properties(tests/unit/test_quantization.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_quantization
+      SOURCES tests/unit/test_quantization.cc
+      LIBS kops_cuda)
+  endif()
 endif()
 
 # ---- install (static libs now; module/wheel targets later) ------------------

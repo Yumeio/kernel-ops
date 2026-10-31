@@ -1,6 +1,15 @@
-# Generate this database on each machine (never share absolute include paths):
-#   python tools/gen_compile_commands.py
-# Ninja supports compile_commands.json on Windows and Linux; Visual Studio does not.
+# clangd configuration (VS Code: llvm-vs-code-extensions.vscode-clangd).
+#
+# clangd reads build-clangd/compile_commands.json. It is generated, never
+# committed (build*/ is ignored):
+#
+#   cmake --preset dev                 -> build/dev/compile_commands.json
+#   python tools/gen_clangd_db.py      -> build-clangd/compile_commands.json
+#
+# The generator rewrites CMake's nvcc command lines for clang and adds one
+# command per library header, whose force-included prelude carries that header's
+# transitive `Requires:` closure (the headers contain no #include by design).
+# Re-run it after configuring another preset, or after adding/moving headers.
 CompileFlags:
   CompilationDatabase: build-clangd
 
@@ -14,46 +23,10 @@ Diagnostics:
   MissingIncludes: None
 
 ---
-# Paths in project fragments are relative and use '/' even on Windows.
-# CompileFlags must be a sibling of If, not nested inside it.
+# Generated databases, reference checkouts and tool caches are not worth
+# indexing. PathMatch is a regex over the absolute path ('\' on Windows), so
+# these patterns key off path components only.
 If:
-  PathMatch: '.*\.(cu|cuh)'
-CompileFlags:
-  Compiler: clang++
-  # Preserve include paths and definitions from CMake, remove NVCC-only options.
-  # CMake/project options here use joined arguments (-gencode=..., -Xcompiler=...).
-  Remove:
-    - '--generate-code*'
-    - '-gencode*'
-    - '--expt-*'
-    - '-expt-*'
-    - '--extended-lambda'
-    - '--use_fast_math'
-    - '-use_fast_math'
-    - '--generate-line-info'
-    - '-lineinfo'
-    - '--ptxas-options*'
-    - '-Xptxas*'
-    - '--compiler-options*'
-    - '-Xcompiler*'
-    - '--threads*'
-    - '--forward-unknown-to-host-compiler'
-    - '-forward-unknown-to-host-compiler'
-    - '--allow-unsupported-compiler'
-    - '-allow-unsupported-compiler'
-    - '-diag-suppress*'
-    - '--diag-suppress*'
-  Add:
-    - '-xcuda'
-    - '-std=c++20'
-    # Parse one portable target rather than NVCC's multi-architecture fat binary.
-    - '--cuda-gpu-arch=sm_80'
-    - '-Wno-unknown-cuda-version'
-    - '-Xclang'
-    - '-fcuda-allow-variadic-functions'
-
----
-If:
-  PathMatch: '(build[^/]*/.*|cutlass/.*|third_party/.*|\.venv/.*)'
+  PathMatch: '.*(build|3rd|clangd|ninja|ccache).*'
 Index:
   Background: Skip

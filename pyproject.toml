@@ -1,0 +1,45 @@
+[build-system]
+requires = ["scikit-build-core>=1.0.0", "torch>=2.13.0", "wheel"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ayaka-cuda"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "build>=1.6.1",
+    "cmake>=4.4.3",
+    "jinja2>=3.1.6",
+    "ninja>=1.13.2",
+    "numpy>=2.5.3",
+    "nvidia-cutlass>=4.2.0.0",
+    "nvidia-cutlass-dsl==4.8.0",
+    "nvidia-mathdx>=25.6.0",
+    "nvidia-ml-py>=13.615.71",
+    "packaging>=26.3",
+    "pybind11>=3.1.0",
+    "pydantic>=2.13.5",
+    "pytest>=9.1.1",
+    "scikit-build-core>=1.1.0",
+    "setuptools>=84.0.0",
+    "torch>=2.14.1",
+    "wheel>=0.48.0",
+]
+
+[tool.wheel]
+exclude = ["dist*", "tests*"]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+
+[tool.scikit-build]
+build-dir = "build"
+cmake.args = ["-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
+editable.rebuild = true

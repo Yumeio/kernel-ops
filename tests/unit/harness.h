@@ -173,6 +173,35 @@ void compare(const std::vector<T>& got, const std::vector<double>& want, double 
   }
 }
 
+struct Options {
+  const char* tier = "standard";
+  const char* json_path = nullptr;
+  bool dryrun = false;
+  bool mutate = false;
+};
+
+inline Options parse_options(int argc, char** argv) {
+  Options o{};
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--tier") == 0 && i + 1 < argc) o.tier = argv[++i];
+    else if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) o.json_path = argv[++i];
+    else if (std::strcmp(argv[i], "--dryrun") == 0) o.dryrun = true;
+    else if (std::strcmp(argv[i], "--mutate") == 0) o.mutate = true;
+  }
+  return o;
+}
+
+/// Tier order used to skip expensive cases without changing their code.
+inline bool tier_enabled(const Options& o, const char* needed) {
+  auto rank = [](const char* t) {
+    if (t == nullptr) return 0;
+    if (std::strcmp(t, "smoke") == 0) return 1;
+    if (std::strcmp(t, "full") == 0) return 3;
+    return 2;
+  };
+  return rank(o.tier) >= rank(needed);
+}
+
 inline int finish(const char* name) {
   if (failure_count() == 0) {
     std::printf("PASS %s\n", name);

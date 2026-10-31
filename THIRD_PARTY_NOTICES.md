@@ -32,6 +32,7 @@ ported (M1 onward), each ported file MUST:
 | attention.rs | MIT | low-bit WHT KV codecs (K8V4/K4V4/K3V4); paged attention structure; experimental 2-bit MoE | `attention/lowbit_kernels.cuh`, `kvcache/kv_layout.cuh` (`kLowBitWHT`), `moe/fused_moe_kernels.cuh` (M04) |
 | TensorRT-LLM | Apache-2.0 | Lamport one-shot allreduce; allreduce fusion epilogue; TRT-LLM-gen shuffled weight layout; `kEpiSigmoidGateMul` | `communication/allreduce_kernels.cuh`, `common/quant.cuh` (`kTrtllmShuffled`), `gemm/gemm_params.cuh` |
 | CUTLASS / CuTe | BSD-3-Clause | tile/cluster/stage vocabulary, `GemmTraits`, block-scaled MMA kinds (no code yet) | `gemm/gemm_params.cuh`, `docs/GEMM_MATRIX.md` |
+| Local read-only reference checkout (`3rd/csrc`, commit `d99cb25`) | Apache-2.0 (same project lineage) | device-body and validation reference for the B0/B1 first slice (`residual`, `rope`, `embedding`, `sampling`, `merge`, `norm`); adapted to the `kops` host API, no framework types | `model_ops/residual.cu`, `position/rope.cu`, `embedding/embedding.cu`, `sampling/*.cu`, `attention/merge.cu`, `norm/norm.cu` |
 | FlashAttention (Dao-AILab) | BSD-3-Clause | FA2 (sm80) / FA3 (sm90) / FA4 (sm100) mainloop structure | `attention/prefill_kernels.cuh`, `attention/decode_kernels.cuh` |
 | ggml | MIT | GGUF block type numbering (`GGML_TYPE_*`) | `common/quant.cuh` (`GGUFType`) |
 | llm-awq | MIT | AWQ packing and zero-point convention | `common/quant.cuh` (`kAWQ`), `quantization/weight_repack_kernels.cuh` |

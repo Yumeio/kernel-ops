@@ -43,6 +43,7 @@
 build/
 Build/
 build-*/
+out/
 
 # Local tool cache (ninja/ccache binaries; see tools/build-windows.bat)
 tools/ninja/
@@ -82,3 +83,7 @@ __pycache__/
 *.pyd
 csrc/*/Doxyfile
 3rd/
+# Capability source rows are committed; generated tables go to build/.
+registry/*
+!registry/capabilities/
+!registry/capabilities/*.yaml

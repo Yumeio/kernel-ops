@@ -1,0 +1,95 @@
+{
+ "family": "quantization",
+ "rows": [
+  {
+   "op_id": "Q01.absmax",
+   "kernel_symbol": "absmax_reduce_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "dtype in {f32,f16,bf16}; [rows,cols] running atomicMax",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.quantize.per_tensor",
+   "kernel_symbol": "quantize_per_tensor_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "e4m3 or int8; static scale",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.quantize.per_token",
+   "kernel_symbol": "quantize_per_token_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "e4m3 or int8 symmetric/asymmetric; dynamic row scale",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.quantize.per_group",
+   "kernel_symbol": "quantize_per_group_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "group in {32,64,128}; row-major/TMA scales; UE8M0; masked",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.quantize.mx",
+   "kernel_symbol": "quantize_mx_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "MXFP8/MXFP4 block 32; UE8M0; row-major/swizzled",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.quantize.nvfp4",
+   "kernel_symbol": "quantize_nvfp4_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "NVFP4 block 16 E4M3 + global fp32; 128x4 swizzle",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.dequantize",
+   "kernel_symbol": "dequantize_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "per-tensor/token/channel/group/block2D/MX; e4m3/int8/int4/fp4 payload",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.pack_int4",
+   "kernel_symbol": "pack_int4_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "signed/unsigned nibble, low nibble first",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.unpack_int4",
+   "kernel_symbol": "unpack_int4_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "signed/unsigned nibble, low nibble first",
+   "evidence": "test_quantization;bench_quantization"
+  },
+  {
+   "op_id": "Q01.hadamard",
+   "kernel_symbol": "hadamard_transform_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "power-of-two n <= 32768; optional signed diagonal; in-place",
+   "evidence": "test_quantization;bench_quantization"
+  }
+ ]
+}

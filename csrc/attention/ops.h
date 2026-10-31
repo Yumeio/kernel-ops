@@ -61,6 +61,19 @@ Status merge_state(const Tensor& o, const Tensor& lse, const Tensor& o_a, const 
 Status merge_states(const Tensor& o, const Tensor& lse, const Tensor& o_states,
                     const Tensor& lse_states, const LaunchContext& ctx);
 
+/// Host arrays of device pointers for branches that scored different key sets
+/// under one softmax (DeepSeek-V4: compressed + sliding-window + sink). The
+/// launcher copies the pointers into the kernel parameter (HybridBranchTable),
+/// so these arrays do not need to be pinned; the branch buffers themselves must
+/// stay at stable device addresses for CUDA-graph capture/replay.
+struct HybridBranches {
+  const float* const* o = nullptr;    // [num_branches] device pointers to [rows, Hq, D] fp32
+  const float* const* lse = nullptr;  // [num_branches] device pointers to [rows, Hq] fp32
+  int32_t num_branches = 0;
+};
+Status merge_hybrid_branches(const Tensor& o, const Tensor& lse, const HybridBranches& branches,
+                             const Tensor& sink_logits, const LaunchContext& ctx);
+
 // ---- A12/A13 MLA ---------------------------------------------------------------------
 Status mla_decode_plan(const AttentionSpec& spec, int32_t max_batch, int32_t q_len,
                        const LaunchContext& ctx, const Workspace& ws, AttentionPlan* plan);

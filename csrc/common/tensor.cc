@@ -56,12 +56,12 @@ bool tensor_is_contiguous(const Tensor& t) noexcept {
   if (bits <= 0) return false;
   // one logical element = bits/8 bytes; work in eighths of a byte to stay exact
   // for packed 4-bit dtypes.
-  int64_t expected = 1;  // in bytes * 8
+  int64_t expected = bits;  // in bytes * 8; innermost logical element is bits wide
   for (int32_t d = t.ndim - 1; d >= 0; --d) {
     const int64_t stride_bytes_x8 =
         (t.stride_unit == StrideUnit::kByte) ? t.stride[d] * 8 : t.stride[d] * bits;
     if (t.shape[d] > 1 && stride_bytes_x8 != expected) return false;
-    expected *= t.shape[d] * bits;
+    expected *= t.shape[d];
   }
   return true;
 }

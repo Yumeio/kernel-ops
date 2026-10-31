@@ -1,0 +1,59 @@
+{
+ "family": "attention",
+ "rows": [
+  {
+   "op_id": "A14.merge_state",
+   "kernel_symbol": "merge_state_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "dtype out in {f32,f16,bf16}; partial fp32; head_dim 64/128/256",
+   "evidence": "test_merge;bench_chains"
+  },
+  {
+   "op_id": "A14.merge_states",
+   "kernel_symbol": "merge_states_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "planned",
+   "evidence": "test_merge"
+  },
+  {
+   "op_id": "A04.merge_split_kv",
+   "kernel_symbol": "merge_split_kv_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_merge;bench_chains"
+  },
+  {
+   "op_id": "A14.merge_hybrid_branches",
+   "kernel_symbol": "merge_hybrid_branches_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "planned",
+   "evidence": "test_merge"
+  },
+  {
+   "op_id": "A12.concat_mla_q",
+   "kernel_symbol": "concat_mla_q_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "bf16/f16/f32; q_pe width 64; strided ql_nope/q_pe inputs",
+   "evidence": "test_merge;bench_merge;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "A12.mla_context_gather",
+   "kernel_symbol": "mla_context_gather_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "latent cache [rank|rope]; block table + ctx_start; native or e4m3 per-tensor",
+   "evidence": "test_merge;bench_merge;docs/KV_CACHE_PARITY.md"
+  }
+ ]
+}

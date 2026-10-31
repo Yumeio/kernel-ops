@@ -1,0 +1,41 @@
+{
+ "family": "activation",
+ "rows": [
+  {
+   "op_id": "F01.act",
+   "kernel_symbol": "act_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "dtype in {f32,f16,bf16}; ActFn subset",
+   "evidence": "test_activation;bench_activation"
+  },
+  {
+   "op_id": "F01.act_and_mul",
+   "kernel_symbol": "act_and_mul_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "dtype in {f32,f16,bf16}; GateLayout all",
+   "evidence": "test_activation;bench_activation"
+  },
+  {
+   "op_id": "F01.gate_mul",
+   "kernel_symbol": "gate_mul_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "gate_width in {1,heads,d}; optional accumulate",
+   "evidence": "test_activation;bench_activation"
+  },
+  {
+   "op_id": "F01.act_and_mul_quant",
+   "kernel_symbol": "act_and_mul_quant_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "GLU + per-token/per-group/MX/NVFP4; masked/contiguous grouped",
+   "evidence": "test_activation;bench_activation"
+  }
+ ]
+}

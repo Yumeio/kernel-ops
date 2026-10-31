@@ -1,0 +1,41 @@
+{
+ "family": "state",
+ "rows": [
+  {
+   "op_id": "L03.state_copy",
+   "kernel_symbol": "state_copy_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "byte copy per (pair, pool); negative slots skip; 16-byte vector path",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_gather",
+   "kernel_symbol": "state_gather_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "slot -> contiguous staging row; per-pool byte prefix from device slot_bytes",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_scatter",
+   "kernel_symbol": "state_scatter_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "contiguous staging row -> slot; inverse of state_gather",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_zero",
+   "kernel_symbol": "state_zero_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "zero selected slots of every pool; graph-capturable",
+   "evidence": "test_state;bench_state"
+  }
+ ]
+}
