@@ -64,7 +64,7 @@ struct PermuteParams {
  * GEMM reads FP8/FP4 directly.
  */
 template <typename scalar_t, ActQuantMode kQuant, int VEC_SIZE>
-__global__ void moe_permute_kernel(const KOPS_GRID_CONST PermuteParams params);
+__global__ void moe_permute_kernel(const __grid_constant__ PermuteParams params);
 
 /**
  * moe_unpermute_reduce_kernel — combine expert outputs back to tokens:

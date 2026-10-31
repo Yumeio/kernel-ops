@@ -78,30 +78,30 @@ __global__ void delta_rule_gating_kernel(
 
 /// 1) chunk-local cumulative sum of g (reset at chunk and sequence boundaries).
 template <DecayGranularity kDecay, int CHUNK>
-__global__ void chunk_local_cumsum_kernel(const KOPS_GRID_CONST DeltaRuleParams params);
+__global__ void chunk_local_cumsum_kernel(const __grid_constant__ DeltaRuleParams params);
 /// 2) A = strictly-lower( beta_i * (k_i * exp(G_i - G_j)) . k_j ) per chunk.
 template <typename input_t, DecayGranularity kDecay, int CHUNK, int BLOCK_K>
-__global__ void chunk_scaled_dot_kkt_kernel(const KOPS_GRID_CONST DeltaRuleParams params);
+__global__ void chunk_scaled_dot_kkt_kernel(const __grid_constant__ DeltaRuleParams params);
 /// 3) A <- (I + A)^{-1} for 64x64 unit-lower-triangular blocks (16x16 hierarchical, fp32).
 template <int CHUNK>
-__global__ void solve_tril_kernel(const KOPS_GRID_CONST DeltaRuleParams params);
+__global__ void solve_tril_kernel(const __grid_constant__ DeltaRuleParams params);
 /// 4) w = A (beta k exp(G)), u = A (beta v).
 template <typename input_t, DecayGranularity kDecay, int CHUNK, int BLOCK_K, int BLOCK_V>
-__global__ void recompute_w_u_kernel(const KOPS_GRID_CONST DeltaRuleParams params);
+__global__ void recompute_w_u_kernel(const __grid_constant__ DeltaRuleParams params);
 /// 5) chunk recurrence: h_{c+1} = decay(c) h_c + K_c^T (U_c - W_c h_c); writes final state and
 ///    prefix-cache snapshots; handles initial states and sequence boundaries.
 template <typename input_t, DecayGranularity kDecay, int CHUNK, int BLOCK_V>
-__global__ void chunk_state_fwd_kernel(const KOPS_GRID_CONST DeltaRuleParams params);
+__global__ void chunk_state_fwd_kernel(const __grid_constant__ DeltaRuleParams params);
 /// 6) o = scale * ( (Q exp(G)) h_c + causal(Q K^T decay) (U - W h_c) ).
 template <typename input_t, DecayGranularity kDecay, int CHUNK, int BLOCK_K, int BLOCK_V>
-__global__ void chunk_output_fwd_kernel(const KOPS_GRID_CONST DeltaRuleParams params);
+__global__ void chunk_output_fwd_kernel(const __grid_constant__ DeltaRuleParams params);
 
 /**
  * fused_recurrent_delta_rule_kernel — token-by-token recurrence (decode, spec-decode verification,
  * very short prefill chunks). One CTA per (sequence, v head, Dv tile); S tile in registers.
  */
 template <typename input_t, DecayGranularity kDecay, int HEAD_DIM_K, int BLOCK_V, bool kUseL2Norm>
-__global__ void fused_recurrent_delta_rule_kernel(const KOPS_GRID_CONST DeltaRuleParams params);
+__global__ void fused_recurrent_delta_rule_kernel(const __grid_constant__ DeltaRuleParams params);
 
 /// Arguments of the fully fused decode layer core (vLLM/NVIDIA fused KDA decode).
 struct FusedDeltaDecodeParams {
@@ -129,6 +129,6 @@ struct FusedDeltaDecodeParams {
  */
 template <typename input_t, DecayGranularity kDecay, int HEAD_DIM_K, int HEAD_DIM_V, int CONV_WIDTH>
 __global__ void fused_short_conv_delta_rule_decode_kernel(
-    const KOPS_GRID_CONST FusedDeltaDecodeParams params);
+    const __grid_constant__ FusedDeltaDecodeParams params);
 
 }  // namespace kops::state

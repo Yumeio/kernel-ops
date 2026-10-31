@@ -4,7 +4,6 @@
 // Element types, numeric limits, FP8 encodings and conversion primitives.
 // Requires: common/macros.cuh.
 //   Toolkit (CUDA): <cuda_fp16.h>, <cuda_bf16.h>, <cuda_fp8.h> (>= 12.8 for e8m0/e2m1).
-//   Toolkit (HIP) : <hip/hip_fp16.h>, <hip/hip_bf16.h>, <hip/hip_fp8.h>.
 //
 // FP8 has TWO encodings in the wild and they are not interchangeable:
 //   kOCP  : e4m3fn / e5m2 (bias 7/15, e4m3 max 448, e5m2 max 57344)  -- NVIDIA, OCP checkpoints
@@ -16,19 +15,11 @@
 
 namespace kops {
 
-// Device scalar aliases exist only where the toolkit provides them: a CUDA/HIP
+// Device scalar aliases exist only where the toolkit provides them: a CUDA
 // device pass, or the host syntax-check shim (KOPS_CUDA_HOST_SHIM). Plain host
 // translation units (bindings, reference, tests) do not get them, because they
 // must never touch a device scalar type.
-#if KOPS_BACKEND_HIP
-using f32_t = float;
-using f16_t = __half;
-using bf16_t = hip_bfloat16;
-using f8e4m3_t = uint8_t;      // payload only; use to_float_fp8/from_float_fp8 with an encoding
-using f8e5m2_t = uint8_t;
-using ue8m0_t = uint8_t;
-using f4e2m1x2_t = uint8_t;
-#elif defined(__CUDACC__) || defined(KOPS_CUDA_HOST_SHIM)
+#if defined(__CUDACC__) || defined(KOPS_CUDA_HOST_SHIM)
 using f32_t = float;
 using f16_t = __half;
 using bf16_t = __nv_bfloat16;

@@ -49,7 +49,7 @@ struct HCParams {
  * (raw_logits) and this kernel only applies constraints (kFromLogits = true).
  */
 template <typename stream_t, typename w_t, int N_HC, bool kFromLogits>
-__global__ void hc_coeff_kernel(const KOPS_GRID_CONST HCParams params);
+__global__ void hc_coeff_kernel(const __grid_constant__ HCParams params);
 
 /**
  * hc_pre_kernel — x_in[t] = sum_i A[t,i] X[t,i,:], optionally fused with the sublayer pre-norm
@@ -57,7 +57,7 @@ __global__ void hc_coeff_kernel(const KOPS_GRID_CONST HCParams params);
  */
 template <typename stream_t, typename out_t, int N_HC, ActQuantMode kQuant, int VEC_SIZE>
 __global__ void hc_pre_kernel(
-    const KOPS_GRID_CONST HCParams params,
+    const __grid_constant__ HCParams params,
     out_t* __restrict__ layer_in,                 // [num_tokens, d] (or quantized payload)
     const ActQuantOut quant,
     const void* __restrict__ sub_norm_weight,     // [d] or null (no fused pre-norm)
@@ -69,7 +69,7 @@ __global__ void hc_pre_kernel(
  */
 template <typename stream_t, typename y_t, int N_HC, int VEC_SIZE>
 __global__ void hc_post_kernel(
-    const KOPS_GRID_CONST HCParams params,
+    const __grid_constant__ HCParams params,
     const y_t* __restrict__ y,                    // [num_tokens, d]
     const int64_t y_stride);
 
@@ -83,7 +83,7 @@ __global__ void hc_post_kernel(
 template <typename stream_t, typename y_t, typename out_t, int N_HC, int D_TILE, ActQuantMode kQuant,
           typename ArchTag>
 __global__ void mega_mhc_kernel(
-    const KOPS_GRID_CONST HCParams next_layer,  // coefficients/weights of layer l (outputs A_l, B_l, C_l)
+    const __grid_constant__ HCParams next_layer,  // coefficients/weights of layer l (outputs A_l, B_l, C_l)
     const float* __restrict__ prev_coeff_b,       // [num_tokens, n, n] B_{l-1}
     const float* __restrict__ prev_coeff_c,       // [num_tokens, n]    C_{l-1}
     const y_t* __restrict__ prev_y,               // [num_tokens, d]    y_{l-1}

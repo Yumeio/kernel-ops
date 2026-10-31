@@ -38,7 +38,7 @@ struct MegaMLPParams {
  * contributors finished. Target domain: small M decode (M <= 64), BF16 first, FP8 next.
  */
 template <typename T, typename W, int BM, int BN1, int BN2, int BK, int STAGES, typename ArchTag>
-__global__ void mega_mlp_kernel(const KOPS_GRID_CONST MegaMLPParams params);
+__global__ void mega_mlp_kernel(const __grid_constant__ MegaMLPParams params);
 
 // ---- E05 attention block (decode) ---------------------------------------------------
 struct MegaAttentionBlockParams {
@@ -70,7 +70,7 @@ struct MegaAttentionBlockParams {
  * only). KV pages written here must not be read by another concurrently running plan.
  */
 template <typename T, int HEAD_DIM, int GQA_GROUP, int PAGE_SIZE, typename ArchTag>
-__global__ void mega_attention_block_kernel(const KOPS_GRID_CONST MegaAttentionBlockParams params);
+__global__ void mega_attention_block_kernel(const __grid_constant__ MegaAttentionBlockParams params);
 
 // ---- E06 local MoE -------------------------------------------------------------------
 struct MegaMoELocalParams {
@@ -101,7 +101,7 @@ struct MegaMoELocalParams {
  * single persistent kernel over expert tiles, skew-aware task ordering. Empty experts skipped.
  */
 template <typename T, typename W, int BM, int BN, int BK, int STAGES, bool kFusedRouter, typename ArchTag>
-__global__ void mega_moe_local_kernel(const KOPS_GRID_CONST MegaMoELocalParams params);
+__global__ void mega_moe_local_kernel(const __grid_constant__ MegaMoELocalParams params);
 
 // ---- E07 distributed MegaMoE -----------------------------------------------------------
 struct MegaMoEEPParams {
@@ -119,7 +119,7 @@ struct MegaMoEEPParams {
  * launch with the same epoch; slowest-rank latency is the reported metric.
  */
 template <typename T, typename W, int BM, int BN, int BK, int NUM_RANKS_PER_NODE, typename ArchTag>
-__global__ void mega_moe_ep_kernel(const KOPS_GRID_CONST MegaMoEEPParams params);
+__global__ void mega_moe_ep_kernel(const __grid_constant__ MegaMoEEPParams params);
 
 // ---- E08 decoder layer (research) -------------------------------------------------------
 /**
@@ -128,9 +128,9 @@ __global__ void mega_moe_ep_kernel(const KOPS_GRID_CONST MegaMoEEPParams params)
  * Weights stream from HBM; no request scheduling or KV allocation inside the kernel.
  */
 template <typename T, typename ArchTag>
-__global__ void mega_decoder_layer_kernel(const KOPS_GRID_CONST MegaPlanDevice plan,
-                                          const KOPS_GRID_CONST MegaAttentionBlockParams attn,
-                                          const KOPS_GRID_CONST MegaMLPParams mlp,
-                                          const KOPS_GRID_CONST MegaMoELocalParams moe);
+__global__ void mega_decoder_layer_kernel(const __grid_constant__ MegaPlanDevice plan,
+                                          const __grid_constant__ MegaAttentionBlockParams attn,
+                                          const __grid_constant__ MegaMLPParams mlp,
+                                          const __grid_constant__ MegaMoELocalParams moe);
 
 }  // namespace kops::mega

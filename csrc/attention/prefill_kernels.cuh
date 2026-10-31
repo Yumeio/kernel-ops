@@ -56,7 +56,7 @@ struct RaggedPrefillParams {
  * Models : every model's prompt phase without prefix cache; vision/audio encoders (kNone mask).
  */
 template <typename Traits, MaskMode kMask, typename Variant>
-__global__ void ragged_prefill_kernel(const KOPS_GRID_CONST RaggedPrefillParams params);
+__global__ void ragged_prefill_kernel(const __grid_constant__ RaggedPrefillParams params);
 
 /// Arguments of paged prefill (chunked prefill, prefix reuse, verification).
 struct PagedPrefillParams {
@@ -85,7 +85,7 @@ struct PagedPrefillParams {
  * Page tables: CSR or block table (PagedKVDesc::table_format), NHD or HND.
  */
 template <typename Traits, MaskMode kMask, typename Variant, kv::KVLayout kLayout>
-__global__ void paged_prefill_kernel(const KOPS_GRID_CONST PagedPrefillParams params);
+__global__ void paged_prefill_kernel(const __grid_constant__ PagedPrefillParams params);
 
 /// Block-sparse mask in BSR form over (R x C) blocks of the [qo_len, kv_len] score matrix.
 struct BlockSparseMask {
@@ -102,7 +102,7 @@ struct BlockSparseMask {
  * dense result (golden test). Mask generation cost (A11) is accounted separately.
  */
 template <typename Traits, typename Variant, kv::KVLayout kLayout>
-__global__ void block_sparse_prefill_kernel(const KOPS_GRID_CONST PagedPrefillParams params,
+__global__ void block_sparse_prefill_kernel(const __grid_constant__ PagedPrefillParams params,
                                             const BlockSparseMask mask);
 
 /**

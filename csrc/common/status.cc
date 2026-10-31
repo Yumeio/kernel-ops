@@ -1,7 +1,7 @@
 // =============================================================================
 // kernel-ops | csrc/common/status.cc
 // Error model implementation: thread-local detail, backend error, C ABI.
-// Host-only, no CUDA/HIP calls, no allocation, no exceptions.
+// Host-only, no CUDA calls, no allocation, no exceptions.
 // =============================================================================
 #include <cstdint>
 #include <cstdarg>
@@ -78,7 +78,7 @@ Status set_error(Status s, const char* fmt, ...) noexcept {
 
 Status set_backend_error(Status s, int32_t backend_error, const char* fmt, ...) noexcept {
   g_error.backend_error = backend_error;
-  g_error.backend = KOPS_BACKEND_HIP ? "hip" : "cuda";
+  g_error.backend = "cuda";
   g_error.status = s;
   if (fmt != nullptr) {
     va_list args;

@@ -119,7 +119,7 @@ __global__ void grouped_gemm_task_map_kernel(
  * kFP8Rowwise, kFP8Blockwise (Sm89 / Sm120), kINT8Rowwise.
  */
 template <typename Traits, GemmRecipe kRecipe, GroupedLayout kLayout>
-__global__ void grouped_gemm_mma_sync_kernel(const KOPS_GRID_CONST GroupedGemmParams params);
+__global__ void grouped_gemm_mma_sync_kernel(const __grid_constant__ GroupedGemmParams params);
 
 /**
  * grouped_gemm_wgmma_kernel — Hopper persistent grouped GEMM (TMA + WGMMA, warp-specialized).
@@ -128,7 +128,7 @@ __global__ void grouped_gemm_mma_sync_kernel(const KOPS_GRID_CONST GroupedGemmPa
  * Models : DeepSeek-V3/V3.2 & Kimi K2 FP8 experts, Qwen3-MoE FP8, GLM-4.5 FP8, Mixtral/Qwen BF16.
  */
 template <typename Traits, GemmRecipe kRecipe, GroupedLayout kLayout, Fp8Accum kAccum>
-__global__ void grouped_gemm_wgmma_kernel(const KOPS_GRID_CONST GroupedGemmParams params);
+__global__ void grouped_gemm_wgmma_kernel(const __grid_constant__ GroupedGemmParams params);
 
 /**
  * grouped_gemm_tcgen05_kernel — Blackwell datacenter grouped GEMM. Recipes: kBF16, kFP8Tensorwise,
@@ -138,11 +138,11 @@ __global__ void grouped_gemm_wgmma_kernel(const KOPS_GRID_CONST GroupedGemmParam
  * Models : DeepSeek-V4 FP4 experts, GPT-OSS MXFP4, Kimi K3 MXFP4, NVFP4 MoE checkpoints, FP8 MoEs.
  */
 template <typename Traits, GemmRecipe kRecipe, GroupedLayout kLayout>
-__global__ void grouped_gemm_tcgen05_kernel(const KOPS_GRID_CONST GroupedGemmParams params);
+__global__ void grouped_gemm_tcgen05_kernel(const __grid_constant__ GroupedGemmParams params);
 
 /// grouped_gemm_sm120_kernel — RTX Blackwell grouped GEMM (block-scaled mma.sync for FP4/MX recipes).
 template <typename Traits, GemmRecipe kRecipe, GroupedLayout kLayout>
-__global__ void grouped_gemm_sm120_kernel(const KOPS_GRID_CONST GroupedGemmParams params);
+__global__ void grouped_gemm_sm120_kernel(const __grid_constant__ GroupedGemmParams params);
 
 /**
  * grouped_mixed_input_gemm_kernel — MoE weight-only / mixed-input on tensor cores (TRT-LLM / CUTLASS
@@ -150,7 +150,7 @@ __global__ void grouped_gemm_sm120_kernel(const KOPS_GRID_CONST GroupedGemmParam
  * kW4A16MXFP4 (GPT-OSS MXFP4 x BF16), kW4A16NVFP4, kW4A8IntFP8, kW4A8FP4xFP8. ArchTag Sm90a or Sm100a.
  */
 template <typename Traits, GemmRecipe kRecipe, GroupedLayout kLayout>
-__global__ void grouped_mixed_input_gemm_kernel(const KOPS_GRID_CONST GroupedGemmParams params);
+__global__ void grouped_mixed_input_gemm_kernel(const __grid_constant__ GroupedGemmParams params);
 
 /**
  * grouped_fp4_to_fp8_gemm_wgmma_kernel — Hopper grouped GEMM for FP4 experts: per-expert MXFP4/NVFP4
@@ -158,7 +158,7 @@ __global__ void grouped_mixed_input_gemm_kernel(const KOPS_GRID_CONST GroupedGem
  * wgmma with promoted accumulation.
  */
 template <typename Traits, GroupedLayout kLayout>
-__global__ void grouped_fp4_to_fp8_gemm_wgmma_kernel(const KOPS_GRID_CONST GroupedGemmParams params);
+__global__ void grouped_fp4_to_fp8_gemm_wgmma_kernel(const __grid_constant__ GroupedGemmParams params);
 
 /**
  * grouped_gemv_kernel — decode MoE where each expert sees only a few rows: one CTA per
@@ -167,7 +167,7 @@ __global__ void grouped_fp4_to_fp8_gemm_wgmma_kernel(const KOPS_GRID_CONST Group
  * int4 groupwise. The weight-bandwidth-optimal path when tokens * topk is small.
  */
 template <typename a_t, GemmRecipe kRecipe, GroupedLayout kLayout, int ROWS_PER_WARP, int WARPS>
-__global__ void grouped_gemv_kernel(const KOPS_GRID_CONST GroupedGemmParams params);
+__global__ void grouped_gemv_kernel(const __grid_constant__ GroupedGemmParams params);
 
 /**
  * Gated W13 and finalize fusions (epilogue configuration of the kernels above, no extra kernels):
@@ -203,9 +203,9 @@ struct LoraSgmvParams {
  * Serving-time multi-LoRA for every dense architecture; MoE LoRA uses kPtrArray grouped GEMM.
  */
 template <typename scalar_t, int TILE_T, int TILE_R>
-__global__ void lora_shrink_kernel(const KOPS_GRID_CONST LoraSgmvParams params);
+__global__ void lora_shrink_kernel(const __grid_constant__ LoraSgmvParams params);
 
 template <typename scalar_t, int TILE_T, int TILE_N>
-__global__ void lora_expand_kernel(const KOPS_GRID_CONST LoraSgmvParams params);
+__global__ void lora_expand_kernel(const __grid_constant__ LoraSgmvParams params);
 
 }  // namespace kops::gemm

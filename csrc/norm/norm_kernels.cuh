@@ -211,6 +211,6 @@ struct NormQuantParams {
  * unless norm_out is requested, in which case norm_out is the bf16 rounding of the same y.
  */
 template <typename scalar_t, typename residual_t, NormType kNorm, ActQuantMode kMode, int VEC_SIZE>
-__global__ void norm_quant_kernel(const KOPS_GRID_CONST NormQuantParams params);
+__global__ void norm_quant_kernel(const __grid_constant__ NormQuantParams params);
 
 }  // namespace kops::norm

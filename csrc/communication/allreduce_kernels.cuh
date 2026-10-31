@@ -68,7 +68,7 @@ struct AllReduceFusionParams {
  * boundary (HPC-Ops fused allreduce-RMSNorm, TRT-LLM allreduce fusion). Supports PDL.
  */
 template <typename T, int WORLD_SIZE, AllReduceAlgo kAlgo, ActQuantMode kQuant>
-__global__ void allreduce_fusion_kernel(const KOPS_GRID_CONST AllReduceFusionParams params);
+__global__ void allreduce_fusion_kernel(const __grid_constant__ AllReduceFusionParams params);
 
 /// all-gather along dim 0 (vocab-parallel logits, sequence parallel, AttnRes SP sharding).
 template <typename T, int WORLD_SIZE>

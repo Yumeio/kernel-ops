@@ -1,17 +1,16 @@
 # ayaka-kernel — ROADMAP triển khai (từ dễ đến khó, theo phụ thuộc)
 
-Cập nhật 2026-10-28. Roadmap này liệt kê 233 `__global__` kernel trong 18 bước và 125 nhịp. 186 kernel đã có thân (gồm hai kernel hợp nhất, xem "Hiện trạng" và §3.1); 47 kernel còn lại thuộc B11–B16. Tên repo là `ayaka-kernel` (trước đây `kernel-ops`); namespace C++ là `ayaka`.
+Cập nhật 2026-10-31. Roadmap này liệt kê 233 `__global__` kernel trong 18 bước và 125 nhịp. Checkout này mới có **5 kernel có thân** (`rms_norm`, `fused_add_rms_norm`, `act`, `act_and_mul`, `merge_state`); 228 kernel còn lại là contract trong header, chưa có định nghĩa. Repo là `ayaka-kernel`; namespace C++ và tiền tố ABI là `kops` (không phải `ayaka`).
 
-**Chiến lược mới (2026-10-28), đọc §3 trước.** Roadmap được xây đủ **chỉ với một RTX 3050 Laptop (SM86, 4 GB)**, không thuê GPU. Hai project chính thức của DeepSeek được thêm vào `3rd/`: **FlashMLA** (`3rd/FlashMLA`, commit `395cb3a`; bản `ba89a34` là bản cuối có Hopper và các định dạng V3.2/V4.0) và **DeepGEMM** (`3rd/DeepGEMM`, commit `5081f85`). Chúng là nguồn đã chứng minh cho phần lớn ô Hopper/Blackwell (§2.3) và là reference chính thức, chạy được trên SM86, cho các ⚠ của DeepSeek (§3.3 K1). §2 nói mỗi ô đạt được tới đâu khi chỉ có SM86, §3 nói làm theo thứ tự nào (giai đoạn P0–P8) và dùng kỹ thuật gì (K1–K7: oracle chính thức, code upstream không phụ thuộc arch, twin SM80-class, kiểm tĩnh SASS, rank ảo, model thu nhỏ, roofline).
+**Chiến lược 2026-10-31, đọc §0.7 và §3 trước.** Roadmap được xây đủ **chỉ với một RTX 3050 Laptop (SM86, 4 GB)**, không thuê GPU, và **không dùng PyTorch, torch binding, CUTLASS/CuTe hay provider adapter**. API duy nhất là `csrc/<family>/ops.h` (`kops::Status` + `Tensor`/`LaunchContext`/`Workspace`); thân kernel và launcher viết ngay trong `csrc/<family>/<stem>.cu`; test và benchmark là C++/ctest. FlashMLA, DeepGEMM, vLLM, SGLang, hpc-ops và attention.rs trong `3rd/` chỉ là **nguồn đọc** (thuật toán, layout, edge case), không được link hay build. §2 nói mỗi ô đạt tới đâu khi chỉ có SM86; §3 nói thứ tự P0–P8 và kỹ thuật K1–K7 (K1/K2/K6 deferred vì cần PyTorch).
 
 - **Không có mốc thời gian.** Thứ tự chỉ dựa vào độ khó và phụ thuộc kỹ thuật. Tiến độ đo bằng status ladder trong registry, theo từng ô (kernel, exact SM): `planned → authored → implemented → compiled → numerically_validated → benchmarked → release_supported`. `authored` là ô đã viết đủ (thân, test, benchmark) nhưng nhắm phần cứng mà máy dev không chạy được (§2).
 - **Mỗi kernel thuộc đúng một bước:** bước có bản native đầu tiên của nó. Instantiation cho kiến trúc mới được liệt kê riêng ở bước của kiến trúc đó.
-- `tools/check_roadmap.py` (chưa có; mở rộng theo §1.6) kiểm tra quy tắc trên mỗi khi bảng kernel hoặc file nguồn thay đổi.
+- `tools/check_roadmap.py` (đã có; mở rộng theo §1.6) kiểm tra quy tắc trên mỗi khi bảng kernel hoặc file nguồn thay đổi.
 - **Cột Reference** trong mọi bảng kernel trỏ tới code tương tự trong vLLM, SGLang, hpc-ops, attention.rs, FlashMLA và DeepGEMM để đối chiếu khi viết kernel (§0.6).
-- **Nhịp và ngân sách file (§1).** Đơn vị công việc là một hàng của bảng kernel, gọi là *nhịp*, và mọi nhịp theo cùng một vòng sáu việc. Số file mới tăng theo family, theo nhóm kernel (một file `.cu`) và theo ô arch (một ô của lưới family × arch), không tăng theo kernel; trần nằm ở Phụ lục E.
-- **Hiện trạng (2026-10-25).** 169 trong 233 kernel có thân, launcher, binding, test và benchmark: toàn bộ B0 (2), B1 (32), B2 (20), B3 (21), B4 (18), B7 (16), B8 (7), B9 (20) và B10 (4), 15/16 của B5 và 14/15 của B6. Hai kernel còn lại của B5 và B6 không có thân riêng: `moe_gemv_kernel` là chế độ indexed của `grouped_gemv_kernel` (xem `csrc/moe/fused_moe.cu`) và `top_p_renorm_probs_kernel` được gộp vào `top_k_top_p_renorm_probs_kernel` (bảng "Biến thể thân kernel" ở §1.6 gán tên trong code cho tên trong bảng). Evidence chỉ có trên SM86 từ working tree dirty (không có commit theo yêu cầu của chủ repo): mọi ô SM86 của các bước này ở mức `numerically_validated` hoặc `benchmarked` với `diagnostic_only`, các ô SM khác là `authored` hoặc `compiled` (compile ở 8 exact SM, không chạy), và chưa ô nào lên `release_supported` (cần `git.dirty = false`). Registry có 1 515 ô (xem `build-b9/REPORT.md` cho số theo status). Gate còn mở: exact SM khác SM86; mục tiêu ≥ 85% băng thông đọc weight của B5 ở LUT/NF4, các format GGUF dưới 4 bit (Q2_K, Q3_K, IQ1–IQ3) và AWQ/GPTQ (sát ngưỡng), trong khi fp4, fp8, int8 và 11/20 format GGUF đã đạt; prefill delta rule chunked cho KDA theo batch (math tensor core 0.88–0.98× kernel recurrent; GDN và KDA một chuỗi nhanh hơn 1.5–2.7×, xem B9). Parity thật đã chạy với FlashInfer 0.7.2 (24 test) và `causal-conv1d` 1.7.0 (18 test). `act_and_mul_quant` (activation.h) đã có thân, launcher, binding và ô registry SM86 `benchmarked`; chỉ `masked_act_and_mul` còn là TODO (khai báo, chưa có định nghĩa). Các family chưa có kernel (B11 trở đi) có header contract `csrc/<family>/<family>.h` cùng `execution/launch.h`, `execution/persistent.cuh`, `runtime/registry.h`, `runtime/trace.h`; chữ ký của chúng nằm trong các khối `#if 0` ("brief") và khớp từng tên với các bảng dưới đây. Các header này còn dùng 16 kiểu dùng chung chưa được khai báo trong `csrc/common/` (danh sách ở AGENTS.md, mục "Contract-only headers"). Bản gốc kiểu `kops::` nằm ở `docs/legacy-contracts/`; `gemm/quant_gemm_kernels.cuh` cũ là header gộp đã bị thay thế bởi `mixed_input_gemm`, `gguf_gemm` và `fp4_gemm`, nên không được mang sang.
-- **Bổ sung hiện trạng (2026-10-28).** Sau ngày trên còn có thân: B17 (5 kernel, `attention/lowbit.cu`, `moe/fused_moe.cu`), 8/11 kernel B12 (`communication/allreduce.cu`, `ep.cu`; kiểm ở `world_size = 1`, `build-b12/REPORT.md`), `gemm_wgmma_kernel` của B11 (ô arch `gemm/sm90a_impl.cuh`, chưa chạy) và `task_queue_reset_kernel` của B16. Bộ test đầy đủ trên SM86 (SOTA-PLAN S2/S3): 30 043 passed / 406 skipped / 0 failed. Chi tiết theo bước ở §3.1.
-- **Phần cứng (§2).** Máy dev chỉ có một GPU SM86 (RTX 3050 Laptop, 4 GB VRAM), chạy WSL2 với CUDA 12.9, nên compile được cả 8 exact SM. Kernel, test và adapter nhắm SM khác (SM80, SM89, SM90a, SM100a/103a/120a/121a), nhiều GPU hoặc VRAM lớn vẫn được viết đủ theo vòng sáu việc, sau khi học code đã chạy thật trong sáu project reference. Chúng không chạy được ở máy dev: ô (kernel, SM) đó dừng ở `authored`/`compiled` kèm evidence twin và SASS (§2.2 mục 6, §3.2). Bộ test viết sẵn thành gói bàn giao cho bất kỳ ai có đúng phần cứng (§2.5, Phụ lục B). Không thêm file: bộ test nằm trong `tests/test_<family>.py`, evidence nằm trong registry.
+- **Nhịp và ngân sách file (§1).** Đơn vị công việc là một hàng của bảng kernel, gọi là *nhịp*, và mọi nhịp theo cùng một vòng năm việc. Số file mới tăng theo family, theo nhóm kernel (một file `.cu`) và theo ô arch (một ô của lưới family × arch), không tăng theo kernel; trần nằm ở Phụ lục E.
+- **Hiện trạng (2026-10-31).** 5/233 kernel có thân trong 3 file `.cu`: `csrc/norm/norm.cu` (2), `csrc/activation/activation.cu` (2), `csrc/attention/merge.cu` (1). 11 launcher công khai còn trả `kNotImplemented` (7 ở `norm`, 2 ở `activation`, 2 ở `merge`) cộng 2 nhánh dispatch chưa phủ hết `ActFn`. `tests/unit/test_m1.cc` phủ 5 kernel này bằng oracle fp64 và contract lỗi; chưa có benchmark hay bảng registry. `tools/check_roadmap.py` đang pass với 233 kernel được gán đúng một bước.
+- **Phần cứng (§2).** Máy dev chỉ có một GPU SM86 (RTX 3050 Laptop, 4 GB VRAM), chạy WSL2 với CUDA 12.9, nên compile được cả 8 exact SM. Kernel nhắm SM khác (SM80, SM89, SM90a, SM100a/103a/120a/121a), nhiều GPU hoặc VRAM lớn vẫn được viết đủ theo vòng năm việc, sau khi đọc code đã chạy thật trong sáu project reference. Chúng không chạy được ở máy dev: ô (kernel, SM) đó dừng ở `authored`/`compiled` kèm evidence twin và SASS (§2.2 mục 6, §3.2). Bộ test C++ viết sẵn thành gói bàn giao cho bất kỳ ai có đúng phần cứng (§2.5, Phụ lục B). Không thêm file: test nằm trong `tests/unit/test_<family>.cc`, benchmark trong `benchmark/bench_<family>.cc`, evidence nằm trong registry.
 
 Bước được đặt tên `B0…B17`, mốc model là `Mốc 1…10`. Cách đặt tên này tránh trùng với nhãn ưu tiên P0/P1/P2 của proposal và với mã catalog (A01, M01, …). Bước mở nhiều việc cùng lúc được chia thành đợt, đặt tên `B0.1…B0.2` và `B1.1…B1.3` (§1.4).
 
@@ -32,24 +31,24 @@ Bước được đặt tên `B0…B17`, mốc model là `Mốc 1…10`. Cách �
 
 ### 0.2 Nguyên tắc
 
-1. **Adapter trước, native sau.** Op khó (GEMM, attention, MLA, grouped GEMM, chunked linear attention, collectives, EP) có ngay từ sớm một hàng registry trỏ tới provider ngoài (`kCublasLt`, `kCutlass`, `kFlashInfer`, `kDeepGemm`, `kFlashMLA`, `kFLA`, `kNccl`, `kDeepEP`). Nhờ vậy model chạy end-to-end và test conformance có từ đầu.
-   - Kernel native thay adapter khi qua numerics và thắng benchmark.
-   - `registry::select` không bao giờ đổi sang candidate làm thay đổi semantics.
-   - Trên máy chỉ có SM86, `kDeepGemm`, `kFlashMLA`, `kTrtllmGen` và `kDeepEP` không chạy được. Vai trò "chuẩn đối chiếu có từ sớm" của chúng do reference PyTorch chính thức của FlashMLA và DeepGEMM, cùng HF transformers, đảm nhận (§3.3 K1). Bản thân adapter chỉ đạt `authored`.
-2. **Bước đo độ khó kernel, Mốc đo model chạy được.** Bước đi theo thứ tự dễ → khó, trong giới hạn phụ thuộc (ghi chú dưới bảng 0.3). Mốc ghi lại tập model chạy được khi đủ bước và adapter.
+1. **Native-first, không adapter trong giai đoạn này.** Mọi op đi thẳng vào kernel native trong `csrc/<family>/*.cu`. `GemmBackend` và `Provider` trong header giữ nguyên ABI, nhưng chỉ `kNative` được cài; `kCublasLt`, `kCutlass`, `kDeepGemm`, `kFlashInfer`, `kFlashMLA`, `kTrtllmGen`, `kNccl`, `kDeepEP`, `kFLA`, `kTriton`, `kMarlin`, `kMachete` trả `kUnsupportedBackend` hoặc `kNotImplemented` cho tới giai đoạn sau. Không có `csrc/providers/`.
+- Kernel native là đường duy nhất; không có fallback ngầm.
+- `registry::select` chỉ chọn candidate `kNative` đã `release_supported`; không bao giờ đổi semantics.
+- Không thêm provider file; `bindings/c_api` chỉ mở khi có consumer FFI thật.
+2. **Bước đo độ khó kernel, Mốc đo mức phủ native.** Bước đi theo thứ tự dễ → khó, trong giới hạn phụ thuộc. Mốc model-level (chạy checkpoint thật) thuộc giai đoạn tích hợp engine, ngoài repo này; gate của repo là phủ kernel và conformance cấp layer bằng golden vector (§3.5).
 3. **Thứ tự kiến trúc:** SM80 → SM89/SM120 → SM90a → SM100a/SM103a.
    - SM120/121 dùng `mma.sync` (thêm block-scale) nên tái sử dụng khung SM80 và dễ hơn SM100, dù ra đời sau Hopper.
    - SM100 là mô hình lập trình mới (TMEM, `tcgen05`, 2-CTA, CLC) nên làm cuối.
 4. **Điều kiện ra bước:**
    - Mọi kernel của bước đạt `numerically_validated` trên các SM bắt buộc của bước và đã `benchmarked`.
-   - Với ô (kernel, SM) mà máy dev không chạy được, điều kiện ra bước là **Gate dev** (§2.2): `authored` kèm bộ test viết sẵn đủ. **Không có "handoff kit (tuỳ chọn)"**: lộ trình kết thúc ở Gate dev của mọi bước và Mốc-dev (§3.5). Handoff kit (§2.5) chỉ là tài liệu tuỳ chọn để nâng status khi có phần cứng, không chặn bước nào.
-   - `release_supported` là điều kiện của Mốc, không chặn bước kế tiếp: có thể tối ưu song song.
+   - Với ô (kernel, SM) mà máy dev không chạy được, điều kiện ra bước là **Gate dev** (§2.2): `authored` kèm bộ test C++ viết sẵn đủ. Lộ trình kết thúc ở Gate dev của mọi bước; handoff kit (§2.5) chỉ là tuỳ chọn để nâng status khi có phần cứng, không chặn bước nào.
+   - `release_supported` là điều kiện của layer conformance, không chặn bước kế tiếp: có thể tối ưu song song.
    - Nhịp có điều kiện (§1.1) chỉ cần xong khi điều kiện của nó đúng; nó không chặn ra bước.
 5. **Không suy diễn giữa kiến trúc.** Kết quả trên SM100 không chứng minh gì cho SM103 hay SM120. Mỗi exact SM có compile log, test và benchmark riêng.
-6. **Nhịp là một hàng bảng.** Mỗi nhịp theo cùng một vòng sáu việc (§1.1) và chỉ xong khi kernel của hàng đó `numerically_validated`. Bước nào mở quá hai family hoặc quá 15 file mới thì chia đợt (§1.4).
-7. **File tăng theo family, nhóm kernel (một file `.cu`) và ô arch, không theo kernel.** Nhịp thêm chỉ sửa file có sẵn; chỉ nhịp mở (và adapter ở Mốc) tạo file, và chỉ ở các vị trí cố định của §1.2.
-8. **Một máy SM86 là đủ để viết hết, không đủ để chứng minh hết (§2.2 mục 6, §3.2).** Mọi kernel đều được viết, compile cho đúng exact SM và đẩy lên mức bằng chứng cao nhất mà SM86 cho phép: chạy thật nếu thân chạy được trên SM80-class, còn không thì twin, SASS và oracle chính thức. Bằng chứng gián tiếp không bao giờ được ghi thành `numerically_validated` của exact SM khác.
-9. **Nguồn chính thức thắng nguồn cộng đồng.** Với semantics riêng của DeepSeek, thứ tự tin cậy là: code chính thức (FlashMLA, DeepGEMM, `inference/` trong repo checkpoint), rồi bản port độc lập chạy được (HF transformers), rồi code cộng đồng (`attn-rs:deepseek_v4/`). Một ⚠ chỉ được gỡ bằng nguồn ở bậc đầu (R6). Bậc thứ hai dùng làm oracle chạy được, và PR ghi rõ bậc nào đã được dùng.
+6. **Nhịp là một hàng bảng.** Mỗi nhịp theo cùng một vòng năm việc (§1.1) và chỉ xong khi kernel của hàng đó `numerically_validated`. Bước nào mở quá hai family hoặc quá 15 file mới thì chia đợt (§1.4).
+7. **File tăng theo family, nhóm kernel (một file `.cu`) và ô arch, không theo kernel.** Nhịp thêm chỉ sửa file có sẵn; chỉ nhịp mở tạo file, và chỉ ở các vị trí cố định của §1.2.
+8. **Một máy SM86 là đủ để viết hết, không đủ để chứng minh hết (§2.2 mục 6, §3.2).** Mọi kernel đều được viết, compile cho đúng exact SM và đẩy lên mức bằng chứng cao nhất mà SM86 cho phép: chạy thật nếu thân chạy được trên SM80-class, còn không thì twin, SASS và oracle fp64. Bằng chứng gián tiếp không bao giờ được ghi thành `numerically_validated` của exact SM khác. Không dùng PyTorch để làm oracle trong giai đoạn này.
+9. **Nguồn chính thức là provenance, không phải oracle chạy được.** Với semantics riêng của DeepSeek, thứ tự tin cậy vẫn là code chính thức (FlashMLA, DeepGEMM, `inference/` trong repo checkpoint), rồi bản port độc lập, rồi code cộng đồng. Nhưng K1 (nạp reference PyTorch của upstream) và K2 (`torch.utils.cpp_extension.load_inline`) bị **deferred**; oracle chạy được của repo là `csrc/reference/` fp64 và golden vector. Một ⚠ chỉ được gỡ bằng nguồn bậc đầu (R6).
 
 ### 0.3 Toàn cảnh
 
@@ -75,7 +74,7 @@ Bước được đặt tên `B0…B17`, mốc model là `Mốc 1…10`. Cách �
 | — | B17 | Thử nghiệm (low-bit KV, expert 2-bit) | ★★★★ | 5 | B7, B8 | — | đủ | — |
 | | | **Tổng** | | **233** | | | | |
 
-Cột **Máy dev** cho biết bước chạy được tới đâu trên máy dev SM86 (§2.1): "đủ" nghĩa là mọi kernel của bước có `numerically_validated` ở dev (với B14–B16 là qua thân SM80-class, §3.3 K3). Cột **Handoff** liệt kê kit tuỳ chọn (Phụ lục B), nằm ngoài lộ trình (§2.5). Phần chạy được ở dev vẫn phải chạy lại ở từng lô, vì kết quả SM86 không thay cho SM khác (nguyên tắc 5). Ô nào máy dev không chạy được dừng ở `authored` hoặc `compiled`, kèm evidence twin và SASS (§2.2 mục 6). Thứ tự thực hiện chỉ với SM86 nằm ở §3.4: nó làm thân SM80-class của B14 và B15 trước thân Hopper/Blackwell của B11 và B13.
+Cột **Máy dev** cho biết bước chạy được tới đâu trên máy dev SM86 (§2.1): "đủ" nghĩa là mọi kernel của bước có `numerically_validated` ở dev (với B14–B16 là qua thân SM80-class, §3.3 K3). Cột **Handoff** liệt kê kit tuỳ chọn (Phụ lục B), nằm ngoài lộ trình (§2.5). Phần chạy được ở dev vẫn phải chạy lại ở từng lô, vì kết quả SM86 không thay cho SM khác (nguyên tắc 5). Ô nào máy dev không chạy được dừng ở `authored` hoặc `compiled`, kèm evidence twin và SASS (§2.2 mục 6). Thứ tự thực hiện chỉ với SM86 nằm ở §3.4: P1 làm B0–B10 + B17 trước, rồi P2–P7.
 
 Thứ tự bước là phụ thuộc trước, độ khó sau, nên độ khó không tăng đơn điệu: B4 (★–★★) đứng sau B3 (★★–★★★) vì phụ thuộc B3, và B15 (★–★★★★) đứng sau B14 (★★★★–★★★★★) vì phụ thuộc B14. B8 (★★–★★★) đứng sau B7 (★★★–★★★★) theo số thứ tự, nhưng cột phụ thuộc chỉ ghi B2, B3, nên làm song song được với B7 (Phụ lục D).
 
@@ -117,53 +116,41 @@ flowchart LR
 
 ### 0.4 Mốc model
 
-| Mốc | Sau bước | Native vs adapter | Model chạy được |
+| Mốc | Sau bước | Phạm vi native | Model / gate (engine integration) |
 |---|---|---|---|
-| Mốc 1 | B0–B2 | Elementwise/KV native; GEMM, attention, top-k/top-p qua adapter | Dense BF16/FP16: GPT-2 → Llama 3.x, Qwen 1.5–3 dense, Gemma 1–3, Phi, Mistral, … |
-| Mốc 2 | B3–B6 | Quant/routing/permute/GEMV native; FP8/grouped/MLA qua adapter | Checkpoint FP8/INT8; MoE: Mixtral, Qwen MoE, DeepSeek-V2/V3/R1, Kimi K2, GLM-4.5, MiniMax-M2 |
-| Mốc 3 | B7–B8 | Native hoàn toàn trên SM80/86/89/120 (trừ MLA) | + W4A16/W8A16, W8A8, GGUF, LoRA, GPT-OSS, Llama 4, DBRX |
+| Mốc 1 | B0–B2 | Elementwise/KV native | Dense BF16/FP16 |
+| Mốc 2 | B3–B6 | Quant/routing/permute/GEMV native | Checkpoint FP8/INT8; MoE |
+| Mốc 3 | B7–B8 | Native trên SM80/86/89/120 | + W4A16/W8A16, W8A8, GGUF, LoRA, GPT-OSS, Llama 4, DBRX |
 | Mốc 4 | B9 | + recurrent native | Mamba 1/2, Jamba, Nemotron-H, Granite-4.0-H, MiniMax-01/M1, Qwen3-Next, Kimi Linear, LFM2 |
-| Mốc 5 | B10 | + speculative | MTP, EAGLE, n-gram, tree draft, spec cho model hybrid |
+| Mốc 5 | B10 | + speculative | MTP, EAGLE, n-gram, tree draft |
 | Mốc 6 | B11 | Native trên SM90a | DeepSeek-V3/R1/V3.1, Kimi K2/K2.5, GLM-4.5/4.6, Qwen3 FP8, GPT-OSS trên Hopper |
-| Mốc 7 | B12 | Collectives và EP native | TP/EP không cần NCCL/DeepEP trên đường nóng |
-| Mốc 8 | B13 | Native trên SM100a/103a/120a/121a | NVFP4, MXFP8, FP8-UE8M0, GPT-OSS W4A8-MX trên Blackwell |
+| Mốc 7 | B12 | Collectives và EP native | TP/EP không cần NCCL/DeepEP |
+| Mốc 8 | B13 | Native trên SM100a/103a/120a/121a | NVFP4, MXFP8, FP8-UE8M0, GPT-OSS W4A8-MX |
 | Mốc 9 | B14 | DSA native | DeepSeek-V3.2 |
 | Mốc 10 | B15 | Toàn bộ | DeepSeek-V4/V4.1 Flash/Pro, Kimi K3 |
 
-Chi tiết điều kiện và gate của từng Mốc nằm ở cuối bước mở Mốc đó. Gate thay thế chạy được chỉ với SM86 (Mốc-dev) nằm ở §3.5.
+Chi tiết điều kiện và gate của từng Mốc nằm ở cuối bước mở Mốc đó. **Trong giai đoạn C++-only, Mốc model-level không phải gate của repo**: nó chỉ chạy khi engine tích hợp (ngoài repo) gọi các kernel này. Gate thay thế là **layer conformance** bằng golden vector C++ (§3.5), dùng `csrc/reference/` và dữ liệu sinh offline; không cần PyTorch ở runtime.
 
-**Mốc và phần cứng.** Mốc-dev (§3.5) chỉ cần Gate dev của các bước; Mốc đầy đủ (bảng trên) cần phần cứng thật và chỉ đóng khi có handoff kit (tuỳ chọn). Gate model có hai dạng khác nhau về VRAM:
-- "Một layer khớp HF transformers" (trọng số đúng shape): chạy được ở máy dev khi layer vừa 4 GB. transformers 5.20.2 đã có trong `.venv-linux` (kiểm 2026-10-28), gồm cả `deepseek_v32`, `deepseek_v4`, `qwen3_next`, `kimi_linear`; layer không vừa 4 GB thì dùng cấu hình thu nhỏ (§3.3 K6).
-- "Greedy decode khớp vLLM trên checkpoint đầy đủ": cần VRAM bằng checkpoint và vLLM (Linux). Mốc 1 cần ≥ 24 GB (Llama-3.1-8B bf16 khoảng 16 GB; handoff kit `sm89` hoặc `sm80`). Mốc 2 và 6 cần GPU 80 GB trở lên cho MoE cỡ vừa và nhiều GPU cho DeepSeek-V3 / Kimi K2. Mốc 7 chạy ở handoff kit `multi`, Mốc 8 ở `sm120a`/`sm100a`/`sm103a`, Mốc 9 và 10 cần nhiều GPU `sm90a`/`sm100a`.
+**Mốc và phần cứng.** Gate cấp layer chạy được ở máy dev khi layer vừa 4 GB; model đầy đủ vẫn cần phần cứng thật và engine. Với model quá lớn cho một lô, gate của Mốc được thay bằng conformance từng layer với trọng số đúng shape.
 
-Với model quá lớn cho một lô, gate của Mốc được thay bằng conformance từng layer với trọng số đúng shape; việc thay phải ghi trong gate của Mốc đó.
+### 0.5 Provider adapter (deferred)
 
-### 0.5 Adapter tạm thời → kernel native thay thế
+Không provider nào được cài trong giai đoạn này. `GemmBackend`/`Provider` enum trong header vẫn giữ nguyên giá trị ABI, nhưng chỉ `kNative` có implementation; mọi giá trị khác trả `kUnsupportedBackend` hoặc `kNotImplemented`. Không có `csrc/providers/`, không có file provider, không có gate hay Mốc nào phụ thuộc adapter.
 
-| Op (catalog) | Adapter (Provider) | Native thay ở |
+| Op (catalog) | Backend tương lai (nếu mở lại) | Ghi chú |
 |---|---|---|
-| G01 dense GEMM BF16/FP16/TF32 | `kCublasLt` | B7 (SM80/86/89/120), B11 (SM90a), B13 (SM100a/103a, SM120a block-scaled) |
-| G03 FP8 tensorwise/rowwise | `kCublasLt` | B7 (SM89/120), B11, B13 |
-| G03 FP8 blockwise (+UE8M0) | `kDeepGemm` (SM90: scale fp32, 1D2D; SM100: scale UE8M0 packed, 1D1D). `kCublasLt` chỉ khi bản CUDA có scale mode blockwise (R5) | B7 (M ≤ 64), B11, B13 |
-| G03 INT8 W8A8 | `kCutlass` | B7, B11, B13 |
-| G04 W4A16/W8A16 | không có adapter (Marlin port thẳng thành native) | B7 |
-| G05 FP4/MX block-scaled | `kCublasLt` (block-scaled Blackwell), `kCutlass`, `kTrtllmGen` | B13 |
-| G06 grouped / MoE | `kCutlass` (grouped), `kDeepGemm` (contiguous / masked / psum, BF16 và FP8×FP4), `kTrtllmGen` | B7, B11, B13 |
-| G05/G06 FP8 activation × FP4 weight (MXFP4) | `kDeepGemm` (`fp8_fp4_gemm_*`, `m_grouped_fp8_fp4_gemm_*`, SM100) | B13 |
-| Batched / einsum FP8 (`bhr,hdr->bhd` của Wv V4.1) | `kDeepGemm` (`fp8_einsum`, `einsum`) | B7 (`fp8_bmm_kernel`), B11 (chế độ batched của `fp8_gemm_wgmma_kernel`), B13 |
-| A01–A06 prefill/decode | `kFlashInfer` | B8 (lớp SM80), B11 (instantiation SM90a), B13 (instantiation SM100a/120a) |
-| A12 MLA decode | `kFlashMLA` (dense chỉ có ở bản `ba89a34`, SM90; bản `395cb3a` chỉ có sparse), `kFlashInfer` | B11 |
-| A11/A13 DSA | `kFlashMLA` sparse (SM90 và định dạng V3.2/V4.0 ở `ba89a34`; SM100/103 và V4.1 ở `395cb3a`, gồm biến thể fused Q-RoPE + attention + O-RoPE + cast FP8), `kDeepGemm` (MQA logits FP8 SM90; FP8/FP4, paged và sparse indexer SM100) | B14 |
-| mHC (`hc_*`, `mega_mhc`) | `kDeepGemm` (`tf32_hc_prenorm_gemm` SM90/SM100, `mega_mhc` SM100) | B15 |
-| MoE gate V4 (router GEMM + top-k sqrtsoftplus) | `kDeepGemm` (`bf16_mega_gate`, SM100) | B6 (đã có thân), dòng instantiation của B15 |
-| Mega MoE (EP dispatch + W13 + SwiGLU + W2 + combine) | `kDeepGemm` (`fp8_fp4_mega_moe`, `bf16_mega_moe`, SM100, symmetric memory) | B16 (`mega_moe_ep_kernel`, `mega_moe_local_kernel`) |
-| L02 Mamba / GDN / KDA / lightning | `kFLA`, `kTriton` | B9 |
-| S01 top-k/top-p | `kFlashInfer` | B6 |
-| C01 collectives | `kNccl` | B12 |
-| C02 EP dispatch/combine | `kDeepEP` | B12 |
-| comm-GEMM | không có (GEMM rồi NCCL tuần tự) | B12 |
+| G01 dense GEMM | `kCublasLt` | B7/B11/B13 native thay |
+| G03 FP8/INT8 | `kCublasLt`, `kCutlass`, `kDeepGemm` | native ở B7/B11/B13 |
+| G05 FP4/MX | `kCublasLt`, `kCutlass`, `kTrtllmGen` | native ở B13 |
+| G06 grouped/MoE | `kCutlass`, `kDeepGemm` | native ở B7/B11/B13 |
+| A01–A06 attention | `kFlashInfer` | native ở B8/B11/B13 |
+| A12 MLA | `kFlashMLA`, `kFlashInfer` | native ở B11 |
+| A11/A13 DSA | `kFlashMLA`, `kDeepGemm` | native ở B14 |
+| mHC / gate V4 / Mega MoE | `kDeepGemm` | native ở B15/B16 |
+| L02 Mamba/GDN/KDA | `kFLA`, `kTriton` | native ở B9 |
+| C01/C02 | `kNccl`, `kDeepEP` | native ở B12 |
 
-Trên máy dev (SM86) không adapter nào trong `kDeepGemm`, `kFlashMLA`, `kTrtllmGen`, `kDeepEP` chạy được: DeepGEMM chỉ chạy trên SM90/SM100 (compile JIT lúc chạy), FlashMLA `395cb3a` chỉ trên SM100/103 và cần CUDA ≥ 13.1. Các hàng adapter của chúng dừng ở `authored`. Ở dev, vai trò đối chiếu do reference PyTorch của chính hai project đảm nhận (§3.3 K1).
+Bảng này chỉ để tra cứu lịch sử và provenance; nó không phải điều kiện của bước, nhịp hay Mốc. Khi một consumer thật cần backend ngoài, mở lại thành một giai đoạn riêng có file provider và test riêng.
 
 ### 0.6 Dự án tham chiếu (cột Reference)
 
@@ -188,7 +175,7 @@ Mỗi bảng kernel có thêm cột **Reference**, trỏ tới code tương tự
 - Mọi đường dẫn và tên hàm trong cột đã được kiểm tra là tồn tại ở bản tải về ngày 2026-10-01. Các project đổi nhanh, nên kiểm lại khi một đường dẫn không còn khớp. Kiểm lại 2026-10-28 với bản trong `3rd/`: 221 đường dẫn còn đúng; 6 đường dẫn không còn ở bản vendor: `sglang:elementwise/dsv4_norm_rope.cu`, `sglang:infllm_v2/*` (ba file), `vllm:libtorch_stable/moe/dsv3_router_gemm_float_out.cu` (bản SGLang cùng tên vẫn có ở `sglang:gemm/`), `vllm:libtorch_stable/quantization/gptq_allspark/allspark_utils.cuh`. Đường dẫn `flashmla:` và `deepgemm:` được kiểm ngày 2026-10-28.
 
 **Lưu ý khi dùng.**
-1. Chỉ lấy thuật toán, layout và edge case. Bỏ lớp framework của reference (`torch::stable::Tensor`, `TORCH_LIBRARY`, FFI Rust/candle): entry point của repo này nhận `at::Tensor` và báo lỗi bằng exception (`AYAKA_CHECK`, `TORCH_CHECK`), còn lõi `launch_*` nhận con trỏ thiết bị và `cudaStream_t` (cùng kiểu với hpc-ops).
+1. Chỉ lấy thuật toán, layout và edge case. Bỏ lớp framework của reference (`torch::stable::Tensor`, `TORCH_LIBRARY`, FFI Rust/candle): entry point của repo này nhận `kops::Tensor` và trả `kops::Status`; lõi kernel nhận con trỏ thiết bị và `kops_stream_t` (cùng kiểu với hpc-ops).
 2. Port thân kernel thì ghi commit, đường dẫn và license vào `THIRD_PARTY_NOTICES.md` trước khi merge (R7).
 3. `hpc-ops` chỉ nhắm SM90 (kèm một kernel SM100) và tối ưu cho H20. Ô ghi "SM90" nghĩa là không chạy được trên SM80/86/89: ở B1–B8 chỉ lấy ý tưởng, từ B11 mới dùng làm khung.
 4. `attn-rs`: nhiều file chỉ là adapter gọi FlashInfer/FlashMLA/TRT-LLM (`flashinfer_*.cu`, `trtllm/`), ô ghi "adapter" khi gặp. Các kernel trong `deepseek_v4/` và `qwen4/` là bản cộng đồng, không phải code chính thức: ô ghi ⚠ vẫn phải xác nhận bằng code chính thức theo R6.
@@ -196,7 +183,28 @@ Mỗi bảng kernel có thêm cột **Reference**, trỏ tới code tương tự
 6. `vllm`: thư mục `attention/` chỉ có header dtype và kernel attention (paged/flash) không nằm trong `csrc` của bản này, nên các hàng attention chủ yếu lấy reference từ attn-rs, hpc-ops và SGLang.
 7. `flashmla`: bản `395cb3a` chỉ còn SM100/103 (sparse decode và prefill cho V4.1, kernel fused norm + RoPE + attention + RoPE + cast, FMHA dense CUTLASS fwd/bwd) cùng hai kernel không phụ thuộc arch trong `csrc/cuda_kernels/smxx/` (metadata của tile scheduler, combine split-KV). Hopper, MLA decode dense và các định dạng V3.2 (656 B/token) và V4.0 (584 B/token) chỉ còn ở `ba89a34`. Định dạng KV và reference nằm ở `tests/quant.py` và `tests/ref.py` (PyTorch thuần). Quy ước khác repo này: query không có key hợp lệ trả LSE = +inf (repo này: −inf), và sink nhân vào output mà không vào LSE trả về (§3.3 K1). License MIT.
 8. `deepgemm`: kernel viết tay (CuTe ít, PTX qua `deep_gemm/include/deep_gemm/ptx/*`), compile JIT lúc chạy và chọn cấu hình bằng heuristic (`csrc/jit_kernels/heuristics/*`). Tên `D = C + A @ B.T` theo layout NT. Scale SM90 là fp32, scale SM100 là UE8M0 đóng 4 giá trị vào một int32, MN-major, căn TMA. Các kernel `k_grouped_*`, `batched_syrk`/`batched_symm` phục vụ huấn luyện (wgrad, optimizer), nằm ngoài phạm vi repo này. `deep_gemm/legacy/*.py` là Triton, chạy được trên SM86. License MIT.
-9. Phần không phụ thuộc arch của FlashMLA và DeepGEMM (`smxx`, `smxx_layout.cuh`, `scheduler/gemm.cuh`) được compile cho SM86 lúc chạy test và đối chiếu bit-exact (§3.3 K2). Phần chỉ chạy trên SM90/SM100 là nguồn đã chứng minh (§2.3), không phải đối tượng chạy ở dev.
+9. Phần không phụ thuộc arch của FlashMLA và DeepGEMM (`smxx`, `smxx_layout.cuh`, `scheduler/gemm.cuh`) là nguồn đọc; K2 (`load_inline` bằng PyTorch) bị **deferred**, nên không compile hay chạy chúng trong giai đoạn C++-only. Phần chỉ chạy trên SM90/SM100 vẫn là nguồn đã chứng minh (§2.3), không phải đối tượng chạy ở dev.
+10. **Quy ước gate trong bảng kernel.** Mọi câu "bit-exact với X" / "khớp X" (vLLM, CUTLASS, FlashInfer, DeepGEMM, FlashMLA, HF) được đọc là **khớp oracle fp64 hoặc golden vector của repo**; X chỉ là provenance và chỉ được chạy khi có second implementation. Không thêm dependency vào build/test vì một ô gate.
+
+### 0.7 Chiến lược binding (2026-10-31)
+
+Repo không có tầng binding framework. Ba tầng của một kernel:
+
+| Tầng | File | Vai trò | Trong giai đoạn này |
+|---|---|---|---|
+| API C++ | `csrc/<family>/ops.h` | contract duy nhất: `kops::Status`, `Tensor`, `LaunchContext`, `Workspace` | đã đủ cho 233 kernel; không sửa khi implement |
+| Device | `csrc/<family>/*_kernels.cuh` | `__global__`, param struct, layout, launch notes | chỉ sửa khi contract kernel đổi (PR riêng + `KOPS_ABI_VERSION++`) |
+| Cài đặt | `csrc/<family>/<stem>.cu` | kernel anonymous-namespace + launcher + instantiation | thêm dần theo bảng bước |
+
+Luật:
+
+1. **Không có binding framework.** Không `csrc/bindings/`, `torch_binding.cpp`, pybind, `python/`, `setup.py`. API C++ trong `ops.h` là binding duy nhất.
+2. **Không third-party.** `KOPS_WITH_TORCH=OFF`, `KOPS_WITH_CUTLASS=OFF`; không CUTLASS/CuTe/CCCL/PyTorch. Kernel dùng CUDA C++ (`mma.sync`, `cp.async`, `wgmma`, `tcgen05`), intrinsic và inline PTX khi cần.
+3. **Header giữ nguyên.** Thêm kernel không sửa `ops.h`/`*_kernels.cuh`. Nếu thiếu khai báo, mở PR contract riêng, cập nhật `KOPS_ABI_VERSION`, không gộp vào PR kernel.
+4. **Provider enum là ABI, provider code thì không.** `GemmBackend`/`Provider` giữ nguyên giá trị; chỉ `kNative` được cài. Giá trị khác trả `kUnsupportedBackend`/`kNotImplemented`.
+5. **C ABI để sau.** `bindings/c_api/kops_c.h` (+ `kops_c.cpp`) là bề mặt FFI duy nhất; chỉ thêm entry point khi có consumer Rust/C/Go thật. Không tạo file theo family, không phải điều kiện của nhịp.
+6. **Test/benchmark C++.** `tests/unit/test_<family>.cc` + `tests/unit/harness.h`; `benchmark/bench_<family>.cc` + `benchmark/harness.h`. Chạy bằng `ctest`; không pytest, không marker Python.
+7. **Python chỉ ở build tooling.** `tools/check_*.py` và `tools/gen_registry.py` được phép; không có Python runtime, test hay benchmark.
 
 ---
 
@@ -205,7 +213,7 @@ Mỗi bảng kernel có thêm cột **Reference**, trỏ tới code tương tự
 Phần này đặt ra hai quy ước mà các bảng bước không tự nêu: đơn vị công việc và trần số file.
 
 - **Đơn vị công việc.** Một bước có từ 2 đến 32 kernel và từ 1 đến 11 hàng bảng kernel (đếm theo hàng kernel gốc, không tính hàng instantiation); B1 mở 6 family. 16 trong 40 nhóm kernel (file `.cu`) bị chạm ở từ 2 bước trở lên (6 nhóm ở 4 bước: 5 nhóm `gemm/*` và `moe/fused_moe`), và family `attention` xuất hiện ở 6 bước. Vì vậy cần một đơn vị chung để các bước chạy cùng một nhịp.
-- **Trần số file.** Nếu mỗi kernel kéo theo một chuỗi file riêng (thân, instantiation, test, dòng registry, case benchmark) thì 233 kernel cho khoảng 1.165 file (ước lượng minh họa: 233 × 5). Trần ở đây tính theo family, nhóm kernel và ô arch: 140 file nguồn mới, cộng tối đa 10 provider (Phụ lục E).
+- **Trần số file.** Nếu mỗi kernel kéo theo một chuỗi file riêng (thân, instantiation, test, dòng registry, case benchmark) thì 233 kernel cho khoảng 1.165 file (ước lượng minh họa: 233 × 5). Trần ở đây tính theo family, nhóm kernel và ô arch: **112 file nguồn mới**, không có provider (Phụ lục E).
 
 Quy ước dưới đây không đổi bước nào chứa kernel nào, không đổi Mốc và cột Reference. Nó định nghĩa đơn vị công việc và nơi mỗi thứ được phép nằm. Ngoài ra §1.1 làm rõ một điểm của nguyên tắc 4: bốn hàng tự ghi "chỉ làm khi …" không chặn ra bước.
 
@@ -213,22 +221,21 @@ Quy ước dưới đây không đổi bước nào chứa kernel nào, không �
 
 Một **nhịp** là một hàng của bảng kernel (ô Header cùng danh sách Kernel của hàng đó). Mỗi hàng của bảng "Instantiation mới cho kernel đã có" ở B11, B13, B14 và B15 cũng là một nhịp. Roadmap có 125 nhịp (115 hàng kernel + 10 hàng instantiation; ba hàng instantiation của B14, B15 thêm ngày 2026-10-28 cho định dạng và gate của DeepSeek-V4/V4.1) cho 233 kernel, mỗi bước từ 1 đến 12 nhịp.
 
-Cỡ của một nhịp có hai giới hạn: không quá 4 kernel và không quá 6 file mới (5 file của family và 1 `.cu`). 112 trong 115 hàng kernel có không quá 4 kernel, và 124 trong 125 nhịp tạo không quá 6 file mới. Bốn nhịp vượt ít nhất một giới hạn: B5 hàng 5 (5 kernel GEMV dequant trong register, mở 4 `.cu`), B5 hàng 7 (mở `moe` và 2 `.cu`, tổng 7 file), B9 hàng 6 (5 bước SSD của Mamba-2) và B9 hàng 7 (7 kernel của chuỗi chunk delta rule). Nhịp vượt giới hạn được làm thành các commit con theo thứ tự trong hàng, trong cùng một PR; nhịp xong khi commit con cuối vào và cả hàng `numerically_validated`.
+Cỡ của một nhịp có hai giới hạn: không quá 4 kernel và không quá 4 file mới (3 file của family và 1 `.cu`). 112 trong 115 hàng kernel có không quá 4 kernel, và 124 trong 125 nhịp tạo không quá 4 file mới. Ba nhịp vượt giới hạn kernel: B5 hàng 5 (5 kernel GEMV dequant trong register), B9 hàng 6 (5 bước SSD của Mamba-2) và B9 hàng 7 (7 kernel của chuỗi chunk delta rule). Một nhịp vượt giới hạn file: B5 hàng 7 (mở `moe` và 2 `.cu`, tổng 5 file). Nhịp vượt giới hạn được làm thành các commit con theo thứ tự trong hàng, trong cùng một PR; nhịp xong khi commit con cuối vào và cả hàng `numerically_validated`.
 
 Mỗi nhịp theo cùng một vòng, đúng thứ tự:
 
-1. **Oracle.** Reference fp64 và các case lỗi (dtype, shape, stride, alignment) trong `tests/test_<family>.py`. Chưa viết thân kernel khi chưa có oracle.
+1. **Oracle.** Reference fp64 trong `csrc/reference/` và các case lỗi (dtype, shape, stride, alignment) trong `tests/unit/test_<family>.cc`. Chưa viết thân kernel khi chưa có oracle.
 2. **Thân kernel** trong `<stem>.cu` (nhóm kernel của hàng), hoặc trong ô arch của family nếu dùng tập lệnh riêng của arch (§1.3).
-3. **Launcher** trong cùng file `<stem>.cu`: kiểm tra đầu vào, chọn theo exact SM, thêm một dòng vào danh sách instantiation; khai báo ở `<family>.h`.
-4. **Binding và test:** thêm vào `csrc/bindings/<family>.cc` (hiện cả hai family đã có vẫn được bind trong `csrc/torch_binding.cpp`), chạy test của family. Test của exact SM, số GPU hoặc VRAM mà máy dev không đáp ứng tự `skip` theo marker (§2.4); chúng vẫn phải được viết ở bước 1.
-5. **Registry:** thêm dòng (kernel, SM) vào `registry/capabilities/<family>.yaml`. Status chỉ nâng khi có evidence (Phụ lục A); ô máy dev không chạy được ghi `authored` kèm `needs: <exact SM>` (§2.2).
-6. **Benchmark:** thêm case vào `benchmark/bench_<family>.py`.
+3. **Launcher** trong cùng file `<stem>.cu`: kiểm tra đầu vào, chọn theo exact SM, thêm một dòng vào danh sách instantiation; khai báo đã có trong `csrc/<family>/ops.h` (không sửa header).
+4. **Test + registry:** thêm case vào `tests/unit/test_<family>.cc` và dòng (kernel, SM) vào `registry/capabilities/<family>.yaml`; chạy `ctest -R <family>`. Test của exact SM, số GPU hoặc VRAM mà máy dev không đáp ứng trả mã 77 (`SKIP_RETURN_CODE`) và vẫn phải được viết ở bước 1.
+5. **Benchmark:** thêm case vào `benchmark/bench_<family>.cc`, chạy bằng target C++.
 
 Nhịp xong khi mọi kernel của hàng `numerically_validated` trên các SM của bước mà máy dev chạy được, và mọi ô (kernel, SM) còn lại của hàng ở `authored` đã qua Gate dev (§2.2). Không có gate thứ hai: ô `authored` giữ nguyên cho tới khi có handoff kit. `benchmarked` và các mục riêng của bước được kiểm ở **Gate ra bước**. Trong một luồng (Phụ lục D) các nhịp làm tuần tự theo thứ tự hàng; các luồng khác nhau chạy song song. Mỗi nhịp là một PR độc lập.
 
 Có hai loại nhịp:
 
-- **Nhịp mở** tạo file, chỉ với ba lý do: nhịp đầu tiên của một family (bộ file của family, §1.2); hàng đầu tiên dùng một nhóm kernel chưa có file `.cu`; nhịp đầu tiên cần tập lệnh riêng của một arch trong một family (ô arch). Có 42 nhịp mở (hai nhịp mở ô arch `model_ops`/sm100a và `mega`/sm100a thêm ngày 2026-10-28). Ngoại lệ: `gemm` và `communication` được adapter mở trước nhịp đầu tiên của chúng, ở Mốc 1 và Mốc 2 (§1.3, mục 4 và 5).
+- **Nhịp mở** tạo file, chỉ với ba lý do: nhịp đầu tiên của một family (bộ file của family, §1.2); hàng đầu tiên dùng một nhóm kernel chưa có file `.cu`; nhịp đầu tiên cần tập lệnh riêng của một arch trong một family (ô arch). Có 42 nhịp mở. `gemm` và `communication` mở ở nhịp native đầu tiên của chúng; không có adapter mở trước.
 - **Nhịp thêm** chỉ sửa file đã có. Có 83 nhịp thêm. Phụ lục E.1 cho biết nhịp mở nằm ở bước nào.
 
 Bốn nhịp là **nhịp có điều kiện**: chính ghi chú của hàng, hoặc rủi ro mà nó trỏ tới ở Phụ lục C, nói rằng chỉ làm khi một điều kiện đúng. Đó là B11 hàng instantiation 4 (chunk kernel SSD / delta rule trên Sm90a: "chỉ làm khi benchmark chứng minh có lợi"), B13 hàng 7 (NVFP4 `ds_mla`: R1 giữ `planned` cho tới khi có spec), B14 hàng 5 (block sparse: "ưu tiên thấp vì chưa có model production bắt buộc") và B17 hàng 2 (`moe_w2`: "chỉ làm khi có checkpoint cần"). Cả bốn đều là nhịp thêm và không có file nào của sổ E.1 gắn với chúng. Chúng vẫn thuộc đúng một bước, nhưng không chặn Gate ra bước khi điều kiện chưa đúng; registry giữ chúng ở `planned`. Đây là điểm bổ sung cho nguyên tắc 4: bản gốc đòi mọi kernel của bước xong, nhưng các hàng này tự ghi là làm có điều kiện. Các hàng ⚠ còn lại (B6, B14 hàng 4, B15) không thuộc loại này: Gate ra bước của chúng đòi đặc tả đã được chốt.
@@ -237,39 +244,39 @@ Bốn nhịp là **nhịp có điều kiện**: chính ghi chú của hàng, ho�
 
 | Loại | Đường dẫn | Số lượng | Tạo ở |
 |---|---|---|---|
-| Contract của family | `csrc/<family>/<family>.h` | 1 mỗi family (14) | đã có cho cả 14 family (12 contract-only, `activation` và `model_ops` đã cài đặt); nhịp đầu tiên chỉ sửa nó |
+| API C++ của family | `csrc/<family>/ops.h` | 1 mỗi family (14) | đã có; **không sửa** khi implement kernel |
+| Device contract | `csrc/<family>/*_kernels.cuh` | 1+ mỗi family | đã có phần lớn; chỉ sửa khi contract kernel đổi (PR riêng + ABI) |
 | Nhóm kernel / miền | `csrc/<family>/<stem>.cu` | 1 mỗi nhóm kernel hoặc miền chức năng (46) | hàng đầu tiên dùng nhóm đó |
 | Ô arch | `csrc/<family>/<arch>_impl.cuh`, `<arch>` ∈ `sm90a`, `sm100a`, `sm120a` | 1 mỗi ô của lưới family × arch (7) | nhịp đầu tiên cần tập lệnh riêng của arch |
-| Binding | `csrc/bindings/<family>.cc` | 1 mỗi family (14) | như contract của family |
-| Test | `tests/test_<family>.py` | 1 mỗi family (14) | như contract của family |
-| Benchmark | `benchmark/bench_<family>.py` | 1 mỗi family (14) | như contract của family |
-| Registry | `registry/capabilities/<family>.yaml` | 1 mỗi family (14) | như contract của family |
-| Provider | `csrc/providers/<provider>.cc` | 1 mỗi provider ở §0.5 (tối đa 10) | Mốc cần adapter |
+| Test C++ | `tests/unit/test_<family>.cc` | 1 mỗi family (14) | nhịp đầu tiên của family |
+| Benchmark C++ | `benchmark/bench_<family>.cc` | 1 mỗi family (14) | nhịp đầu tiên của family |
+| Registry | `registry/capabilities/<family>.yaml` | 1 mỗi family (14) | nhịp đầu tiên của family |
+| Harness | `tests/unit/harness.h`, `benchmark/harness.h` | 2 | B0.1 |
 | Hạ tầng | danh sách ở Phụ lục E.2 | 17, cố định | B0.1 (14), Mốc 1 (1), B2 (1), Mốc 2 (1) |
 
-`<stem>` là tên **miền chức năng** của file, lấy từ bộ từ vựng đóng: `host`, `dense`, `moe`, `chunk`, `recurrent`, `stats`, `select`, `sparse`, `lowbit`, `prep`, hoặc tên nhóm kernel gốc (`norm`, `rope`, `kvcache`, `gemm_mma`, `marlin_dense`, …). **Cấm hậu tố số thứ tự** `_part<N>`, `_v<N>`, `_new`, `_old`: mọi `.cu` phải có trong danh mục Phụ lục E.2 và `tools/check_roadmap.py` từ chối tên ngoài danh mục. Một nhóm kernel là một file `.cu` chứa toán học device, kernel `__global__`, launcher, instantiation tường minh và entry point `at::Tensor` của các kernel cùng hàng. `<family>.h` khai báo mọi entry point của mọi nhóm trong family. 14 family là 14 thư mục có `<family>.h`; `execution` không có bộ family riêng: launcher ở `execution/launch.cc`, test và benchmark nằm trong bộ của `mega`.
+`<stem>` là tên **miền chức năng** của file, lấy từ bộ từ vựng đóng: `host`, `dense`, `moe`, `chunk`, `recurrent`, `stats`, `select`, `sparse`, `lowbit`, `prep`, hoặc tên nhóm kernel gốc (`norm`, `rope`, `kvcache`, `gemm_mma`, `marlin_dense`, …). **Cấm hậu tố số thứ tự** `_part<N>`, `_v<N>`, `_new`, `_old`: mọi `.cu` phải có trong danh mục Phụ lục E.2 và `tools/check_roadmap.py` từ chối tên ngoài danh mục. Một nhóm kernel là một file `.cu` chứa toán học device, kernel `__global__`, launcher `kops::Status`, instantiation tường minh. `csrc/<family>/ops.h` khai báo mọi entry point của family; `csrc/<family>/*_kernels.cuh` khai báo `__global__` và param struct. Repo có 14 kernel family + 4 service family (`backends`, `load`, `memory`, `reference`) + `execution`; service family và `execution` không có kernel trong bảng 233.
 
-Trần: 140 file nguồn mới trong sổ theo bước (Phụ lục E.1) = 46 file `.cu` + 14 × 5 file family + 7 ô arch + 17 hạ tầng, cộng tối đa 10 provider, tổng 150 file. Trần chỉ tăng qua một header contract riêng mới (§1.3, mục 6), mỗi lần cần chủ repo duyệt. Đây là trần, không phải số còn thiếu: một phần đã có trong repo (hạ tầng dùng chung và 4 kernel đã có của `activation/` và `model_ops/`). Hai family đó đã theo bố cục này (`activation/activation.h` + `activation.cu`, `model_ops/model_ops.h` + `residual.cu`); chỉ binding (`csrc/torch_binding.cpp`) và benchmark của `model_ops` (`bench_residual_kernel.py`) còn tên cũ, được giữ cho tới khi một nhịp chạm tới family, rồi chỉ di chuyển code, không sửa.
+Trần: **112 file nguồn mới** trong sổ theo bước (Phụ lục E.1) = 46 file `.cu` + 14 × 3 file family (test, benchmark, registry) + 7 ô arch + 17 hạ tầng; **0 provider**. Đã có trong repo: 14 `ops.h`, 3 `.cu` (`norm`, `activation`, `merge`) và 5 file hạ tầng; phần còn phải tạo khoảng 104 file. Trần chỉ tăng qua một header contract riêng mới (§1.3, mục 6), mỗi lần cần chủ repo duyệt.
 
 ### 1.3 Đặt code ở đâu
 
-1. **Không file theo kernel, dtype, shape hay SM**; ngoại lệ duy nhất là 5 ô arch ở mục 2. Biến thể là tham số template cộng một dòng trong danh sách instantiation tường minh của `<stem>.cu` (dạng X-macro). Không có file `.cu` instantiation riêng. Hàm host không có kernel (ví dụ `rope::compute_inv_freq`, `kv::swap_pages`, `kv::copy_batch_async`) nằm trong `.cu` của nhóm kernel mà chúng phục vụ. Kernel `__global__` và hàm device nằm trong namespace ẩn danh của `<stem>.cu`: ABI là `<family>.h` (giá trị enum, layout struct tham số, chữ ký entry point và `launch_*`), không phải chữ ký kernel.
-2. **Ô arch** là một ô của lưới family × arch, chứa thân dùng tập lệnh MMA riêng của arch: `wgmma` (sm90a), `tcgen05`/TMEM (sm100a), `mma.sync` block-scaled (sm120a). Còn lại nằm trong `<stem>.cu`. Có 7 ô: `gemm` {sm90a, sm100a, sm120a}, `attention` {sm90a, sm100a}, `model_ops` {sm100a}, `mega` {sm100a} (hai ô cuối thêm ngày 2026-10-28, xem cuối mục này). Khi một arch chỉ cần trait hoặc tile mới trên thân có sẵn thì thêm dòng instantiation, không thêm ô: attention SM120a tái dùng thân `mma.sync` của B8 (nguyên tắc 3), KV NVFP4 chỉ là chuyển đổi FP4 nên dùng cổng feature của `csrc/common/arch.h`. File `.cu` của nhóm include ô arch sau cổng exact-SM. Lưới ô chỉ đổi bằng một PR sửa mục này và Phụ lục E (ví dụ ô `state`/sm90a, nếu nhịp có điều kiện "Chunk kernel SSD / delta rule" ở B11 được làm và cần `wgmma`). **Quyết định 2026-10-28 về hai ô mới.** (1) Mở `model_ops/sm100a_impl.cuh` cho thân Sm100a của `mega_mhc_kernel` (port `deepgemm:deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh`, khoảng 1 400 dòng gồm epilogue, scheduler, layout). Đó là một kernel `tcgen05` TF32 riêng, có cấp phát TMEM, vai trò warp và epilogue Sinkhorn/RMSNorm/cast FP8 của riêng nó, không phải lời gọi vào mainloop GEMM. Ô được mở ở cuối P3 của §3.4, sau khi thân generic đã validate. (2) Mở `mega/sm100a_impl.cuh` cho thân Sm100a của `mega_moe_local_kernel` và `mega_moe_ep_kernel` (port Mega MoE của DeepGEMM: khoảng 1 300–1 500 dòng mỗi biến thể, cộng scheduler, layout và barrier giữa rank). Ô được mở ở cuối P7, chỉ khi twin FP8×FP4 của `grouped_gemm_tcgen05_kernel` (P5) và EP rank ảo (P6) đã xanh; nếu chưa thì không tạo ô, và hai ô Sm100a đó giữ `planned`, còn SM100 dùng adapter `kDeepGemm`. Không đặt hai thân này vào `gemm/sm100a_impl.cuh`: kernel phải nằm ở family launch nó, và ô `gemm` đã gánh toàn bộ B13. Helper `tcgen05` dùng chung (cấp phát TMEM, descriptor UMMA, TMA, pipeline `mbarrier`) chuyển sang `csrc/common/` khi family thứ hai cần tới (AGENTS.md). Không mở ô `sm90a` cho hai family này: trên SM90 dùng thân generic (split-K + `last_cta_arrive`), vì bản cluster của Hopper không có nguồn đã chứng minh. Thân twin (`_twin`, §3.3 K3) và thân SM80-class không phải ô arch: chúng là dòng instantiation trong `<stem>.cu`.
-3. **Mã sinh ra** (bảng registry từ YAML, mở rộng instantiation, bảng binding) chỉ nằm trong build tree, không commit.
-4. **Adapter không phải nhịp.** Adapter được nối ở Mốc cần nó, mỗi provider một file `csrc/providers/<provider>.cc`, với `<provider>` là tên enum bỏ chữ `k` đầu, viết thường (`kCublasLt` → `cublaslt.cc`). Adapter cần `<family>.h`, binding, test, benchmark và registry của family nó phục vụ, nên khi family chưa có nhịp native thì adapter mở bộ file của family đó: Mốc 1 mở `gemm` (`kCublasLt`), Mốc 2 mở `communication` (`kNccl`, `kDeepEP`). Các adapter còn lại dùng bộ file đã mở (E.2). Provider chỉ có API Python (dự kiến `kFLA`, `kTriton`) dùng chung một module Python. Khi native thay adapter, hàng registry của adapter vẫn giữ làm fallback (nguyên tắc 1), và file provider chỉ được bỏ khi không còn hàng registry nào trỏ tới nó. Ví dụ: NCCL và DeepEP vẫn là fallback sau Mốc 7.
-5. **Thứ tự của E.1 là kế hoạch, không phải ràng buộc.** E.1 xếp theo thứ tự tài liệu (B0 → B17, hàng Mốc đặt sau bước cuối của Mốc). Mốc không chặn bước, và B4, B5 chỉ phụ thuộc B3 còn B12 phụ thuộc B0, B3, B7 (§0.3), nên các bước này có thể đến trước hàng Mốc tương ứng. Family do nhịp hoặc adapter nào đến trước mở. Khi thứ tự thực tế khác E.1, chuyển 5 file family từ hàng Mốc sang nhịp đến trước, ghi lại ở E.1 và kiểm lại giới hạn đợt (§1.4).
-6. **Header contract của family (`<family>.h`) không bị tách theo kernel.** Thêm một nhóm kernel mới thì thêm khai báo vào `<family>.h` có sẵn và một dòng vào E.2 (kèm một `.cu` vào trần). Chỉ khi một family thật sự cần header riêng (ví dụ `execution`, không có bộ family) mới thêm header, và phải ghi vào E.2.
-7. **Test model:** `tests/test_models.py`, mỗi model là một dòng tham số, không phải một file.
-8. **`docs/TREE.md`:** phần proposed tree phải khớp Phụ lục E. Khi lệch thì Phụ lục E thắng và proposed tree được sinh lại.
-9. **Kernel chưa cài đặt nằm trong brief.** Chữ ký `__global__`, struct và enum chỉ dùng cho kernel của một nhóm nằm trong khối `#if 0` của `<family>.h`, dưới tiêu đề `// ---- <stem>.cu`. Nhịp cài đặt nhóm đó chuyển brief sang `<stem>.cu` thành code thật, xóa khối, và chỉ giữ trong header những struct mà một entry point phơi ra. Chữ ký entry point trong header là tạm (tensor nào được ghi, tensor nào có thể vắng) cho tới nhịp đầu tiên của family; kiểu dùng chung còn thiếu được khai báo trong `csrc/common/` ở nhịp đầu tiên cần tới nó.
+1. **Không file theo kernel, dtype, shape hay SM**; ngoại lệ duy nhất là 7 ô arch ở mục 2. Biến thể là tham số template cộng một dòng trong danh sách instantiation tường minh của `<stem>.cu` (dạng X-macro). Không có file `.cu` instantiation riêng. Hàm host không có kernel (ví dụ `rope::compute_inv_freq`, `kv::swap_pages`, `kv::copy_batch_async`) nằm trong `.cu` của nhóm kernel mà chúng phục vụ. Kernel `__global__` và hàm device nằm trong namespace ẩn danh của `<stem>.cu`: ABI là `ops.h` (giá trị enum, layout struct tham số, chữ ký entry point), không phải chữ ký kernel.
+2. **Ô arch** là một ô của lưới family × arch, chứa thân dùng tập lệnh MMA riêng của arch: `wgmma` (sm90a), `tcgen05`/TMEM (sm100a), `mma.sync` block-scaled (sm120a). Còn lại nằm trong `<stem>.cu`. Có 7 ô: `gemm` {sm90a, sm100a, sm120a}, `attention` {sm90a, sm100a}, `model_ops` {sm100a}, `mega` {sm100a} (hai ô cuối thêm ngày 2026-10-28, xem cuối mục này). Khi một arch chỉ cần trait hoặc tile mới trên thân có sẵn thì thêm dòng instantiation, không thêm ô: attention SM120a tái dùng thân `mma.sync` của B8 (nguyên tắc 3), KV NVFP4 chỉ là chuyển đổi FP4 nên dùng cổng exact-SM trong `csrc/common/macros.cuh`. File `.cu` của nhóm include ô arch sau cổng exact-SM. Lưới ô chỉ đổi bằng một PR sửa mục này và Phụ lục E (ví dụ ô `state`/sm90a, nếu nhịp có điều kiện "Chunk kernel SSD / delta rule" ở B11 được làm và cần `wgmma`). **Quyết định 2026-10-28 về hai ô mới.** (1) Mở `model_ops/sm100a_impl.cuh` cho thân Sm100a của `mega_mhc_kernel` (đọc `deepgemm:deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh`, khoảng 1 400 dòng gồm epilogue, scheduler, layout). Đó là một kernel `tcgen05` TF32 riêng, có cấp phát TMEM, vai trò warp và epilogue Sinkhorn/RMSNorm/cast FP8 của riêng nó, không phải lời gọi vào mainloop GEMM. Ô được mở ở cuối P3 của §3.4, sau khi thân generic đã validate. (2) Mở `mega/sm100a_impl.cuh` cho thân Sm100a của `mega_moe_local_kernel` và `mega_moe_ep_kernel` (đọc Mega MoE của DeepGEMM: khoảng 1 300–1 500 dòng mỗi biến thể, cộng scheduler, layout và barrier giữa rank). Ô được mở ở cuối P7, chỉ khi twin FP8×FP4 của `grouped_gemm_tcgen05_kernel` (P5) và EP rank ảo (P6) đã xanh; nếu chưa thì không tạo ô, và hai ô Sm100a đó giữ `planned`. Không đặt hai thân này vào `gemm/sm100a_impl.cuh`: kernel phải nằm ở family launch nó, và ô `gemm` đã gánh toàn bộ B13. Helper `tcgen05` dùng chung (cấp phát TMEM, descriptor UMMA, TMA, pipeline `mbarrier`) chuyển sang `csrc/common/` khi family thứ hai cần tới (AGENTS.md). Không mở ô `sm90a` cho hai family này: trên SM90 dùng thân generic (split-K + `last_cta_arrive`), vì bản cluster của Hopper không có nguồn đã chứng minh. Thân twin (`_twin`, §3.3 K3) và thân SM80-class không phải ô arch: chúng là dòng instantiation trong `<stem>.cu`.
+3. **Mã sinh ra** (bảng registry từ YAML, mở rộng instantiation, bảng test/registry) chỉ nằm trong build tree, không commit.
+4. **Provider không phải nhịp và không được cài trong giai đoạn này.** `GemmBackend`/`Provider` enum trong header giữ nguyên ABI; chỉ `kNative` có implementation. Không có `csrc/providers/`, không có file `cublaslt.cc`/`cutlass.cc`/`deepgemm.cc`/`flashmla.cc`/`nccl.cc`/`deepep.cc`. Khi một consumer thật cần backend ngoài, mở lại thành giai đoạn riêng có file provider, test và registry riêng.
+5. **Thứ tự của E.1 là kế hoạch, không phải ràng buộc.** E.1 xếp theo thứ tự tài liệu (B0 → B17, hàng Mốc đặt sau bước cuối của Mốc). Mốc không chặn bước, và B4, B5 chỉ phụ thuộc B3 còn B12 phụ thuộc B0, B3, B7 (§0.3), nên các bước này có thể đến trước hàng Mốc tương ứng. Family do nhịp nào đến trước mở. Khi thứ tự thực tế khác E.1, chuyển 3 file family từ hàng Mốc sang nhịp đến trước, ghi lại ở E.1 và kiểm lại giới hạn đợt (§1.4).
+6. **API contract của family (`ops.h`) không bị tách theo kernel.** Thêm một nhóm kernel mới thì thêm `.cu` và một dòng vào E.2; không thêm file host theo kernel. Chỉ khi một family thật sự cần header riêng (ví dụ `execution`, không có bộ family) mới thêm header, và phải ghi vào E.2. Nếu phải đổi chữ ký hay layout trong `ops.h`/`*_kernels.cuh`, mở PR contract riêng và tăng `KOPS_ABI_VERSION`.
+7. **Conformance cấp layer:** `tests/unit/test_conformance.cc` + golden vector trong `tests/golden/`, sinh offline. Không có `tests/test_models.py`, không chạy HF/vLLM ở runtime.
+8. **`docs/TREE.md`:** nếu có, phần proposed tree phải khớp Phụ lục E. Khi lệch thì Phụ lục E thắng và proposed tree được sinh lại. Trong checkout này `docs/` chưa có file nào được track.
+9. **Kernel chưa cài đặt chỉ là declaration.** Các header hiện tại là contract thật, không có khối `#if 0` brief. Nhịp cài đặt thêm định nghĩa và launcher trong `<stem>.cu`, giữ nguyên chữ ký trong `ops.h`; kiểu dùng chung mới (nếu có) được khai báo trong `csrc/common/` ở nhịp đầu tiên cần tới nó, kèm PR contract.
 
 ### 1.4 Đợt
 
-Một đợt mở không quá 2 family và tạo không quá 15 file mới (provider không tính, vì không thuộc nhịp). Bước vượt giới hạn thì chia đợt. Gate ra bước áp theo đợt cho phần của đợt đó; bước chỉ xong khi mọi đợt xong.
+Một đợt mở không quá 2 family và tạo không quá 15 file mới. Bước vượt giới hạn thì chia đợt. Gate ra bước áp theo đợt cho phần của đợt đó; bước chỉ xong khi mọi đợt xong.
 
-- **B0** chia hai đợt: B0.1 dựng hạ tầng (14 file, chưa có kernel) và B0.2 là nhịp đầu tiên (mở `model_ops`, 6 file). Riêng B0, Gate ra bước áp sau B0.2, trên các file do B0.1 dựng.
-- **B1** mở 6 family với 37 file mới nên chia B1.1–B1.3, mỗi đợt 2 family và 10–11 kernel (12–13 file mới).
-- Mọi bước khác đã nằm trong giới hạn: lớn nhất là B2 (14 file mới, gồm `docs/KV_CACHE_PARITY.md`) và B5 (13 file mới). Hàng Mốc 1 và Mốc 2 của Phụ lục E.1 mỗi hàng mở một family (6 file, gồm 1 file hạ tầng).
+- **B0** chia hai đợt: B0.1 dựng hạ tầng (14 file, chưa có kernel) và B0.2 là nhịp đầu tiên (mở `model_ops`, 4 file). Riêng B0, Gate ra bước áp sau B0.2, trên các file do B0.1 dựng.
+- **B1** mở 6 family với 25 file mới nên chia B1.1–B1.3, mỗi đợt 2 family và 8–9 file mới.
+- Mọi bước khác đã nằm trong giới hạn: lớn nhất là B5 (11 file) và B2 (10 file, gồm `docs/KV_CACHE_PARITY.md`). Mốc 1 và Mốc 2 chỉ tạo 1 file hạ tầng mỗi hàng; `gemm` mở ở B4 (5 file) và `communication` mở ở B12 (6 file).
 
 ### 1.5 Tách file: theo miền, không theo số thứ tự
 
@@ -364,55 +371,53 @@ Bảng trên chưa đủ cho B7 (khoản nợ tài liệu, sửa ở P0 của §
 
 ## 2. Phần cứng: một RTX 3050, viết đủ cho mọi exact SM
 
-Từ B7 (FP8 `mma.sync`), B11 (Hopper), B12 (nhiều GPU) tới B13–B16 (Blackwell, sparse, persistent), nhiều kernel nhắm GPU mà máy dev không có. Từ 2026-10-28 roadmap chỉ dựa vào **một máy: RTX 3050 Laptop (SM86, 4 GB)**. Quy ước: **vẫn viết đủ thân kernel, launcher, binding, test và benchmark theo vòng sáu việc (§1.1) cho mọi exact SM, sau khi học code đã chạy thật (§2.3), rồi đẩy bằng chứng lên mức cao nhất mà SM86 cho phép (§2.2 mục 6, §3.2). Không chạy được thì không tuyên bố chạy đúng.** Lô thuê (§2.5) không còn là một bước của lộ trình: nó là gói bàn giao để bất kỳ ai có đúng phần cứng chạy lại bộ test viết sẵn. Phần này không thêm file: mọi thứ nằm trong các vị trí của §1.2.
+Từ B7 (FP8 `mma.sync`), B11 (Hopper), B12 (nhiều GPU) tới B13–B16 (Blackwell, sparse, persistent), nhiều kernel nhắm GPU mà máy dev không có. Từ 2026-10-31 roadmap chỉ dựa vào **một máy: RTX 3050 Laptop (SM86, 4 GB)**. Quy ước: **vẫn viết đủ thân kernel, launcher, test C++ và benchmark C++ theo vòng năm việc (§1.1) cho mọi exact SM, sau khi đọc code reference (§2.3), rồi đẩy bằng chứng lên mức cao nhất mà SM86 cho phép (§2.2 mục 6, §3.2). Không chạy được thì không tuyên bố chạy đúng.** Lô thuê (§2.5) không phải một bước của lộ trình: nó là gói bàn giao để bất kỳ ai có đúng phần cứng chạy lại bộ test C++ viết sẵn. Phần này không thêm file: mọi thứ nằm trong các vị trí của §1.2.
 
 ### 2.1 Máy dev và nguồn bằng chứng
 
-Máy dev (kiểm 2026-10-28): Windows + WSL2 (Linux, gcc), driver host 591.59; RTX 3050 Laptop, SM86, 16 SM, 4 GB VRAM; CUDA Toolkit 12.9 (`nvcc --list-gpu-arch` tới `compute_121`, nên compile được cả 8 exact SM, kể cả `sm_100a`, `sm_103a`, `sm_120a`, `sm_121a`); torch 2.14.1+cu126; RAM của WSL2 khoảng 5–6 GB, 4 nhân. Vì RAM, build dùng `ninja -j 2` và `nvcc --threads=2` (`build-b9/build-ayaka.sh`) và không chạy hai build cùng lúc. `.venv-linux` có Triton, FlashInfer 0.7.2, flash-linear-attention, `causal-conv1d` 1.7.0, transformers 5.20.2 (có `deepseek_v3`, `deepseek_v32`, `deepseek_v4`, `qwen3_next`, `kimi_linear`, `gpt_oss`, `llama4`, `minimax`, `nemotron_h`, `falcon_h1`, `lfm2`, …), `gguf`, `scipy`, `einops`. Không có: vLLM (thay bằng `tests/upstream_shims/`), mamba_ssm (dùng bản Triton SGLang vendor), DeepGEMM và FlashMLA (cả hai chỉ chạy trên SM90/SM100; FlashMLA `395cb3a` còn cần CUDA ≥ 13.1 để build).
+Máy dev (kiểm 2026-10-31): Windows + WSL2 (Linux, gcc), driver host 591.59; RTX 3050 Laptop, SM86, 16 SM, 4 GB VRAM; CUDA Toolkit 12.9 (`nvcc --list-gpu-arch` tới `compute_121`, nên compile được cả 8 exact SM, kể cả `sm_100a`, `sm_103a`, `sm_120a`, `sm_121a`); RAM của WSL2 khoảng 5–6 GB, 4 nhân. Công cụ: `cmake`, `ninja`, `ccache`, `ctest`, `compute-sanitizer`, `ncu`, `cuobjdump`, `ptxas`. **Không có PyTorch, torch, vLLM, FlashInfer, FLA, transformers hay Python runtime**; `3rd/` chỉ để đọc code. Vì RAM, build dùng `ninja -j 2` và `nvcc --threads=2` (`cmake --build build -j 2`) và không chạy hai build cùng lúc.
 
 | Việc | Máy dev (SM86) | Ngoài lộ trình (gói bàn giao, §2.5) |
 |---|---|---|
-| Compile 8 exact SM, `ptxas -v`, SASS | có (`build-b9/build-arch.sh`, `build-b9/arch-compile-summary.json`) | — |
+| Compile 8 exact SM, `ptxas -v`, SASS | có (`cmake --build`, `ptxas -v`, `cuobjdump -sass`) | — |
 | Build gcc/Linux | có (WSL2) | — |
 | Test, benchmark, `compute-sanitizer` trên SM86 | có | — |
 | Chạy thân dùng lệnh riêng của arch (`wgmma`, TMA, `tcgen05`/TMEM, `mma.sync` block-scaled, FP8 `mma.sync`, `cvt` FP8/FP4) | không; twin SM86 kiểm phần logic (§3.3 K3) | exact SM đó |
 | Nhiều GPU, P2P, NVLink | không; rank ảo trên một GPU kiểm giao thức (§3.3 K5) | handoff kit `multi` |
-| VRAM > 4 GB | không; cấu hình thu nhỏ, model nhỏ, nạp theo layer (§3.3 K6) | GPU lớn |
-| Oracle chính thức của DeepSeek (FlashMLA `tests/ref.py`, `tests/quant.py`; DeepGEMM `deep_gemm/utils/math.py`, reference trong `tests/`) | có: PyTorch thuần, nạp theo đường dẫn (§3.3 K1) | — |
-| Thư viện đối chiếu chạy thật | FlashInfer, FLA, causal-conv1d, transformers, Triton | vLLM, DeepGEMM, FlashMLA, mamba_ssm |
+| VRAM > 4 GB | không; cấu hình thu nhỏ, golden vector, nạp theo layer (K6 deferred) | GPU lớn |
+| Oracle chính thức của DeepSeek (FlashMLA, DeepGEMM, HF) | **deferred**: cần PyTorch (K1) | — |
+| Thư viện đối chiếu chạy thật | không dùng; chỉ đọc code trong `3rd/` | — |
 
 Hệ quả:
-1. `compiled` của mọi exact SM lấy ngay ở máy dev. Thêm, đổi tên hay xóa `.cu` thì cấu hình lại `build-arch` (`cmake -S . -B build-arch`), vì glob nguồn không có `CONFIGURE_DEPENDS` (AGENTS.md). CI Linux không còn là điều kiện; nó chỉ có ích để chạy gate khi máy dev bận.
-2. Mọi test dùng shape cỡ model thật gắn `large` hoặc `mem_gb(n)`; test đối chiếu thư viện thứ ba dùng `pytest.importorskip`. Chúng tự `skip` ở máy dev và được liệt kê trong gói bàn giao.
+1. `compiled` của mọi exact SM lấy ngay ở máy dev. Thêm, đổi tên hay xóa `.cu` thì cấu hình lại build (`cmake -S . -B build`), vì glob nguồn không có `CONFIGURE_DEPENDS` (AGENTS.md).
+2. Mọi test dùng shape cỡ model thật gắn tier `large` hoặc `mem_gb(n)` trong harness C++; chúng trả 77 ở máy dev và được liệt kê trong gói bàn giao.
 3. Kết quả SM86 không phải bằng chứng cho SM khác (nguyên tắc 5 của §0.2). Ngoại lệ duy nhất là smoke, không phải bằng chứng: cubin `sm_80` chạy được trên SM86 (cùng major). Cubin `sm_89`, `sm_90a`, `sm_100a`, `sm_120a` không chạy được trên SM86.
 
 ### 2.2 Status `authored`, Gate dev và trần bằng chứng trên SM86
 
-Ô (kernel, exact SM) có thêm status `authored` (Phụ lục A): thân kernel, launcher, binding, test và case benchmark đã viết xong theo §1.1, nhưng chưa có bằng chứng chạy trên exact SM đó. Luật:
+Ô (kernel, exact SM) có thêm status `authored` (Phụ lục A): thân kernel, launcher, test C++ và case benchmark đã viết xong theo §1.1, nhưng chưa có bằng chứng chạy trên exact SM đó. Luật:
 
-1. **Áp dụng khi** máy dev không chạy được exact SM đích, hoặc kernel cần nhiều GPU, hoặc cần VRAM vượt máy dev. Adapter của provider chỉ chạy trên arch cao (`kDeepGemm`, `kFlashMLA`, `kTrtllmGen`, `kDeepEP`) theo cùng luật.
+1. **Áp dụng khi** máy dev không chạy được exact SM đích, hoặc kernel cần nhiều GPU, hoặc cần VRAM vượt máy dev.
 2. **Gate dev** của một ô `authored`, đủ để vào main:
-   - Thân, launcher, binding và case benchmark đã viết. Entry point kiểm tra đối số **trước** khi chọn exact SM: trên máy không đủ SM, đối số sai vẫn ném đúng lỗi contract, còn đối số đúng ném lỗi "unsupported SM" có thông điệp riêng và không launch gì (một test khẳng định điều này).
-   - Bộ test đủ các lớp của §2.4: lớp (a), (a+), (b), (s) và, nếu thân dùng lệnh riêng của arch, (t) xanh ở máy dev; lớp (c) và (d) `skip` đúng lý do, ví dụ `needs architecture 90a, found 86`.
-   - `--ayaka-dryrun` xanh và `--ayaka-dryrun --ayaka-mutate` đỏ: test phát hiện được kernel sai trước khi kernel chạy.
+   - Thân, launcher và case benchmark đã viết. Entry point kiểm tra đối số **trước** khi chọn exact SM: trên máy không đủ SM, đối số sai vẫn trả đúng `Status` contract, còn đối số đúng trả `kUnsupportedArch` có thông điệp riêng và không launch gì (một test khẳng định điều này).
+   - Bộ test đủ các lớp của §2.4: lớp (a), (b), (s) và, nếu thân dùng lệnh riêng của arch, (t) xanh ở máy dev; lớp (c) và (d) trả 77 đúng lý do, ví dụ `needs architecture 90a, found 86`.
+   - `test_<family> --dryrun` xanh và `test_<family> --mutate` đỏ: test phát hiện được kernel sai trước khi kernel chạy.
    - Compile: mọi exact SM của ô compile sạch ở máy dev (CUDA 12.9), ghi `ptxas -v` (register, smem, spill) và SASS probe (§3.3 K4).
    - PR ghi *nguồn đã chứng minh* của ô (§2.3), hoặc ghi rõ "không có nguồn đã chứng minh".
-3. **`authored` không đủ để** được `registry::select` chọn tự động (chỉ `release_supported` mới được, theo AGENTS.md), tính vào gate model của Mốc, hay ghi `numerically_validated`, `benchmarked` khi không có bằng chứng của đúng exact SM đó. Evidence `twin`, `sass`, `oracle_upstream` (§3.2) đi kèm ô nhưng không đổi status.
-4. **Nhịp xong ở dev** khi mọi ô chạy được ở SM86 đạt `numerically_validated` và mọi ô còn lại qua Gate dev. Bước **ra** ở Gate dev. Không có bước "đóng" bằng thuê GPU: Mốc-dev (§3.5) là mốc thay thế chạy được trên SM86; bằng chứng của exact SM khác chỉ được bổ sung qua handoff kit (tuỳ chọn, §2.5).
+3. **`authored` không đủ để** được `registry::select` chọn tự động (chỉ `release_supported` mới được, theo AGENTS.md), tính vào gate model (engine integration), hay ghi `numerically_validated`, `benchmarked` khi không có bằng chứng của đúng exact SM đó. Evidence `twin`, `sass`, `oracle_f64` (§3.2) đi kèm ô nhưng không đổi status.
+4. **Nhịp xong ở dev** khi mọi ô chạy được ở SM86 đạt `numerically_validated` và mọi ô còn lại qua Gate dev. Bước **ra** ở Gate dev. Không có bước "đóng" bằng thuê GPU: layer conformance (§3.5) là gate thay thế chạy được trên SM86; bằng chứng của exact SM khác chỉ được bổ sung qua handoff kit (tuỳ chọn, §2.5).
 5. **Tầng nền trước.** Ô `authored` dựa trên ô `authored` khác (ví dụ `grouped_gemm_wgmma_kernel` trên `gemm_wgmma_kernel` và helper TMA; comm-GEMM trên mainloop GEMM) nhân rủi ro: lỗi ở tầng nền làm hỏng mọi ô ở tầng trên, và chỉ lộ ra khi chạy trên phần cứng thật (R8). Viết theo tầng, và tầng nền phải có twin xanh (§3.3 K3) trước khi viết tầng trên.
 6. **Trần bằng chứng khi chỉ có SM86:**
 
    | Loại ô | Mức cao nhất đạt được với RTX 3050 | Bằng chứng |
    |---|---|---|
-   | (kernel, SM86), gồm thân SM80-class (§3.3 K3, T1) | `benchmarked` (`diagnostic_only` cho tới khi có commit sạch) | report pytest và benchmark của SM86 |
+   | (kernel, SM86), gồm thân SM80-class (§3.3 K3, T1) | `benchmarked` (`diagnostic_only` cho tới khi có commit sạch) | JSON của `ctest` và benchmark C++ trên SM86 |
    | (kernel, SM80) | `compiled`, cộng smoke cubin `sm_80` trên SM86 (không tính là bằng chứng) | `ptxas -v`, SASS |
-   | (kernel, SM89/90a/100a/103a/120a/121a) | `compiled` + evidence `sass`, `twin`, `oracle_upstream` | §3.2 |
+   | (kernel, SM89/90a/100a/103a/120a/121a) | `compiled` + evidence `sass`, `twin`, `oracle_f64` | §3.2 |
    | Đa GPU thật | `authored` + evidence rank ảo (§3.3 K5) | report rank ảo |
-   | Adapter `kDeepGemm`, `kFlashMLA`, `kTrtllmGen`, `kDeepEP` | `authored` | contract test |
-   | Mốc | Mốc-dev (§3.5) | conformance cấu hình thu nhỏ và model nhỏ |
+   | Mốc | layer conformance (§3.5) | JSON conformance C++ |
 
-   Ô SM86 lên được `release_supported` khi chủ repo cho tạo commit sạch (report có `git.dirty = false`) và conformance Mốc-dev của một model đi qua kernel đó pass (Phụ lục A, R15). Ô của exact SM khác không lên `release_supported` trong lộ trình này.
-
+   Ô SM86 lên được `release_supported` khi chủ repo cho tạo commit sạch (report có `git.dirty = false`) và layer conformance của model đi qua kernel đó pass (Phụ lục A, R15). Ô của exact SM khác không lên `release_supported` trong lộ trình này.
 ### 2.3 Học từ reference trước khi viết
 
 Ô không chạy được thì phải dựa vào code đã chạy thật. Với mỗi ô `authored`:
@@ -431,122 +436,124 @@ Hệ quả:
 
 2. **Đọc và tóm tắt trước khi viết thân.** Mô tả PR nêu: pipeline (số stage, giao thức barrier/`mbarrier`, vai trò từng warp), tile, cluster, swizzle và layout scale, epilogue; phần giữ nguyên và phần khác contract của roadmap (nhất là các dòng *Không có:*).
 3. **Giữ cấu hình đã chứng minh** (tile, stage, cluster shape, số thanh ghi của `setmaxnreg`, TMA box, swizzle mode, layout scale) thay vì tự suy; chỉ đổi khi có bằng chứng từ phần cứng đích. Cấu hình tự suy không kiểm được là nguồn lỗi chính khi không có phần cứng. DeepGEMM chọn cấu hình lúc chạy (JIT, `deepgemm:csrc/jit_kernels/heuristics/sm90.hpp`, `sm100.hpp`): repo này không mang JIT; mỗi cấu hình được chọn thành một dòng instantiation tường minh (§1.3), còn heuristic thành bảng tactic.
-4. **CUTLASS/CuTe thay cho PTX tay** khi reference dùng CUTLASS/CuTe (CUTLASS đã là dependency trong `CMakeLists.txt`). PTX tay (`wgmma`, `tcgen05`, `mbarrier`, `tensormap.replace`) chỉ khi reference cũng viết tay (DeepGEMM viết tay qua `deepgemm:deep_gemm/include/deep_gemm/ptx/*`). Viết thân arch qua ba policy của twin (§3.3 K3) để phần logic chạy được trên SM86.
+4. **Không dùng CUTLASS/CuTe trong giai đoạn này.** Reference dùng CUTLASS/CuTe chỉ để đọc cấu hình và layout; thân kernel của repo viết bằng CUDA C++/intrinsic/PTX. Khi cần một primitive mà CUDA không phơi ra (ví dụ descriptor `wgmma`/`tcgen05`), viết helper trong `csrc/common/` hoặc trong ô arch, không thêm dependency.
 5. **Provenance (R7):** ghi commit, đường dẫn và license vào `THIRD_PARTY_NOTICES.md` khi port thân kernel. FlashMLA và DeepGEMM dùng license MIT; commit của bản local: FlashMLA `395cb3a` (V4.1, SM100/103), `ba89a34` (bản cuối có Hopper và V3.2/V4.0), DeepGEMM `5081f85`.
 6. **Ô không có nguồn đã chứng minh** (tính lại 2026-10-28 sau khi thêm FlashMLA và DeepGEMM; cột Reference của hàng là chuẩn): `fp8_block_gemm_small_m_kernel` bản `mma.sync` (B7; DeepGEMM chỉ cho semantics scale); `fp4_to_fp8_gemm_wgmma_kernel`, `grouped_gemm_wgmma_kernel` ở layout FP4/MX, `grouped_fp4_to_fp8_gemm_wgmma_kernel`, `w4a8_int_gemm_kernel` Sm90a (B11); `ep_dispatch_kernel`, `ep_combine_kernel` ngoài Mega MoE (nguồn một phần: `deepgemm:deep_gemm/include/deep_gemm/comm/barrier.cuh`, `deepgemm:deep_gemm/include/deep_gemm/layout/sym_buffer.cuh`), `allgather_kernel`, `reduce_scatter_kernel`, ba kernel comm-GEMM (B12); `int8_gemm_tcgen05_kernel`, `mixed_input_gemm_tcgen05_kernel`, `grouped_mixed_input_gemm_kernel` Sm100a, BF16 và grouped trên SM120a (B13); `kv_compressor_kernel` (B14: HF transformers cho semantics, không cho thân kernel); `attn_res_kernel`, `attn_res_commit_kernel` (B15); `mega_mlp_kernel`, `mega_attention_block_kernel`, `mega_decoder_layer_kernel` (B16). Đã ra khỏi danh sách: `mla_get_metadata_kernel`, `mla_decode_kernel` (FlashMLA), `grouped_gemm_wgmma_kernel` layout masked (DeepGEMM), `gemm_tcgen05_kernel` tổng quát (DeepGEMM `sm100_bf16_gemm.cuh`), `lightning_indexer_kernel` FP8/FP4 trên tensor core (DeepGEMM), `mega_moe_ep_kernel` và `mega_moe_local_kernel` (DeepGEMM Mega MoE, SM100). Nguồn upstream ngoài sáu project (CUTLASS examples, DeepEP, FlashInfer, TRT-LLM, FLA, mamba_ssm) dùng làm reference, PR ghi đường dẫn và commit upstream. Các ô này đứng cuối thứ tự viết của luồng (§2.2 mục 5) và có rủi ro R12.
 
 ### 2.4 Bộ test viết sẵn
 
-Các lớp nằm trong `tests/test_<family>.py`, dùng `tests/kit.py` và marker của `tests/hw.py` (hạ tầng đã có; mẫu có sẵn là `test_mx_hardware_cvt_equals_software` và `test_nvfp4_hardware_cvt_equals_software` trong `tests/test_quantization.py`). Lớp (a+), (t), (s) thêm từ 2026-10-28; marker `twin`, `sass` thêm vào `tests/hw.py` ở P0 (§3.4).
+Bộ test nằm trong `tests/unit/`, dùng `tests/unit/harness.h`; một executable mỗi family, đăng ký với CTest. TU test include device header nên được CMake đánh dấu `LANGUAGE CUDA` và biên dịch bằng `nvcc`; vẫn là test C++, không có pytest, không marker Python.
 
-| Lớp | Marker | Máy dev | Nội dung |
+| Lớp | Label CTest | Máy dev | Nội dung |
 |---|---|---|---|
-| (a) Oracle và layout | `oracle` | chạy | Reference fp64; công thức layout (swizzle, scale TMA, task map, tile scheduler, metadata, UE8M0, descriptor `wgmma`/`tcgen05`); "giá trị vàng" lấy từ code reference. Không cần kernel hay GPU |
-| (a+) Oracle chính thức | `oracle` | chạy | Oracle của repo so với reference chính thức trên cùng input: FlashMLA `tests/ref.py` và `tests/quant.py`, DeepGEMM `deep_gemm/utils/math.py` và reference trong `tests/`, HF transformers (§3.3 K1). Lệch thì sửa oracle trước khi viết kernel |
-| (b) Contract | `contract` | chạy | dtype, shape, stride, alignment sai bị từ chối và output giữ nguyên sentinel (`kit.expect_rejected`); lỗi "unsupported SM" khi chạy sai máy |
-| (t) Twin | `twin` | chạy | Thân arch build với policy SM80 (§3.3 K3, T2), chạy trên SM86 với sweep tier `smoke`/`standard` của lớp (c), dưới `compute-sanitizer` racecheck/synccheck |
-| (s) Tĩnh | `sass` | chạy | `ptxas -v` trong ngân sách (register, smem của SM đích, spill 0 ở kernel nóng); SASS probe: có lệnh mong đợi, không có `LDL`/`STL` ở kernel nóng (§3.3 K4) |
-| (c) Numerics trên đích | `arch(...)`, `gpus(n)`, `p2p`, `cuda_min`, `mem_gb(n)`, `large` | `skip` | Sweep của Gate ra bước (M, K lớn, tail tile, expert rỗng, …) với `kit.Tol` theo CONTRACTS.md; nhánh phần cứng so với nhánh software |
-| (d) Hệ thống | như (c) | `skip` | `kit.graph_roundtrip`, `kit.assert_deterministic`, replay khi số token mỗi expert đổi; kernel đồng bộ giữa CTA hoặc giữa peer chạy dưới watchdog (`timeout` của shell hoặc pytest-timeout) để deadlock báo lỗi thay vì treo máy |
+| (a) Oracle | `oracle` | chạy | Reference fp64 trong `csrc/reference/`; công thức layout (swizzle, scale TMA, task map, metadata, UE8M0, descriptor); golden vector trong `tests/golden/`. Không cần GPU. |
+| (b) Contract | `contract` | chạy | dtype, shape, stride, alignment sai bị từ chối bằng `Status` và output giữ nguyên sentinel; máy thiếu exact SM trả `kUnsupportedArch`. |
+| (t) Twin | `twin` | chạy | Thân arch build với policy SM80 (§3.3 K3, T2), chạy trên SM86 với sweep tier của lớp (c), dưới `compute-sanitizer` racecheck/synccheck. |
+| (s) Tĩnh | `sass` | chạy | `ptxas -v` trong ngân sách (register, smem của SM đích, spill 0 ở kernel nóng); SASS probe: có lệnh mong đợi, không có `LDL`/`STL` ở kernel nóng (§3.3 K4). |
+| (c) Numerics | `arch` | trả 77 nếu thiếu SM/GPU/VRAM | Sweep của Gate ra bước (M, K lớn, tail tile, expert rỗng, …) với tolerance trong `CONTRACTS.md`; nhánh phần cứng so với nhánh software. |
+| (d) Hệ thống | `system` | trả 77 nếu thiếu SM/GPU | Graph roundtrip, determinism, replay khi số token mỗi expert đổi; kernel đồng bộ giữa CTA hoặc giữa peer chạy dưới watchdog (`TIMEOUT` của CTest) để deadlock báo lỗi thay vì treo máy. |
 
 Quy tắc:
-- **Dùng `arch`, không dùng `arch_min`, cho lệnh chỉ có ở một arch.** `arch_min` so capability từ dưới lên, nên `arch_min("90a")` sẽ chạy test `wgmma` trên Blackwell và fail giả (`wgmma` chỉ có ở `sm_90a`; `tcgen05` chỉ ở `sm_100a`/`sm_103a`; SM120a dùng `mma.sync`). `arch_min` chỉ dùng cho tính năng có ở mọi capability cao hơn, như `cvt` FP8 (SM89 trở lên) và `cvt` FP4.
+- **Exact SM, không `arch_min`.** Harness so `LaunchContext::arch_id` với `KOPS_TARGET_*`; lệnh chỉ có ở `sm_90a`/`sm_100a` không chạy trên Blackwell. Không có suy diễn từ capability lớn hơn.
 - Lớp (t) không thay lớp (c): ô `authored` không lên `numerically_validated` nhờ twin.
-- Test (c) và (t) ghi metric qua fixture `check` (`rel_fro`, `calc_diff`, `max_ulp`, phần tử sai nhất) để `--ayaka-report` đủ thông tin sửa lỗi.
-- Case dùng `kit.grid(smoke, standard, full)`: tier `smoke` phủ mọi nhánh (mỗi dtype và recipe ít nhất một case).
-- Mỗi hàng bảng kernel có ít nhất một test lớp (c) cho mỗi exact SM của bước, và một test (t) cho mỗi thân arch (§1.6 kiểm).
-- Test so với thư viện thứ ba (vLLM, FlashInfer, FLA, mamba_ssm, DeepGEMM, FlashMLA, HF) dùng `pytest.importorskip`; gói bàn giao không được để chúng `skip`. Oracle chính thức nạp theo đường dẫn (K1) không phải import thư viện, nên không `skip` ở máy dev.
+- Test (c) và (t) ghi metric vào JSON (`rel_fro`, `calc_diff`, `max_ulp`, phần tử sai nhất) để `--json` đủ thông tin sửa lỗi.
+- Case dùng `--tier=smoke|standard|full`: tier `smoke` phủ mọi nhánh (mỗi dtype và recipe ít nhất một case).
+- Mỗi hàng bảng kernel có ít nhất một test lớp (c) cho mỗi exact SM của bước, và một test (t) cho mỗi thân arch.
+- Không test so với thư viện thứ ba ở runtime. K1 (oracle chính thức PyTorch) và K2 (`load_inline`) bị deferred; golden vector được sinh offline và commit như dữ liệu.
 
 ### 2.5 Handoff kit (tuỳ chọn, nằm ngoài lộ trình)
 
-Chạy trên exact SM khác SM86 **không** nằm trong lộ trình và **không chặn bước nào**. Quy trình dưới đây chỉ để khi có máy đúng exact SM (mượn, CI có GPU, hoặc ngân sách cho phép sau này): bộ test viết sẵn chạy được ngay mà không phải viết thêm. Phụ lục B liệt kê các handoff kit. Gói bàn giao của mỗi bước gồm: commit, lệnh build, danh sách test lớp (c)/(d) đang `skip` ở dev, thư viện đối chiếu cần cài, thứ tự chạy và các evidence `twin`/`sass` đã có. Chạy trên Linux có PyTorch CUDA, build đúng exact SM của máy:
+Chạy trên exact SM khác SM86 **không** nằm trong lộ trình và **không chặn bước nào**. Quy trình dưới đây chỉ để khi có máy đúng exact SM (mượn, CI có GPU, hoặc ngân sách cho phép sau này): bộ test C++ viết sẵn chạy được ngay mà không phải viết thêm. Phụ lục B liệt kê các handoff kit. Gói bàn giao của mỗi bước gồm: commit, lệnh build, danh sách test trả 77 ở dev, thứ tự chạy và các evidence `twin`/`sass` đã có. Chạy trên Linux có CUDA toolkit, build đúng exact SM của máy:
 
 ```bash
 git clone <repo> && cd ayaka-kernel && git checkout <commit của PR>
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAYAKA_CUDA_ARCHS=90a    # exact SM của lô
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DKOPS_CUDA_ARCHS=90a    # exact SM của lô
 cmake --build build -j
-python -m pytest tests --ayaka-tier smoke    --ayaka-report out/sm90a-smoke.json
-python -m pytest tests --ayaka-tier standard --ayaka-report out/sm90a-standard.json
-PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool memcheck --error-exitcode 1 \
-    python -m pytest tests/test_<family>.py --ayaka-tier smoke -x       # thêm racecheck, synccheck cho kernel có mbarrier
-python -m benchmark.bench_<family> --json out/sm90a-<family>.json
+ctest --test-dir build -L "oracle|contract" --output-on-failure
+ctest --test-dir build -L "arch|system" --output-on-failure
+compute-sanitizer --tool memcheck --error-exitcode 1 \
+    ctest --test-dir build -L twin --output-on-failure
+./build/benchmark/bench_<family> --json out/sm90a-<family>.json
 ```
 
 Điều kiện nhận kết quả (mới được nâng status):
 - `env.arch_tag` của report đúng exact SM của lô; `git.dirty` là `false` và `git.commit` là commit của PR. Sửa trên máy ngoài thì phải commit trước khi lấy report làm bằng chứng.
-- Không test nào của ô trong lô ở trạng thái `skipped` vì "not implemented", "needs architecture", "needs N GPUs" hay "could not import".
+- Không test nào của ô trong lô trả 77 vì "not implemented", "needs architecture", "needs N GPUs" hay "could not import".
 - Test pass cho `numerically_validated` của (kernel, exact SM) tương ứng; benchmark JSON cho `benchmarked`; `release_supported` vẫn cần đủ điều kiện ở Phụ lục A.
 - Registry ghi `commit`, `arch_tag`, tên GPU và `sha256` của report. Report gắn vào PR, không commit vào repo.
-- Test fail: report đã có `failure` và `metrics`; sửa ở máy dev bằng oracle, twin và dryrun. Ô giữ `authored`.
+- Test fail: report đã có `failure` và `metrics`; sửa ở máy dev bằng oracle, twin và `--dryrun`. Ô giữ `authored`.
 
-Mọi lô chạy cả bộ test (test của SM khác tự `skip`), nên kernel generic của B0–B10 tự nhận bằng chứng cho SM của lô khi pass. Thứ tự gợi ý khi có máy, theo rủi ro tăng dần: (1) `sm80` và `sm89`; (2) `sm90a`; (3) `sm120a` trước `sm100a`; (4) `sm100a`, rồi `sm103a`; (5) `multi`. Chỉ chạy một lô khi gate compile của exact SM đó, `--ayaka-dryrun` và lớp (t) đã xanh, và thư viện đối chiếu đã cài (R10).
+Mọi lô chạy cả bộ test (test của SM khác trả 77), nên kernel generic của B0–B10 tự nhận bằng chứng cho SM của lô khi pass. Thứ tự gợi ý khi có máy, theo rủi ro tăng dần: (1) `sm80` và `sm89`; (2) `sm90a`; (3) `sm120a` trước `sm100a`; (4) `sm100a`, rồi `sm103a`; (5) `multi`. Chỉ chạy một lô khi gate compile của exact SM đó, `--dryrun` và lớp (t) đã xanh.
 
 ### 2.6 Compile mọi exact SM ở máy dev
 
-CUDA 12.9 ở máy dev compile được 8 exact SM (`build-b9/arch-compile-summary.json`: 1 160 ô, 1 134 không spill; 26 ô có spill là kernel sampling cũ của B6 và Hadamard, xem `build-b9/REPORT.md`). Còn ba giới hạn:
-1. **RAM 5–6 GB:** gate compile 8 SM chạy hàng giờ với `-j 1`/`-j 2`; chạy qua đêm và không chạy song song với build khác. Trong một nhịp, chỉ build lại translation unit đã sửa cho exact SM của ô (memory `ayaka-targeted-build`), gate đầy đủ chạy ở Gate ra bước.
-2. **FlashMLA `395cb3a` cần CUDA ≥ 13.1, nhưng repo này không cần (quyết định 2026-10-28).** Kiểm code: lý do duy nhất là hai lệnh chuyển đổi trong `flashmla:csrc/cuda_kernels/sm100/helpers.h`. `cvt.rn.bf16x2.ue8m0x2` (13.1) chỉ dựng bf16 từ exponent: e ∈ [1, 254] cho bit `e << 7`, e = 0 cho subnormal `0x0040`, e = 255 là NaN. `cvt.rn.bf16x2.e4m3x2` / `.e2m1x2` (13.2) có đường thay thế chính xác qua `f16x2` và `f32`, mà FlashMLA tự dùng khi `SM100_HAS_NATIVE_BF16X2_CVT = 0`. Vì vậy: (a) build chính giữ CUDA 12.9 (torch cu126; driver host 591.59 chỉ hỗ trợ runtime tới 13.1, nên module build bằng 13.2 chạy rủi ro); (b) khi port, dùng đường thay thế và đặt sau cổng `__CUDACC_VER_MAJOR__`/`__CUDACC_VER_MINOR__`, để build bằng 13.x sau này tự dùng lệnh gốc; (c) lớp (a) có test vét cạn cho 256 giá trị UE8M0, mọi mã e4m3 và e2m1, so đường thay thế với đặc tả PTX ISA (chạy được ở SM86; lệnh gốc chỉ kiểm được trên `sm_100a`). Chỉ cài `cuda-toolkit-13-2` (có trong apt; đĩa còn khoảng 911 GB) song song, để compile riêng trong thư mục `build-arch13` (`-DCMAKE_CUDA_COMPILER=/usr/local/cuda-13.2/bin/nvcc`, chỉ `sm_100a`/`sm_103a`), khi cần SASS probe cho biến thể lệnh gốc. Khi cài: không cài gói `cuda` hay gói driver trong WSL2, giữ `/usr/local/cuda` trỏ vào 12.9, và kiểm bản CUTLASS trong repo có hỗ trợ CUDA 13 không.
-3. **DeepGEMM cần CUDA ≥ 12.9 và C++20** (đã đủ). Thư viện này compile lúc chạy (JIT) trên GPU SM90/SM100, nên ở máy dev không build nó thành thư viện; chỉ đọc, port, và nạp phần không phụ thuộc arch (§3.3 K2).
+CUDA 12.9 ở máy dev compile được 8 exact SM; log `ptxas -v` và SASS probe đặt trong build tree, không commit. Còn ba giới hạn:
+1. **RAM 5–6 GB:** gate compile 8 SM chạy hàng giờ với `-j 1`/`-j 2`; chạy qua đêm và không chạy song song với build khác. Trong một nhịp, chỉ build lại translation unit đã sửa cho exact SM của ô; gate đầy đủ chạy ở Gate ra bước.
+2. **Không build FlashMLA/DeepGEMM/vLLM.** K1/K2 deferred; repo không cần CUDA 13.x. Toolkit 12.9 là bản duy nhất cho build chính.
+3. **C++17, không C++20 bắt buộc.** `CMakeLists.txt` đặt C++17; chỉ nâng khi một kernel thật sự cần.
 
 `ptxas` kiểm tính hợp lệ tĩnh của lệnh (hình dạng `tcgen05` và `wgmma`, kiểu dữ liệu, thanh ghi, smem), nên bắt được một lớp lỗi lớn trước khi chạy trên phần cứng thật. Nó không bắt được lỗi đồng bộ, layout hay số học: phần đó do twin (K3) và oracle (K1, K4) gánh.
 
 ---
 
-## 3. Chiến lược 2026-10-28: xây đủ roadmap chỉ với RTX 3050
+## 3. Chiến lược 2026-10-31: C++-only trên một RTX 3050
 
-Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher, binding, test, benchmark; mọi ô đạt trần bằng chứng của §2.2 mục 6; mọi Mốc có một Mốc-dev chạy trên SM86; và phần không chạy được ở SM86 đã sẵn sàng thành gói bàn giao. FlashMLA và DeepGEMM thay đổi chiến lược ở ba chỗ: chúng cho **nguồn đã chứng minh** cho phần lớn ô Hopper/Blackwell của B11, B13, B14 và B16; chúng cho **reference chính thức chạy được trên SM86** (PyTorch thuần) cho các ⚠ của DeepSeek (định dạng KV, sparse attention, indexer, mHC, MoE gate); và chúng có **code không phụ thuộc arch** (metadata, combine, layout scale, tile scheduler) chạy thẳng trên SM86.
+Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher, test C++ và benchmark C++; mọi ô đạt trần bằng chứng của §2.2 mục 6; phần không chạy được ở SM86 đã sẵn sàng thành gói bàn giao. FlashMLA và DeepGEMM vẫn là **nguồn đọc** cho phần lớn ô Hopper/Blackwell của B11, B13, B14 và B16, và là provenance cho các ⚠ của DeepSeek; nhưng K1 (oracle PyTorch) và K2 (`load_inline`) bị deferred, nên không có reference nào chạy trong build/test.
 
-### 3.1 Điểm xuất phát (2026-10-28)
+### 3.1 Điểm xuất phát (2026-10-31)
 
-Đếm bằng cách đối chiếu bảng kernel với `__global__` trong `csrc/` và bảng "Biến thể thân kernel" (§1.6).
+Đếm bằng cách đối chiếu bảng kernel với `__global__` có thân trong `csrc/` và bảng "Biến thể thân kernel" (§1.6).
 
 | Bước | Có thân / tổng | Còn thiếu thân |
 |---|---|---|
-| B0–B10, B17 | 166 / 166 (gồm 2 kernel hợp nhất của B5, B6) | — |
-| B11 | 1 / 12 | 11: `fp8_gemm_wgmma`, `int8_gemm_wgmma`, `machete_gemm`, `machete_prepack`, `fp4_to_fp8_gemm_wgmma`, `grouped_gemm_prepare`, `grouped_gemm_wgmma`, `grouped_fp4_to_fp8_gemm_wgmma`, `grouped_mixed_input_gemm`, `mla_get_metadata`, `mla_decode` |
-| B12 | 8 / 11 | 3 comm-GEMM: `allgather_gemm`, `gemm_reduce_scatter`, `gemm_allreduce` |
-| B13 | 0 / 12 | cả bước |
-| B14 | 0 / 8 | cả bước |
-| B15 | 0 / 8 | cả bước |
-| B16 | 1 / 6 (2/6 khi `mega_step_kernel` body lands) | 5 kernel `mega_*`; `mega_step` là biến thể thân (thêm dòng §1.6 khi body lands) |
-| **Tổng** | **186 / 233** | **47** |
+| B0 | 0 / 2 | 2 |
+| B1 | 5 / 32 (2 norm, 2 activation, 1 merge) | 27 |
+| B2 | 0 / 20 | 20 |
+| B3 | 0 / 21 | 21 |
+| B4 | 0 / 18 | 18 |
+| B5 | 0 / 16 | 16 |
+| B6 | 0 / 15 | 15 |
+| B7 | 0 / 16 | 16 |
+| B8 | 0 / 7 | 7 |
+| B9 | 0 / 20 | 20 |
+| B10 | 0 / 4 | 4 |
+| B11 | 0 / 12 | 12 |
+| B12 | 0 / 11 | 11 |
+| B13 | 0 / 12 | 12 |
+| B14 | 0 / 8 | 8 |
+| B15 | 0 / 8 | 8 |
+| B16 | 0 / 6 | 6 |
+| B17 | 0 / 5 | 5 |
+| **Tổng** | **5 / 233** | **228** |
 
-Khi `mega_step_kernel` body lands: B16 2/6, tổng 187/233, còn lại 46; 233 kernel/125 nhịp/140 file không đổi vì đây là biến thể thân.
+Năm kernel có thân nằm trong B1: `rms_norm_kernel`, `fused_add_rms_norm_kernel` (`csrc/norm/norm.cu`), `act_kernel`, `act_and_mul_kernel` (`csrc/activation/activation.cu`) và `merge_state_kernel` (`csrc/attention/merge.cu`). 11 launcher công khai còn trả `kNotImplemented`; 2 nhánh dispatch chưa phủ hết `ActFn`. 233 kernel / 125 nhịp / 112 file không đổi.
 
-Nợ hiệu năng của các bước đã có thân (chỉ đo được ở SM86, đầy đủ ở SOTA-PLAN.md): B5 `lut_gemv` NF4, chín format GGUF dưới 4 bit, `gguf_moe_mmvq`, AWQ/GPTQ sát ngưỡng; B9 KDA chunked theo batch (0.88–0.98× kernel recurrent); B2 FP8 software; SOTA-PLAN W1.2, W2.1, W3.1 (non-causal D = 128, D = 256), W2.4 và các mục chưa bắt đầu W7.1, W5.3, W6.1, W1.4. Registry: mọi ô SM86 `diagnostic_only`, không ô nào `release_supported`.
+Không còn "nợ hiệu năng" hay report cũ trong checkout này: mọi số đo sẽ được sinh lại bằng benchmark C++ khi kernel tương ứng có thân.
 
 ### 3.2 Thang bằng chứng trên một SM86
 
 | Mức | Tên | Chứng minh | Không chứng minh | Ghi ở registry |
 |---|---|---|---|---|
-| E0 | Viết | Thân, launcher, binding, test, benchmark tồn tại; contract đúng; dryrun xanh, mutate đỏ | Kernel chạy đúng | status `authored` |
+| E0 | Viết | Thân, launcher, test C++, benchmark tồn tại; contract đúng; `--dryrun` xanh, `--mutate` đỏ | Kernel chạy đúng | status `authored` |
 | E1 | Compile + SASS | Lệnh hợp lệ cho exact SM; register, smem, spill trong ngân sách; có đúng lớp lệnh (ví dụ `HGMMA`, `UTMALDG` ở `sm_90a`) | Đồng bộ, layout, số học | status `compiled`; evidence `sass` |
-| E2 | Oracle chính thức | Oracle của repo khớp code chính thức (FlashMLA, DeepGEMM, HF) trên cùng input, kể cả định dạng byte | Kernel đúng | evidence `oracle_upstream` |
+| E2 | Oracle fp64 | Oracle `csrc/reference/` fp64 và golden vector khớp công thức/định dạng | Kernel đúng | evidence `oracle_f64` |
 | E3 | Twin | Scheduler, layout địa chỉ, pipeline (stage, phase, parity của `mbarrier`), vai trò warp, epilogue, scale, mask chạy đúng trên SM86 | Lệnh MMA/TMA/TMEM thật, fence của async proxy, cluster, hiệu năng | evidence `twin` |
 | E4 | Chạy thật trên SM86 | Kernel (generic hoặc SM80-class) đúng và đo được trên SM86 | SM khác | status `numerically_validated`, `benchmarked` của ô SM86 |
-| E5 | Mốc-dev | Model (thu nhỏ hoặc nhỏ thật) đi qua kernel cho kết quả khớp reference | Model thật cỡ lớn, phần cứng khác | evidence `conformance` của Mốc-dev |
+| E5 | Layer conformance | Layer C++ khớp golden vector | Model thật cỡ lớn, phần cứng khác | evidence `conformance` |
 
-Evidence `sass`, `twin`, `oracle_upstream`, `conformance` là trường mới của ô registry (thêm vào `tools/gen_registry.py` ở P0, không thêm file). Mỗi trường ghi đường dẫn report, `sha256` và commit (hoặc `dirty` kèm hash của working tree như hiện nay).
+Evidence `sass`, `twin`, `oracle_f64`, `conformance` là trường của ô registry (thêm vào `tools/gen_registry.py` ở P0, không thêm file). Mỗi trường ghi đường dẫn report, `sha256` và commit (hoặc `dirty` kèm hash của working tree như hiện nay). K1 (`oracle_upstream`) không còn là trường bắt buộc vì oracle chính thức chưa chạy được.
 
-### 3.3 Bảy kỹ thuật thay phần cứng
+### 3.3 Kỹ thuật thay phần cứng
 
-**K1 — Oracle chính thức nạp theo đường dẫn.** `tests/upstream.py` thêm loader nạp file Python của upstream theo đường dẫn (như `vllm_lightning()` hiện có), không build và không import gói C++ của chúng; module C++ (`deep_gemm._C`, `flash_mla.cuda`) được thay bằng stub như `tests/upstream_shims/`.
-- FlashMLA `395cb3a`: `tests/quant.py` (định dạng KV V4.1: 528 B FP8 = 512 e4m3 + 16 scale UE8M0 theo khối 32; 288 B FP4 = 256 B e2m1 + 32 scale e4m3 theo khối 16), `tests/ref.py` (`ref_sparse_attn_fwd`, `ref_sparse_attn_decode`: hai phạm vi KV `kv` + `extra_kv`, `topk_length`, sink, `rms_norm_scale_factor`), `tests/lib.py`.
-- FlashMLA `ba89a34`: `tests/quant.py` cho V3.2 (656 B) và V4.0 (584 B). Lấy bằng `git -C 3rd/FlashMLA show ba89a34:tests/quant.py` vào build tree, không chép vào repo.
-- DeepGEMM `5081f85`: `deep_gemm/utils/math.py` (`per_token_cast_to_fp8`, `per_block_cast_to_fp8`, `per_token_cast_to_fp4`, `ceil_to_ue8m0`, `pack_ue8m0_to_int`), `tests/generators.py` (layout grouped contiguous/masked/psum, SF layout), `tests/test_attention.py::ref_mqa_logits`, `ref_paged_mqa_logits`, `tests/test_mega_mhc.py::mhc_reference` (mHC + Sinkhorn + RMSNorm + FP8 1×32), `tests/test_mega_gate.py` (gate sqrtsoftplus), `tests/test_hyperconnection.py`.
-- HF transformers 5.20.2: `DeepseekV4HyperConnection`, `DeepseekV4HyperHead`, `DeepseekV4CSACompressor`, `DeepseekV4HCACompressor`, `DeepseekV4Indexer`, `DeepseekV4HashRouter`, `DeepseekV4TopKRouter`, `DeepseekV4GroupedLinear` (`models/deepseek_v4/modeling_deepseek_v4.py`) và các model của §3.5. Đây là bản port độc lập, không phải code chính thức (R17).
-- Quy ước của upstream được đổi trong shim, không trong contract kernel (R18): FlashMLA trả LSE = +inf và output 0 cho query không có key hợp lệ, repo này dùng −inf; FlashMLA nhân output với 1/(1 + exp(sink − lse)) và không đưa sink vào LSE trả về; DeepGEMM đặt tên `D = C + A @ B.T` (NT); scale SM90 là fp32, scale SM100 là UE8M0 đóng 4 giá trị vào một int32, MN-major, căn TMA.
+**K1 — Oracle chính thức (deferred).** Loader PyTorch cho FlashMLA, DeepGEMM và HF transformers không được dùng trong giai đoạn C++-only. Các file `tests/quant.py`, `tests/ref.py`, `deep_gemm/utils/math.py`, `modeling_deepseek_v4.py` chỉ là nguồn đọc để viết oracle fp64 và golden vector. Khi có giai đoạn PyTorch riêng, K1 mở lại.
 
-**K2 — Code upstream không phụ thuộc arch chạy trên SM86.** Phần code chỉ dùng lệnh SM80 được compile cho `sm_86` lúc chạy test bằng `torch.utils.cpp_extension.load_inline` từ `tests/upstream.py` (cache trong build tree; không thêm file vào repo, không chép code), rồi so bit-exact với kernel của repo:
-- `flashmla:csrc/cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu`: một warp chia tham lam các khối KV vào `num_sm_parts`, có `topk_length` và `extra_topk`. Đây là thuật toán của `mla_get_metadata_kernel` (B11).
-- `flashmla:csrc/cuda_kernels/smxx/decode/combine/combine.cu`: combine split-KV kèm sink (bỏ thuộc tính PDL khi launch trên SM86). Đối chiếu `merge_split_kv_kernel` (B1).
-- `deepgemm:deep_gemm/include/deep_gemm/impls/smxx_layout.cuh`: transpose SF, đóng gói UE8M0, căn TMA. Đối chiếu `fp8_scale_to_tma_layout_kernel`, `fp8_block_scale_to_ue8m0_kernel` (B4).
-- `deepgemm:deep_gemm/include/deep_gemm/scheduler/gemm.cuh`: persistent tile scheduler theo `GemmType` (chỉ số học số nguyên). Đối chiếu task map của B7 và scheduler của B11/B13.
-- `deepgemm:deep_gemm/legacy/m_grouped_gemm.py`: grouped GEMM BF16 contiguous viết bằng Triton, chạy trên SM86 (thay `.._C.get_mk_alignment_for_contiguous_layout` bằng hằng số). Đối chiếu `grouped_gemm_mma_sync_kernel` layout Contiguous (B7).
+**K2 — Code upstream không phụ thuộc arch (deferred).** `torch.utils.cpp_extension.load_inline` không có trong build; `smxx` của FlashMLA, `smxx_layout.cuh` và `scheduler/gemm.cuh` của DeepGEMM chỉ được đọc. Phần logic nào cần đối chiếu thì port sang oracle fp64 hoặc golden vector, không compile upstream.
+
+**K3 — Twin SM80-class.**
 
 **K3 — Twin SM80-class.** Có hai dạng:
 - **T1, thân SM80-class thật.** Một instantiation thật (`ArchTraits<Sm80>`) của kernel trong cùng `<stem>.cu`: `mma.sync`, `cp.async`, `ldmatrix`; FP8/FP4 giải mã bằng software khi SM không có `cvt`. Ô SM86 của nó đi hết thang tới `benchmarked`. Registry được chọn nó cho SM80/86/89/120a khi nó `release_supported` và không đổi semantics. Áp cho: `mla_decode_kernel` (B11), toàn bộ B14, toàn bộ B15, `mega_*` trên mainloop B7/B8 (B16), comm-GEMM trên mainloop B7 (B12). Thân SM80-class là dòng instantiation, không phải file mới (§1.3 mục 1).
-- **T2, twin logic của thân arch.** Thân trong ô arch (`<arch>_impl.cuh`) được viết qua ba policy: `MmaAtom` (`wgmma`, `tcgen05.mma` hoặc `mma.sync` block-scaled ↔ `mma.sync` m16n8k16 BF16 với scale áp bằng software), `LoadPolicy` (TMA + `mbarrier.expect_tx` ↔ `cp.async` + `cp.async.mbarrier.arrive.noinc`), `AccumStore` (TMEM ↔ register/smem). Build với `-DAYAKA_TWIN=ON` (chỉ cho SM86, không bao giờ ở bản release) thì `<stem>.cu` instantiate thêm thân arch với policy SM80, đặt hậu tố `_twin` và bind vào `ayaka_cuda._twin`; registry không thấy chúng. CuTe hỗ trợ sẵn cách này: đổi MMA atom (`SM90_64x…_SS` ↔ `SM80_16x8x16_…`) và copy atom (TMA ↔ `SM80_CP_ASYNC_*`), pipeline TMA ↔ pipeline `cp.async`. `mbarrier` có từ `sm_80`, nên giao thức stage/phase/parity chạy thật trên SM86.
+- **T2, twin logic của thân arch.** Thân trong ô arch (`<arch>_impl.cuh`) được viết qua ba policy: `MmaAtom` (`wgmma`, `tcgen05.mma` hoặc `mma.sync` block-scaled ↔ `mma.sync` m16n8k16 BF16 với scale áp bằng software), `LoadPolicy` (TMA + `mbarrier.expect_tx` ↔ `cp.async` + `cp.async.mbarrier.arrive.noinc`), `AccumStore` (TMEM ↔ register/smem). Build với `-DKOPS_TWIN=ON` (chỉ cho SM86, không bao giờ ở bản release) thì `<stem>.cu` instantiate thêm thân arch với policy SM80, đặt hậu tố `_twin` và bind vào `kops_cuda._twin`; registry không thấy chúng. Không cần CuTe: policy SM80 dùng `mma.sync`/`cp.async` viết tay. `mbarrier` có từ `sm_80`, nên giao thức stage/phase/parity chạy thật trên SM86.
 - **T2 kiểm được:** raster và persistent loop, layout grouped (contiguous, masked, psum, indexed), số học địa chỉ swizzle, vai trò producer/consumer, phase và parity của `mbarrier`, epilogue, scale (1×128, 128×128, UE8M0, MX, NVFP4), mask/causal, split-K, sink, LSE; racecheck/synccheck chạy trên twin.
 - **T2 không kiểm được:** mã hóa TMA descriptor, box và OOB fill; layout toán hạng của `wgmma`/`tcgen05` (kiểm tĩnh ở K4); `setmaxnreg`; cluster, DSMEM, multicast (twin dùng cluster 1); cấp phát và giải phóng TMEM; fence của async proxy (`fence.proxy.async`); hiệu năng. Đây là các lỗi chỉ lộ ra trên phần cứng thật (R13).
 - **Luật:** twin và thân arch dùng chung một template; chỉ policy khác. Phần riêng của arch (vỏ) giữ mỏng nhất có thể và theo đúng nguồn đã chứng minh. Một lỗi chỉ sửa ở twin là lỗi của thiết kế policy, phải sửa ở template chung.
@@ -558,56 +565,57 @@ Evidence `sass`, `twin`, `oracle_upstream`, `conformance` là trường mới c�
 
 **K5 — Rank ảo trên một GPU.** N rank là N vùng rời nhau trong một cấp phát trên cùng GPU (staging, cờ, epoch); `PeerBuffers` của mỗi rank trỏ vào vùng của rank khác như peer pointer. Kernel B12 hiện có nhận peer pointer, nên chạy nguyên thân, không cần twin. Chạy bằng một launch cooperative với block chia theo rank (rank = `blockIdx` / số block mỗi rank), hoặc N stream với grid đủ nhỏ để mọi block cùng resident (kiểm bằng occupancy API). Nếu không bảo đảm cùng resident thì spin-wait có thể deadlock; đây cũng là test của luật tiến triển. Rank ảo kiểm được: barrier và epoch qua nhiều lần replay graph, one-shot/two-shot, thứ tự cộng cố định theo rank, layout/dispatch/combine của EP với 2/4/8 rank và số token thật, cờ theo chunk của comm-GEMM, Mega MoE EP. Rank ảo không kiểm được: mô hình bộ nhớ P2P/NVLink giữa hai GPU, `multimem`/NVLS, handle IPC, RDMA, băng thông thật. CUDA IPC giữa hai tiến trình trên WSL2 có dùng được hay không thì phải kiểm lại; nếu không, chỉ dùng rank ảo trong một tiến trình.
 
-**K6 — Model trong 4 GB.** Ba mức, từ rẻ tới đắt:
-- **Cấu hình thu nhỏ đúng kiến trúc.** Lấy config HF của từng họ model, giảm `hidden_size`, số layer, số expert, số head, nhưng giữ `head_dim`, RoPE, kiểu routing, `layer_types`, định dạng KV. Trọng số ngẫu nhiên có seed. Reference là HF transformers fp32; đường của repo ghép kernel qua `python/`. So từng layer và logits. Phủ mọi họ của §0.4 mà transformers 5.20.2 có (danh sách ở §3.5).
-- **Checkpoint thật vừa 4 GB.** Model nhỏ BF16 hoặc GGUF/AWQ 4 bit (ví dụ Qwen3-0.6B, Llama-3.2-1B, Gemma-3-1B, Mamba2-130m, LFM2-350M; danh sách chốt trong `tests/test_models.py`). Greedy decode N token so với HF transformers (vLLM không có ở dev), chạy dưới CUDA graph.
-- **Nạp theo layer cho checkpoint lớn.** Đọc safetensors bằng mmap, mỗi lần một layer; với MoE chỉ nạp expert được chọn cho vài token. Chỉ tải shard chứa layer cần kiểm. Mục đích là kiểm định dạng lượng tử trên phân phối trọng số thật (FP8 block scale, UE8M0, MXFP4), không phải chạy cả model. Giới hạn bởi RAM 5–6 GB và dung lượng tải.
+**K6 — Layer conformance trong 4 GB (thay cho model chạy end-to-end).** Vì không có PyTorch/transformers, K6 không chạy HF. Thay bằng: golden vector sinh offline cho từng layer (input, weight, output, state) và test C++ so khớp; cấu hình thu nhỏ chỉ là kích thước tensor trong golden vector. Model đầy đủ thuộc engine integration, ngoài repo.
 
 **K7 — Hiệu năng ngoài SM86.** Không đo được và không ghi `benchmarked`. Chỉ ghi: mô hình roofline của ô (byte, FLOP, occupancy từ `ptxas`); `ncu` của twin trên SM86 để tìm lỗi cấu trúc (bank conflict, truy cập không coalesce, stall), không phải số của đích; cấu hình giữ đúng nguồn đã chứng minh (§2.3 mục 3). Hàng có điều kiện chỉ làm "khi benchmark chứng minh có lợi" (B11 hàng instantiation 4) giữ `planned` trong lộ trình này.
 
 ### 3.4 Lộ trình theo giai đoạn
 
-Thứ tự giai đoạn ưu tiên việc cho bằng chứng cao nhất trên SM86 (E4, E5) trước, việc chỉ đạt E1–E3 sau, và trong mỗi luồng giữ thứ tự tầng nền trước (R8). Thứ tự này khác thứ tự số bước ở một chỗ: thân SM80-class của B14 và B15 (P2, P3) làm trước thân Hopper và Blackwell (P4, P5). Phụ thuộc B11 → B14 và B13 → B15 ở §0.3 chỉ áp cho ô Sm90a/Sm100a; ô SM80-class của B14 chỉ cần B3 và B8, của B15 chỉ cần B6, B7 và B14.
+Thứ tự giai đoạn ưu tiên việc cho bằng chứng cao nhất trên SM86 (E4, E5) trước, việc chỉ đạt E1–E3 sau, và trong mỗi luồng giữ thứ tự tầng nền trước (R8). Giai đoạn P1 là hiện tại; P2–P7 chỉ mở sau khi B0–B10 xong.
 
-| Giai đoạn | Nội dung | Nhịp (hàng) | Kernel mới có thân | Kỹ thuật | Bằng chứng đạt |
+| Giai đoạn | Nội dung | Nhịp (hàng) | Kernel | Kỹ thuật | Bằng chứng đạt |
 |---|---|---|---|---|---|
-| P0 | Hạ tầng bằng chứng, không kernel | — | 0 | K1, K2 (loader), K4 (probe) | — |
-| P1 | Đối chiếu chính thức cho bước đã có thân | B1, B3, B4, B6, B7 (không nhịp mới) | 0 | K1, K2 | E2, E4 |
-| P2 | MLA và DSA chạy trên SM86 | B11 hàng 8; B14 hàng 1–3 và hai hàng instantiation | 5 | K1, K2, K3 (T1, T2) | E4 (SM86), E1 + E3 (Sm90a/Sm100a) |
-| P3 | Cấu trúc DeepSeek-V4/V4.1 | B14 hàng 4; B15 hàng 1–5 và một hàng instantiation | 10 | K1, K3 (T1), K6 | E4, E5 (Mốc-dev 10), ⚠ Kimi K3 giữ nguyên |
-| P4 | Hopper còn lại | B11 hàng 1–7, ba hàng instantiation không điều kiện | 9 | K3 (T2), K4 | E1, E2, E3 (`machete_prepack`: E4) |
-| P5 | Blackwell | B13 hàng 1–6 và ba hàng instantiation; hàng 7 có điều kiện | 10 | K3 (T2), K4 | E1, E2, E3 |
-| P6 | Communication | B12 hàng 6 (comm-GEMM); test rank ảo cho hàng 1–5 | 3 | K3 (T1), K5 | E4 ở rank ảo |
-| P7 | Persistent và megakernel | B16 hàng 2–6 | 5 | K3 (T1), K5 | E4 (SM86), E1 + E3 (Sm90a/Sm100a) |
-| P8 | Mốc-dev và gói bàn giao | — | 0 | K6 | E5 |
+| P0 | Hạ tầng C++: CMake, harness, registry, SASS probe | — | 0 | — | — |
+| P1 | B0–B10 + B17 native (đường dễ → khó) | B0–B10, B17 | 166 (5 đã có) | — | E0–E4 |
+| P2 | MLA và DSA chạy trên SM86 | B11 hàng 8; B14 hàng 1–3 | 5 | K3, K4 | E4 (SM86), E1 + E3 (Sm90a/Sm100a) |
+| P3 | Cấu trúc DeepSeek-V4/V4.1 | B14 hàng 4; B15 hàng 1–5 | 10 | K3, K6 | E4, E5, ⚠ Kimi K3 giữ nguyên |
+| P4 | Hopper còn lại | B11 hàng 1–7 | 9 | K3, K4 | E1 + E3 |
+| P5 | Blackwell | B13 hàng 1–6 | 10 | K3, K4 | E1 + E3 |
+| P6 | Communication | B12 hàng 6 (comm-GEMM); rank ảo cho hàng 1–5 | 3 | K3, K5 | E4 ở rank ảo |
+| P7 | Persistent và megakernel | B16 hàng 2–6 | 5 | K3, K5 | E4 (SM86), E1 + E3 |
+| P8 | Layer conformance và gói bàn giao | — | 0 | K6 | E5 |
 
-Cộng P2–P7: 5 + 10 + 9 + 10 + 3 + 5 = 42 kernel. Năm kernel còn lại của 47 là hai kernel NVFP4 `ds_mla` (B13 hàng 7, nhịp có điều kiện, R1) và ba kernel block sparse (B14 hàng 5, nhịp có điều kiện); hai hàng này giữ `planned` cho tới khi điều kiện của chúng đúng. Luồng hiệu năng SM86 (nợ ở §3.1, SOTA-PLAN.md) chạy xen kẽ suốt các giai đoạn, vì nó dùng cùng GPU nhưng không chặn giai đoạn nào.
+B11–B16 có 57 kernel; bảng trên chỉ liệt kê các kernel khó nhất của từng bước. Các kernel còn lại của B11–B16 (metadata, prepack, comm không-GEMM, …) làm trong cùng bước tương ứng, theo đúng bảng bước. Hai nhịp có điều kiện (NVFP4 `ds_mla` ở B13 hàng 7 và block sparse ở B14 hàng 5) giữ `planned` và không chặn giai đoạn nào.
 
-**Kernel còn thiếu, gán theo giai đoạn.** Danh sách này khớp §3.1 (47 kernel) và là nguồn cho `tools/check_roadmap.py`: mỗi tên phải xuất hiện đúng một lần ở đây hoặc ở bảng nhịp B11–B16.
+**Kernel khó, gán theo giai đoạn.**
 
-| Giai đoạn | Kernel | Số |
-|---|---|---|
-| P2 | `mla_get_metadata`, `mla_decode`, `lightning_indexer`, `sparse_topk`, `sparse_mla` | 5 |
-| P3 | `kv_compressor`, `compressed_attention`, `hc_expand`, `hc_head`, `hc_pre`, `hc_post`, `hc_coeff`, `mega_mhc`, `attn_res`, `attn_res_commit` | 10 |
-| P4 | `fp8_gemm_wgmma`, `int8_gemm_wgmma`, `machete_prepack`, `machete_gemm`, `grouped_gemm_prepare`, `grouped_gemm_wgmma`, `fp4_to_fp8_gemm_wgmma`, `grouped_fp4_to_fp8_gemm_wgmma`, `grouped_mixed_input_gemm` | 9 |
-| P5 | `gemm_sm120`, `fp8_gemm_sm120`, `fp4_gemm_sm120`, `grouped_gemm_sm120`, `gemm_tcgen05`, `fp8_gemm_tcgen05`, `int8_gemm_tcgen05`, `fp4_gemm_tcgen05`, `mixed_input_gemm_tcgen05`, `grouped_gemm_tcgen05` | 10 |
-| P6 | `allgather_gemm`, `gemm_reduce_scatter`, `gemm_allreduce` | 3 |
-| P7 | `mega_mlp`, `mega_moe_local`, `mega_attention_block`, `mega_decoder_layer`, `mega_moe_ep` | 5 |
-| có điều kiện | `concat_and_cache_ds_mla_nvfp4`, `cp_gather_and_upconvert_ds_mla_nvfp4`, `kv_block_summary`, `block_topk_select`, `block_sparse_prefill` | 5 |
-| **Tổng** | | **47** |
+| Giai đoạn | Kernel |
+|---|---|
+| P2 | `mla_get_metadata`, `mla_decode`, `lightning_indexer`, `sparse_topk`, `sparse_mla` |
+| P3 | `kv_compressor`, `compressed_attention`, `hc_expand`, `hc_head`, `hc_pre`, `hc_post`, `hc_coeff`, `mega_mhc`, `attn_res`, `attn_res_commit` |
+| P4 | `fp8_gemm_wgmma`, `int8_gemm_wgmma`, `machete_prepack`, `machete_gemm`, `grouped_gemm_prepare`, `grouped_gemm_wgmma`, `fp4_to_fp8_gemm_wgmma`, `grouped_fp4_to_fp8_gemm_wgmma`, `grouped_mixed_input_gemm` |
+| P5 | `gemm_sm120`, `fp8_gemm_sm120`, `fp4_gemm_sm120`, `grouped_gemm_sm120`, `gemm_tcgen05`, `fp8_gemm_tcgen05`, `int8_gemm_tcgen05`, `fp4_gemm_tcgen05`, `mixed_input_gemm_tcgen05`, `grouped_gemm_tcgen05` |
+| P6 | `allgather_gemm`, `gemm_reduce_scatter`, `gemm_allreduce` |
+| P7 | `mega_mlp`, `mega_moe_local`, `mega_attention_block`, `mega_decoder_layer`, `mega_moe_ep` |
 
-**P0 — Hạ tầng bằng chứng.**
-- `tests/upstream.py`: loader K1 (FlashMLA `395cb3a` và `ba89a34`, DeepGEMM, HF) và K2 (`load_inline` cho `smxx` của FlashMLA, `smxx_layout.cuh` và `scheduler/gemm.cuh` của DeepGEMM, Triton legacy); stub cho `deep_gemm._C` và `flash_mla.cuda`; hàm đổi quy ước (LSE ±inf, sink, NT, định dạng SF).
-- `tests/hw.py`: marker `twin`, `sass`. `tests/kit.py`: `sass_probe(cubin, expect, forbid)` và ngân sách `ptxas`.
-- `CMakeLists.txt`: option `AYAKA_TWIN` (chỉ khi `AYAKA_CUDA_ARCHS` là `86`).
-- `tools/gen_registry.py`: trường evidence `sass`, `twin`, `oracle_upstream`, `conformance` (§3.2).
-- `tools/check_roadmap.py` (§1.6, chưa có): viết ở P0, vì từ P2 bảng nhịp và bảng biến thể đổi nhiều. Ghi vào bảng biến thể (§1.6) việc `gemm_mma_sync_kernel` là thân chung của các hàng B7 không có `__global__` riêng.
-- Ra khi: `pytest -m oracle` có test đối chiếu `tests/oracles/quant.py` với DeepGEMM `deep_gemm/utils/math.py` (UE8M0, 1×128, 128×128, e2m1) và FlashMLA `tests/quant.py` (V3.2, V4.0, V4.1, V4.1 FP4) đều xanh.
+**P0 — Hạ tầng C++.** Không kernel.
+- `tests/unit/harness.h`: bản tối thiểu đã có (device buffer, `Status` check, so fp64/ULP, trả 77 khi không tạo được context); `--tier`, `--json`, `--dryrun`, `--mutate` bổ sung ở nhịp kế tiếp.
+- `benchmark/harness.h`: CUDA events, warmup, flush L2, JSON environment record.
+- `tests/unit/test_m1.cc`: walking skeleton cho 5 kernel đã có.
+- `CMakeLists.txt`: `KOPS_BUILD_TESTS`, `KOPS_BUILD_BENCHMARKS`, `KOPS_TWIN` (chỉ arch 86), hàm `kops_add_test`; `enable_testing()` trước `add_test`.
+- `tools/gen_registry.py`: trường evidence `sass`, `twin`, `oracle_f64`, `conformance` (§3.2).
+- `tools/check_roadmap.py`: giữ rule hiện có; thêm kiểm test/benchmark C++ và bảng biến thể (§1.6).
+- `tools/sass_probe.py`: `ptxas -v` budget + `cuobjdump -sass` expect/forbid.
+- Ra khi: `cmake -S . -B build && cmake --build build && ctest --test-dir build` xanh; `test_m1` phủ 5 kernel và contract lỗi.
 
-**P1 — Đối chiếu chính thức cho bước đã có thân.** Không có kernel mới. Các mục này trước đây chờ GPU hoặc vLLM, giờ chạy ở dev:
-- B3 `concat_and_cache_ds_mla_kernel`, `cp_gather_and_upconvert_ds_mla_fp8_kernel`: khớp byte với FlashMLA `ba89a34` `tests/quant.py` (V3.2 656 B), ngoài gate vLLM sẵn có.
-- B4 `fp8_scale_to_tma_layout_kernel`, `fp8_block_scale_to_ue8m0_kernel`, `fp8_block2d_quant_weight_kernel`: bit-exact với DeepGEMM `smxx_layout.cuh` (K2) và `per_block_cast_to_fp8` (K1).
-- B1 `merge_split_kv_kernel`: khớp FlashMLA `combine.cu` (K2), kể cả sink.
+**P1 — B0–B10 + B17 native.** Giai đoạn hiện tại. Làm theo thứ tự bước, family nào xong family đó:
+- B0: `residual`, `cast` (`model_ops/residual.cu`).
+- B1: hoàn tất `norm` (7 launcher còn stub), `activation` (2), `attention/merge` (2), rồi `position`, `embedding`, `sampling`, `logits_processor`.
+- B2: `kvcache`, `state`; B3 `quantization`; B4 prep; B5 GEMV; B6 routing/permute/sampling; B7 `mma.sync`; B8 attention; B9 recurrent; B10 speculative; B17 low-bit.
+- Oracle là `csrc/reference/` fp64; không có đối chiếu PyTorch.
+- Ra khi: 166/166 kernel của B0–B10 + B17 có thân; mỗi family có `tests/unit/test_<family>.cc` và `benchmark/bench_<family>.cc`; `ctest` xanh trên SM86.
+
+
 - B6 `moe_topk_kernel`, `moe_fused_router_topk_kernel` ở SqrtSoftplus: khớp gate của DeepGEMM `tests/test_mega_gate.py` và `DeepseekV4TopKRouter`.
 - B7 `grouped_gemm_mma_sync_kernel` Contiguous: khớp Triton legacy của DeepGEMM (K2); task map khớp `scheduler/gemm.cuh` (K2).
 
@@ -616,24 +624,24 @@ Cộng P2–P7: 5 + 10 + 9 + 10 + 3 + 5 = 42 kernel. Năm kernel còn lại củ
 - `mla_decode_kernel`: T1 `Sm80` (cache BF16 576 và FP8 V3.2 656 B giải mã software; MTP q_len > 1; combine qua `merge_split_kv_kernel`) đối chiếu FlashMLA (semantics dense ở `ba89a34`) và `attn-rs:mla_paged_attention.cu`; thân Sm90a port `flashmla@ba89a34:csrc/kernels/sm90/decode/dense/splitkv_mla.cuh` qua T2.
 - B14 hàng 1–3: `lightning_indexer_kernel` (T1: BF16/INT8 `mma.sync`, FP8/FP4 giải mã software, contiguous và paged, metadata là biến thể thân), `sparse_topk_kernel` (generic radix), `sparse_mla_kernel` (T1: cache 656/584/528/288 B, hai phạm vi KV, `topk_length`, sink, biến thể fused Q-norm/RoPE và O-RoPE + cast FP8 của V4.1). Đối chiếu FlashMLA `tests/ref.py` và DeepGEMM `ref_mqa_logits`. Thân Sm90a (FlashMLA `ba89a34`, DeepGEMM `sm90_fp8_*mqa_logits`) và Sm100a (FlashMLA `395cb3a`, DeepGEMM `sm100_*mqa_logits`) qua T2.
 - Hai hàng instantiation mới của B14: codec KV V4.0 và V4.1 cho kernel `ds_mla` của B3; `WeightPacking` cho permute Q_b/Wv của V4.1.
-- Ra khi: các ô SM86 E4; ô Sm90a/Sm100a E1 + E3; Mốc-dev 9 (DeepSeek-V3.2 thu nhỏ, §3.5) pass.
+- Ra khi: các ô SM86 E4; ô Sm90a/Sm100a E1 + E3; layer conformance 9 (§3.5) pass.
 
 **P3 — Cấu trúc DeepSeek-V4/V4.1.**
 - B14 hàng 4: `kv_compressor_kernel` (CSA chồng 2m, HCA) và `compressed_attention_kernel` (nhánh nén + SWA + sink trong một kernel hai phạm vi kiểu FlashMLA, hoặc gộp bằng `merge_hybrid_branches_kernel`). Oracle là HF `DeepseekV4CSACompressor`/`HCACompressor`. ⚠ chỉ được gỡ khi so thêm với code inference chính thức trong repo checkpoint (R6).
 - B15 hàng 1–4: `hc_expand`, `hc_head`, `hc_pre`, `hc_post`, `hc_coeff` (phần chiếu dùng TF32 `gemm_mma_sync_kernel` + `kEpiRowSumSq`, đúng việc `tf32_hc_prenorm_gemm` của DeepGEMM làm), `mega_mhc_kernel` generic (split-K + `last_cta_arrive` thay cluster) khớp `mhc_reference` của DeepGEMM (Sinkhorn, RMSNorm, FP8 1×32 UE8M0, ba layout SF); thân Sm100a port `sm100_mega_mhc.cuh` vào ô mới `model_ops/sm100a_impl.cuh` (§1.3 mục 2), làm cuối giai đoạn, qua T2 (twin dùng `mma.sync` TF32 m16n8k8 có từ SM80, nên gần thân thật hơn các twin khác).
 - B15 hàng 5 (`attn_res_*`, Kimi K3): viết theo tech report, ô giữ `implemented`, ⚠ còn nguyên (không có code chính thức).
 - Hàng instantiation mới của B15: gate V4 (semantics `bf16_mega_gate`) trên kernel routing của B6.
-- Ra khi: các ô SM86 E4; Mốc-dev 10 (DeepSeek-V4 thu nhỏ) pass.
+- Ra khi: các ô SM86 E4; layer conformance 10 (§3.5) pass.
 
-**P4 — Hopper còn lại (B11).** Thứ tự tầng nền: pipeline TMA/`mbarrier` của `gemm_wgmma_kernel` (đã có) có twin xanh → `fp8_gemm_wgmma_kernel` (DeepGEMM `sm90_fp8_gemm_1d2d.cuh`: promote mỗi K 128, multicast, persistent; chế độ batched cho einsum `bhr,hdr->bhd` của V4.1) → `int8_gemm_wgmma_kernel` → `machete_prepack_kernel` (generic, E4 ở SM86: bit-exact với layout Machete của vLLM) và `machete_gemm_kernel` → `grouped_gemm_prepare_kernel` (dựng problem generic, E4; `tensormap.replace` qua E1) → `grouped_gemm_wgmma_kernel` (DeepGEMM contiguous/masked/psum) → `fp4_to_fp8_gemm_wgmma_kernel`, `grouped_fp4_to_fp8_gemm_wgmma_kernel`, `grouped_mixed_input_gemm_kernel` (không có nguồn, viết cuối, R12). Ba hàng instantiation không điều kiện (prefill Sm90a, `paged_decode_tc` Sm90a, `w4a8_int_gemm` Sm90a) theo sau; hàng chunk SSD/delta rule giữ `planned` (K7).
+**P4 — Hopper còn lại (B11).** Thứ tự tầng nền: pipeline TMA/`mbarrier` của `gemm_wgmma_kernel` (viết mới, twin xanh) → `fp8_gemm_wgmma_kernel` (đọc DeepGEMM `sm90_fp8_gemm_1d2d.cuh`: promote mỗi K 128, multicast, persistent; chế độ batched cho einsum `bhr,hdr->bhd` của V4.1) → `int8_gemm_wgmma_kernel` → `machete_prepack_kernel` (generic, E4 ở SM86) và `machete_gemm_kernel` → `grouped_gemm_prepare_kernel` (dựng problem generic, E4; `tensormap.replace` qua E1) → `grouped_gemm_wgmma_kernel` (contiguous/masked/psum) → `fp4_to_fp8_gemm_wgmma_kernel`, `grouped_fp4_to_fp8_gemm_wgmma_kernel`, `grouped_mixed_input_gemm_kernel` (không có nguồn, viết cuối, R12). Ba hàng instantiation không điều kiện (prefill Sm90a, `paged_decode_tc` Sm90a, `w4a8_int_gemm` Sm90a) theo sau; hàng chunk SSD/delta rule giữ `planned` (K7).
 
-**P5 — Blackwell (B13).** SM120a trước (`mma.sync` block-scaled; twin là `mma.sync` BF16 với scale software), rồi SM100a/103a (`tcgen05`; nguồn DeepGEMM `sm100_bf16_gemm.cuh`, `sm100_fp8_fp4_gemm_1d1d.cuh`; FMHA dense của FlashMLA cho hàng instantiation prefill Sm100a), SM121a cùng thân với tactic riêng. Hàng 7 (NVFP4 `ds_mla` 352 B) giữ có điều kiện; nhu cầu KV FP4 của DeepSeek đã được định dạng chính thức V4.1 288 B ở P2 đáp ứng (R1).
+**P5 — Blackwell (B13).** SM120a trước (`mma.sync` block-scaled; twin là `mma.sync` BF16 với scale software), rồi SM100a/103a (`tcgen05`; đọc DeepGEMM `sm100_bf16_gemm.cuh`, `sm100_fp8_fp4_gemm_1d1d.cuh`; FMHA dense của FlashMLA cho hàng instantiation prefill Sm100a), SM121a cùng thân với tactic riêng. Hàng 7 (NVFP4 `ds_mla` 352 B) giữ có điều kiện; KV FP4 chính thức V4.1 288 B thuộc dòng instantiation của P2 (R1).
 
-**P6 — Communication.** Test rank ảo 2/4/8 cho 8 kernel B12 đã có thân (K5). Viết ba kernel comm-GEMM trên mainloop B7 với cờ theo chunk; ô SM86 E4 ở rank ảo; ô đa GPU thật giữ `authored`.
+**P6 — Communication.** Test rank ảo 2/4/8 cho 11 kernel B12 (K5). Viết ba kernel comm-GEMM trên mainloop B7 với cờ theo chunk; ô SM86 E4 ở rank ảo; ô đa GPU thật giữ `authored`.
 
-**P7 — Persistent và megakernel.** `mega_mlp_kernel`, `mega_moe_local_kernel`, `mega_attention_block_kernel`, `mega_decoder_layer_kernel` và variant `mega_step_kernel` (multi-layer, v1 MHA/MoE) trên mainloop B7/B8 (T1, kernel SM86 thật; 16 SM của máy dev thuận lợi cho test "không deadlock khi ít SM"). `mega_moe_ep_kernel` qua rank ảo; thân Sm100a port Mega MoE của DeepGEMM vào ô mới `mega/sm100a_impl.cuh` qua T2, làm cuối giai đoạn và chỉ khi twin FP8×FP4 của P5 và EP rank ảo của P6 đã xanh (§1.3 mục 2). Điều kiện release "nhanh hơn modular + CUDA graph + PDL" đo được ở SM86 cho ô SM86, trừ phần PDL (cần SM90).
+**P7 — Persistent và megakernel.** `mega_mlp_kernel`, `mega_moe_local_kernel`, `mega_attention_block_kernel`, `mega_decoder_layer_kernel` và variant `mega_step_kernel` (multi-layer, v1 MHA/MoE) trên mainloop B7/B8 (T1, kernel SM86 thật; 16 SM của máy dev thuận lợi cho test "không deadlock khi ít SM"). `mega_moe_ep_kernel` qua rank ảo; thân Sm100a đọc Mega MoE của DeepGEMM và port vào ô mới `mega/sm100a_impl.cuh` qua T2, làm cuối giai đoạn và chỉ khi twin FP8×FP4 của P5 và EP rank ảo của P6 đã xanh (§1.3 mục 2). Điều kiện release "nhanh hơn modular + CUDA graph + PDL" đo được ở SM86 cho ô SM86, trừ phần PDL (cần SM90).
 
-**P8 — Mốc-dev và báo cáo.** `tests/test_models.py` (E.2 #15) với cấu hình thu nhỏ cho mọi họ ở §3.5 và checkpoint nhỏ thật; báo cáo cuối liệt kê mọi ô theo mức E0–E5. Handoff kit (Phụ lục B) là tuỳ chọn: P8 sinh danh sách test đang `skip` để bất kỳ ai có GPU chạy lại, nhưng không chờ kit nào. P8 bắt đầu từ P2 (mỗi giai đoạn thêm dòng Mốc-dev của nó) và đóng sau P7.
+**P8 — Layer conformance và báo cáo.** `tests/unit/test_conformance.cc` + `tests/golden/` cho từng layer; báo cáo cuối liệt kê mọi ô theo mức E0–E5. Handoff kit (Phụ lục B) là tuỳ chọn: P8 sinh danh sách test trả 77 để bất kỳ ai có GPU chạy lại, nhưng không chờ kit nào. P8 bắt đầu từ P1 (mỗi family thêm golden vector của nó) và đóng sau P7.
 
 **P9 — B18: family mới, sau v0.1.** Chỉ mở sau khi 233 kernel đạt Gate dev. Đây là các family phát hiện khi audit `3rd/` (vLLM `libtorch_stable`, SGLang `sgl-kernel`) mà roadmap 233 kernel chưa có. Mỗi family mở đúng 5 file theo §1.2 và một `.cu` theo miền; tên file không dùng `_partN`.
 
@@ -649,55 +657,55 @@ Cộng P2–P7: 5 + 10 + 9 + 10 + 3 + 5 = 42 kernel. Năm kernel còn lại củ
 | `gemm/marlin_moe.cu` | biến thể `marlin_moe_wna16` của `marlin_gemm_kernel` | có | `vllm:moe/marlin_moe_wna16/` |
 | `vision/conv3d.cu`, `vision/patch_embed.cu` | `conv3d`, `patch_embed`, `rope2d`, `window_attn` | có | `sglang:cpu/conv3d.cpp`, `sglang:spatial/` |
 
-P9 thêm ~20 kernel và 9 family; con số 233/125/140 của v0.1 không đổi. Điều kiện vào P9: Gate dev của P0–P8 xanh, và có checkpoint/model thật để test (trừ `cooperative_topk` cần SM90).
+P9 thêm ~20 kernel và 9 family; con số 233/125/112 của v0.1 không đổi. Mỗi family mở 4 file (ops.h đã có + test + benchmark + registry) và một `.cu` theo miền. Điều kiện vào P9: Gate dev của P0–P8 xanh, và có checkpoint/model thật để test (trừ `cooperative_topk` cần SM90).
 
 
-### 3.5 Mốc-dev
+### 3.5 Layer conformance
 
-Mốc đầy đủ (§0.4) cần checkpoint lớn và đúng exact SM, nên nằm ngoài lộ trình. Mốc-dev là gate thay thế chạy được trên SM86. Mốc-dev không thay Mốc: nó không mở `release_supported` cho exact SM khác.
+Mốc model-level (§0.4) cần engine, checkpoint và PyTorch, nên nằm ngoài repo. Gate thay thế là **layer conformance C++**: golden vector sinh offline cho từng layer, test trong `tests/unit/test_conformance.cc`, chạy trên SM86. Layer conformance không thay Mốc: nó không mở `release_supported` cho exact SM khác.
 
-| Mốc | Mốc-dev trên SM86 | Model hoặc cấu hình |
+| Mốc | Layer conformance trên SM86 | Golden vector / provenance |
 |---|---|---|
-| 1 | Conformance từng layer và logits (cấu hình thu nhỏ); greedy 128 token trên checkpoint nhỏ thật, dưới CUDA graph, toàn bộ kernel native (B7/B8 đã thay adapter) | Llama, Qwen3, Gemma 2/3, Phi-3 thu nhỏ; Qwen3-0.6B, Llama-3.2-1B, Gemma-3-1B |
-| 2 | Conformance thu nhỏ của MoE và FP8 (FP8 qua đường giải mã software của SM86) | Mixtral, Qwen3-MoE, DeepSeek-V3 (MLA qua T1 của P2), GLM-4.5, MiniMax-M2 thu nhỏ; GGUF 4 bit nhỏ |
-| 3 | Như Mốc 2 cho weight-only, sink + SWA, chunked attention | GPT-OSS (MXFP4 qua Marlin FE2M1), Llama 4, Gemma 3 thu nhỏ; checkpoint AWQ/GPTQ nhỏ; LoRA |
-| 4 | Conformance từng layer (KDA + MLA NoPE + MoE top-8 sigmoid) và prefix cache qua snapshot | Mamba2-130m thật; Jamba, Nemotron-H, Falcon-H1, LFM2, Qwen3-Next, Kimi Linear, MiniMax-01 thu nhỏ |
-| 5 | Phân phối rejection sampling (chi-square, đã có ở B10); MTP trên DeepSeek-V3 thu nhỏ; acceptance length chỉ khi cặp draft/target vừa 4 GB | — |
-| 6, 8 | Không có Mốc-dev riêng: model của hai Mốc này chạy ở SM86 qua đường generic (đã thuộc Mốc-dev 2, 3); phần Hopper/Blackwell chỉ có E1–E3 | — |
-| 7 | Conformance một layer khi chia TP 2/4 qua rank ảo (K5) | model thu nhỏ của Mốc-dev 1, 2 |
-| 9 | Indexer + top-k + sparse MLA FP8 656 B qua T1 | DeepSeek-V3.2 thu nhỏ (`deepseek_v32`) |
-| 10 | mHC, CSA/HCA, hash route, sink, định dạng KV V4.1 | DeepSeek-V4 thu nhỏ (`deepseek_v4`); Kimi K3 không có reference nên không có Mốc-dev (R6) |
+| 1 | embedding → norm → GEMV → residual, dưới CUDA graph | Llama/Qwen/Gemma/Phi shapes; fp64 reference |
+| 2 | MoE routing + permute + grouped GEMV + FP8 decode | Mixtral/Qwen3-MoE/DeepSeek-V3 shapes |
+| 3 | weight-only, sink + SWA, chunked attention | GPT-OSS/Llama 4/Gemma 3 shapes |
+| 4 | KDA + MLA NoPE + MoE top-8 sigmoid, prefix state snapshot | Mamba2/Jamba/Qwen3-Next shapes |
+| 5 | rejection sampling (chi-square) + tree verify | phân phối target |
+| 6, 8 | không có layer riêng: dùng layer của Mốc 1–3 | — |
+| 7 | một layer khi chia TP 2/4 qua rank ảo (K5) | layer của Mốc 1–2 |
+| 9 | indexer + top-k + sparse MLA FP8 656 B qua T1 | DeepSeek-V3.2 shapes |
+| 10 | mHC, CSA/HCA, hash route, sink, định dạng KV V4.1 | DeepSeek-V4 shapes; Kimi K3 vẫn ⚠ (R6) |
 
 ### 3.6 Đích cuối của lộ trình SM86
 
-- 233/233 kernel có thân, launcher, binding, test các lớp của §2.4 và case benchmark; 125 nhịp đã chạy vòng sáu việc, trừ 4 nhịp có điều kiện còn `planned`.
+- 233/233 kernel có thân, launcher, test các lớp của §2.4 và case benchmark; 125 nhịp đã chạy vòng năm việc, trừ 4 nhịp có điều kiện còn `planned`.
 - Mọi ô SM86 của kernel chạy được ở SM86 (generic và T1) đạt `benchmarked`; gate hiệu năng SM86 của từng bước đạt, hoặc khoảng cách được ghi lại.
 - Mọi ô exact SM khác đạt `compiled` cộng `sass`; ô có thân arch có thêm `twin`; không ô nào được ghi `numerically_validated` nếu không có báo cáo từ đúng exact SM đó.
-- Mốc-dev 1–5, 7, 9, 10 pass.
+- Layer conformance 1–5, 7, 9, 10 pass.
 - Có handoff kit (tuỳ chọn) cho `sm80`, `sm89`, `sm90a`, `sm120a`, `sm100a`, `sm103a`, `sm121a`, `multi`; không kit nào là điều kiện của v0.1.
 - `release_supported` cho ô SM86 chỉ khi chủ repo cho tạo commit sạch (R15).
 
 ### 3.7 Nhịp làm việc trên một máy
 
 - Một GPU và 5–6 GB RAM: một build tại một thời điểm, test GPU chạy tuần tự, gate compile 8 SM chạy qua đêm. Không chạy build của thư viện thứ ba cạnh build của module (AGENTS.md).
-- Vòng một nhịp có ô `authored`: oracle (lớp a, a+) → thân generic hoặc T1 → build SM86, test, dryrun, mutate → thân arch theo ba policy → build `AYAKA_TWIN`, lớp (t) dưới sanitizer → build lại translation unit đã sửa cho exact SM của ô, lớp (s) → registry (status và evidence) → benchmark SM86.
-- Mỗi giai đoạn kết thúc bằng một lần chạy cả bộ test (native, dryrun, mutate) như `build-b9/run_final_suite.sh` và một lần gate compile 8 SM; report đặt trong thư mục `build-*` của giai đoạn, không đè `build-b9/final-*.json`.
+- Vòng một nhịp có ô `authored`: oracle fp64 → thân generic hoặc T1 → build SM86, `ctest`, `--dryrun`, `--mutate` → thân arch theo ba policy → build `KOPS_TWIN`, lớp (t) dưới sanitizer → build lại translation unit đã sửa cho exact SM của ô, lớp (s) → registry (status và evidence) → benchmark C++ trên SM86.
+- Mỗi giai đoạn kết thúc bằng một lần chạy cả bộ test (`ctest --test-dir build`) và một lần gate compile 8 SM; report JSON đặt trong thư mục `build-*` của giai đoạn.
 
 ---
 
 ## B0 — Nền móng và walking skeleton
 
-**Mục tiêu.** Dựng toàn bộ đường ống bằng kernel đơn giản nhất. Đường ống là vòng sáu việc của một nhịp (§1.1) chạy trên bộ file cố định của §1.2: oracle → thân kernel và launcher (`<stem>.cu`, khai báo ở `<family>.h`) → binding và test → registry → benchmark. Mọi bước sau chỉ thêm thân kernel và thêm dòng vào các file này; file mới chỉ xuất hiện ở nhịp mở.
+**Mục tiêu.** Dựng toàn bộ đường ống bằng kernel đơn giản nhất. Đường ống là vòng năm việc của một nhịp (§1.1) chạy trên bộ file cố định của §1.2: oracle → thân kernel và launcher (`<stem>.cu`, khai báo ở `ops.h`) → test + registry → benchmark. Mọi bước sau chỉ thêm thân kernel và thêm dòng vào các file này; file mới chỉ xuất hiện ở nhịp mở.
 
 **SM.** Compile cả 8 target; validate trên SM80 và SM90a. Ở máy dev, validate trên SM86 (Gate dev); SM80 và SM90a ở handoff kit (handoff kit (tuỳ chọn)).
 
-**Nhịp.** 1 nhịp · 2 kernel · mở family `model_ops` · file mới: 20 (14 hạ tầng, 5 file family, 1 `.cu`). Hiện trạng: cả hai kernel đã có thân và launcher, mới validate trên SM86.
+**Nhịp.** 1 nhịp · 2 kernel · mở family `model_ops` · file mới: 18 (14 hạ tầng, 3 file family, 1 `.cu`). Hiện trạng: 0/2 kernel có thân; `residual_add_kernel` và `cast_kernel` còn là declaration.
 
 **Phần cứng.** Máy dev (SM86) chạy hết nhịp. Chạy lại ở handoff kit `sm80` và `sm90a` (handoff kit (tuỳ chọn)). Từ khi máy dev lên CUDA 12.9, compile cả 8 target chạy ngay ở máy dev (§2.6); trước đó toolkit 12.4 chỉ build được 4 target.
 
 **Đợt.** B0 chia hai đợt (§1.4):
 - B0.1 — hạ tầng (danh sách ở Phụ lục E.2): 14 file mới, chưa có kernel.
-- B0.2 — nhịp đầu tiên, hàng duy nhất của bảng dưới đây: mở `model_ops`, 1 nhịp, 2 kernel, 6 file mới.
+- B0.2 — nhịp đầu tiên, hàng duy nhất của bảng dưới đây: mở `model_ops`, 1 nhịp, 2 kernel, 4 file mới.
 
 Riêng B0, Gate ra bước áp sau B0.2, trên các file do B0.1 dựng.
 
@@ -706,13 +714,13 @@ Riêng B0, Gate ra bước áp sau B0.2, trên các file do B0.1 dựng.
 | model_ops/residual.cu | `residual_add_kernel`, `cast_kernel` | ★ | Load/store vector 16 B, có nhánh scalar khi không align. Đây là hai kernel đầu tiên đi hết đường ống. | <ul><li>`vllm:libtorch_stable/quantization/vectorization_utils.cuh` — `vectorize_with_alignment` (xử lý phần đầu lệch alignment bằng scalar rồi mới chạy vector: mẫu cho nhánh scalar của B0)</li><li>`vllm:libtorch_stable/cuda_vec_utils.cuh` — `u32x8_t`, `VecTraits` (vector 256-bit, chọn kiểu theo arch lúc compile)</li><li>`vllm:libtorch_stable/layernorm_kernels.cu` — `fused_add_rms_norm_kernel` (residual add kèm norm; template `width` = số phần tử mỗi vector)</li><li>`vllm:libtorch_stable/cache_kernels.cu` — `convert_fp8_kernel` (cast FP8 ↔ fp16/bf16 theo phần tử)</li></ul> |
 
 **Hạ tầng (không phải kernel):**
-- `common/device_impl.cuh`: `Vec`, warp/block reduce, `SoftmaxState`, fast math. Chuyển đổi fp8/fp4/ue8m0 có hai đường: software (SM80) và `cvt` (SM89+, SM100+).
-- `common/check.h`: `AYAKA_CHECK*`, helper kiểm tra dtype/shape/stride/alignment và `DeviceStream`. Input sai ném exception (`std::runtime_error` hoặc `c10::Error`), không `printf`, không `abort`; không có kiểu `Status`.
-- `execution/launch.cc`: `launch_kernel` (`cudaLaunchKernelEx`, thuộc tính PDL) và `GraphHandle` cơ bản.
-- Registry sinh từ `registry/capabilities/<family>.yaml` (mỗi family một file) bằng một script duy nhất (`tools/gen_registry.py`, tên đề xuất); mã sinh ra nằm trong build tree. Phần viết tay là `select` / `explain` (`csrc/runtime/registry.cc`) và `trace` cùng `write_environment_record` (`csrc/runtime/trace.cc`), tên đề xuất, theo `runtime/registry.h` và `runtime/trace.h`.
-- `cmake/arch.cmake` theo exact SM; `cmake/instantiate.cmake` nối bảng instantiation vào build. Mã sinh ra, nếu có, chỉ nằm trong build tree.
-- Test: oracle fp64 (PyTorch) và case sai dtype/shape/stride/alignment nằm trong `tests/test_<family>.py` của từng family; một module helper chung (`tests/conftest.py`, tên đề xuất) cho so ULP, sweep, graph capture và dựng case sai; `tests/test_models.py` (tạo ở Mốc 1) cho conformance model.
-- Benchmark: `benchmark/` (thư mục hiện có) gồm một harness chung (`benchmark/harness.py`, tên đề xuất: CUDA events, flush L2, warmup, environment record) và `bench_<family>.py`; case là dữ liệu trong file, không phải một file mỗi case.
+- `common/device.cuh` (đã có): `Vec`, warp/block reduce, fast math; chỉ thêm `device_impl.cuh` khi một kernel thật sự cần.
+- `common/status.h` + `common/tensor.h` (đã có): `Status`, `Tensor`, `LaunchContext`, `Workspace`, `check_tensor`. Không có `check.h` riêng, không exception, không `c10::Error`, không `printf`/`abort`.
+- `execution/launch.cc`: `launch_kernel` (`cudaLaunchKernelEx`, PDL) và `GraphHandle`; khai báo ở `execution/launch.h` (đã có).
+- Registry sinh từ `registry/capabilities/<family>.yaml` bằng `tools/gen_registry.py`; mã sinh nằm trong build tree. Phần viết tay: `select`/`explain` (`csrc/runtime/registry.cc`, đã có) và `trace`/`write_environment_record` (`csrc/runtime/trace.cc`).
+- `cmake/arch.cmake` (đã có) và `cmake/instantiate.cmake`.
+- Test: `tests/unit/harness.h` + `tests/unit/test_<family>.cc`; oracle fp64 trong `csrc/reference/`; contract lỗi trả `Status`. Không pytest, không PyTorch.
+- Benchmark: `benchmark/harness.h` + `benchmark/bench_<family>.cc`; CUDA events, flush L2, JSON environment record.
 - CI: `check_requires.py`, `check_roadmap.py` (mở rộng ở §1.6), compile matrix 8 SM (CI không GPU). Runner GPU tối thiểu: SM80 và SM90a.
 - Tài liệu: `CONTRACTS.md` và khung `THIRD_PARTY_NOTICES.md` ở B0.1; `docs/KV_CACHE_PARITY.md` tạo ở B2 và `GEMM_MATRIX.md` ở Mốc 2.
 
@@ -732,9 +740,9 @@ Hạ tầng gồm 17 file (Phụ lục E.2): 14 file dựng ở đợt B0.1, 3 f
 
 **SM.** CUDA generic, compile 8 target; validate SM80 và SM90a; smoke test SM89/SM120 nếu có máy.
 
-**Nhịp.** 11 nhịp chia 3 đợt (bên dưới) · 32 kernel · mở 6 family `activation`, `norm`, `position`, `embedding`, `sampling`, `attention` · file mới: 37 (30 file family, 7 `.cu`). Hiện trạng (2026-10-06): cả 11 nhịp đã có thân kernel, launcher, binding, test và benchmark, validate trên SM86 (Gate dev); các ô SM khác ở `authored`. Chưa đạt mục tiêu băng thông ≥ 80% của máy dev: `fused_qk_norm_rope_kernel` (khoảng 70% ở head_dim 128), `softmax_kernel` (khoảng 43%), `argmax_kernel` kèm logprob (khoảng 33%), `compute_logprobs_kernel` (40% với `top_n = 0`, 3–11% với `top_n > 0`), `apply_token_bitmask_kernel` (khoảng 19%) và `merge_states_kernel` bf16 ở 2048 hàng (73–84%); các kernel merge còn lại đạt 89–100% băng thông copy; số đo thật ở `registry/capabilities/*.yaml` (`limitations`) và `build-cmake/b1-*-benchmark.json`.
+**Nhịp.** 11 nhịp chia 3 đợt (bên dưới) · 32 kernel · mở 6 family `activation`, `norm`, `position`, `embedding`, `sampling`, `attention` · file mới: 25 (18 file family, 7 `.cu`). Hiện trạng (2026-10-31): 5/32 kernel có thân (`rms_norm`, `fused_add_rms_norm`, `act`, `act_and_mul`, `merge_state`); 27 kernel còn lại là declaration. Chưa có benchmark nên chưa có số băng thông.
 
-**Phần cứng.** Máy dev chạy toàn bộ 11 nhịp. handoff kit (tuỳ chọn): (1) handoff kit `sm80` và `sm90a` chạy lại cùng test và đo băng thông riêng từng GPU (mục tiêu ≥ 80% DRAM tính theo GPU đó; số đo ở máy dev không thay thế); (2) nhánh vector 256-bit (`AYAKA_HAS_256B_PTX`: toolkit ≥ 12.9 và target `a` của Blackwell) chỉ chạy được ở handoff kit `sm100a`/`sm120a`; test `vec_bytes_cap=32` đã có (`tests/README.md`).
+**Phần cứng.** Máy dev chạy toàn bộ 11 nhịp. handoff kit (tuỳ chọn): (1) `sm80` và `sm90a` chạy lại cùng test và đo băng thông riêng từng GPU (mục tiêu ≥ 80% DRAM tính theo GPU đó; số đo ở máy dev không thay thế); (2) nhánh vector 256-bit chỉ chạy trên target `a` của Blackwell; harness kiểm exact SM và trả 77 nếu thiếu, test vẫn phải viết sẵn.
 
 **Đợt.** B1 mở 6 family nên chia 3 đợt (§1.4). Mỗi đợt qua các mục của Gate ra bước áp cho family của đợt đó trước khi sang đợt sau:
 - B1.1 — hàng 1–4: `activation`, `norm` · 4 nhịp, 11 kernel, 12 file mới.
@@ -770,19 +778,19 @@ Hạ tầng gồm 17 file (Phụ lục E.2): 14 file dựng ở đợt B0.1, 3 f
 - **Graph-safe:** không host sync, không cấp phát.
 - **Benchmark** (mục tiêu đề xuất, chốt trong CONTRACTS.md):
   - ≥ 80% băng thông DRAM đo được trên cùng GPU ở shape lớn.
-  - Không chậm hơn kernel vLLM tương ứng ở shape decode (T ≤ 256).
+  - So với roofline và kernel copy trên cùng GPU; so sánh vLLM là tuỳ chọn khi có.
 
 ---
 
 ## B2 — Bộ nhớ theo chỉ số: KV cache, state cache, page
 
-**Mục tiêu.** Đủ phần ghi, đọc và di chuyển cache để chạy attention qua adapter. Đối chiếu từng hàm với `docs/KV_CACHE_PARITY.md`.
+**Mục tiêu.** Đủ phần ghi, đọc và di chuyển cache để chạy attention native. Đối chiếu từng hàm với `docs/KV_CACHE_PARITY.md` (tạo ở B2).
 
 **SM.** CUDA generic; validate SM80 và SM90a.
 
-**Nhịp.** 8 nhịp · 20 kernel · mở family `kvcache`, `state` · file mới: 14 (1 hạ tầng, 10 file family, 3 `.cu`).
+**Nhịp.** 8 nhịp · 20 kernel · mở family `kvcache`, `state` · file mới: 10 (1 hạ tầng, 6 file family, 3 `.cu`).
 
-**Phần cứng.** Máy dev chạy hết. handoff kit (tuỳ chọn): (1) đường FP8 dùng `cvt` phần cứng từ SM89 (`AYAKA_HAS_FP8_HW`): SM86 chạy nhánh software, nên nhánh `cvt` chạy ở handoff kit `sm89` và phải khớp nhánh software từng bit; (2) `kv::copy_batch_async` dùng `cuMemcpyBatchAsync`, API không có trong `cuda.h` của toolkit 12.4 (kiểm 2026-10-05): máy dev chỉ test đường fallback, đường chính chạy ở lô có toolkit và driver mới; (3) gate "bit-exact với `_C` của vLLM" cần vLLM (không có trong `.venv` dev): ở dev dùng oracle trong repo, so với vLLM thật ở lô Linux có cài vLLM (nên gộp vào handoff kit `sm80` hoặc `sm89`).
+**Phần cứng.** Máy dev chạy hết. handoff kit (tuỳ chọn): (1) đường FP8 dùng `cvt` phần cứng từ SM89: SM86 chạy nhánh software, nhánh `cvt` chạy ở `sm89` và phải khớp nhánh software từng bit; (2) `kv::copy_batch_async` dùng `cuMemcpyBatchAsync`, kiểm phiên bản driver lúc chạy và fallback khi thiếu; (3) gate "bit-exact với vLLM" cũ thay bằng oracle fp64 + golden vector; không cần vLLM.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -800,7 +808,7 @@ Hạ tầng gồm 17 file (Phụ lục E.2): 14 file dựng ở đợt B0.1, 3 f
 - `kv::copy_batch_async`: dùng `cuMemcpyBatchAsync`, giới hạn bằng `max_descriptors_per_call`. Fallback khi driver cũ hoặc khi dùng legacy default stream.
 
 **Gate ra bước.**
-- Bit-exact với các op `_C` của vLLM trên cùng input, cho mọi hàng trong KV_CACHE_PARITY.md:
+- Bit-exact với oracle fp64/golden vector cho mọi hàng trong KV_CACHE_PARITY.md (vLLM chỉ là provenance):
   - Layout NHD, HND, VllmLegacy.
   - Page size {16, 32, 64, 128}.
   - D ∈ {64, 80, 96, 128, 192, 256}, và Dk ≠ Dv.
@@ -810,23 +818,14 @@ Hạ tầng gồm 17 file (Phụ lục E.2): 14 file dựng ở đợt B0.1, 3 f
 - Băng thông: mục tiêu như B1.
 
 **Bằng chứng B2 dev (2026-10-06).** Đã triển khai đủ 8 nhịp / 20 kernel; build chính và build kiểm tra độc lập
-đều chạy 912 test đạt trên SM86 (154 skip do thiếu vLLM, exact-SM khác hoặc toolkit 12.8). Có log `ptxas -v`
-cho SM80/86/89/90a; SM80/89/90a vẫn là `authored`. Oracle đạt 914 test; mutation gây 871 lỗi như kỳ vọng,
-43 test còn đạt chỉ là oracle cố định, contract bị từ chối và output rỗng. Memcheck: 0 lỗi; racecheck: 0 lỗi/cảnh báo;
-synccheck: 0 lỗi. Registry có bằng chứng cho cả 20 kernel, không có B2 `release_supported`.
-Gate hiệu năng và gate thuê còn mở: FP8 software ghi/encode/context gather chưa đạt mục tiêu 80%, state zero
-slot 768 byte đạt khoảng 79.8%; còn thiếu đối chiếu vLLM thật, chạy exact-SM khác và nhánh driver batch CUDA 12.8.
+**Bằng chứng B2 dev.** Chưa có: chưa kernel nào của B2 có thân. Không dùng số liệu cũ. Khi có thân, bằng chứng là JSON của `ctest` và benchmark C++ trên SM86; chi tiết hợp đồng nằm ở `docs/KV_CACHE_PARITY.md`.
 Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.md`.
 
-### Mốc 1 — Dense BF16 end-to-end (qua adapter)
+### Mốc 1 — Dense BF16 end-to-end (native)
 
-**Điều kiện.** B0–B2 native, cộng các adapter sau:
-- `gemm` qua `kCublasLt`: epilogue Bias/GELU dùng của cuBLASLt, phần còn lại dùng kernel B1.
-- Attention `prefill_plan/run` và `decode_plan/run` qua `kFlashInfer`.
-- Top-k/top-p qua `kFlashInfer`.
-- Transpose Conv1D của GPT-2 làm bằng framework lúc load (bản native ở B4).
-
-**File.** Mốc này mở family `gemm` (hàng "Mốc 1" của Phụ lục E.1) vì adapter `kCublasLt` cần launcher, binding, test, benchmark và registry của `gemm`. Thêm `csrc/providers/cublaslt.cc`, `csrc/providers/flashinfer.cc` (`kFlashInfer` dùng bộ file `attention` và `sampling` đã mở ở B1.3) và `tests/test_models.py`. Adapter không phải nhịp (§1.3, mục 4). Nếu một nhịp `gemm` của B4 hoặc B5 đến trước thì nó mở `gemm` thay Mốc (§1.3, mục 5).
+**Điều kiện.** B0–B2 native. Không có adapter: GEMM, attention, top-k/top-p trả `kNotImplemented` cho tới khi kernel native tương ứng có thân (B5/B7/B8).
+**File.** `gemm` mở ở nhịp native đầu tiên (B4/B5), không phải ở Mốc này. Không có `csrc/providers/`.
+**Gate (engine integration).** Model-level deferred; xem §3.5.
 
 **Model.**
 - GPT-2, GPT-J, GPT-NeoX/Pythia, OPT, BLOOM, Falcon, MPT (khi `clip_qkv` = null).
@@ -836,8 +835,8 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 - StarCoder/2, OLMo 2, Command-R, Granite 3, InternLM, Yi, Baichuan, MiniCPM.
 
 **Gate.**
-- `tests/test_models.py` một layer khớp HF transformers (reference fp32).
-- Greedy decode 256 token khớp vLLM cùng checkpoint trên tập đại diện: GPT-2, Llama-3.1-8B, Qwen3-8B, Gemma-2-9B, Phi-3-mini.
+- Layer conformance C++ (§3.5); không có `tests/test_models.py`, không chạy HF transformers.
+- Greedy decode 256 token dưới CUDA graph kiểm bằng C++ (determinism + graph replay); so vLLM thuộc engine integration, ngoài repo.
 - Decode chạy được dưới CUDA graph.
 
 ---
@@ -851,9 +850,9 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 - MX/NVFP4 dùng `cvt` FP4/FP8 phần cứng trên SM100+/SM120, và có nhánh software cho SM80–90.
 - Validate SM80, SM90a; kiểm nhánh `cvt` nếu có SM100/SM120.
 
-**Nhịp.** 9 nhịp · 21 kernel · mở family `quantization` · file mới: 6 (5 file family, 1 `.cu`).
+**Nhịp.** 9 nhịp · 21 kernel · mở family `quantization` · file mới: 4 (3 file family, 1 `.cu`).
 
-**Phần cứng.** Máy dev chạy nhánh software của FP8, MX và NVFP4 cùng mọi kernel còn lại. Nhánh `cvt` phần cứng chạy ở handoff kit `sm89` (FP8) và `sm120a`, `sm100a` (FP4/MX) và phải khớp nhánh software từng bit; test đã có (`test_mx_hardware_cvt_equals_software`, `test_nvfp4_hardware_cvt_equals_software`). Gate "khớp byte-by-byte với vLLM" của `ds_mla` và indexer cần vLLM: lô Linux có vLLM.
+**Phần cứng.** Máy dev chạy nhánh software của FP8, MX và NVFP4 cùng mọi kernel còn lại. Nhánh `cvt` phần cứng chạy ở handoff kit `sm89` (FP8) và `sm120a`, `sm100a` (FP4/MX) và phải khớp nhánh software từng bit; test C++ viết sẵn (`test_mx_cvt_equals_software`, `test_nvfp4_cvt_equals_software`). Gate byte-exact dùng golden vector sinh offline từ định dạng FlashMLA/DeepGEMM.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -870,7 +869,7 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 **Gate ra bước.**
 - Bit-exact với reference của từng format, gồm các trường hợp amax = 0, NaN/Inf và subnormal.
 - Round trip quant → dequant: sai số ≤ nửa bước lượng tử.
-- `ds_mla` và indexer: khớp byte-by-byte với vLLM.
+- `ds_mla` và indexer: khớp byte với golden vector của định dạng (sinh offline từ `tests/quant.py` của FlashMLA/DeepGEMM, không chạy PyTorch ở runtime).
 - Bản fusion khớp bitwise với chuỗi kernel rời.
 - Băng thông: như B1.
 
@@ -884,9 +883,9 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 
 **SM.** CUDA generic; validate SM80, SM90a.
 
-**Nhịp.** 6 nhịp · 18 kernel · không mở family hay ô arch · file mới: 2 (2 `.cu`). Theo thứ tự của E.1, `gemm` đã được Mốc 1 mở (adapter `kCublasLt`): các hàng `gemm/` của bước này chỉ thêm `.cu` và dòng vào file đã có (§1.3, mục 5).
+**Nhịp.** 6 nhịp · 18 kernel · mở family `gemm` · file mới: 5 (3 file family, 2 `.cu`). `gemm` mở ở nhịp native đầu tiên của nó (B4), không phải ở Mốc 1.
 
-**Phần cứng.** Máy dev chạy hết kernel và kiểm layout bằng công thức của reference (lớp (a), §2.4). Gate "khớp cuBLASLt/CUTLASS" của layout scale (`block_scale_swizzle_kernel`, `fp8_scale_to_tma_layout_kernel`) chỉ kiểm được khi một GEMM block-scaled thật đọc layout đó: handoff kit `sm120a`, `sm100a`, cùng B13. Gate "bit-exact với repack của vLLM" cần vLLM (lô Linux).
+**Phần cứng.** Máy dev chạy hết kernel và kiểm layout bằng công thức oracle (lớp (a), §2.4). Gate layout scale (`block_scale_swizzle_kernel`, `fp8_scale_to_tma_layout_kernel`) kiểm bằng descriptor oracle và golden vector; khi có GEMM block-scaled thật thì kiểm thêm ở handoff kit `sm120a`/`sm100a`. Không cần vLLM/CUTLASS.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -898,7 +897,7 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 | gemm/gemm_prep.cu | `block_scale_swizzle_kernel`, `fp8_scale_to_tma_layout_kernel`, `fp8_block2d_quant_weight_kernel` | ★★ | <ul><li>Swizzle scale cho NVFP4/MX phải khớp cuBLASLt/CUTLASS.</li><li>Scale column-major TMA-aligned, pad M.</li><li>Quant weight BF16 → FP8 128×128.</li></ul> | <ul><li>`deepgemm:deep_gemm/include/deep_gemm/impls/smxx_layout.cuh` (transpose SF sang MN-major căn TMA, đóng gói UE8M0; không phụ thuộc arch: đối chiếu bit-exact ở dev, §3.3 K2)</li><li>`deepgemm:deep_gemm/utils/math.py` — `per_block_cast_to_fp8` (BF16 → FP8 128×128)</li><li>`attn-rs:nvfp4_quant.cu` — `nvfp4_swizzle_scales_kernel` (swizzle scale NVFP4)</li><li>`attn-rs:mxfp4_quant.cu` — `mxfp4_swizzle_scales_kernel` (swizzle scale MXFP4)</li><li>`vllm:libtorch_stable/quantization/fp4/nvfp4_utils.cuh` — `cvt_quant_to_fp4_get_sf_out_offset` (công thức offset của layout scale swizzled)</li><li>`hpc-ops:group_gemm/sm90/group_gemm_blockwise_fp8.cu` — `reformat_x_scale_kernel` (định dạng lại scale X cho GEMM blockwise: xem layout mà TMA kernel mong đợi)</li></ul> |
 
 **Gate ra bước.**
-- Bit-exact với tham chiếu: vLLM repack, CUTLASS util, layout trong tài liệu cuBLASLt.
+- Bit-exact với golden vector của layout (sinh offline từ công thức/tài liệu); vLLM repack và CUTLASS util chỉ là provenance.
 - Đường ống load chạy ngoài graph và không giữ lại workspace.
 - Benchmark ghi "prep time" riêng cho từng recipe.
 
@@ -912,9 +911,9 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 
 **SM.** CUDA-core generic; validate SM80, SM89, SM90a.
 
-**Nhịp.** 7 nhịp · 16 kernel · mở family `moe` · file mới: 13 (5 file family, 8 `.cu`). Hiện trạng (2026-10-21): cả 7 nhịp có thân và test trên SM86. Đạt ≥ 85% băng thông đọc weight ở M = 1 (`build-b9/bench-gemm.json`): bf16 (1.00), `gemv_argmax` (1.01), router, `grouped_gemv` bf16 (1.00), `int8_gemv` (0.92–1.00), `fp8_gemv` (0.86–1.02), `fp4_gemv` MXFP4 0.86–0.93 và NVFP4 0.92–0.96 (trước đó 0.29–0.44, nhờ bản `mma.sync`), và 11 trong 20 format GGUF. Chưa đạt: `lut_gemv` NF4 (0.56–0.70), chín format GGUF dưới 4 bit (0.45–0.70), `gguf_moe_mmvq` (0.46–0.87) và AWQ/GPTQ (0.77–0.93, dao động ±0.1 giữa các lần chạy). Chưa có baseline Marlin và vLLM GGUF.
+**Nhịp.** 7 nhịp · 16 kernel · mở family `moe` · file mới: 11 (3 file family, 8 `.cu`). Hiện trạng (2026-10-31): 0/16 kernel có thân; toàn bộ là declaration.
 
-**Phần cứng.** Máy dev chạy các GEMV CUDA-core (fp32, bf16, int8, W4A16, E2M1 LUT, GGUF, grouped/MoE GEMV). `fp8_gemv_kernel` có hai đường (`cvt` từ SM89, LUT ở SM80): SM86 chạy LUT, đường `cvt` chạy ở handoff kit `sm89` và phải khớp LUT từng bit. Mục tiêu ≥ 85% băng thông đọc weight là số theo từng GPU (handoff kit `sm80`, `sm89`, `sm90a`); baseline Marlin M = 1 và vLLM GGUF cần vLLM. Shape MoE đủ 256 expert của DeepSeek-V3 (khoảng 11 GB ở FP8) không vừa 4 GB: gắn `mem_gb`.
+**Phần cứng.** Máy dev chạy các GEMV CUDA-core (fp32, bf16, int8, W4A16, E2M1 LUT, GGUF, grouped/MoE GEMV). `fp8_gemv_kernel` có hai đường (`cvt` từ SM89, LUT ở SM80): SM86 chạy LUT, đường `cvt` chạy ở handoff kit `sm89` và phải khớp LUT từng bit. Mục tiêu ≥ 85% băng thông đọc weight là số theo từng GPU (handoff kit `sm80`, `sm89`, `sm90a`); baseline Marlin/vLLM là tuỳ chọn, mục tiêu chính là roofline. Shape MoE đủ 256 expert của DeepSeek-V3 (khoảng 11 GB ở FP8) không vừa 4 GB: gắn `mem_gb`.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -932,19 +931,19 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
   một hàng cho cùng bit với mọi grid size và mọi batch (test 100 lần + row-alone vs batch).
 - Benchmark ở M = 1 với shape thật (Llama-3-8B/70B, Qwen3, DeepSeek-V3).
   - Mục tiêu ≥ 85% băng thông đọc weight.
-  - Baseline: cuBLASLt, Marlin M = 1, vLLM GGUF.
+  - Baseline: roofline băng thông và kernel copy; so sánh cuBLASLt/Marlin/vLLM là tuỳ chọn.
 
 ---
 
 ## B6 — Routing, permute, sampling
 
-**Mục tiêu.** Phần điều khiển của MoE và sampling đầy đủ. Grouped GEMM vẫn qua adapter cho tới B7.
+**Mục tiêu.** Phần điều khiển của MoE và sampling đầy đủ. Grouped GEMM trả `kNotImplemented` cho tới khi kernel native của B7 có thân.
 
 **SM.** CUDA generic; validate SM80, SM90a.
 
 **Nhịp.** 9 nhịp · 15 kernel · không mở family hay ô arch · file mới: 2 (2 `.cu`).
 
-**Phần cứng.** Máy dev chạy hết (CUDA-core). Lô `sm80` và `sm90a` chạy lại gate. Kiểm định chi-square ≥ 10^6 mẫu chạy được ở dev; "benchmark so với FlashInfer sampling" cần FlashInfer (lô Linux).
+**Phần cứng.** Máy dev chạy hết (CUDA-core). Lô `sm80` và `sm90a` chạy lại gate. Kiểm định chi-square ≥ 10^6 mẫu chạy được ở dev; benchmark sampling so với roofline, FlashInfer là tuỳ chọn.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -959,23 +958,18 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 | sampling/sampling.cu | `gumbel_max_sampling_kernel` | ★★ | argmax(log p + Gumbel) với counter RNG; tie-break xác định. | <ul><li>`hpc-ops:sampler/fused_sampler_temperature.cu` — `fused_sampler_temperature_kernel` (argmax(logit/T + Gumbel); noise từ curand hoặc truyền sẵn (`gumbel_noise_ptr`) để test bit-exact; `draft_token_ids` mask cho speculative)</li><li>`hpc-ops:sampler/sampler_rng.cuh` — `gumbel_noise_from_uniform` (Gumbel = −log(−log U), kẹp `1e-20` để U → 1 không phá điểm; offset RNG phía host (xem hàng `top_k_top_p_sampling_kernel`))</li></ul> |
 
 **Gate ra bước.**
-- Routing bit-exact với reference PyTorch của từng model, kể cả khi hòa: Mixtral, Qwen3-MoE, DeepSeek-V3 (grouped), GPT-OSS (SoftmaxAfterTopK + bias), Llama 4 (sigmoid top-1), Kimi K2.
+- Routing bit-exact với oracle fp64/golden vector của từng model, kể cả khi hòa: Mixtral, Qwen3-MoE, DeepSeek-V3 (grouped), GPT-OSS (SoftmaxAfterTopK + bias), Llama 4 (sigmoid top-1), Kimi K2. Reference PyTorch chỉ là nguồn đọc (K1 deferred).
 - Deterministic mode: permute/unpermute cho kết quả bitwise ổn định giữa các lần chạy và giữa các batch size.
 - Sampling:
   - Kiểm định thống kê (chi-square, ≥ 10^6 mẫu) so với phân phối mục tiêu sau top-k/top-p/min-p.
   - Cùng seed thì tái lập được.
-  - Benchmark so với FlashInfer sampling.
+  - Benchmark so với roofline; FlashInfer sampling là tuỳ chọn.
 
-### Mốc 2 — Checkpoint lượng tử và MoE (adapter cho GEMM nặng và MLA)
+### Mốc 2 — Checkpoint lượng tử và MoE (native)
 
-**Điều kiện.** B3–B6 native, cộng các adapter sau:
-- FP8 tensorwise/rowwise qua `kCublasLt`.
-- FP8 blockwise và grouped contiguous/masked qua `kDeepGemm` (SM90a/SM100a).
-- Grouped BF16/INT8 qua `kCutlass`.
-- MLA qua `kFlashMLA` / `kFlashInfer`.
-- TP qua `kNccl`; EP qua `kDeepEP`.
-
-**File.** Mốc này mở family `communication` (hàng "Mốc 2" của Phụ lục E.1; 5 file) vì `kNccl` và `kDeepEP` cần launcher, binding, test, benchmark và registry. Thêm `GEMM_MATRIX.md` và 5 file provider trong `csrc/providers/`: `deepgemm.cc`, `cutlass.cc`, `flashmla.cc`, `nccl.cc`, `deepep.cc`. `kDeepGemm` và `kCutlass` dùng bộ file của `gemm` (Mốc 1) và `moe` (B5); `kFlashMLA` dùng bộ file của `attention` (B1.3). Adapter không phải nhịp (§1.3, mục 4). Nếu nhịp collectives của B12 đến trước thì nó mở `communication` thay Mốc (§1.3, mục 5).
+**Điều kiện.** B3–B6 native; FP8/grouped/MLA native ở B7/B11/B13/B14. Không adapter.
+**File.** `communication` mở ở nhịp native đầu tiên (B12). Không provider. Thêm `GEMM_MATRIX.md`.
+**Gate (engine integration).** Model-level deferred; xem §3.5.
 
 **Model.**
 - MoE: Mixtral, Grok-1, Qwen2-MoE, Qwen3-MoE, OLMoE.
@@ -994,7 +988,7 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 ## B7 — Tensor core thế hệ 1: `mma.sync` (SM80/86/89/120)
 
 **Mục tiêu.**
-- Dựng khung GEMM dùng chung: tactic, 17 epilogue op (SOTA-PLAN S1.4 thêm `kEpiRowSumSq`, `kEpiKvAppend`: hai op cấp dữ liệu cho op sau), autotune, tactic cache.
+- Dựng khung GEMM dùng chung: tactic, 17 epilogue op (hai op cuối `kEpiRowSumSq`, `kEpiKvAppend` là op cấp dữ liệu cho op sau), autotune, tactic cache.
 - Viết mọi biến thể GEMM chạy trên `mma.sync`.
 
 **SM.**
@@ -1003,9 +997,9 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 
 **Nhịp.** 10 nhịp · 16 kernel · không mở gì, chỉ thêm vào file có sẵn · file mới: 0. Đích của cả 10 nhịp là các `.cu` của `gemm` (mở ở B4, B5) và của `moe` (B5). Đây là chỗ ngưỡng tách file (§1.5) dễ bị chạm nhất.
 
-**Hiện trạng (2026-10-24).** Cả 10 nhịp / 16 kernel đã có thân, launcher, binding, test và case benchmark; nhịp 10 (`gguf_mmq_kernel`, `gguf_moe_mmq_kernel`) dùng dp4a (đường fallback của hàng), chưa dùng int8 `mma.sync`. Trên SM86, full suite: 28 532 passed / 371 skipped / 0 failed (`build-b9/b7-full-native.json`); bộ test B7 standard: 2 167 passed / 87 skipped / 0 failed (`build-b9/b7-native.json`); dry-run B7: 2 179 passed / 75 skipped (`build-b9/b7-dryrun.json`); mutation phát hiện 1 859 lỗi (`build-b9/b7-mutate.json`). Benchmark B7 nằm ở `build-b9/b7-benchmark.json` (chạy `benchmark.bench_gemm --mma`); số quick chỉ là chẩn đoán, chưa thay cho handoff kit `sm80`/`sm89`/`sm120a`. Quick SM86: BF16 dense 0.98–1.00× cuBLAS ở M = 1 và 0.74–0.87× ở M = 64, grouped 1.28×, fused MoE 2.85×, LoRA 1.39×; **GGUF MMQ row 10 chỉ 0.39–0.60 TFLOP/s (0.03–0.24× bf16; MoE 0.51× GEMV decode)**, vì là đường dp4a fallback, không phải int8 `mma.sync` — hàng này chưa có gate hiệu năng, cần tối ưu sau. Còn mở: chạy FP8 `mma.sync` thật trên SM89/SM120a, compile lại 8 exact SM sau thay đổi, sanitizer đầy đủ và commit sạch; registry B7 đã có ô SM86 và các ô `authored` cho SM khác.
+**Hiện trạng (2026-10-31).** 0/16 kernel có thân. Toàn bộ là declaration trong `csrc/gemm/*_kernels.cuh`; chưa có test, benchmark hay registry.
 
-**Phần cứng.** Máy dev chạy được `mma.sync` m16n8k16 BF16/FP16 và s8 (SM80+) cho `gemm_mma_sync_kernel`, `dual_gemm_kernel`, `bmm_kernel`, `int8_gemm_mma_sync_kernel`, `w4a8_int_gemm_kernel`, `marlin_gemm_kernel`, các `grouped_gemm_*` và `fused_moe_gemm_kernel` ở BF16/INT8, `lora_*`, `gguf_mmq_*`. **Viết sẵn, không chạy ở dev:** mọi đường FP8 `mma.sync` e4m3 (`fp8_gemm_mma_sync_kernel`, `fp8_bmm_kernel`, `fp8_block_gemm_small_m_kernel`, nhánh FP8 của `grouped_gemm_mma_sync_kernel` và `fused_moe_gemm_kernel`) cần SM89 hoặc SM120a: handoff kit `sm89` trước, rồi `sm120a`; `fp8_block_gemm_small_m_kernel` còn chạy một lần ở `sm90a`. Tactic cache khóa theo SM nên tactic SM86 không dùng cho SM khác; các mục tiêu benchmark (BF16 SM80 ≥ 90% cuBLASLt, FP8 SM89) chỉ đo được ở handoff kit `sm80`, `sm89`; "Marlin so với vLLM" và "LoRA so với Punica" cần vLLM.
+**Phần cứng.** Máy dev chạy được `mma.sync` m16n8k16 BF16/FP16 và s8 (SM80+) cho `gemm_mma_sync_kernel`, `dual_gemm_kernel`, `bmm_kernel`, `int8_gemm_mma_sync_kernel`, `w4a8_int_gemm_kernel`, `marlin_gemm_kernel`, các `grouped_gemm_*` và `fused_moe_gemm_kernel` ở BF16/INT8, `lora_*`, `gguf_mmq_*`. **Viết sẵn, không chạy ở dev:** mọi đường FP8 `mma.sync` e4m3 (`fp8_gemm_mma_sync_kernel`, `fp8_bmm_kernel`, `fp8_block_gemm_small_m_kernel`, nhánh FP8 của `grouped_gemm_mma_sync_kernel` và `fused_moe_gemm_kernel`) cần SM89 hoặc SM120a: handoff kit `sm89` trước, rồi `sm120a`; `fp8_block_gemm_small_m_kernel` còn chạy một lần ở `sm90a`. Tactic cache khóa theo SM nên tactic SM86 không dùng cho SM khác; mục tiêu benchmark là roofline và self-baseline, so cuBLASLt/vLLM là tuỳ chọn.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1032,11 +1026,11 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 
   | Kernel | Mục tiêu / baseline |
   |---|---|
-  | BF16 SM80 | ≥ 90% cuBLASLt ở shape LLM thật; nếu chưa đạt thì ghi rõ khoảng cách |
-  | FP8 SM89 | So với cuBLASLt |
-  | Marlin | So với vLLM Marlin theo M-bucket |
-  | Grouped | So với CUTLASS grouped và Triton fused_moe |
-  | LoRA | So với Punica/vLLM |
+  | BF16 SM80 | ≥ 90% roofline; cuBLASLt là tuỳ chọn |
+  | FP8 SM89 | So roofline; cuBLASLt là tuỳ chọn |
+  | Marlin | So kernel copy/roofline; vLLM là tuỳ chọn |
+  | Grouped | So roofline; CUTLASS/Triton là tuỳ chọn |
+  | LoRA | So roofline; Punica/vLLM là tuỳ chọn |
 
 ---
 
@@ -1050,7 +1044,7 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 
 **Nhịp.** 5 nhịp · 7 kernel · không mở family hay ô arch · file mới: 2 (2 `.cu`).
 
-**Phần cứng.** Máy dev chạy hết (mã `mma.sync` SM80; FP8 KV dequant bằng nhánh software). handoff kit (tuỳ chọn): handoff kit `sm89` cho nhánh `cvt` của FP8 KV; handoff kit `sm80`, `sm89` cho benchmark so với FlashInfer FA2 (cần FlashInfer, Linux); handoff kit `sm120a` cho SM120a/SM121a (cùng thân `mma.sync`, đo riêng).
+**Phần cứng.** Máy dev chạy hết (mã `mma.sync` SM80; FP8 KV dequant bằng nhánh software). handoff kit (tuỳ chọn): `sm89` cho nhánh `cvt` của FP8 KV; `sm80`, `sm89` cho benchmark (FlashInfer là tuỳ chọn); `sm120a` cho SM120a/SM121a (cùng thân `mma.sync`, đo riêng).
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1079,11 +1073,11 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
   | Mistral, Phi-3 | SWA |
   | BLOOM/MPT | ALiBi |
 
-- **Benchmark:** so với FlashInfer FA2 trên SM80/SM89.
+- **Benchmark:** so với roofline; FlashInfer FA2 là tuỳ chọn.
 
 ### Mốc 3 — Native hoàn toàn trên SM80/86/89/120
 
-**Điều kiện.** B7–B8. MLA vẫn đi qua adapter cho tới B11.
+**Điều kiện.** B7–B8 native. MLA native ở B11 hoặc qua thân SM80-class của P2.
 
 **Model.**
 - Mọi model của Mốc 1, không cần adapter.
@@ -1100,8 +1094,8 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 - MoE BF16/W4A16: Mixtral, Qwen3-MoE, Kimi K2-Thinking (INT4 Marlin MoE).
 
 **Gate.**
-- Output `registry::explain` cho thấy không chọn adapter nào trên các SM này, trừ MLA.
-- Greedy token khớp vLLM.
+- `registry::explain` cho thấy chỉ candidate `kNative` được chọn.
+- Greedy token: engine integration (ngoài repo); layer conformance C++ là gate của repo.
 
 ---
 
@@ -1113,7 +1107,7 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 - SM80+: phần matmul trong chunk dùng `mma.sync`.
 - Instantiation SM90a làm thêm nếu benchmark cần.
 
-**Nhịp.** 7 nhịp · 20 kernel · không mở family hay ô arch · file mới: 5 (5 `.cu`, gồm `delta_rule_chunk.cu`). Hiện trạng (2026-10-21): cả 7 nhịp đã có thân, test (1084 test của `tests/test_state.py` pass trên SM86), benchmark và hàng registry; scan Mamba-1 song song, lightning prefill, SSD 5 bước và prefill GDN/KDA 7 bước chạy tới 64k token (KDA/GDN tới 1M token so với kernel recurrent). Parity thật trên SM86 với flash-linear-attention (GDN, KDA), mamba_ssm (SSD) và vLLM `lightning_attention` (chỉ ở một block 256 token: kernel vendored lệch định nghĩa ở 64 token đầu của các block sau, xem `build-b9/REPORT.md`). Prefill delta rule có hai math (`ChunkMath`): `kFp32` (fp32 FMA, sai số ~1e-6) và `kTensorCore` (`mma.sync`, operand bf16, cộng dồn fp32, sai số ~4e-3 so với định nghĩa). Với bf16 và Hv = 8, Dk = Dv = 128, so với kernel recurrent: GDN nhanh hơn 2.69× (một chuỗi 16k) và 1.45–1.51× (batch 4 chuỗi), KDA nhanh hơn 1.61× (một chuỗi); KDA theo batch vẫn chậm hơn một chút (0.95–0.98×, 0.88–0.91× với input fp32); math fp32 chỉ 1.03× / 0.58× / 0.54× / 0.33× (`build-b9/b9-benchmark-ratios.md`). Parity thật với `causal-conv1d` 1.7.0 (18 test). Chưa có: thực thi trên SM80/90a.
+**Nhịp.** 7 nhịp · 20 kernel · không mở family hay ô arch · file mới: 5 (5 `.cu`, gồm `delta_rule_chunk.cu`). Hiện trạng (2026-10-31): 0/20 kernel có thân; toàn bộ là declaration.
 
 **Phần cứng.** Máy dev chạy hết. Chuỗi dài (≥ 64k; KDA tới 1M token) và state theo shape model thật không vừa 4 GB: gắn `large`/`mem_gb`, chạy khi có GPU VRAM lớn. Đối chiếu FLA (Triton) và mamba_ssm cần Linux và các thư viện đó; benchmark "so với FLA Triton" ở handoff kit `sm80`, `sm90a`.
 
@@ -1146,7 +1140,7 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 - Jamba / Jamba-1.5, Nemotron-H, Nemotron-3 Nano.
 - Falcon-H1, Granite-4.0-H, Zamba2, Bamba.
 - LFM2, MiniMax-01/M1, Qwen3-Next / Qwen3.5.
-- Kimi Linear (MLA qua adapter tới B11).
+- Kimi Linear (MLA native ở B11 hoặc qua thân SM80-class của P2).
 
 **Gate.**
 - Conformance từng layer.
@@ -1165,13 +1159,7 @@ Chi tiết hợp đồng, lệnh kiểm tra và số đo: `docs/KV_CACHE_PARITY.
 
 **Phần cứng.** Máy dev chạy các kiểm định thống kê và tree verify. "Acceptance length trên draft thật" cần checkpoint target và draft: lô có VRAM đủ.
 
-**Hiện trạng (2026-10-25).** Cả 3 nhịp / 4 kernel có thân, launcher, binding, test và case benchmark:
-`rejection_sample_kernel` (chain p/q, residual, greedy, bonus), `tree_verify_kernel` (target-only exact), `build_tree_attention_mask_kernel`
-(bit mask LSB-first 32-bit atomic ở boundary byte) và `state_commit_accepted_kernel` trong `state/state_cache.cu` (copy theo B9
-intermediate + `initial_slots` cho zero-accepted). Trên SM86 bộ lọc B10 pass 35 test, gồm chi-square 10^6 mẫu cho chain và tree,
-mask bit-exact với prefix lẻ bit, `paged_prefill` đọc mask, và state hybrid conv/Mamba-2/GDN bitwise bằng chạy tuần tự; toàn bộ
-`test_sampling.py` + `test_state.py` 5 409 passed / 1 skipped. Dry-run pass, mutation phát hiện lỗi, sanitizer memcheck/racecheck/
-synccheck 0 lỗi/hazard. Benchmark nằm ở `build-b10/b10-sampling-benchmark.json` và `build-b10/b10-state-benchmark.json`; registry
+**Hiện trạng (2026-10-31).** 0/4 kernel có thân. Toàn bộ là declaration trong `csrc/sampling/speculative_kernels.cuh` và `csrc/state/state_cache_kernels.cuh`; chưa có test, benchmark hay registry.
 có ô SM86 `benchmarked` (diagnostic) và các SM khác `compiled` (chưa chạy). Còn mở: chạy exact SM khác, acceptance
 length trên draft thật (MTP/EAGLE checkpoint) và commit sạch.
 
@@ -1201,7 +1189,7 @@ length trên draft thật (MTP/EAGLE checkpoint) và commit sạch.
 
 **Mục tiêu.**
 - Đưa GEMM, grouped GEMM và MLA lên mức hiệu năng Hopper.
-- Bỏ adapter DeepGEMM/FlashMLA trên SM90a.
+- Kernel native thay mọi backend ngoài trên SM90a; không còn adapter DeepGEMM/FlashMLA.
 
 **SM.** SM90a: H100, H200, H20. H20 có tỉ lệ băng thông/compute khác nên tactic riêng và benchmark riêng.
 
@@ -1209,11 +1197,10 @@ length trên draft thật (MTP/EAGLE checkpoint) và commit sạch.
 
 **Phần cứng.** Cả bước nhắm SM90a, handoff kit `sm90a` (H100, H200, H20). CUDA 12.9 của máy dev compile được `sm_90a` (`wgmma`, TMA, `setmaxnreg`), nên mọi ô đạt `compiled` ở dev kèm `ptxas -v` và SASS probe, nhưng không chạy được. Chỉ với SM86 (§3.4 P2, P4): `mla_get_metadata_kernel` và `machete_prepack_kernel` là thân generic, chạy thật; `mla_decode_kernel` có thêm thân SM80-class (T1) chạy thật; phần dựng `GroupedProblem` của `grouped_gemm_prepare_kernel` chạy thật, còn `tensormap.replace` chỉ đạt E1; mọi thân `wgmma` còn lại đạt E1 + E3 (twin, §3.3 K3).
 
-**Hiện trạng (2026-10-25).** Nhịp 1 đã có code thật: `gemm_wgmma_kernel` (BF16/FP16, TMA + WGMMA + một producer WG/một consumer WG) trong ô arch `gemm/sm90a_impl.cuh`, launcher/tactic ở `gemm/gemm_wgmma.cu`, ABI `impl="wgmma"` tường minh. Build `sm_90a` sạch, `ptxas -v` 102 register, 0 spill, 0 stack; SASS có `HGMMA.64x128x16` và `UTMALDG.2D`; build SM86 không có hai lệnh này. Dev gate trên SM86: 8 test contract pass, 31 test numeric/graph skip; `--ayaka-dryrun` 31 pass; mutation đỏ. Chưa chạy trên SM90a, nên ô registry vẫn `authored`; TF32, GLU, quant_out, scatter, atomic và các cấu hình cluster/ping-pong/persistent là các nhịp sau của cùng hàng.
-- *Chạy được ở dev (không dùng lệnh `sm_90a`):* `machete_prepack_kernel` (bit-exact với layout của `vllm:libtorch_stable/quantization/machete/machete_prepack_kernel.cuh` qua oracle), `mla_get_metadata_kernel` (thuần CUDA: port `flashmla:csrc/cuda_kernels/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu`, một warp, không lệnh riêng của arch; bản upstream chạy được trên SM86 qua §3.3 K2) và thân SM80-class của `mla_decode_kernel`.
-- *Viết sẵn:* `gemm_wgmma_kernel`, `fp8_gemm_wgmma_kernel`, `int8_gemm_wgmma_kernel`, `machete_gemm_kernel`, `fp4_to_fp8_gemm_wgmma_kernel`, `grouped_gemm_prepare_kernel` (`tensormap.replace`), `grouped_gemm_wgmma_kernel`, `grouped_fp4_to_fp8_gemm_wgmma_kernel`, `grouped_mixed_input_gemm_kernel`, `mla_decode_kernel` và ba hàng instantiation SM90a không có điều kiện (hàng chunk kernel là nhịp có điều kiện).
-- *Nguồn đã chứng minh:* DeepGEMM SM90 (`sm90_bf16_gemm.cuh`, `sm90_fp8_gemm_1d2d.cuh`, `scheduler/gemm.cuh`), FlashMLA `ba89a34` SM90 (MLA decode dense), hpc-ops SM90 (chạy trên H20) và CUTLASS 3.x của vLLM/SGLang (§2.3); ô không có nguồn được liệt kê ở §2.3 mục 6. Làm tầng nền trước: `gemm_wgmma_kernel` và helper TMA (twin xanh), rồi FP8/INT8, rồi grouped, cuối cùng các ô không có nguồn (§2.2 mục 5). MLA (`mla_get_metadata`, `mla_decode`) làm sớm hơn, ở P2 của §3.4, vì chạy được trên SM86.
-- *handoff kit (tuỳ chọn) (gói bàn giao):* các mục của Gate ra bước chạy ở handoff kit `sm90a`; đối chiếu chạy thật với DeepGEMM, FlashMLA `ba89a34` và vLLM Machete cần các thư viện đó trên SM90. Ở dev, đối chiếu semantics dùng reference PyTorch của chúng (§3.3 K1). H20 có tactic và benchmark riêng. Mốc 6 đóng ở đây.
+**Hiện trạng (2026-10-31).** 0/12 kernel có thân. `gemm/sm90a_impl.cuh` và `attention/sm90a_impl.cuh` chưa tồn tại.
+- *Viết theo thứ tự:* `gemm_wgmma_kernel` + helper TMA (twin xanh) → FP8/INT8 → grouped → Machete → MLA → các ô không có nguồn.
+- *Nguồn đọc:* DeepGEMM SM90 (`sm90_bf16_gemm.cuh`, `sm90_fp8_gemm_1d2d.cuh`, `scheduler/gemm.cuh`), FlashMLA `ba89a34` SM90, hpc-ops SM90, CUTLASS 3.x của vLLM/SGLang (§2.3). Không build hay link.
+- *Handoff kit:* `sm90a`; đối chiếu chạy thật với DeepGEMM/FlashMLA cần thư viện trên SM90, nhưng đó là tuỳ chọn ngoài lộ trình.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1247,15 +1234,15 @@ Mỗi hàng của bảng dưới đây là một nhịp. Nó thêm một dòng v
 - **Đối chiếu:**
   - MLA decode so với FlashMLA (BF16 và FP8 DS).
   - Grouped so với DeepGEMM contiguous/masked.
-  - Machete so với vLLM Machete.
+  - Machete so với golden vector layout của vLLM (không cần vLLM runtime).
 - **Graph:** grouped prepare + GEMM capture/replay khi số token mỗi expert thay đổi giữa các lần replay.
 - **Benchmark:**
-  - BF16 ≥ cuBLASLt.
+  - BF16 ≥ roofline; cuBLASLt là tuỳ chọn.
   - FP8 blockwise so với DeepGEMM; ghi khoảng cách nếu có.
 
 ### Mốc 6 — Hopper native (một GPU)
 
-**Model.** Trên H100/H200/H20, không cần adapter:
+**Model.** Trên H100/H200/H20, native (không adapter):
 - DeepSeek-V3/R1/V3.1.
 - Kimi K2/K2.5/K2-Thinking, Kimi Linear.
 - GLM-4.5/4.6, MiniMax-M2.
@@ -1274,9 +1261,9 @@ Mỗi hàng của bảng dưới đây là một nhịp. Nó thêm một dòng v
 
 **SM.** SM80 (A100 NVLink), SM90a (H100/H200 NVSwitch). SM100 (GB200 MNNVL) làm sau B13.
 
-**Nhịp.** 6 nhịp · 11 kernel · không mở family hay ô arch · file mới: 3 (3 `.cu`). Theo thứ tự của E.1, `communication` đã được Mốc 2 mở (adapter `kNccl`, `kDeepEP`): kernel native của bước này chỉ thêm `.cu` và dòng vào file đã có (§1.3, mục 5).
+**Nhịp.** 6 nhịp · 11 kernel · mở family `communication` · file mới: 6 (3 file family, 3 `.cu`). Không có adapter `kNccl`/`kDeepEP`.
 
-**Phần cứng.** Máy dev là WSL2 với một GPU. Hiện trạng (2026-10-28, `build-b12/REPORT.md`): 8/11 kernel (hàng 1–5) có thân, launcher, binding, test, benchmark và chạy ở `world_size = 1` trên SM86 (53 passed, 4 skipped vì marker đa GPU); ba kernel comm-GEMM chưa có thân. Chỉ với SM86 (§3.4 P6): kernel của bước nhận peer pointer, nên chạy nguyên thân với **rank ảo** 2/4/8 trên một GPU (§3.3 K5). Cách này kiểm được barrier, epoch qua replay graph, thứ tự cộng cố định theo rank, layout/dispatch/combine của EP và cờ theo chunk của comm-GEMM, nhưng không kiểm được mô hình bộ nhớ P2P/NVLink, `multimem`/NVLS, IPC và RDMA. Ô đa GPU thật giữ `authored`, test gắn `gpus(n)`, `p2p` và `arch`, thuộc gói bàn giao `multi` (Linux, 2/4/8 GPU NVLink, SM80 hoặc SM90a; EP internode cần nhiều node RDMA; multimem/NVLS cần NVSwitch). Test có đồng bộ giữa peer chạy dưới watchdog (§2.4). Nguồn: custom allreduce của vLLM/SGLang và allreduce của hpc-ops; EP trong kernel có nguồn một phần ở Mega MoE của DeepGEMM (`deepgemm:deep_gemm/include/deep_gemm/comm/barrier.cuh`, `deepgemm:deep_gemm/include/deep_gemm/layout/sym_buffer.cuh`, SM100, symmetric memory); comm-GEMM không có nguồn (DeepEP, NVSHMEM là upstream ngoài). Mốc 7 đóng ở handoff kit `multi`; Mốc-dev 7 dùng rank ảo (§3.5).
+**Phần cứng.** Máy dev là WSL2 với một GPU. Hiện trạng (2026-10-31): 0/11 kernel có thân. Chỉ với SM86 (§3.4 P6): kernel nhận peer pointer, nên chạy với **rank ảo** 2/4/8 trên một GPU (§3.3 K5). Cách này kiểm được barrier, epoch qua replay graph, thứ tự cộng cố định theo rank, layout/dispatch/combine của EP và cờ theo chunk của comm-GEMM, nhưng không kiểm được P2P/NVLink, `multimem`/NVLS, IPC và RDMA. Ô đa GPU thật giữ `authored`, test trả 77 nếu thiếu GPU, thuộc gói bàn giao `multi`. Nguồn đọc: custom allreduce của vLLM/SGLang, allreduce của hpc-ops, barrier/sym_buffer của DeepGEMM; comm-GEMM không có nguồn (DeepEP/NVSHMEM là upstream ngoài). Mốc 7 đóng ở handoff kit `multi`; layer conformance 7 dùng rank ảo (§3.5).
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1316,7 +1303,7 @@ TP dùng custom allreduce + fusion; EP intranode rồi internode; comm-GEMM nơi
 
 **Nhịp.** 10 nhịp (7 hàng kernel + 3 hàng instantiation) · 12 kernel · mở ô arch `gemm/sm100a_impl.cuh`, `gemm/sm120a_impl.cuh`, `attention/sm100a_impl.cuh` · file mới: 3 (3 ô arch). Hàng kernel 7 (NVFP4 `ds_mla`) là nhịp có điều kiện: chưa validate được cho tới khi có spec (R1), không chặn Gate ra bước (§1.1).
 
-**Phần cứng.** Cả bước nằm ngoài máy dev. CUDA 12.9 của máy dev compile được `sm_100a`, `sm_103a`, `sm_120a`, `sm_121a`, nên mọi ô đạt `compiled` kèm `ptxas -v` và SASS probe ngay ở dev (§2.6). Ở dev chạy được lớp (a) oracle layout (swizzle scale, layout scale của `kind::mxf4nvf4`, UE8M0, quy tắc làm tròn), (a+) đối chiếu `deep_gemm/utils/math.py`, (b) contract và (t) twin: thân SM120a với `mma.sync` BF16 và scale software, thân SM100a với policy SM80 thay `tcgen05`/TMEM (§3.3 K3, giai đoạn P5 của §3.4). Viết sẵn theo lô, từng tầng: `sm120a` (RTX 5090, RTX PRO 6000: `*_sm120_kernel`, attention Sm120a, và chạy lại B7/B8 trên SM120a) → `sm100a` (B200: `tcgen05` + TMEM, MLA Sm100a, attention Sm100a) → `sm103a` (B300; throughput INT8 đo riêng, R4) → `sm121a` (DGX Spark, ít khi thuê được: giữ `authored` tới khi có máy). `gemm_tcgen05_kernel` là khung của mọi kernel SM100 sau nó: nguồn gần nhất là `deepgemm:deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh` (GEMM BF16 tổng quát trên `tcgen05`, viết tay, chạy production trên B200), rồi `hpc-ops:gemm/sm100/gated_mla_gemm.cuh` (GEMM chuyên cho gated MLA) và CUTLASS 3.x của vLLM. `mixed_input_gemm_tcgen05_kernel` và `grouped_mixed_input_gemm_kernel` Sm100a không có nguồn đã chứng minh (R12). Mốc 8 đóng sau các handoff kit `sm120a`, `sm100a`, `sm103a`.
+**Phần cứng.** Cả bước nằm ngoài máy dev. CUDA 12.9 của máy dev compile được `sm_100a`, `sm_103a`, `sm_120a`, `sm_121a`, nên mọi ô đạt `compiled` kèm `ptxas -v` và SASS probe ngay ở dev (§2.6). Ở dev chạy được lớp (a) oracle layout (swizzle scale, layout scale của `kind::mxf4nvf4`, UE8M0, quy tắc làm tròn), (b) contract và (t) twin: thân SM120a với `mma.sync` BF16 và scale software, thân SM100a với policy SM80 thay `tcgen05`/TMEM (§3.3 K3, giai đoạn P5 của §3.4). Viết sẵn theo lô, từng tầng: `sm120a` (RTX 5090, RTX PRO 6000: `*_sm120_kernel`, attention Sm120a, và chạy lại B7/B8 trên SM120a) → `sm100a` (B200: `tcgen05` + TMEM, MLA Sm100a, attention Sm100a) → `sm103a` (B300; throughput INT8 đo riêng, R4) → `sm121a` (DGX Spark, ít khi thuê được: giữ `authored` tới khi có máy). `gemm_tcgen05_kernel` là khung của mọi kernel SM100 sau nó: nguồn đọc gần nhất là `deepgemm:deep_gemm/include/deep_gemm/impls/sm100_bf16_gemm.cuh` (GEMM BF16 tổng quát trên `tcgen05`), rồi `hpc-ops:gemm/sm100/gated_mla_gemm.cuh` (GEMM chuyên cho gated MLA). `mixed_input_gemm_tcgen05_kernel` và `grouped_mixed_input_gemm_kernel` Sm100a không có nguồn đã chứng minh (R12). Mốc 8 đóng sau các handoff kit `sm120a`, `sm100a`, `sm103a`.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1334,15 +1321,15 @@ Mỗi hàng của bảng dưới đây là một nhịp. Nó thêm một dòng v
 
 | Kernel đã có (bước gốc) | Instantiation | Ghi chú | Reference |
 |---|---|---|---|
-| `ragged_prefill_kernel`, `paged_prefill_kernel`, `paged_decode_tc_kernel` (B8) | Sm100a (FMHA `tcgen05`), Sm120a | Adapter `kFlashInfer` / `kTrtllmGen` giữ cho tới khi native thắng | <ul><li>`flashmla:csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cuh`, `flashmla:csrc/cuda_kernels/sm100/prefill/dense/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp` (FMHA dense SM100 dựng trên CUTLASS, do NVIDIA đóng góp; có tile scheduler causal `kernel/fmha_causal_tile_scheduler.hpp`)</li><li>`attn-rs:flashinfer_adapter_prefill.cu` (chỉ là adapter FlashInfer, không phải thân kernel)</li><li>`attn-rs:flashinfer_adapter_decode.cu` (chỉ là adapter FlashInfer, không phải thân kernel)</li></ul> |
+| `ragged_prefill_kernel`, `paged_prefill_kernel`, `paged_decode_tc_kernel` (B8) | Sm100a (FMHA `tcgen05`), Sm120a | Native thay; không adapter | <ul><li>`flashmla:csrc/cuda_kernels/sm100/prefill/dense/fmha_cutlass_fwd_sm100.cuh`, `flashmla:csrc/cuda_kernels/sm100/prefill/dense/kernel/sm100_fmha_fwd_kernel_tma_warpspecialized.hpp` (FMHA dense SM100 dựng trên CUTLASS, do NVIDIA đóng góp; có tile scheduler causal `kernel/fmha_causal_tile_scheduler.hpp`)</li><li>`attn-rs:flashinfer_adapter_prefill.cu` (chỉ là adapter FlashInfer, không phải thân kernel)</li><li>`attn-rs:flashinfer_adapter_decode.cu` (chỉ là adapter FlashInfer, không phải thân kernel)</li></ul> |
 | `mla_decode_kernel` (B11) | Sm100a | <ul><li>So với FlashMLA sm100</li><li>FlashMLA `395cb3a` chỉ còn sparse decode trên SM100, không có MLA decode dense; thân dense Sm100a theo CUTLASS của vLLM.</li></ul> | <ul><li>`vllm:libtorch_stable/attention/mla/cutlass_sm100_mla/kernel/sm100_fmha_mla_tma_warpspecialized.hpp` (MLA decode SM100 (CUTLASS, TMA + warp specialization))</li><li>`vllm:libtorch_stable/attention/mla/cutlass_sm100_mla/kernel/sm100_mla_tile_scheduler.hpp` (tile scheduler)</li><li>`sglang:attention/cutlass_mla_kernel.cu` (host của SGLang cho cùng kernel (thư mục `cutlass_sm100_mla/`))</li></ul> |
 | `grouped_mixed_input_gemm_kernel` (B11) | Sm100a | MoE weight-only | — không có trong 6 project (kể cả FlashMLA, DeepGEMM) |
 
 **Gate ra bước.**
-- Layout block-scale khớp bit-exact với cuBLASLt/CUTLASS.
+- Layout block-scale khớp bit-exact với oracle fp64/golden vector.
 - Numerics của từng recipe so với reference fp64 trên input đã dequant.
 - Validate trên phần cứng của từng SM khi có handoff kit (§2.5); Gate dev chỉ đòi `authored` + lớp test (a), (b) + SASS. Không suy SM120 từ SM100, cũng không suy SM103 từ SM100.
-- Benchmark so với cuBLASLt block-scaled, CUTLASS, trtllm-gen và DeepGEMM sm100.
+- Benchmark so với roofline; cuBLASLt/CUTLASS/trtllm-gen/DeepGEMM là tuỳ chọn.
 
 ### Mốc 8 — Blackwell native
 
@@ -1392,7 +1379,7 @@ Mỗi hàng của bảng dưới đây là một nhịp (thêm 2026-10-28). Nó 
 
 ### Mốc 9 — DeepSeek-V3.2 native
 
-DSA chạy native trên SM90a/SM100a, KV cache 656 B và indexer FP8. Mốc-dev 9 (§3.5): DeepSeek-V3.2 thu nhỏ qua thân SM80-class trên SM86.
+DSA chạy native trên SM90a/SM100a, KV cache 656 B và indexer FP8. Layer conformance 9 (§3.5): DeepSeek-V3.2 shapes qua thân SM80-class trên SM86.
 
 ---
 
@@ -1404,7 +1391,7 @@ DSA chạy native trên SM90a/SM100a, KV cache 656 B và indexer FP8. Mốc-dev 
 
 **Nhịp.** 6 nhịp (5 hàng kernel + 1 hàng instantiation, thêm 2026-10-28) · 8 kernel · mở ô arch `model_ops/sm100a_impl.cuh` (hàng 4, quyết định 2026-10-28, §1.3 mục 2) · file mới: 3 (2 `.cu`, 1 ô arch).
 
-**Phần cứng.** `hc_expand_kernel`, `hc_head_kernel`, `hc_pre_kernel`, `hc_post_kernel`, `hc_coeff_kernel` (Sinkhorn fp32), `attn_res_kernel` và `attn_res_commit_kernel` (quant MXFP8 qua nhánh software) là CUDA-core, chạy được ở dev; việc có thể `numerically_validated` hay không vẫn do R6 quyết định (cần code chính thức), không phải GPU. `mega_mhc_kernel` có hai thân: thân generic (split-K, reduce bằng `last_cta_arrive` của `execution/persistent.cuh` thay cho cluster) chạy và validate ở máy dev, và thân cluster/`tcgen05` port từ `deepgemm:deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh` (handoff kit `sm100a`; ở dev đạt E1 + E3). Gate "logits toàn model" cần checkpoint đầy đủ (nhiều GPU lớn): chỉ cho Mốc 10; Gate bước đóng bằng conformance từng layer với trọng số đúng shape trên một GPU VRAM lớn. Ở dev, conformance chạy trên DeepSeek-V4 thu nhỏ (HF `deepseek_v4`, Mốc-dev 10, §3.5).
+**Phần cứng.** `hc_expand_kernel`, `hc_head_kernel`, `hc_pre_kernel`, `hc_post_kernel`, `hc_coeff_kernel` (Sinkhorn fp32), `attn_res_kernel` và `attn_res_commit_kernel` (quant MXFP8 qua nhánh software) là CUDA-core, sẽ chạy được ở dev khi có thân; việc có thể `numerically_validated` hay không vẫn do R6 quyết định (cần code chính thức), không phải GPU. `mega_mhc_kernel` có hai thân: thân generic (split-K, reduce bằng `last_cta_arrive` của `execution/persistent.cuh` thay cho cluster) sẽ chạy và validate ở máy dev, và thân cluster/`tcgen05` đọc từ `deepgemm:deep_gemm/include/deep_gemm/impls/sm100_mega_mhc.cuh` (handoff kit `sm100a`; ở dev sẽ đạt E1 + E3). Gate "logits toàn model" thuộc engine integration, ngoài repo. Ở dev, layer conformance 10 dùng golden vector DeepSeek-V4 shapes (§3.5).
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1449,7 +1436,7 @@ Hàng dưới đây là một nhịp (thêm 2026-10-28), chạy bằng CUDA core
 
 ### Mốc 10 — DeepSeek-V4 Flash/Pro, Kimi K3
 
-Hai model chạy native trên SM90a và SM100a/103a. Mốc-dev 10 (§3.5): DeepSeek-V4 thu nhỏ trên SM86; Kimi K3 chưa có Mốc-dev vì chưa có reference.
+Hai model chạy native trên SM90a và SM100a/103a. Layer conformance 10 (§3.5): DeepSeek-V4 shapes trên SM86; Kimi K3 chưa có layer conformance vì chưa có reference.
 
 ---
 
@@ -1461,11 +1448,11 @@ Hai model chạy native trên SM90a và SM100a/103a. Mốc-dev 10 (§3.5): DeepS
 
 **Thứ tự.** E04 → E05 → E06 → E07 → E08 → `mega_step` (variant của E08).
 
-**Nhịp.** 6 nhịp · 6 kernel · mở family `mega` và ô arch `mega/sm100a_impl.cuh` (hàng 3, có điều kiện về thời điểm, §1.3 mục 2) · file mới: 8 (5 file family, 2 `.cu`, 1 ô arch). `mega_step_kernel` là **biến thể thân** của `mega_decoder_layer_kernel`, không thêm kernel/nhịp; khi body lands, thêm một dòng vào bảng §1.6 (`mega_step_kernel | mega/mega.cu | mega_decoder_layer_kernel`), số có thân đổi 186→187/47→46 và B16 1/6→2/6, còn 233/125/140 không đổi.
+**Nhịp.** 6 nhịp · 6 kernel · mở family `mega` và ô arch `mega/sm100a_impl.cuh` (hàng 3, có điều kiện về thời điểm, §1.3 mục 2) · file mới: 6 (3 file family, 2 `.cu`, 1 ô arch). `mega_step_kernel` là **biến thể thân** của `mega_decoder_layer_kernel`, không thêm kernel/nhịp; khi body lands, thêm một dòng vào bảng §1.6 (`mega_step_kernel | mega/mega.cu | mega_decoder_layer_kernel`), số có thân đổi 5→6/228→227 và B16 1/6→2/6, còn 233/125/112 không đổi.
 
-**Hiện trạng (2026-10-25; bổ sung 2026-10-28).** Chỉ nhịp 1 có code (SOTA-PLAN S1.3, dùng sớm vì mọi persistent/last-CTA của L2 cần nó): `execution/persistent.cuh` định nghĩa runtime device (`task_queue_next/wait/signal`, `last_cta_arrive`; bộ đếm gắn epoch 12 bit, đếm 20 bit; watchdog `__trap` sau ~2^24 lần thăm dò) và `execution/persistent.cu` có `task_queue_reset_kernel` (một block, tăng epoch 1..4095, xóa cursor/counters khi epoch quay vòng và ở bước đầu) cùng launcher `launch_task_queue_reset`. Test: `tests/persistent_test.cu` (target `ayaka_persistent_test`, `-DAYAKA_BUILD_TESTS=ON`): DAG 64 tầng × 10 tile = 640 task, grid 1/2/3/5, một wave resident và 4 wave (luật tiến triển (c) cho phép cả grid quá tải), mỗi grid một lần chạy thường so với tính lại trên host cộng 1 500 lần replay CUDA graph `[reset + DAG]`, thêm 9 000 lần replay qua hai lần quay vòng epoch; CTA cuối (`last_cta_arrive`) tính lại cả DAG và kiểm mỗi task chạy đúng một lần. Đã kiểm đột biến: bỏ epoch khỏi `tagged_count` thì test đỏ. Chưa có: binding, case benchmark, ô registry (cần evidence exact-SM), `scheduler_next`, và mọi kernel `mega_*`. `PersistentTileScheduler` còn là khai báo. E08 còn thiếu entry point `mega_run_decoder` + `MegaDecoderParams`; `mega.h` còn thiếu `MegaPolicyDevice` (barrier/prefetch/phase ticks) và `StageDesc.precision`; `MegaPlanInfo` cần resource fields (threads/regs/smem/CTAs/spill/num_device_launches). Bổ sung ở beat đầu, trước khi viết body.
+**Hiện trạng (2026-10-31).** 0/6 kernel có thân. `execution/persistent.cuh` đã có contract (`task_queue_next/wait/signal`, `last_cta_arrive`, epoch, watchdog); `execution/persistent.cu`, `task_queue_reset_kernel`, test, benchmark và mọi kernel `mega_*` chưa có. `PersistentTileScheduler` còn là khai báo. ABI cần bổ sung ở nhịp đầu: `MegaPolicyDevice` (barrier/prefetch/phase ticks), `StageDesc.precision`, resource fields trong `MegaPlanInfo`.
 
-**Phần cứng.** `task_queue_reset_kernel` chạy ở dev. Với các kernel `mega_*`, phần dùng mainloop của B7 (`mma.sync`) chạy được ở dev; phần dùng mainloop B11/B13 hoặc peer của B12 chạy ở handoff kit `sm90a`, `sm100a`, `multi`. Máy dev có ít SM, hữu ích để thử "không deadlock khi ít SM" nhưng không thay cho GPU nhiều SM như H100. Mọi test chạy dưới watchdog (§2.4). Chỉ với SM86 (§3.4 P7): `mega_mlp_kernel`, `mega_moe_local_kernel`, `mega_attention_block_kernel`, `mega_decoder_layer_kernel` có thân trên mainloop B7/B8 chạy thật ở dev; `mega_moe_ep_kernel` chạy với rank ảo (§3.3 K5); thân Sm100a của hai kernel MoE port Mega MoE của DeepGEMM và đạt E1 + E3. `mega_moe_local_kernel` và `mega_moe_ep_kernel` có nguồn đã chứng minh từ DeepGEMM (SM100); ba kernel `mega_*` còn lại vẫn không có (R12) và được làm sau cùng. **Phạm vi v1:** `mega_decoder_layer_kernel`/`mega_step_kernel` chỉ MHA/MLP/MoE; MLA/Kimi Linear mega là biến thể follow-on sau B11, không chặn Gate B16. Nếu gộp MLA ngay phải thêm `MegaMLAParams` (q_nope/q_pe, kv_lora_rank, rope_dim, W_UK/W_UV, metadata, num_splits) — ABI lớn hơn, không làm ở beat đầu.
+**Phần cứng.** `task_queue_reset_kernel` sẽ chạy ở dev khi có thân. Với các kernel `mega_*`, phần dùng mainloop của B7 (`mma.sync`) chạy được ở dev; phần dùng mainloop B11/B13 hoặc peer của B12 chạy ở handoff kit `sm90a`, `sm100a`, `multi`. Máy dev có ít SM, hữu ích để thử "không deadlock khi ít SM" nhưng không thay cho GPU nhiều SM như H100. Mọi test chạy dưới watchdog (§2.4). Chỉ với SM86 (§3.4 P7): `mega_mlp_kernel`, `mega_moe_local_kernel`, `mega_attention_block_kernel`, `mega_decoder_layer_kernel` sẽ có thân trên mainloop B7/B8, chạy thật ở dev; `mega_moe_ep_kernel` chạy với rank ảo (§3.3 K5); thân Sm100a của hai kernel MoE port Mega MoE của DeepGEMM và đạt E1 + E3. `mega_moe_local_kernel` và `mega_moe_ep_kernel` có nguồn đã chứng minh từ DeepGEMM (SM100); ba kernel `mega_*` còn lại vẫn không có (R12) và được làm sau cùng. **Phạm vi v1:** `mega_decoder_layer_kernel`/`mega_step_kernel` chỉ MHA/MLP/MoE; MLA/Kimi Linear mega là biến thể follow-on sau B11, không chặn Gate B16. Nếu gộp MLA ngay phải thêm `MegaMLAParams` (q_nope/q_pe, kv_lora_rank, rope_dim, W_UK/W_UV, metadata, num_splits) — ABI lớn hơn, không làm ở beat đầu.
 
 **Chọn plan và resource budget.** `mega_prepare` chọn plan bằng **bảng đo affine** theo (M bucket, N, K, exact SM) + cân wave (`nb = ceil(nchunk/waves)`) + sàn + `nbref`, fit từ e2e, **không** dùng mô hình băng thông giải tích; chỉ tuyên bố thứ hạng thô. `MegaPlanInfo` phải ghi (threads, regs/thread, smem/CTA, CTAs/SM, spill, `num_device_launches`); `ptxas` 0 spill kernel nóng; smem ≤ `cudaDevAttrMaxSharedMemoryPerBlockOptin`, không hard-code 101 376/99 KiB. Prefetch/streamer là policy nội bộ, bật sau A/B; `krot` bị cấm ngoài `kFast` (đổi thứ tự cộng fp32 theo `blockIdx`). Một plan một stream; cùng plan trên hai stream phải throw.
 
@@ -1494,7 +1481,7 @@ Hai model chạy native trên SM90a và SM100a/103a. Mốc-dev 10 (§3.5): DeepS
 
 ## B17 — Thử nghiệm
 
-**Mục tiêu.** Giữ trong `ayaka::experimental`.
+**Mục tiêu.** Giữ trong `kops::experimental`.
 - Trạng thái không vượt `benchmarked` khi chưa có model/checkpoint dùng tới.
 - Cần nghiên cứu chất lượng (perplexity, eval long-context) trước khi làm numerics.
 
@@ -1502,13 +1489,7 @@ Hai model chạy native trên SM90a và SM100a/103a. Mốc-dev 10 (§3.5): DeepS
 
 **Phần cứng.** Máy dev chạy hết (`lowbit_*` là CUDA-core cộng Hadamard; hàng `moe_w2` là nhịp có điều kiện).
 
-**Hiện trạng (2026-10-25).** Cả 5 kernel có thân, launcher, binding, test và benchmark trên SM86:
-`attention/lowbit.cu` (store/decode/prefill SIMT fp32, D=64/128/256) và `moe/fused_moe.cu`
-(`moe_w2_pack_kernel`, `moe_w2_gemm_kernel`). B17 filter: 49 passed; dry run: 48 passed/1 skipped;
-mutation: 46 detected. Registry có 24 ô `attention` và 16 ô `moe`; ô SM86 `benchmarked`,
-các exact SM khác `authored`. Quality (Qwen2.5-0.5B/WikiText-2): K8V4 +7.0%, K4V4 +506.9%,
-K3V4 +3042.7% PPL so với BF16, nên không ô nào `release_supported`; W2 chỉ có test synthetic vì
-chưa có checkpoint. Báo cáo: `build-b17/REPORT.md`, `build-b17/QUALITY.md`.
+**Hiện trạng (2026-10-31).** 0/5 kernel có thân; toàn bộ là declaration. Chưa có benchmark, registry hay đánh giá quality. Quality gate (PPL) chỉ chạy được khi có engine + checkpoint, ngoài repo.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1521,20 +1502,20 @@ chưa có checkpoint. Báo cáo: `build-b17/REPORT.md`, `build-b17/QUALITY.md`.
 
 | Status | Điều kiện |
 |---|---|
-| `authored` | Ô (kernel, exact SM) mà máy dev không chạy được (§2.2). Thân, launcher, binding, test bốn lớp (§2.4) và case benchmark đã viết; qua Gate dev: lớp (a) và (b) xanh, `--ayaka-dryrun` xanh và `--ayaka-mutate` đỏ, nguồn đã chứng minh được ghi (§2.3). Chưa có bằng chứng chạy trên exact SM đó; `registry::select` không chọn |
+| `authored` | Ô (kernel, exact SM) mà máy dev không chạy được (§2.2). Thân, launcher, test bốn lớp (§2.4) và case benchmark đã viết; qua Gate dev: lớp (a), (b), (s) xanh, `--dryrun` xanh và `--mutate` đỏ, nguồn đọc đã ghi (§2.3). Chưa có bằng chứng chạy trên exact SM đó; `registry::select` không chọn |
 | `implemented` | Có thân kernel + launcher; contract test pass; compile ở ít nhất một SM |
-| `compiled` | Compile ở mọi exact SM trong predicate. Ghi `ptxas -v`: register, smem, spill (kernel nóng phải 0 spill) |
-| `numerically_validated` | <ul><li>Sweep reference pass ngưỡng trong CONTRACTS.md.</li><li>Edge case: T = 0, `slot < 0`, padding rows, tail tile, expert rỗng, NaN/Inf.</li><li>Test deterministic / batch-invariant nếu kernel khai báo hỗ trợ.</li></ul> |
-| `benchmarked` | Có case trong `benchmark/bench_<family>.py` và environment record; so với baseline ghi ở bước tương ứng |
-| `release_supported` | <ul><li>Đạt mục tiêu benchmark, hoặc lý do được ghi lại.</li><li>Graph-safe.</li><li>Evidence trong registry đủ.</li><li>Conformance của model đi qua kernel này pass.</li></ul> |
+| `compiled` | Compile ở mọi exact SM trong predicate. Ghi `ptxas -v`: register, smem, spill (kernel nóng phải 0 spill) và SASS probe |
+| `numerically_validated` | <ul><li>Sweep oracle fp64/golden vector pass ngưỡng trong CONTRACTS.md.</li><li>Edge case: T = 0, `slot < 0`, padding rows, tail tile, expert rỗng, NaN/Inf.</li><li>Test deterministic / batch-invariant nếu kernel khai báo hỗ trợ.</li></ul> |
+| `benchmarked` | Có case trong `benchmark/bench_<family>.cc` và JSON environment record; so với baseline ghi ở bước tương ứng |
+| `release_supported` | <ul><li>Đạt mục tiêu benchmark, hoặc lý do được ghi lại.</li><li>Graph-safe.</li><li>Evidence trong registry đủ.</li><li>Layer conformance của model đi qua kernel này pass.</li></ul> |
 
 **Nơi lấy bằng chứng.** Bằng chứng gắn với exact SM của ô, không chuyển giữa các SM:
 - `compiled`: máy dev (CUDA 12.9, cả 8 exact SM) hoặc CI Linux, kèm log `ptxas -v` và SASS probe (§3.3 K4).
 - `numerically_validated`, `benchmarked`: thiết bị thuộc đúng exact SM đó — máy dev cho SM86; SM khác chỉ khi có handoff kit (tuỳ chọn, §2.5). Report phải có `env.arch_tag` khớp, `git.commit` và `git.dirty = false`.
 - Registry ghi `commit`, `arch_tag`, tên GPU và `sha256` của report.
-- Evidence gián tiếp của §3.2 (`sass`, `oracle_upstream`, `twin`, `conformance` của Mốc-dev) gắn vào ô nhưng không phải status: nó không nâng ô lên `numerically_validated` hay `benchmarked` của exact SM khác SM86, và `registry::select` không đọc nó.
+- Evidence gián tiếp của §3.2 (`sass`, `oracle_f64`, `twin`, `conformance` của layer) gắn vào ô nhưng không phải status: nó không nâng ô lên `numerically_validated` hay `benchmarked` của exact SM khác SM86, và `registry::select` không đọc nó.
 
-Một nhịp xong khi mọi ô (kernel, SM) của hàng chạy được ở máy dev đạt `numerically_validated` và mọi ô còn lại đạt `authored` qua Gate dev (§1.1, §2.2). Một bước **ra** khi mọi nhịp không có điều kiện xong, kernel chạy được ở dev đã `benchmarked` ở dev và mọi mục của Gate ra bước đo được ở dev đạt (Gate dev); bước **đóng** khi handoff kit của nó đã chạy và các ô `authored` lên tới `numerically_validated` và `benchmarked` (handoff kit (tuỳ chọn)). `release_supported` là điều kiện của Mốc, và Mốc chờ bước đóng. B0 có gate riêng (Gate dev: hai kernel `numerically_validated` trên SM86; handoff kit (tuỳ chọn): `release_supported` trên SM80 và SM90a).
+Một nhịp xong khi mọi ô (kernel, SM) của hàng chạy được ở máy dev đạt `numerically_validated` và mọi ô còn lại đạt `authored` qua Gate dev (§1.1, §2.2). Một bước **ra** khi mọi nhịp không có điều kiện xong, kernel chạy được ở dev đã `benchmarked` ở dev và mọi mục của Gate ra bước đo được ở dev đạt (Gate dev); bước **đóng** khi handoff kit của nó đã chạy và các ô `authored` lên tới `numerically_validated` và `benchmarked` (handoff kit (tuỳ chọn)). `release_supported` là điều kiện của layer conformance, và layer conformance chờ bước đóng. B0 có gate riêng (Gate dev: hai kernel `numerically_validated` trên SM86; handoff kit (tuỳ chọn): `release_supported` trên SM80 và SM90a).
 
 ## Phụ lục B — Phần cứng tham chiếu (handoff, ngoài lộ trình)
 
@@ -1554,7 +1535,7 @@ Một nhịp xong khi mọi ô (kernel, SM) của hàng chạy được ở máy
 - Nhiều node RDMA cho EP internode.
 - GB200 NVL72 cho MNNVL, sau B13.
 
-**Handoff kit.** Mỗi kit là một lần chạy trên một loại GPU (§2.5); tên kit là tên exact SM. Đây là tài liệu tham chiếu, **không** phải gate của lộ trình chỉ-SM86 (§3). Mọi lô Linux chạy cả bộ test, còn cột "Chạy gì" là phần chỉ lô đó mới chạy được. Thư viện đối chiếu (vLLM, FlashInfer, FLA, mamba_ssm, DeepGEMM, transformers) cài khi gate của bước cần chúng.
+**Handoff kit.** Mỗi kit là một lần chạy trên một loại GPU (§2.5); tên kit là tên exact SM. Đây là tài liệu tham chiếu, **không** phải gate của lộ trình chỉ-SM86 (§3). Mọi lô Linux chạy cả bộ test C++ và benchmark C++; không cài thư viện đối chiếu, chỉ cần CUDA toolkit, CMake, Ninja và ccache.
 
 | Lô | GPU và VRAM tối thiểu | Chạy gì | Bước |
 |---|---|---|---|
@@ -1573,24 +1554,25 @@ VRAM: máy dev có 4 GB, nên test shape cỡ model thật gắn `large` hoặc 
 
 | ID | Rủi ro | Ảnh hưởng | Cách xử lý |
 |---|---|---|---|
-| R1 | Layout bên trong record NVFP4 ds_mla 352 B do provider sở hữu | B13 KV NVFP4 | Giữ `planned` cho tới khi có spec; adapter nếu provider cung cấp. Thu hẹp 2026-10-28: KV FP4 chính thức của DeepSeek là V4.1 FP4 288 B (`flashmla:tests/quant.py`), làm ở dòng instantiation của B14; R1 chỉ còn cho layout 352 B |
+| R1 | Layout bên trong record NVFP4 ds_mla 352 B do provider sở hữu | B13 KV NVFP4 | Giữ `planned` cho tới khi có spec; provider deferred. Thu hẹp 2026-10-28: KV FP4 chính thức của DeepSeek là V4.1 FP4 288 B (`flashmla:tests/quant.py`), làm ở dòng instantiation của B14; R1 chỉ còn cho layout 352 B |
 | R2 | Expert FP4 của DeepSeek-V4 là MX hay NV | Recipe ở B11/B13/B15 | Đọc `quantization_config` của checkpoint |
 | R3 | Họ attention của GLM-5 chưa rõ | Không có trong roadmap | Kiểm `config.json` rồi mới ánh xạ |
 | R4 | Throughput INT8 trên SM103 | B13 `int8_gemm_tcgen05_kernel` | Benchmark riêng, không suy từ SM100 |
-| R5 | Scale mode FP8 của cuBLASLt theo từng phiên bản CUDA | Adapter ở Mốc 2 | Kiểm lúc build; fallback `kDeepGemm` |
+| R5 | Scale mode FP8 của cuBLASLt theo từng phiên bản CUDA | Provider ở Mốc 2 cũ | Không áp dụng trong giai đoạn C++-only; chỉ kiểm nếu mở lại `kCublasLt` |
 | R6 | Đặc tả DeepSeek-V4 (CSA/HCA, mHC) và Kimi K3 (SiTU, AttnRes, LatentMoE) lấy từ tech report | B6/B14/B15 (mọi ⚠) | Chỉ validate với code inference chính thức + config. Tình trạng 2026-10-28: đã có nguồn chính thức cho mHC (DeepGEMM `mhc_reference`), gate V4 (DeepGEMM `bf16_mega_gate`), định dạng KV và sparse attention V3.2/V4.0/V4.1 (FlashMLA), indexer (DeepGEMM `ref_mqa_logits`); còn chờ: CSA/HCA compressor, `hc_expand`/`hc_head` (mới chỉ có HF), AttnRes và SiTU của Kimi K3 |
 | R7 | Provenance khi port code ngoài (Marlin, Machete, llama.cpp, FLA, FlashMLA, DeepGEMM) | Mọi bước có port | Ghi commit, path và license vào THIRD_PARTY_NOTICES.md trước khi merge. FlashMLA (`395cb3a`, `ba89a34`) và DeepGEMM (`5081f85`) dùng MIT; FMHA SM100 trong FlashMLA là code CUTLASS của NVIDIA (BSD-3-Clause), kiểm header từng file khi port |
 | R8 | Ô `authored` xếp chồng: lỗi ở tầng nền (helper TMA, mainloop `wgmma`, layout scale) làm hỏng mọi ô trên nó và chỉ lộ ra ở handoff kit | B11 → B13 → B14 → B16; comm-GEMM của B12 | Viết và thuê theo tầng (§2.2 mục 5); oracle layout (lớp (a)) kiểm trước; ô không có nguồn viết cuối |
-| R9 | Code viết ở Windows/MSVC chưa từng build bằng gcc/clang; máy thuê là Linux | Mọi lô | Đã xử lý: máy dev build bằng gcc trên WSL2 từ B9 (`build-b9/build-ayaka.sh`). Còn lại: build MSVC không còn được kiểm thường xuyên |
-| R10 | Lô thuê tính theo giờ: lỗi compile, thiếu thư viện đối chiếu, test treo (deadlock) hay report bẩn làm mất giờ | Mọi lô | Checklist trước lô (§2.5): CI compile xanh, `--ayaka-dryrun` xanh, thư viện đối chiếu cài sẵn, watchdog, chạy tier `smoke` trước, commit trước khi lấy report |
-| R11 | Toolkit máy dev (12.4) không có `sm_100a`/`sm_120a`, và chưa có workflow CI | B13 và phần Blackwell của B1, B3, B14–B16 | Đã xử lý: CUDA 12.9 compile đủ 8 exact SM (`build-b9/arch-compile-summary.json`). Lệnh PTX chỉ có ở CUDA 13.x mà FlashMLA `395cb3a` dùng có đường thay thế chính xác trên 12.9; toolkit 13.2 chỉ là tùy chọn compile-only (§2.6 mục 2) |
+| R9 | Code viết ở Windows/MSVC chưa từng build bằng gcc/clang; máy thuê là Linux | Mọi lô | Máy dev build bằng gcc trên WSL2; build MSVC ít được kiểm. Ghi rõ trong handoff kit. |
+| R10 | Lô thuê tính theo giờ: lỗi compile, thiếu golden vector, test treo (deadlock) hay report bẩn làm mất giờ | Mọi lô | Checklist trước lô (§2.5): compile xanh, `--dryrun` xanh, golden vector có sẵn, watchdog, tier `smoke` trước, commit sạch. |
+| R11 | Toolkit máy dev cũ không có `sm_100a`/`sm_120a` | B13 và phần Blackwell | Đã xử lý: CUDA 12.9 compile đủ 8 exact SM. Không cần CUDA 13 vì không build FlashMLA/DeepGEMM. |
 | R12 | Ô không có nguồn đã chứng minh (danh sách ở §2.3 mục 6) được viết hoàn toàn từ tài liệu và upstream ngoài sáu project | B7 small-M, B11–B16 | Ghi đường dẫn và commit upstream trong PR; đứng cuối thứ tự viết; twin phải xanh trước khi viết ô cùng loại tiếp theo. Danh sách đã ngắn lại sau khi thêm FlashMLA và DeepGEMM (2026-10-28) |
 | R13 | Twin xanh nhưng thân arch sai: lỗi nằm ở phần twin không phủ (TMA descriptor, OOB fill, `expect_tx`, `setmaxnreg`, cluster/multicast, TMEM, `fence.proxy.async`) | Mọi ô `authored` của B11, B13, B14, B16 | Vỏ riêng của arch giữ mỏng và theo đúng nguồn đã chứng minh; descriptor oracle và SASS probe (§3.3 K4); ghi rõ trong gói bàn giao phần nào chỉ có E1 |
 | R14 | Upstream đổi định dạng không tương thích: FlashMLA `395cb3a` bỏ Hopper, V3.2, V4.0 và đổi layout KV FP8/FP4 (2026-09-30) | B3, B11, B14 | Ghim commit cho từng định dạng (`ba89a34` cho V3.2/V4.0, `395cb3a` cho V4.1); tên `KVCodec` mang phiên bản; oracle đọc đúng commit |
-| R15 | Chỉ với SM86 và không commit thì không ô nào lên `release_supported` | Mọi bước | Chủ repo quyết định khi nào cho tạo commit sạch; ô SM86 lên `release_supported` được khi có commit và conformance Mốc-dev (§2.2 mục 6) |
+| R15 | Chỉ với SM86 và không commit thì không ô nào lên `release_supported` | Mọi bước | Chủ repo quyết định khi nào cho tạo commit sạch; ô SM86 lên `release_supported` được khi có commit và layer conformance (§2.2 mục 6). |
 | R16 | RAM WSL2 5–6 GB: build lớn bị kill, gate compile 8 SM mất hàng giờ | Mọi giai đoạn | Một build tại một thời điểm, `-j 2`, build lại chỉ translation unit đã sửa; gate đầy đủ chạy qua đêm (§2.6, §3.7) |
-| R17 | HF transformers là bản port độc lập, có thể lệch code chính thức | B14 hàng 4, B15 hàng 1, Mốc-dev | Dùng làm oracle chạy được; không dùng để gỡ ⚠ (nguyên tắc 9); khi có code chính thức thì so ba bên |
-| R18 | Quy ước khác nhau giữa upstream và repo (LSE ±inf, sink trong LSE, NT, định dạng scale SM90/SM100, dung sai hòa của gate) | Mọi test đối chiếu FlashMLA/DeepGEMM | Đổi quy ước trong shim của `tests/upstream.py`, không đổi contract kernel; mỗi quy ước có một test riêng |
+| R17 | HF transformers là bản port độc lập, có thể lệch code chính thức | B14 hàng 4, B15 hàng 1 | K1 deferred; golden vector sinh offline từ oracle fp64/công thức, ghi provenance. Không dùng HF ở runtime. |
+| R18 | Quy ước khác nhau giữa upstream và repo (LSE ±inf, sink trong LSE, NT, định dạng scale SM90/SM100, dung sai hòa) | Golden vector/so sánh tương lai | Ghi quy ước trong tài liệu golden vector; chỉ áp shim khi K1 mở lại. Không đổi contract kernel. |
+| R19 | Không có PyTorch: không chạy được model-level, HF oracle hay `load_inline` | Mốc 1–10, K1/K2/K6 | Layer conformance + golden vector là gate hiện tại; mở lại K1/K2/K6 khi có giai đoạn PyTorch riêng. |
 
 ## Phụ lục D — Luồng làm song song
 
@@ -1609,46 +1591,45 @@ Bước đánh số theo phụ thuộc trước, độ khó sau (§0.3); các lu
 
 Phần Hopper và Blackwell của luồng GEMM và Attention (B11, B13) đặt thân trong ô arch (§1.3), nên không sửa thân generic của B5, B7 và B8.
 
-**Trên một máy (từ 2026-10-28).** Máy dev có một GPU và 5–6 GB RAM, nên các luồng ở trên không chạy song song thật: build và test GPU chạy tuần tự. Thứ tự thực hiện là các giai đoạn P0–P8 của §3.4. Bảng trên chỉ còn dùng để biết việc nào không phụ thuộc việc nào. Luồng hiệu năng SM86 (SOTA-PLAN.md) chen vào giữa các giai đoạn, không chặn giai đoạn nào.
+**Trên một máy (từ 2026-10-28).** Máy dev có một GPU và 5–6 GB RAM, nên các luồng ở trên không chạy song song thật: build và test GPU chạy tuần tự. Thứ tự thực hiện là các giai đoạn P0–P8 của §3.4. Bảng trên chỉ còn dùng để biết việc nào không phụ thuộc việc nào.
 
 ## Phụ lục E — Ngân sách file và sổ nhịp
 
-Các số trong phụ lục này tính từ bảng kernel của roadmap theo §1.1–§1.4. Chúng là trần, không phải số file còn thiếu: một phần đã có trong repo, trong đó có 14 file `<family>.h` (mỗi family một file, đã nằm trong cột "File mới" của E.1). Khi bảng kernel đổi (thêm, bớt hoặc chuyển hàng), tính lại và cập nhật phụ lục cùng lúc. Phần cứng ngoài máy dev (§2) không thêm file và không đổi số nào ở đây: test viết sẵn nằm trong `tests/test_<family>.py`, evidence nằm trong `registry/capabilities/<family>.yaml`, report của handoff kit gắn vào PR.
+Các số trong phụ lục này tính từ bảng kernel của roadmap theo §1.1–§1.4. Chúng là trần, không phải số file còn thiếu: một phần đã có trong repo (14 `ops.h`, 3 `.cu`, 5 file hạ tầng). Khi bảng kernel đổi (thêm, bớt hoặc chuyển hàng), tính lại và cập nhật phụ lục cùng lúc. Phần cứng ngoài máy dev (§2) không thêm file: test C++ nằm trong `tests/unit/test_<family>.cc`, evidence nằm trong `registry/capabilities/<family>.yaml`, report của handoff kit gắn vào PR.
 
 ### E.1 Sổ nhịp theo bước
 
 | Bước | Đợt | Nhịp | Nhịp mở | Kernel | Family mở | Ô arch mở | `.cu` mới | File mới | Lũy kế |
 |---|---|---|---|---|---|---|---|---|---|
 | B0 | B0.1 (hạ tầng) | 0 | 0 | 0 | — | — | 0 | 14 | 14 |
-| B0 | B0.2 | 1 | 1 | 2 | `model_ops` | — | 1 | 6 | 20 |
-| B1 | B1.1 | 4 | 2 | 11 | `activation`, `norm` | — | 2 | 12 | 32 |
-| B1 | B1.2 | 4 | 2 | 10 | `position`, `embedding` | — | 2 | 12 | 44 |
-| B1 | B1.3 | 3 | 3 | 11 | `sampling`, `attention` | — | 3 | 13 | 57 |
-| B2 | — | 8 | 3 | 20 | `kvcache`, `state` | — | 3 | 14 | 71 |
-| Mốc 1 | adapter | 0 | 0 | 0 | `gemm` | — | 0 | 6 | 77 |
-| B3 | — | 9 | 1 | 21 | `quantization` | — | 1 | 6 | 83 |
-| B4 | — | 6 | 2 | 18 | — | — | 2 | 2 | 85 |
-| B5 | — | 7 | 4 | 16 | `moe` | — | 8 | 13 | 98 |
-| B6 | — | 9 | 2 | 15 | — | — | 2 | 2 | 100 |
-| Mốc 2 | adapter | 0 | 0 | 0 | `communication` | — | 0 | 6 | 106 |
-| B7 | — | 10 | 0 | 16 | — | — | 3 | 3 | 109 |
-| B8 | — | 5 | 2 | 7 | — | — | 2 | 2 | 111 |
-| B9 | — | 7 | 3 | 20 | — | — | 5 | 5 | 116 |
-| B10 | — | 3 | 1 | 4 | — | — | 2 | 2 | 118 |
-| B11 | — | 12 | 2 | 12 | — | `gemm/sm90a_impl.cuh`, `attention/sm90a_impl.cuh` | 1 | 3 | 121 |
-| B12 | — | 6 | 3 | 11 | — | — | 3 | 3 | 124 |
-| B13 | — | 10 | 3 | 12 | — | `gemm/sm100a_impl.cuh`, `gemm/sm120a_impl.cuh`, `attention/sm100a_impl.cuh` | 0 | 3 | 127 |
-| B14 | — | 7 | 1 | 8 | — | — | 1 | 1 | 128 |
-| B15 | — | 6 | 3 | 8 | — | `model_ops/sm100a_impl.cuh` | 2 | 3 | 131 |
-| B16 | — | 6 | 3 | 6 | `mega` | `mega/sm100a_impl.cuh` | 2 | 8 | 139 |
-| B17 | — | 2 | 1 | 5 | — | — | 1 | 1 | 140 |
-| **Tổng** | | **125** | **42** | **233** | **14** | **7** | **46** | **140** | |
+| B0 | B0.2 | 1 | 1 | 2 | `model_ops` | — | 1 | 4 | 18 |
+| B1 | B1.1 | 4 | 2 | 11 | `activation`, `norm` | — | 2 | 8 | 26 |
+| B1 | B1.2 | 4 | 2 | 10 | `position`, `embedding` | — | 2 | 8 | 34 |
+| B1 | B1.3 | 3 | 3 | 11 | `sampling`, `attention` | — | 3 | 9 | 43 |
+| B2 | — | 8 | 3 | 20 | `kvcache`, `state` | — | 3 | 10 | 53 |
+| Mốc 1 | native | 0 | 0 | 0 | — | — | 0 | 1 | 54 |
+| B3 | — | 9 | 1 | 21 | `quantization` | — | 1 | 4 | 58 |
+| B4 | — | 6 | 2 | 18 | `gemm` | — | 2 | 5 | 63 |
+| B5 | — | 7 | 4 | 16 | `moe` | — | 8 | 11 | 74 |
+| B6 | — | 9 | 2 | 15 | — | — | 2 | 2 | 76 |
+| Mốc 2 | native | 0 | 0 | 0 | — | — | 0 | 1 | 77 |
+| B7 | — | 10 | 0 | 16 | — | — | 3 | 3 | 80 |
+| B8 | — | 5 | 2 | 7 | — | — | 2 | 2 | 82 |
+| B9 | — | 7 | 3 | 20 | — | — | 5 | 5 | 87 |
+| B10 | — | 3 | 1 | 4 | — | — | 2 | 2 | 89 |
+| B11 | — | 12 | 2 | 12 | — | `gemm/sm90a_impl.cuh`, `attention/sm90a_impl.cuh` | 1 | 3 | 92 |
+| B12 | — | 6 | 3 | 11 | `communication` | — | 3 | 6 | 98 |
+| B13 | — | 10 | 3 | 12 | — | `gemm/sm100a_impl.cuh`, `gemm/sm120a_impl.cuh`, `attention/sm100a_impl.cuh` | 0 | 3 | 101 |
+| B14 | — | 7 | 1 | 8 | — | — | 1 | 1 | 102 |
+| B15 | — | 6 | 3 | 8 | — | `model_ops/sm100a_impl.cuh` | 2 | 3 | 105 |
+| B16 | — | 6 | 3 | 6 | `mega` | `mega/sm100a_impl.cuh` | 2 | 6 | 111 |
+| B17 | — | 2 | 1 | 5 | — | — | 1 | 1 | 112 |
 
-"File mới" = 5 file cho mỗi family mở (`<family>.h`, binding, test, benchmark, registry) + `.cu` mới + ô arch mới + file hạ tầng tạo ở hàng đó (E.2, cột "Tạo ở"). Hàng Mốc 1 và Mốc 2 là adapter mở sớm một family (§1.3, mục 4), không phải nhịp. E.1 xếp theo thứ tự tài liệu; thứ tự thực tế có thể khác (§1.3, mục 5). Bảng instantiation của B11, B13, B14 và B15 thêm nhịp nhưng không thêm kernel, nên cột Kernel không đổi (ba hàng của B14, B15 thêm ngày 2026-10-28 không thêm file). Cột Nhịp đếm cả 4 nhịp có điều kiện (B11, B13, B14, B17; §1.1); không có file nào của sổ gắn với chúng. Provider (tối đa 10) không nằm trong bảng.
+"File mới" = 3 file cho mỗi family mở (test, benchmark, registry; `ops.h` đã có, không tính) + `.cu` mới + ô arch mới + file hạ tầng tạo ở hàng đó (E.2, cột "Tạo ở"). Mốc 1 và Mốc 2 chỉ tạo file hạ tầng; `gemm` mở ở B4 và `communication` mở ở B12. E.1 xếp theo thứ tự tài liệu; thứ tự thực tế có thể khác (§1.3, mục 5). Bảng instantiation của B11, B13, B14 và B15 thêm nhịp nhưng không thêm kernel, nên cột Kernel không đổi. Cột Nhịp đếm cả 4 nhịp có điều kiện (B11, B13, B14, B17; §1.1); không có file nào của sổ gắn với chúng. Provider: 0 file.
 
 ### E.2 Danh mục file mới
 
-**Theo family.** Mỗi family trong bảng có đủ 5 file: `csrc/<family>/<family>.h`, `csrc/bindings/<family>.cc`, `tests/test_<family>.py`, `benchmark/bench_<family>.py`, `registry/capabilities/<family>.yaml`. Cột `<stem>` liệt kê mỗi `.cu` là `csrc/<family>/<stem>.cu`; ô arch là `csrc/<family>/<arch>_impl.cuh`.
+**Theo family.** Mỗi family có 4 file: `csrc/<family>/ops.h` (đã có), `tests/unit/test_<family>.cc`, `benchmark/bench_<family>.cc`, `registry/capabilities/<family>.yaml`; 3 file sau là file mới. `csrc/<family>/*_kernels.cuh` đã có phần lớn; chỉ sửa khi contract kernel đổi. Cột `<stem>` liệt kê mỗi `.cu` là `csrc/<family>/<stem>.cu`; ô arch là `csrc/<family>/<arch>_impl.cuh`.
 
 | Family | Mở ở | Bước có kernel | `<stem>` của `.cu` | Ô arch |
 |---|---|---|---|---|
@@ -1661,10 +1642,10 @@ Các số trong phụ lục này tính từ bảng kernel của roadmap theo §1
 | `attention` | B1.3 | B1, B2, B8, B11, B14, B17 | `merge`, `mla`, `prefill`, `decode`, `sparse`, `lowbit` | `sm90a`, `sm100a` |
 | `kvcache` | B2 | B2, B3, B13 | `kvcache` | — |
 | `state` | B2 | B2, B9, B10 | `state_cache`, `conv1d`, `ssm`, `linear_attention`, `delta_rule`, `delta_rule_chunk` | — |
-| `gemm` | Mốc 1 | B4, B5, B7, B11, B13 | `gemm_prep`, `dense_gemm`, `gemm_mma`, `gemm_wgmma`, `fp8_gemm`, `int8_gemm`, `mixed_input_gemm`, `marlin_dense`, `marlin_moe`, `fp4_gemm`, `gguf_gemm`, `grouped_gemm` | `sm90a`, `sm100a`, `sm120a` |
+| `gemm` | B4 | B4, B5, B7, B11, B13 | `gemm_prep`, `dense_gemm`, `gemm_mma`, `gemm_wgmma`, `fp8_gemm`, `int8_gemm`, `mixed_input_gemm`, `marlin_dense`, `marlin_moe`, `fp4_gemm`, `gguf_gemm`, `grouped_gemm` | `sm90a`, `sm100a`, `sm120a` |
 | `quantization` | B3 | B3, B4 | `quant`, `weight_repack` | — |
 | `moe` | B5 | B5, B6, B7, B17 | `fused_moe`, `routing`, `permute` | — |
-| `communication` | Mốc 2 | B12 | `allreduce`, `ep`, `comm_gemm` | — |
+| `communication` | B12 | B12 | `allreduce`, `ep`, `comm_gemm` | — |
 | `mega` | B16 | B16 | `mega` | `sm100a` |
 | `execution` (hỗ trợ, không có bộ family) | B16 | B16 | `persistent` | — |
 
@@ -1674,27 +1655,27 @@ Cột "Bước có kernel" cho thấy mỗi family được chạm ở những b
 
 | # | File | Tạo ở | Vai trò |
 |---|---|---|---|
-| 1 | `csrc/common/device_impl.cuh` | B0.1 | `Vec`, warp/block reduce, `SoftmaxState`, fast math, chuyển đổi fp8/fp4/ue8m0 |
-| 2 | `csrc/common/check.h` | B0.1 | đã có; `AYAKA_CHECK*`, helper kiểm tra dtype/shape/stride/alignment, `DeviceStream` |
+| 1 | `csrc/common/device.cuh` | B0.1 | đã có; `Vec`, warp/block reduce, fast math |
+| 2 | `csrc/common/status.h`, `csrc/common/tensor.h` | B0.1 | đã có; `Status`, `Tensor`, `LaunchContext`, `Workspace`, `check_tensor` |
 | 3 | `csrc/execution/launch.cc` | B0.1 | `launch_kernel` và `GraphHandle` cơ bản |
-| 4 | `csrc/runtime/registry.cc` (tên đề xuất) | B0.1 | `select` / `explain` và nạp bảng registry sinh ra, theo `runtime/registry.h` |
-| 5 | `csrc/runtime/trace.cc` (tên đề xuất) | B0.1 | `trace` và `write_environment_record`, theo `runtime/trace.h` |
-| 6 | `cmake/arch.cmake` | B0.1 | build theo exact SM |
+| 4 | `csrc/runtime/registry.cc` | B0.1 | đã có; `select` / `explain` và nạp bảng registry sinh ra |
+| 5 | `csrc/runtime/trace.cc` | B0.1 | `trace` và `write_environment_record`, theo `runtime/trace.h` |
+| 6 | `cmake/arch.cmake` | B0.1 | đã có; build theo exact SM |
 | 7 | `cmake/instantiate.cmake` | B0.1 | nối bảng instantiation vào build; mã sinh ra nằm trong build tree |
-| 8 | `tools/gen_registry.py` (tên đề xuất) | B0.1 | YAML của registry → bảng registry trong build tree |
-| 9 | `tests/conftest.py` (tên đề xuất) | B0.1 | helper chung của test: so ULP, sweep, graph capture, dựng case sai dtype/shape/stride/alignment (các case nằm trong `tests/test_<family>.py`) |
-| 10 | `benchmark/harness.py` (tên đề xuất) | B0.1 | CUDA events, flush L2, warmup, environment record |
-| 11 | `tools/check_requires.py` | B0.1 | đã có (AGENTS.md); kiểm `Requires:` |
-| 12 | `tools/check_roadmap.py` | B0.1 | roadmap gốc nêu file này; mở rộng theo §1.6 để kiểm bảng kernel và ngân sách file |
+| 8 | `tools/gen_registry.py` | B0.1 | YAML của registry → bảng registry trong build tree |
+| 9 | `tests/unit/harness.h` | B0.1 | case registry, label CTest, `--tier`/`--json`/`--dryrun`/`--mutate`, `KOPS_SKIP_IF` (mã 77), so ULP/tolerance |
+| 10 | `benchmark/harness.h` | B0.1 | CUDA events, flush L2, warmup, JSON environment record |
+| 11 | `tools/check_requires.py` | B0.1 | đã có; kiểm `Requires:` |
+| 12 | `tools/check_roadmap.py` | B0.1 | đã có; mở rộng theo §1.6 để kiểm bảng kernel, ngân sách file và test C++ |
 | 13 | `CONTRACTS.md` | B0.1 | ngưỡng numerics, rule làm tròn, ngưỡng benchmark, ngưỡng tách file |
-| 14 | `THIRD_PARTY_NOTICES.md` | B0.1 | provenance khi port code ngoài (R7); tạo khung ở B0.1, điền từ lần port đầu tiên |
-| 15 | `tests/test_models.py` | Mốc 1 | conformance model theo Mốc; mỗi model là một dòng tham số |
-| 16 | `docs/KV_CACHE_PARITY.md` | B2 | đối chiếu KV cache với vLLM (B2) |
-| 17 | `GEMM_MATRIX.md` | Mốc 2 | ma trận recipe GEMM theo SM (gate Mốc 2) |
+| 14 | `THIRD_PARTY_NOTICES.md` | B0.1 | đã có; provenance khi port code ngoài (R7) |
+| 15 | `tests/unit/test_conformance.cc` | Mốc 1 | layer conformance + golden vector trong `tests/golden/` |
+| 16 | `docs/KV_CACHE_PARITY.md` | B2 | đối chiếu KV cache với oracle/golden vector |
+| 17 | `GEMM_MATRIX.md` | Mốc 2 | ma trận recipe GEMM theo SM |
 
-**Provider (tối đa 10 file).** Một file `csrc/providers/<provider>.cc` mỗi provider ở §0.5, thêm ở Mốc cần nó (§1.3, mục 4): Mốc 1: `kCublasLt`, `kFlashInfer`; Mốc 2: `kDeepGemm`, `kCutlass`, `kFlashMLA`, `kNccl`, `kDeepEP`; Mốc 4: `kFLA`, `kTriton`; Mốc 8: `kTrtllmGen`. Provider chỉ có API Python (dự kiến `kFLA`, `kTriton`) dùng chung một module Python nên số file thực tế ít hơn.
+**Provider:** 0 file. Không có `csrc/providers/`, không có `python/`.
 
-**Tổng trần:** 140 (sổ E.1, đã gồm 17 hạ tầng) + 10 (provider) = 150 file nguồn mới, chưa kể `CMakeLists.txt` và `python/`.
+**Tổng trần:** **112 file nguồn mới** (46 `.cu` + 14×3 file family + 7 ô arch + 17 hạ tầng). Đã có 3 `.cu` và 5 file hạ tầng; còn khoảng 104 file phải tạo. Không tính `CMakeLists.txt`, `ROADMAP.md` và các file build tooling đã có.
 
 ### E.3 Không còn sổ tách
 

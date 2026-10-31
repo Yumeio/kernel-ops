@@ -39,7 +39,7 @@ struct MLADecodeParams {
  */
 template <int KV_LORA_RANK, int ROPE_DIM, int HEADS_PER_CTA, int PAGE_SIZE, typename DTypeQ,
           typename DTypeKV, typename DTypeO, typename ArchTag>
-__global__ void mla_decode_kernel(const KOPS_GRID_CONST MLADecodeParams params);
+__global__ void mla_decode_kernel(const __grid_constant__ MLADecodeParams params);
 
 /**
  * mla_get_metadata_kernel — split the (request, kv) work of all requests into num_sm_parts balanced

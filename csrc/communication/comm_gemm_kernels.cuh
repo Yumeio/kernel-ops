@@ -31,7 +31,7 @@ struct CommGemmParams {
  * Output [M_total, N_local] (column-parallel QKV / gate_up under SP).
  */
 template <typename Traits, gemm::GemmRecipe kRecipe, int WORLD_SIZE>
-__global__ void allgather_gemm_kernel(const KOPS_GRID_CONST CommGemmParams params);
+__global__ void allgather_gemm_kernel(const __grid_constant__ CommGemmParams params);
 
 /**
  * gemm_reduce_scatter_kernel — row-parallel output (o_proj / down_proj under SP): each finished
@@ -39,7 +39,7 @@ __global__ void allgather_gemm_kernel(const KOPS_GRID_CONST CommGemmParams param
  * Output [M_total / world_size, N].
  */
 template <typename Traits, gemm::GemmRecipe kRecipe, int WORLD_SIZE>
-__global__ void gemm_reduce_scatter_kernel(const KOPS_GRID_CONST CommGemmParams params);
+__global__ void gemm_reduce_scatter_kernel(const __grid_constant__ CommGemmParams params);
 
 /**
  * gemm_allreduce_kernel — row-parallel output without SP: tiles are reduced across ranks in the
@@ -47,6 +47,6 @@ __global__ void gemm_reduce_scatter_kernel(const KOPS_GRID_CONST CommGemmParams 
  * residual + RMSNorm (+ quant) for the next layer's input. Decode-latency oriented.
  */
 template <typename Traits, gemm::GemmRecipe kRecipe, int WORLD_SIZE, AllReduceAlgo kAlgo>
-__global__ void gemm_allreduce_kernel(const KOPS_GRID_CONST CommGemmParams params);
+__global__ void gemm_allreduce_kernel(const __grid_constant__ CommGemmParams params);
 
 }  // namespace kops::comm

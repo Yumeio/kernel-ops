@@ -30,7 +30,7 @@ struct SpecVerifyParams {
  * Greedy rows: accept iff target_argmax == draft. Deterministic given RngParams.
  */
 template <int VEC_SIZE>
-__global__ void rejection_sample_kernel(const KOPS_GRID_CONST SpecVerifyParams params);
+__global__ void rejection_sample_kernel(const __grid_constant__ SpecVerifyParams params);
 
 /// Tree verification (EAGLE-2/3, Medusa): tree encoded as first-child / next-sibling arrays.
 struct TreeVerifyParams {
@@ -49,7 +49,7 @@ struct TreeVerifyParams {
 };
 
 template <int VEC_SIZE>
-__global__ void tree_verify_kernel(const KOPS_GRID_CONST TreeVerifyParams params);
+__global__ void tree_verify_kernel(const __grid_constant__ TreeVerifyParams params);
 
 /**
  * build_tree_attention_mask_kernel — packed custom mask (attention MaskMode::kCustom) where node i

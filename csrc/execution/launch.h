@@ -8,9 +8,9 @@
 // Requires: common/*, execution/persistent.cuh.
 //
 // Backend neutrality: streams/graphs are opaque handles. PDL and clusters are
-// CUDA SM90+ features; on HIP they are rejected with kUnsupportedBackend rather
-// than silently downgraded (a silent downgrade would change overlap and ordering
-// guarantees the caller relies on).
+// CUDA SM90+ features; the deferred HIP path must reject them with
+// kUnsupportedBackend rather than silently downgrade (a silent downgrade would
+// change overlap and ordering guarantees the caller relies on).
 // =============================================================================
 
 namespace kops::exec {

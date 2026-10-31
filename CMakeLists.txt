@@ -45,6 +45,7 @@ set(CMAKE_BUILD_TYPE "${KOPS_BUILD_TYPE}" CACHE STRING "kernel-ops build type" F
 set(KOPS_CUDA_ARCHS "native" CACHE STRING
     "CUDA targets: native, or a ;-list such as 80;89;90a;100a;120a")
 option(KOPS_BUILD_TESTS "Build the host/GPU smoke tests" ON)
+option(KOPS_BUILD_BENCHMARKS "Build the C++ benchmark targets" OFF)
 option(KOPS_WITH_CUTLASS "Link CUTLASS-based adapters (not implemented yet)" OFF)
 option(KOPS_WITH_TORCH "Build bindings/torch (needs libtorch; not in M1)" OFF)
 
@@ -90,8 +91,13 @@ endif()
 
 # ---- tests ------------------------------------------------------------------
 if(KOPS_BUILD_TESTS)
+  enable_testing()
+  # Device headers use __grid_constant__, so the test TU is compiled by nvcc.
+  set_source_files_properties(tests/unit/test_m1.cc PROPERTIES LANGUAGE CUDA)
   add_executable(kops_test_m1 tests/unit/test_m1.cc)
   target_link_libraries(kops_test_m1 PRIVATE kops_cuda)
   add_test(NAME kops_test_m1 COMMAND kops_test_m1)
-  enable_testing()
+  set_tests_properties(kops_test_m1 PROPERTIES
+    TIMEOUT 300
+    SKIP_RETURN_CODE 77)
 endif()

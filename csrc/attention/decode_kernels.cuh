@@ -46,7 +46,7 @@ struct DecodeParams {
  */
 template <int HEAD_DIM, int GQA_GROUP, int PAGE_SIZE, int VEC_SIZE, int NUM_STAGES, typename DTypeQ,
           typename DTypeKV, typename DTypeO, typename Variant, kv::KVLayout kLayout>
-__global__ void paged_decode_kernel(const KOPS_GRID_CONST DecodeParams params);
+__global__ void paged_decode_kernel(const __grid_constant__ DecodeParams params);
 
 /**
  * paged_decode_tc_kernel — tensor-core decode: the G * q_len query rows of a kv head form the M
@@ -57,7 +57,7 @@ __global__ void paged_decode_kernel(const KOPS_GRID_CONST DecodeParams params);
 template <int HEAD_DIM_QK, int HEAD_DIM_VO, int ROWS_PER_CTA, int CTA_TILE_KV, int NUM_STAGES,
           typename DTypeQ, typename DTypeKV, typename DTypeO, typename Variant, kv::KVLayout kLayout,
           typename ArchTag>
-__global__ void paged_decode_tc_kernel(const KOPS_GRID_CONST DecodeParams params);
+__global__ void paged_decode_tc_kernel(const __grid_constant__ DecodeParams params);
 
 /**
  * paged_decode_dynamic_kernel — A05 persistent decode: CTAs pull DecodeTask items (balanced by KV
@@ -68,7 +68,7 @@ __global__ void paged_decode_tc_kernel(const KOPS_GRID_CONST DecodeParams params
 template <int HEAD_DIM_QK, int HEAD_DIM_VO, int GQA_GROUP, int CTA_TILE_KV, int NUM_STAGES,
           typename DTypeQ, typename DTypeKV, typename DTypeO, typename Variant, kv::KVLayout kLayout,
           typename ArchTag>
-__global__ void paged_decode_dynamic_kernel(const KOPS_GRID_CONST DecodeParams params,
+__global__ void paged_decode_dynamic_kernel(const __grid_constant__ DecodeParams params,
                                             uint32_t* __restrict__ task_counter,  // epoch-tagged
                                             const uint32_t epoch);
 

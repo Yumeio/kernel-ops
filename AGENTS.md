@@ -63,9 +63,12 @@ headers themselves as the source of truth for signatures and layouts.
   Headers with prerequisites document them in a `Requires:` comment. A `.cu` or
   `.cc` translation unit includes toolkit headers and project headers in the
   order recorded by `tools/header_check/check_all_headers.cc` and
-  `docs/TREE.md`.
+  `docs/TREE.md`. A `*_kernels.cuh` is device-only: it writes the CUDA keyword
+  `__grid_constant__` directly, so it may only be included from a CUDA device
+  pass or from a host check that includes
+  `tools/header_check/cuda_host_shim.h`. Host code includes `ops.h` instead.
 - `csrc/common/macros.cuh` defines qualifiers, shape notation, target ids
-  (`KOPS_TARGET_*`), backend-neutral handle types, capability gates, and
+  (`KOPS_TARGET_*`), backend-neutral handle types, architecture tags, and
   `KOPS_ABI_VERSION`. Treat public struct layouts, enum values, kernel template
   parameters, argument order, and launcher signatures as ABI. Update the ABI
   version when changing one of those contracts.
@@ -124,12 +127,16 @@ codec, and deterministic semantics when selecting or adding a variant.
 
 `csrc/common/macros.cuh` declares target tags for NVIDIA SM 70, 75, 80, 86,
 89, 90a, 100a, 103a, 120a, 121a and AMD gfx90a, gfx942, gfx950, gfx1100,
-gfx1200. These are compile-time contracts, not a list of built modules or
-supported operators. General feature gates (`KOPS_HAS_*`) and
-architecture-specific `a` feature gates are distinct. A kernel requiring
-WGMMA, tcgen05/TMEM, or SM120 block-scaled instructions must be compiled for
-the matching target; do not infer compatibility from a larger numeric SM, and
-do not infer one gfx target from another.
+gfx1200. **CUDA is the only built backend for now**; the `Gfx*` tags,
+`KOPS_TARGET_GFX*` ids, `BackendKind::kHip` and the C `KOPS_BE_HIP` value are
+reserved ABI space for the deferred HIP path and must not be reported as
+supported. These are compile-time contracts, not a list of built modules or
+supported operators. There are no `KOPS_HAS_*` feature macros: a kernel that
+requires WGMMA, tcgen05/TMEM, TMA or SM120 block-scaled instructions is only
+compiled for the matching target (optionally guarded by the compiler's
+`__CUDA_ARCH_FEAT_*` macros), and runtime choice goes through the registry. Do
+not infer compatibility from a larger numeric SM, and do not infer one gfx
+target from another.
 
 The public surface is backend-neutral: `kops_stream_t`, `kops_error_t`,
 `kops_graph_t` and `KOPS_TMA_DESC` instead of CUDA types, `LaunchContext::arch_id`

@@ -53,7 +53,8 @@ typedef uint8_t kops_fp8_encoding_t;  /* 0 = OCP (448), 1 = FNUZ (240) */
 typedef uint8_t kops_exec_strategy_t; /* 0 modular, 1 graph, 2 pdl, 3 persistent, 4 megakernel */
 
 /* NB: KOPS_BACKEND_CUDA/KOPS_BACKEND_HIP are compile-time macros in
- * csrc/common/macros.cuh; the C runtime constants use a different prefix. */
+ * csrc/common/macros.cuh. CUDA is the only built backend for now; the HIP
+ * value below is reserved and must not be reported as supported. */
 enum { KOPS_BE_CUDA = 0, KOPS_BE_HIP = 1 };
 enum { KOPS_STRIDE_ELEMENT = 0, KOPS_STRIDE_BYTE = 1 };
 enum { KOPS_FP8_OCP = 0, KOPS_FP8_FNUZ = 1 };
@@ -131,7 +132,7 @@ typedef struct kops_abi_manifest {
   uint32_t sizeof_workspace;
   uint32_t sizeof_workspace_requirements;
   uint32_t sizeof_launch_context;
-  uint32_t kernarg_limit_bytes;   /* CUDA 32764, HIP ~4096 */
+  uint32_t kernarg_limit_bytes;   /* CUDA 32764 */
   uint32_t reserved;
 } kops_abi_manifest;
 

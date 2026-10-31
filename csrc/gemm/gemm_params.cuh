@@ -286,7 +286,8 @@ struct GemmTactic {
 // -----------------------------------------------------------------------------
 
 /// Tensor maps are encoded on the host at plan time (cuTensorMapEncodeTiled), or patched on
-/// device per group for grouped GEMM (grouped_gemm_prepare_kernel). Passed as KOPS_GRID_CONST.
+/// device per group for grouped GEMM (grouped_gemm_prepare_kernel). Held as a
+/// `__grid_constant__` kernel parameter.
 struct GemmTmaParams {
   KOPS_TMA_DESC tma_a;           // A tiles (FP4 operands for kind::mxf8f6f4 use the padded 4->8-bit TMA mode)
   KOPS_TMA_DESC tma_b;

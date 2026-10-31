@@ -1,26 +1,19 @@
 // =============================================================================
 // kernel-ops | csrc/common/tensor.cc
-// Host-side tensor validation and device probing. This file touches the backend
-// runtime (cuda_runtime.h / hip_runtime.h), so it is compiled with the CUDA/HIP
-// language enabled; the public header stays backend-neutral.
+// Host-side tensor validation and device probing. This file touches the CUDA
+// runtime (cuda_runtime.h), so it is compiled with CUDA language enabled; the
+// public header stays backend-neutral.
 // =============================================================================
 #include <cstdint>
 #include <cstring>
 
 #include "csrc/common/macros.cuh"
 
-#if KOPS_BACKEND_HIP
-#include <hip/hip_runtime.h>
-#include <hip/hip_fp16.h>
-#include <hip/hip_bf16.h>
-#include <hip/hip_fp8.h>
-#else
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
-#endif
 
 #include "csrc/common/status.h"
 #include "csrc/common/dtype.cuh"
@@ -120,18 +113,6 @@ Status check_tensor(const Tensor& t, DType expected, int32_t expected_ndim, size
 
 Status make_launch_context(int32_t device, kops_stream_t stream, LaunchContext* out) noexcept {
   if (out == nullptr) return detail::set_error(Status::kInvalidArgument, "null LaunchContext");
-#if KOPS_BACKEND_HIP
-  hipDeviceProp_t prop{};
-  if (hipGetDeviceProperties(&prop, device) != hipSuccess) {
-    return detail::set_error(Status::kCudaError, "hipGetDeviceProperties(%d) failed", device);
-  }
-  out->backend = BackendKind::kHip;
-  out->arch_id = 9000;  // filled from the runtime's gfx name by the HIP build
-  out->wave_size = 64;
-  out->compute_units = prop.multiProcessorCount;
-  out->lds_bytes = static_cast<int32_t>(prop.sharedMemPerBlock);
-  out->max_ctas_per_cu = prop.maxBlocksPerMultiProcessor;
-#else
   cudaDeviceProp prop{};
   const cudaError_t err = cudaGetDeviceProperties(&prop, device);
   if (err != cudaSuccess) {
@@ -144,7 +125,6 @@ Status make_launch_context(int32_t device, kops_stream_t stream, LaunchContext* 
   out->compute_units = prop.multiProcessorCount;
   out->lds_bytes = static_cast<int32_t>(prop.sharedMemPerBlock);
   out->max_ctas_per_cu = prop.maxBlocksPerMultiProcessor;
-#endif
   out->stream = stream;
   out->device = device;
   return Status::kSuccess;

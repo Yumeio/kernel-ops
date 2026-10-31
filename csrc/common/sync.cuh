@@ -9,12 +9,13 @@
 //
 // Backend contract (ABI v2):
 //   CUDA : full contract as documented below.
-//   HIP  : acquire/release map to s_waitcnt + __threadfence_block/device. The
-//          async-proxy fence, cluster barrier and programmatic dependent launch
-//          do not exist. They are no-ops that PRESERVE ORDERING (the release/
-//          acquire pairs around them still hold) but provide NO overlap: a plan
-//          that requests PDL on HIP must be rejected by the launcher
-//          (kUnsupportedBackend), never silently serialized.
+//   HIP  : deferred. When it is enabled, acquire/release map to s_waitcnt +
+//          __threadfence_block/device; the async-proxy fence, cluster barrier
+//          and programmatic dependent launch do not exist there. They must be
+//          no-ops that PRESERVE ORDERING (the release/acquire pairs around them
+//          still hold) but provide NO overlap: a plan that requests PDL on HIP
+//          must be rejected by the launcher (kUnsupportedBackend), never
+//          silently serialized.
 // =============================================================================
 
 namespace kops {
@@ -44,7 +45,7 @@ KOPS_DEVICE void signal_epoch_count(uint32_t* counter, uint32_t epoch);
 /// HIP: no-op (single generic proxy); ordering is already covered by release/acquire.
 KOPS_DEVICE void fence_proxy_async();
 /// Cluster-wide barrier (barrier.cluster.arrive + wait), SM90+.
-/// HIP: no-op when KOPS_HAS_CLUSTERS == 0; callers must not build a protocol that
+/// HIP: no-op (no cluster support); callers must not build a protocol that
 /// depends on it there (kUnsupportedBackend at plan time).
 KOPS_DEVICE void cluster_sync();
 

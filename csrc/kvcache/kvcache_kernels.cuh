@@ -128,7 +128,7 @@ struct FusedQKVAppendParams {
  * rounding (see docs/CONTRACTS.md, "fused chain" row), verified by a golden test.
  */
 template <typename scalar_t, typename cache_t, int HEAD_DIM, KVCodec kCodec, KVLayout kLayout, bool kHasNorm>
-__global__ void fused_qkv_norm_rope_append_kernel(const KOPS_GRID_CONST FusedQKVAppendParams params);
+__global__ void fused_qkv_norm_rope_append_kernel(const __grid_constant__ FusedQKVAppendParams params);
 
 /**
  * ring_kv_append_kernel — per-sequence ring buffer for sliding-window layers: position p is written

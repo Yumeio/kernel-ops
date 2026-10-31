@@ -36,7 +36,7 @@ struct SelectiveScanParams {
  * y_t = C_t h_t + D u_t; y *= silu(z). Chunked over time with fp32 state in registers.
  */
 template <typename input_t, typename weight_t, int kNThreads, int kNItems, int kNRows, bool kIsVarlen>
-__global__ void selective_scan_fwd_kernel(const KOPS_GRID_CONST SelectiveScanParams params);
+__global__ void selective_scan_fwd_kernel(const __grid_constant__ SelectiveScanParams params);
 
 /// Decode / short-sequence state update (Mamba-1 and Mamba-2).
 struct SSMStateUpdateParams {
@@ -61,7 +61,7 @@ struct SSMStateUpdateParams {
 };
 
 template <typename input_t, typename weight_t, int DSTATE, int HEADDIM_TILE>
-__global__ void selective_state_update_kernel(const KOPS_GRID_CONST SSMStateUpdateParams params);
+__global__ void selective_state_update_kernel(const __grid_constant__ SSMStateUpdateParams params);
 
 /// Mamba-2 SSD (state space duality) chunked prefill: shared arguments of the 5-kernel pipeline.
 struct SSDParams {
@@ -95,18 +95,18 @@ struct SSDParams {
 
 /// 1) dt = clamp(softplus(dt + bias)); dA_cumsum = cumsum(dt * A) within chunks.
 template <typename input_t, int BLOCK_H, int CHUNK>
-__global__ void ssd_chunk_cumsum_kernel(const KOPS_GRID_CONST SSDParams params);
+__global__ void ssd_chunk_cumsum_kernel(const __grid_constant__ SSDParams params);
 /// 2) CB[c] = C_c B_c^T within each chunk (per group).
 template <typename input_t, int CHUNK, int BLOCK_N>
-__global__ void ssd_bmm_chunk_kernel(const KOPS_GRID_CONST SSDParams params);
+__global__ void ssd_bmm_chunk_kernel(const __grid_constant__ SSDParams params);
 /// 3) chunk_states[c] = sum_t exp(dA_cs[last] - dA_cs[t]) dt_t B_t x_t^T.
 template <typename input_t, int CHUNK, int BLOCK_P, int BLOCK_N>
-__global__ void ssd_chunk_state_kernel(const KOPS_GRID_CONST SSDParams params);
+__global__ void ssd_chunk_state_kernel(const __grid_constant__ SSDParams params);
 /// 4) inter-chunk recurrence with initial states, reset at sequence starts -> passed / final states.
 template <int BLOCK_P, int BLOCK_N>
-__global__ void ssd_state_passing_kernel(const KOPS_GRID_CONST SSDParams params);
+__global__ void ssd_state_passing_kernel(const __grid_constant__ SSDParams params);
 /// 5) y = intra-chunk (CB masked by decay) x + C . passed_state (decayed) + D x, gated by silu(z).
 template <typename input_t, int CHUNK, int BLOCK_P>
-__global__ void ssd_chunk_scan_kernel(const KOPS_GRID_CONST SSDParams params);
+__global__ void ssd_chunk_scan_kernel(const __grid_constant__ SSDParams params);
 
 }  // namespace kops::state

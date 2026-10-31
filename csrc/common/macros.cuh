@@ -1,7 +1,7 @@
 #pragma once
 // =============================================================================
 // kernel-ops | csrc/common/macros.cuh
-// Qualifiers, backend detection, target ids, capability gates, version tags.
+// Qualifiers, backend, target ids, version tags.
 //
 // HEADER POLICY (whole repo)
 //   * Headers declare; they never #include anything. The translation unit
@@ -10,16 +10,15 @@
 //   * Toolkit prerequisites for every CUDA TU: <cstdint>, <cstddef>, <cuda.h>
 //     (CUtensorMap), <cuda_runtime.h>, <cuda_fp16.h>, <cuda_bf16.h>, <cuda_fp8.h>,
 //     <cuda_fp4.h> (CUDA >= 12.8 for __nv_fp8_e8m0 and __nv_fp4x2_e2m1).
-//     For every HIP TU: <cstdint>, <cstddef>, <hip/hip_runtime.h>,
-//     <hip/hip_fp16.h>, <hip/hip_bf16.h>, <hip/hip_fp8.h>.
 //   * Every __global__ kernel declared here is a contract: template params,
 //     argument order, shapes, dtypes, aliasing and launch geometry are part of
 //     KOPS_ABI_VERSION.
 //
-// BACKENDS (ABI v2)
-//   One contract, two backends. Nothing in the public surface may name a
-//   backend type: use kops_stream_t / kops_error_t / kops_graph_t / KOPS_TMA_DESC.
-//   Target ids are integers (see "Target ids"); NVIDIA and AMD ids never alias.
+// BACKENDS
+//   CUDA is the only built backend for now. HIP/AMD target ids are reserved
+//   (see "Target ids") and must not be reported as supported. Nothing in the
+//   public surface may name a backend type: use kops_stream_t / kops_error_t /
+//   kops_graph_t / KOPS_TMA_DESC.
 //
 // SHAPE NOTATION (used in all docstrings)
 //   T   = total tokens in a ragged batch        B   = number of requests/sequences
@@ -29,8 +28,8 @@
 //   E   = experts (global unless noted)         K   = top-k experts per token
 //   V   = vocabulary (local shard unless noted) P   = KV pages, PS = page size
 //   S   = number of KV splits                   N/M = generic GEMM dims (D = A[M,K] * B[N,K]^T)
-//   W   = wave/sub-group width (32 on CUDA, 64 on CDNA); "one wave per row" means
-//         KOPS_WAVE lanes, never a hard-coded 32.
+//   W   = wave/sub-group width (32 on CUDA; 64 on CDNA when HIP is enabled);
+//         "one wave per row" means W lanes, never a hard-coded 32.
 // =============================================================================
 
 #define KOPS_VERSION_MAJOR 0
@@ -41,23 +40,14 @@
 #define KOPS_ABI_VERSION 2
 
 // =============================================================================
-// Backend detection
+// Backend
+//   CUDA only for now. The HIP value stays reserved so the C ABI keeps its
+//   meaning when the AMD path is brought back.
 // =============================================================================
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__)
-#define KOPS_BACKEND_HIP 1
-#define KOPS_BACKEND_CUDA 0
-#else
-#define KOPS_BACKEND_HIP 0
 #define KOPS_BACKEND_CUDA 1
-#endif
+#define KOPS_BACKEND_HIP 0
 
-#if defined(__CUDA_ARCH__) || defined(__HIP_DEVICE_COMPILE__)
-#define KOPS_DEVICE_PASS 1
-#else
-#define KOPS_DEVICE_PASS 0
-#endif
-
-#if defined(__CUDACC__) || defined(__HIPCC__) || defined(__CUDA_ARCH__)
+#if defined(__CUDACC__) || defined(__CUDA_ARCH__)
 #define KOPS_HOST_DEVICE __host__ __device__
 #define KOPS_DEVICE __device__ __forceinline__
 #define KOPS_HOST_DEVICE_INLINE __host__ __device__ __forceinline__
@@ -67,39 +57,30 @@
 #define KOPS_DEVICE inline
 #define KOPS_HOST_DEVICE_INLINE inline
 #endif
-#define KOPS_RESTRICT __restrict__
-
-// KOPS_GRID_CONST needs CUDA >= 11.7 and has no HIP equivalent: on HIP the
-// parameter is a plain const value and oversized plans must live in memory
-// (see KOPS_KERNARG_LIMIT_BYTES).
-#if KOPS_BACKEND_HIP || !defined(__CUDACC__)
-#define KOPS_GRID_CONST
-#else
-#define KOPS_GRID_CONST __grid_constant__
-#endif
 
 namespace kops {
 
 // ---- Backend-neutral handle types (ABI v2) -----------------------------------
-/// Stream/handle owned by the caller (cudaStream_t or hipStream_t). Never
-/// dereferenced by the library; cast to the backend type inside a launcher.
+/// Stream/handle owned by the caller (cudaStream_t). Never dereferenced by the
+/// library; cast to the backend type inside a launcher.
 using kops_stream_t = void*;
-/// Backend error code (cudaError_t / hipError_t widened to int32).
+/// Backend error code (cudaError_t widened to int32).
 using kops_error_t = int32_t;
-/// Graph / graph-exec handles (cudaGraph_t / hipGraph_t).
+/// Graph / graph-exec handles (cudaGraph_t).
 using kops_graph_t = void*;
-/// Event handle (cudaEvent_t / hipEvent_t).
+/// Event handle (cudaEvent_t).
 using kops_event_t = void*;
 
 inline constexpr int32_t kInvalidDevice = -1;
-/// Kernel parameter space: 32764 B (CUDA, sm_70+ with CUDA >= 12.1) vs ~4 KB (AMD).
-inline constexpr int32_t kKernargLimitBytes = KOPS_BACKEND_HIP ? 4096 : 32764;
+/// Kernel parameter space: 32764 B (CUDA, sm_70+ with CUDA >= 12.1).
+inline constexpr int32_t kKernargLimitBytes = 32764;
 /// Reserved kernel id: a row without an assigned instantiation.
 inline constexpr uint64_t kInvalidKernelId = 0;
 /// kernel_id = FNV-1a 64 of the canonical string
 /// "<symbol>|<template args>|<arch_id>|<backend>" (see runtime/registry.h).
 inline constexpr uint64_t kKernelIdHashFnv1a64 = 0x100000001b3ull;
 
+/// kHip = 1 is reserved for the deferred AMD path; only kCuda is produced.
 enum class BackendKind : uint8_t { kCuda = 0, kHip = 1 };
 
 /// Unit of a stride field. Used by kops::Tensor and kv::PagedKVDesc alike: one
@@ -114,7 +95,8 @@ enum class StrideUnit : uint8_t { kElement = 0, kByte = 1 };
 // Target ids
 //   NVIDIA: the SM number    (700, 750, 800, 860, 890, 900, 1000, 1030, 1200, 1210)
 //   AMD   : 9000 + gfx id    (gfx90a = 9010, gfx942 = 9420, gfx950 = 9500,
-//                             gfx1100 = 11000, gfx1200 = 12000)
+//                             gfx1100 = 11000, gfx1200 = 12000) -- reserved,
+//                             no AMD target is built or reported yet.
 // Ids are compile-time (device pass) and runtime (LaunchContext::arch_id).
 // =============================================================================
 #define KOPS_TARGET_SM70 700
@@ -144,120 +126,21 @@ KOPS_HOST_DEVICE_INLINE bool target_is_nvidia(int32_t arch_id) {
 }  // namespace kops
 
 // =============================================================================
-// Capability gates
-//   NVIDIA gates are monotonic *within* the 80..121 ladder but not below it:
-//   sm70/sm75 have no bf16 MMA and no async copy, sm75 has ldmatrix.
-//   AMD gates are per-family; never infer one gfx target from another.
+// Capabilities
+//   There are deliberately no KOPS_HAS_* feature macros. A kernel that needs
+//   wgmma, tcgen05/TMEM, TMA or SM120 block-scaled MMA is compiled for the exact
+//   target that provides it (optionally guarded by the compiler's own
+//   __CUDA_ARCH_FEAT_* macros); runtime choice goes through
+//   kops::runtime::Registry. Never infer a feature from a larger numeric SM or
+//   from a neighbouring gfx target: sm_100 is not sm_120, gfx942 is not gfx950.
 // =============================================================================
-#if KOPS_BACKEND_HIP && KOPS_DEVICE_PASS
-#if defined(__gfx90a__)
-#define KOPS_ARCH KOPS_TARGET_GFX90A
-#elif defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__)
-#define KOPS_ARCH KOPS_TARGET_GFX942
-#elif defined(__gfx950__)
-#define KOPS_ARCH KOPS_TARGET_GFX950
-#elif defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__)
-#define KOPS_ARCH KOPS_TARGET_GFX1100
-#elif defined(__gfx1200__) || defined(__gfx1201__)
-#define KOPS_ARCH KOPS_TARGET_GFX1200
-#else
-#define KOPS_ARCH 0
-#endif
-#define KOPS_WAVE 64
-#define KOPS_HAS_BF16_MMA 1
-#define KOPS_HAS_ASYNC_COPY 1
-#define KOPS_HAS_LDMATRIX 0      // no ldmatrix: use ds_read_b128 / global_load_lds
-#define KOPS_HAS_DS_READ 1
-#define KOPS_HAS_TMA 0
-#define KOPS_HAS_CLUSTERS 0
-#define KOPS_HAS_PDL 0
-#define KOPS_HAS_MULTIMEM 0
-#define KOPS_HAS_WGMMA 0
-#define KOPS_HAS_TCGEN05 0
-#define KOPS_HAS_SM120_BLOCKSCALED 0
-#define KOPS_HAS_MFMA 1
-#define KOPS_HAS_WMMA 0
-#if defined(__gfx90a__)
-#define KOPS_HAS_FP8_MMA 0
-#define KOPS_HAS_SCALED_FP4 0
-#else
-#define KOPS_HAS_FP8_MMA 1
-#define KOPS_HAS_SCALED_FP4 0
-#endif
-#if defined(__gfx950__)
-#undef KOPS_HAS_SCALED_FP4
-#define KOPS_HAS_SCALED_FP4 1
-#endif
-#elif KOPS_DEVICE_PASS
-#define KOPS_ARCH (__CUDA_ARCH__)
-#define KOPS_WAVE 32
-#define KOPS_HAS_BF16_MMA (KOPS_ARCH >= 800)
-#define KOPS_HAS_ASYNC_COPY (KOPS_ARCH >= 800)     // cp.async
-#define KOPS_HAS_LDMATRIX (KOPS_ARCH >= 750)
-#define KOPS_HAS_DS_READ 0
-#define KOPS_HAS_TMA (KOPS_ARCH >= 900)            // cp.async.bulk.tensor
-#define KOPS_HAS_CLUSTERS (KOPS_ARCH >= 900)       // thread block clusters, DSMEM
-#define KOPS_HAS_PDL (KOPS_ARCH >= 900)            // griddepcontrol.{wait,launch_dependents}
-#define KOPS_HAS_MULTIMEM (KOPS_ARCH >= 900)       // multimem.ld_reduce / st (NVLS)
-#define KOPS_HAS_MFMA 0
-#define KOPS_HAS_WMMA 0
-// ---- Arch-specific ("a") features: only when compiled for that exact target --
-#if defined(__CUDA_ARCH_FEAT_SM90_ALL)
-#define KOPS_HAS_WGMMA 1                           // sm_90a: wgmma.mma_async, setmaxnreg
-#else
-#define KOPS_HAS_WGMMA 0
-#endif
-#if defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL)
-#define KOPS_HAS_TCGEN05 1                         // sm_100a/103a: tcgen05.mma, TMEM, 2-CTA MMA
-#else
-#define KOPS_HAS_TCGEN05 0
-#endif
-#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
-#define KOPS_HAS_SM120_BLOCKSCALED 1               // sm_120a/121a: mma.sync block-scaled FP4/FP6/FP8
-#else
-#define KOPS_HAS_SM120_BLOCKSCALED 0
-#endif
-#define KOPS_HAS_FP8_MMA (KOPS_ARCH >= 890)        // mma.sync e4m3/e5m2 (Ada+)
-#define KOPS_HAS_SCALED_FP4 (KOPS_HAS_TCGEN05 || KOPS_HAS_SM120_BLOCKSCALED)
-#else
-// Host pass: no device feature is usable; launchers must use the runtime
-// LaunchContext::arch_id and the registry, never these macros. KOPS_WAVE still
-// reports the backend's wave width because host code formats launch geometry.
-#define KOPS_ARCH 0
-#define KOPS_WAVE (KOPS_BACKEND_HIP ? 64 : 32)
-#define KOPS_HAS_BF16_MMA 0
-#define KOPS_HAS_ASYNC_COPY 0
-#define KOPS_HAS_LDMATRIX 0
-#define KOPS_HAS_DS_READ 0
-#define KOPS_HAS_TMA 0
-#define KOPS_HAS_CLUSTERS 0
-#define KOPS_HAS_PDL 0
-#define KOPS_HAS_MULTIMEM 0
-#define KOPS_HAS_WGMMA 0
-#define KOPS_HAS_TCGEN05 0
-#define KOPS_HAS_SM120_BLOCKSCALED 0
-#define KOPS_HAS_MFMA 0
-#define KOPS_HAS_WMMA 0
-#define KOPS_HAS_FP8_MMA 0
-#define KOPS_HAS_SCALED_FP4 0
-#endif
 
 // =============================================================================
 // Backend-defined TMA descriptor
-//   CUDA: CUtensorMap (128 B, toolkit prerequisite <cuda.h>).
-//   HIP : no TMA; the field is an opaque 128 B blob so the struct layout, and
-//         therefore the rest of the ABI, stays identical across backends.
+//   CUtensorMap (128 B, toolkit prerequisite <cuda.h>). The name stays a macro
+//   because it is part of the public operand descriptor contract.
 // =============================================================================
-#if KOPS_BACKEND_HIP
-namespace kops {
-struct alignas(64) KopsTmaDesc {
-  uint64_t opaque[16];
-};
-}  // namespace kops
-#define KOPS_TMA_DESC ::kops::KopsTmaDesc
-#else
 #define KOPS_TMA_DESC CUtensorMap
-#endif
 
 // =============================================================================
 // Compile-time architecture tags
@@ -267,7 +150,8 @@ namespace kops {
 /// Compile-time architecture tags. Kernels templated on an ArchTag must only be
 /// instantiated in the matching target. SM100 and SM120 are NOT interchangeable
 /// even though both report compute capability >= 10.0, and gfx942 is not
-/// forward-compatible with gfx950.
+/// forward-compatible with gfx950. Gfx tags below are reserved for the deferred
+/// HIP path and have no build.
 struct Sm70 { static constexpr int kArch = KOPS_TARGET_SM70; };     // V100 (no bf16, no cp.async)
 struct Sm75 { static constexpr int kArch = KOPS_TARGET_SM75; };     // T4, RTX 20xx (ldmatrix, no bf16)
 struct Sm80 { static constexpr int kArch = KOPS_TARGET_SM80; };     // A100, A30

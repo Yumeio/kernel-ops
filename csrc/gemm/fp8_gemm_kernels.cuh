@@ -25,7 +25,7 @@ namespace kops::gemm {
  * block: acc_block * sA[m, kb] * sB[n/128, kb] added into fp32 accumulators).
  */
 template <typename Traits, GemmRecipe kRecipe>
-__global__ void fp8_gemm_mma_sync_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
+__global__ void fp8_gemm_mma_sync_kernel(const __grid_constant__ ScaledGemmArgs args);
 
 /**
  * fp8_gemm_wgmma_kernel — Hopper FP8 GEMM (TMA + WGMMA, warp-specialized cooperative / ping-pong,
@@ -38,7 +38,7 @@ __global__ void fp8_gemm_mma_sync_kernel(const KOPS_GRID_CONST ScaledGemmArgs ar
  * Swap-AB instantiations serve M <= 64 decode shapes (N becomes the 64-row WGMMA dimension).
  */
 template <typename Traits, GemmRecipe kRecipe, Fp8Accum kAccum>
-__global__ void fp8_gemm_wgmma_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void fp8_gemm_wgmma_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * fp8_gemm_tcgen05_kernel — Blackwell datacenter FP8 GEMM.
@@ -52,14 +52,14 @@ __global__ void fp8_gemm_wgmma_kernel(const KOPS_GRID_CONST GemmTmaParams params
  * 1-SM and 2-SM (CTA pair) instantiations; persistent.
  */
 template <typename Traits, GemmRecipe kRecipe>
-__global__ void fp8_gemm_tcgen05_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void fp8_gemm_tcgen05_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * fp8_gemm_sm120_kernel — RTX Blackwell FP8: kFP8Tensorwise / kFP8Rowwise via mma.sync kind::f8f6f4,
  * kMXFP8 / kFP8BlockwiseUE8M0 via mma.sync kind::mxf8f6f4.block_scale; TMA + warp-specialized.
  */
 template <typename Traits, GemmRecipe kRecipe>
-__global__ void fp8_gemm_sm120_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void fp8_gemm_sm120_kernel(const __grid_constant__ GemmTmaParams params);
 
 /// Parameters of fp8_block_gemm_small_m_kernel.
 struct Fp8BlockGemmParams {
@@ -84,7 +84,7 @@ struct Fp8BlockGemmParams {
  *          Qwen3 FP8, MiniMax-M2 FP8.
  */
 template <int M_TILE, int N_TILE, typename ArchTag>
-__global__ void fp8_block_gemm_small_m_kernel(const KOPS_GRID_CONST Fp8BlockGemmParams params);
+__global__ void fp8_block_gemm_small_m_kernel(const __grid_constant__ Fp8BlockGemmParams params);
 
 /**
  * fp8_gemv_kernel — M <= 8 FP8-weight GEMV on CUDA cores: e4m3 weights widened in registers
@@ -92,7 +92,7 @@ __global__ void fp8_block_gemm_small_m_kernel(const KOPS_GRID_CONST Fp8BlockGemm
  * The weight-bandwidth-optimal decode path on every arch including those without FP8 MMA.
  */
 template <typename a_t, GemmRecipe kRecipe, int M_TILE, int ROWS_PER_WARP, int WARPS>
-__global__ void fp8_gemv_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
+__global__ void fp8_gemv_kernel(const __grid_constant__ ScaledGemmArgs args);
 
 /**
  * fp8_bmm_kernel — strided-batched FP8 GEMM (per-batch tensorwise or rowwise scales): MLA
@@ -100,6 +100,6 @@ __global__ void fp8_gemv_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
  * FlashInfer bmm_fp8 equivalent. A may be bf16 (quantized in the prologue) or e4m3.
  */
 template <typename a_t, typename d_t, GemmRecipe kRecipe, typename ArchTag>
-__global__ void fp8_bmm_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
+__global__ void fp8_bmm_kernel(const __grid_constant__ ScaledGemmArgs args);
 
 }  // namespace kops::gemm

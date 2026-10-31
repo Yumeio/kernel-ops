@@ -33,7 +33,7 @@ namespace kops::gemm {
  *          STAGES * (TILE_M + TILE_N) * TILE_K * sizeof(T).
  */
 template <typename Traits>
-__global__ void gemm_mma_sync_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
+__global__ void gemm_mma_sync_kernel(const __grid_constant__ ScaledGemmArgs args);
 
 /**
  * gemm_wgmma_kernel — Hopper: TMA loads into a STAGES-deep smem ring guarded by mbarriers;
@@ -44,7 +44,7 @@ __global__ void gemm_mma_sync_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
  * Persistent with a linear-tile scheduler (+ stream-K when Traits enable it).
  */
 template <typename Traits>
-__global__ void gemm_wgmma_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void gemm_wgmma_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * gemm_tcgen05_kernel — Blackwell datacenter: TMA -> smem, tcgen05.mma (kind::f16 / kind::tf32)
@@ -55,14 +55,14 @@ __global__ void gemm_wgmma_kernel(const KOPS_GRID_CONST GemmTmaParams params);
  * Sm100a (B200/GB200) and Sm103a (B300/GB300) are separate instantiations.
  */
 template <typename Traits>
-__global__ void gemm_tcgen05_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void gemm_tcgen05_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * gemm_sm120_kernel — Blackwell GeForce / RTX PRO / GB10: TMA + warp-specialized pipeline feeding
  * mma.sync (no WGMMA, no TMEM, smaller smem than SM100). Separate tile tables from Sm100a.
  */
 template <typename Traits>
-__global__ void gemm_sm120_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void gemm_sm120_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * gemm_simt_kernel — CUDA-core FMA GEMM: exact fp32 (fp32 routers / LM heads kept in fp32,
@@ -70,7 +70,7 @@ __global__ void gemm_sm120_kernel(const KOPS_GRID_CONST GemmTmaParams params);
  * when a tensor-core candidate with the same semantics exists.
  */
 template <typename a_t, typename b_t, typename d_t, typename acc_t, int TILE_M, int TILE_N, int TILE_K>
-__global__ void gemm_simt_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
+__global__ void gemm_simt_kernel(const __grid_constant__ ScaledGemmArgs args);
 
 // -----------------------------------------------------------------------------
 // Small-M / decode shapes
@@ -102,7 +102,7 @@ struct GemvParams {
  * Numerics: fp32 accumulation; deterministic when split_k == 1 or split_workspace is used.
  */
 template <typename a_t, typename b_t, typename d_t, int M_TILE, int ROWS_PER_WARP, int WARPS, int VEC_SIZE>
-__global__ void gemv_kernel(const KOPS_GRID_CONST GemvParams params);
+__global__ void gemv_kernel(const __grid_constant__ GemvParams params);
 
 /// Arguments of gemv_argmax_kernel.
 struct GemvArgmaxParams {
@@ -131,7 +131,7 @@ struct GemvArgmaxParams {
  * sampler path is used otherwise. Ties -> lowest id. TP: cross-rank argmax via communication/.
  */
 template <typename h_t, typename w_t, int M_TILE, int WARPS>
-__global__ void gemv_argmax_kernel(const KOPS_GRID_CONST GemvArgmaxParams params);
+__global__ void gemv_argmax_kernel(const __grid_constant__ GemvArgmaxParams params);
 
 /// Arguments of dual_gemm_kernel.
 struct DualGemmParams {
@@ -154,7 +154,7 @@ struct DualGemmParams {
  * up_proj separate and repacking into a fused [2I, H] weight is not desired.
  */
 template <typename Traits>
-__global__ void dual_gemm_kernel(const KOPS_GRID_CONST DualGemmParams params);
+__global__ void dual_gemm_kernel(const __grid_constant__ DualGemmParams params);
 
 /**
  * splitk_reduce_kernel — D = epilogue(sum_s partial[s]) for parallel split-K workspaces.
@@ -193,7 +193,7 @@ struct RouterGemmParams {
  * Launch : grid = (ceil(E / EXPERTS_PER_CTA), ceil(M / M_TILE)), block = 128..256.
  */
 template <typename x_t, typename w_t, int M_TILE, int EXPERTS_PER_CTA>
-__global__ void router_gemm_kernel(const KOPS_GRID_CONST RouterGemmParams params);
+__global__ void router_gemm_kernel(const __grid_constant__ RouterGemmParams params);
 
 /**
  * router_gemm_bf16x2_kernel — G02 two-term decomposition (HPC-Ops gemm_bf16xfp32):
@@ -202,7 +202,7 @@ __global__ void router_gemm_kernel(const KOPS_GRID_CONST RouterGemmParams params
  * registry records max-abs error vs an fp32 reference per (H, E) shape.
  */
 template <int M_TILE, int EXPERTS_PER_CTA, typename ArchTag>
-__global__ void router_gemm_bf16x2_kernel(const KOPS_GRID_CONST RouterGemmParams params);
+__global__ void router_gemm_bf16x2_kernel(const __grid_constant__ RouterGemmParams params);
 
 // -----------------------------------------------------------------------------
 // Strided-batched GEMM
@@ -228,6 +228,6 @@ struct BmmParams {
  * Models : DeepSeek V2/V3/V3.2/V4, Kimi K2/K2.5/K3 (gated MLA), Kimi Linear MLA layers, MiniCPM3.
  */
 template <typename a_t, typename b_t, typename d_t, int TILE_M, int TILE_N, int TILE_K, typename ArchTag>
-__global__ void bmm_kernel(const KOPS_GRID_CONST BmmParams params);
+__global__ void bmm_kernel(const __grid_constant__ BmmParams params);
 
 }  // namespace kops::gemm

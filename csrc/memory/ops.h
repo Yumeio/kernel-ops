@@ -39,7 +39,7 @@ struct MemPoolDesc {
   MemKind kind = MemKind::kDevice;
   bool peer_accessible = false;  // map into other devices in the group
   bool shareable_ipc = false;    // exportable to another process
-  bool multicast = false;        // NVLS multicast object (CUDA SM90+, ignored on HIP)
+  bool multicast = false;        // NVLS multicast object (CUDA SM90+)
 };
 
 struct MemPoolStats {
@@ -92,8 +92,8 @@ Status offload_run(const OffloadDesc& desc, const LaunchContext& ctx);
 Status onload_run(const OffloadDesc& desc, const LaunchContext& ctx);
 
 // ---- Green context / SM partitioning ----------------------------------------
-/// Reserve a contiguous slice of CUs (CUDA green context; HIP: kUnsupportedBackend
-/// unless the runtime exposes an equivalent partition API).
+/// Reserve a contiguous slice of CUs (CUDA green context; kUnsupportedBackend
+/// where the runtime exposes no equivalent partition API).
 struct GreenCtxDesc {
   int32_t device = 0;
   int32_t min_compute_units = 1;

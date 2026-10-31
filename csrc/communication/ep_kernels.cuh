@@ -57,7 +57,7 @@ struct EPDispatchParams {
 };
 
 template <typename T, int NUM_RANKS_PER_NODE>
-__global__ void ep_dispatch_kernel(const KOPS_GRID_CONST EPDispatchParams params);
+__global__ void ep_dispatch_kernel(const __grid_constant__ EPDispatchParams params);
 
 /// Arguments of EP combine (weighted reduction back at the source rank).
 struct EPCombineParams {
@@ -75,6 +75,6 @@ struct EPCombineParams {
 };
 
 template <typename T, int NUM_RANKS_PER_NODE>
-__global__ void ep_combine_kernel(const KOPS_GRID_CONST EPCombineParams params);
+__global__ void ep_combine_kernel(const __grid_constant__ EPCombineParams params);
 
 }  // namespace kops::comm

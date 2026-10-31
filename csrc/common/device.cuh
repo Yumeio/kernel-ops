@@ -16,10 +16,10 @@ struct alignas(sizeof(T) * N) Vec {
 };
 
 /// 128-bit vectorized load/store; pointer must be 16-byte aligned.
-template <typename T, int N> KOPS_DEVICE Vec<T, N> load_vec(const T* KOPS_RESTRICT ptr);
-template <typename T, int N> KOPS_DEVICE void store_vec(T* KOPS_RESTRICT ptr, const Vec<T, N>& v);
+template <typename T, int N> KOPS_DEVICE Vec<T, N> load_vec(const T* __restrict__ ptr);
+template <typename T, int N> KOPS_DEVICE void store_vec(T* __restrict__ ptr, const Vec<T, N>& v);
 /// Load with L1 no-allocate / evict-first hint (streamed weights, KV pages).
-template <typename T, int N> KOPS_DEVICE Vec<T, N> load_vec_streaming(const T* KOPS_RESTRICT ptr);
+template <typename T, int N> KOPS_DEVICE Vec<T, N> load_vec_streaming(const T* __restrict__ ptr);
 
 // ---- Fast math (fp32) ------------------------------------------------------
 KOPS_DEVICE float fast_exp2(float x);        // ex2.approx.ftz

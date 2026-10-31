@@ -4,9 +4,8 @@
 // Error model for every host launcher. Kernels never printf-and-return; host
 // launchers validate, return a Status, and keep a thread-local detail string.
 // Requires: common/macros.cuh (kops_error_t, KOPS_ABI_VERSION).
-//   TU also needs <cstdint> and the backend runtime headers (<cuda_runtime.h> or
-//   <hip/hip_runtime.h>); the backend error type is widened to int32 and never
-//   appears in this header.
+//   TU also needs <cstdint> and <cuda_runtime.h>; the backend error type is
+//   widened to int32 and never appears in this header.
 //
 // ABI: Status values are append-only. The plain C surface is
 // bindings/c_api/kops_c.h; this header is the C++ view of the same contract.
@@ -41,10 +40,10 @@ const char* status_name(Status s) noexcept;
 /// host thread (e.g. "attention.decode: head_dim_qk=96 not in {64,128,256}").
 /// Valid until the next kops call on the same thread.
 const char* last_error_message() noexcept;
-/// Backend error code captured together with the last kCudaError (cudaError_t or
-/// hipError_t, widened to int32). 0 means "no backend error recorded".
+/// Backend error code captured together with the last kCudaError (cudaError_t,
+/// widened to int32). 0 means "no backend error recorded".
 kops_error_t last_backend_error() noexcept;
-/// "cuda" | "hip" for the backend that produced the last error, or "none".
+/// "cuda" for the backend that produced the last error, or "none".
 const char* last_error_backend() noexcept;
 /// Reset the thread-local error slot.
 void clear_last_error() noexcept;
@@ -54,7 +53,7 @@ namespace detail {
 /// `return detail::set_error(kInvalidArgument, "x: %s", why);`. printf-style,
 /// truncated to 480 bytes; never allocates, never throws.
 Status set_error(Status s, const char* fmt, ...) noexcept;
-/// Same, plus the backend error code and backend name ("cuda"/"hip").
+/// Same, plus the backend error code and backend name ("cuda").
 Status set_backend_error(Status s, int32_t backend_error, const char* fmt, ...) noexcept;
 }  // namespace detail
 

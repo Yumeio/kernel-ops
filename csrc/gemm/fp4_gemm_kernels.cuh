@@ -46,7 +46,7 @@ struct BlockScaledGemmParams {
  * block amax computed within the N tile, which must be a multiple of the block size).
  */
 template <typename Traits, GemmRecipe kRecipe>
-__global__ void fp4_gemm_tcgen05_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void fp4_gemm_tcgen05_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * fp4_gemm_sm120_kernel — RTX Blackwell / GB10 native FP4: block-scaled mma.sync
@@ -54,7 +54,7 @@ __global__ void fp4_gemm_tcgen05_kernel(const KOPS_GRID_CONST GemmTmaParams para
  * Separate tile tables and smem budget from Sm100a; never selected by an sm_100 capability row.
  */
 template <typename Traits, GemmRecipe kRecipe>
-__global__ void fp4_gemm_sm120_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void fp4_gemm_sm120_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * fp4_to_fp8_gemm_wgmma_kernel — Hopper path for FP4 weights (kW4A8FP4xFP8): each FP4 weight tile
@@ -63,7 +63,7 @@ __global__ void fp4_gemm_sm120_kernel(const KOPS_GRID_CONST GemmTmaParams params
  * wgmma e4m3 with Fp8Accum::kPromoted. Halves weight bytes vs FP8 at FP8 MMA rate.
  */
 template <typename Traits, ScaleGranularity kWeightBlock>
-__global__ void fp4_to_fp8_gemm_wgmma_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void fp4_to_fp8_gemm_wgmma_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * fp4_gemv_kernel — M <= 8 decode GEMV for any FP4 weight (MXFP4 / NVFP4) on any arch: e2m1 decoded
@@ -71,6 +71,6 @@ __global__ void fp4_to_fp8_gemm_wgmma_kernel(const KOPS_GRID_CONST GemmTmaParams
  * activations bf16 (W4A16) or e4m3 / MXFP8 (W4A8). Weight-bandwidth bound; split-K for small N.
  */
 template <typename a_t, GemmRecipe kRecipe, int M_TILE, int ROWS_PER_WARP, int WARPS>
-__global__ void fp4_gemv_kernel(const KOPS_GRID_CONST ScaledGemmArgs args);
+__global__ void fp4_gemv_kernel(const __grid_constant__ ScaledGemmArgs args);
 
 }  // namespace kops::gemm

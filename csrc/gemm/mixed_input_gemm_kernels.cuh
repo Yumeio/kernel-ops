@@ -56,7 +56,7 @@ struct MarlinParams {
 template <typename scalar_t, quant::MarlinWeightType kWType, int THREADS, int THREAD_M_BLOCKS,
           int THREAD_N_BLOCKS, int THREAD_K_BLOCKS, bool M_BLOCK_SIZE_8, int STAGES,
           int GROUP_BLOCKS, bool IS_ZP_FLOAT>
-__global__ void marlin_gemm_kernel(const KOPS_GRID_CONST MarlinParams params);
+__global__ void marlin_gemm_kernel(const __grid_constant__ MarlinParams params);
 
 /**
  * machete_gemm_kernel — Hopper mixed-input GEMM (TMA + WGMMA): weights pre-packed by
@@ -66,7 +66,7 @@ __global__ void marlin_gemm_kernel(const KOPS_GRID_CONST MarlinParams params);
  * (int4 -> e4m3 with scale folding, fp8 activations; Hopper W4A8-AWQ).
  */
 template <typename Traits, GemmRecipe kRecipe, int GROUP_SIZE, bool kHasZeros>
-__global__ void machete_gemm_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void machete_gemm_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * mixed_input_gemm_tcgen05_kernel — Blackwell mixed-input: a converter warpgroup dequantizes weight
@@ -75,7 +75,7 @@ __global__ void machete_gemm_kernel(const KOPS_GRID_CONST GemmTmaParams params);
  * MXFP4 x BF16 on B200), kW4A16NVFP4, kW8A16FP8, kW4A8IntFP8, kW4A8FP4xFP8.
  */
 template <typename Traits, GemmRecipe kRecipe>
-__global__ void mixed_input_gemm_tcgen05_kernel(const KOPS_GRID_CONST GemmTmaParams params);
+__global__ void mixed_input_gemm_tcgen05_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
  * w4a16_gemv_kernel — M <= 4 weight-only int4 GEMV with group scales/zeros (AWQ or GPTQ layout
