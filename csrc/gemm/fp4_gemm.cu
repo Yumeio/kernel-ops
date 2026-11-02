@@ -1,8 +1,10 @@
 // =============================================================================
 // kernel-ops | csrc/gemm/fp4_gemm.cu
-// B5 row 7: FP4-weight GEMV on CUDA cores.
+// B5 row 7: FP4-weight GEMV.
 //   fp4_gemv_kernel   MXFP4 (UE8M0 / 32) and NVFP4 (E4M3 / 16 + fp32 global) weights x bf16/fp16
-//                     activations, M <= 8
+//                     activations: CUDA cores, M <= 8 (ROWS_PER_WARP > 0);
+//                     WeightPacking::kMarlin = fp4_to_marlin tiles on mma.sync m16n8k16, SM80+,
+//                     M <= 16, N % 64 == 0 (ROWS_PER_WARP == 0)
 // Host entry: fp4_gemm (kW4A16MXFP4 / kW4A16NVFP4); the W4A4 / W4A8 recipes need FP4 activations
 // or tensor cores (B11 / B13) and return kNotImplemented.
 //
@@ -83,13 +85,82 @@ __device__ __forceinline__ void store_result(const ScaledGemmArgs& a, int64_t m,
   }
 }
 
+// -----------------------------------------------------------------------------
+// Marlin tiles on tensor cores (SM80+): fp4_to_marlin output, weight = MMA operand A.
+// Geometry, fragment mapping and numerics: common/device_impl.cuh (dev::tc_gemv_body).  The weight
+// fragment is the bare e2m1 code (exact in bf16 and fp16); the block scale (E4M3 per 16 / UE8M0 per 32,
+// any exponent) is applied in fp32 to the block's accumulator, so nothing depends on the fp16 range.
+// -----------------------------------------------------------------------------
+
+template <typename a_t, bool kNV>
+struct Fp4TilePolicy {
+  using Tc = dev::TcFrag<a_t>;
+  static constexpr int kBlockK = kNV ? 16 : 32;
+
+  const uint8_t* scales;   // [K/blk, N] bytes, Marlin-permuted: lane r reads its columns {r + 8 j} as 8 bytes
+  int n;
+
+  struct State {
+    uint2 s;               // scale bytes j = 2 w + h: row r (h = 0) or r + 8 (h = 1) of sub-tile w
+  };
+
+  __device__ __forceinline__ State load(int blk, int nt, int r) const {
+    State st;
+    st.s = *reinterpret_cast<const uint2*>(scales + static_cast<int64_t>(blk) * n + nt * dev::kTcTileN + 8 * r);
+    return st;
+  }
+
+  __device__ __forceinline__ void unpack_scales(const State& st, float (&sf)[8]) const {
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t byte = ((j < 4 ? st.s.x : st.s.y) >> (8 * (j & 3))) & 0xFFu;
+      sf[j] = kNV ? dev::e4m3_decode(byte) : ue8m0_to_f(byte);
+    }
+  }
+
+  __device__ __forceinline__ void dequant(const State&, int, uint32_t q, uint32_t (&fa)[4]) const {
+    fa[0] = Tc::e2m1x2(q & 0x000F000Fu);           // row r,     k 2c, 2c+1
+    fa[2] = Tc::e2m1x2((q >> 4) & 0x000F000Fu);    // row r,     k 2c+8, 2c+9
+    fa[1] = Tc::e2m1x2((q >> 8) & 0x000F000Fu);    // row r + 8, k 2c, 2c+1
+    fa[3] = Tc::e2m1x2((q >> 12) & 0x000F000Fu);   // row r + 8, k 2c+8, 2c+9
+  }
+};
+
+/// 1 / global scale, then the repo epilogue, then the round to the output dtype (== activation dtype).
+template <typename a_t>
+struct Fp4TcStore {
+  const ScaledGemmArgs* args;
+  float inv_g;
+  __device__ __forceinline__ void operator()(float v, int tok, int col) const {
+    const ScaledGemmArgs& a = *args;
+    dev::from_f(static_cast<a_t*>(a.d)[static_cast<int64_t>(tok) * a.ldd + col],
+                dev::gemm_epilogue<a_t>(v * inv_g, a.epi, tok, col));
+  }
+};
+
+template <typename a_t, GemmRecipe kRecipe, int M_TILE>
+__device__ __forceinline__ void fp4_tc_body(const ScaledGemmArgs& args) {
+  constexpr bool kNV = kRecipe == GemmRecipe::kW4A16NVFP4 || kRecipe == GemmRecipe::kNVFP4;
+  const Fp4TilePolicy<a_t, kNV> pol{static_cast<const uint8_t*>(args.b.scale), static_cast<int>(args.n)};
+  const Fp4TcStore<a_t> epi{&args, args.b.global_scale != nullptr ? 1.0f / *args.b.global_scale : 1.0f};
+  dev::tc_gemv_body<Fp4TilePolicy<a_t, kNV>, Fp4TcStore<a_t>, a_t, M_TILE>(
+      static_cast<const a_t*>(args.a.data), args.a.ld, static_cast<const uint32_t*>(args.b.data), pol, epi,
+      static_cast<int>(args.m), static_cast<int>(args.n), static_cast<int>(args.k));
+}
+
 }  // namespace
 
 template <typename a_t, GemmRecipe kRecipe, int M_TILE, int ROWS_PER_WARP, int WARPS>
 __global__ void fp4_gemv_kernel(const __grid_constant__ ScaledGemmArgs args) {
+  if constexpr (ROWS_PER_WARP == 0) {
+    // Marlin tiles on mma.sync (M_TILE 8 or 16, WARPS == dev::kTcWarps); the CUDA-core body below is
+    // dead code for this instantiation and the compiler drops it.
+    fp4_tc_body<a_t, kRecipe, M_TILE>(args);
+    return;
+  }
   constexpr bool kNV = kRecipe == GemmRecipe::kW4A16NVFP4 || kRecipe == GemmRecipe::kNVFP4;
   constexpr int BLK = kNV ? 16 : 32;
-  constexpr int R = ROWS_PER_WARP;
+  constexpr int R = ROWS_PER_WARP > 0 ? ROWS_PER_WARP : 1;
   const int lane = threadIdx.x & 31;
   const int64_t n0 = (static_cast<int64_t>(blockIdx.x) * WARPS + (threadIdx.x >> 5)) * R;
   if (n0 >= args.n) return;
@@ -201,8 +272,21 @@ Status launch_fp4_tile(const ScaledGemmArgs& args, cudaStream_t s) {
   return launch_error("fp4_gemv_kernel");
 }
 
+/// Marlin tiles: one CTA of dev::kTcWarps warps per 64-column n-tile, M <= 16 in one launch.
+template <typename a_t, GemmRecipe kR>
+Status launch_fp4_tc(const ScaledGemmArgs& args, cudaStream_t s) {
+  const dim3 grid(static_cast<unsigned>(args.n / dev::kTcTileN));
+  if (args.m <= 8) {
+    fp4_gemv_kernel<a_t, kR, 8, 0, dev::kTcWarps><<<grid, dev::kTcWarps * 32, 0, s>>>(args);
+  } else {
+    fp4_gemv_kernel<a_t, kR, 16, 0, dev::kTcWarps><<<grid, dev::kTcWarps * 32, 0, s>>>(args);
+  }
+  return launch_error("fp4_gemv_kernel");
+}
+
 template <typename a_t, GemmRecipe kR>
 Status launch_fp4(const ScaledGemmArgs& args, cudaStream_t s) {
+  if (args.b.packing == WeightPacking::kMarlin) return launch_fp4_tc<a_t, kR>(args, s);
   if (args.m <= 1) return launch_fp4_tile<a_t, kR, 1, 4>(args, s);
   if (args.m <= 2) return launch_fp4_tile<a_t, kR, 2, 4>(args, s);
   if (args.m <= 4) return launch_fp4_tile<a_t, kR, 4, 2>(args, s);
@@ -233,12 +317,23 @@ Status fp4_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBacken
   if (adt != DType::kBFloat16 && adt != DType::kFloat16) {
     return detail::set_error(Status::kUnsupportedDtype, "fp4_gemm: activations must be bf16 or fp16");
   }
-  if (args.b.dtype != DType::kFloat4E2M1x2) return detail::set_error(Status::kUnsupportedDtype, "fp4_gemm: weights must be packed e2m1");
+  // WeightPacking::kMarlin = fp4_to_marlin tiles (int32 words) on mma.sync, SM80+, M <= 16.
+  const bool marlin = args.b.packing == WeightPacking::kMarlin;
+  if (marlin && ctx.arch_id >= KOPS_TARGET_SM70 && ctx.arch_id < KOPS_TARGET_SM80) {
+    return detail::set_error(Status::kUnsupportedArch,
+                             "fp4_gemm: the Marlin-tile body is mma.sync bf16/fp16 and needs SM80 or newer (arch %d)", ctx.arch_id);
+  }
+  if (marlin ? (args.b.dtype != DType::kUInt32 && args.b.dtype != DType::kInt32) : args.b.dtype != DType::kFloat4E2M1x2) {
+    return detail::set_error(Status::kUnsupportedDtype, marlin ? "fp4_gemm: Marlin tiles are int32 words" : "fp4_gemm: weights must be packed e2m1");
+  }
   if (args.b.scale_dtype != (nv ? DType::kFloat8E4M3 : DType::kFloat8E8M0)) {
     return detail::set_error(Status::kUnsupportedDtype, nv ? "fp4_gemm: NVFP4 scales must be E4M3" : "fp4_gemm: MXFP4 scales must be UE8M0");
   }
   if (args.d_dtype != DType::kBFloat16 && args.d_dtype != DType::kFloat16 && args.d_dtype != DType::kFloat32) {
     return detail::set_error(Status::kUnsupportedDtype, "fp4_gemm: output must be bf16, fp16 or fp32");
+  }
+  if (marlin && args.d_dtype != adt) {
+    return detail::set_error(Status::kUnsupportedDtype, "fp4_gemm: the Marlin-tile body writes the activation dtype (fp32 output needs the CUDA-core path)");
   }
   const int blk = nv ? 16 : 32;
   if (args.b.group_k != 0 && args.b.group_k != blk) {
@@ -247,21 +342,33 @@ Status fp4_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBacken
   if (args.b.major != MajorOrder::kKMajor || args.a.major != MajorOrder::kKMajor) {
     return detail::set_error(Status::kUnsupportedLayout, "fp4_gemm: K-major operands only");
   }
-  if (args.b.scale_layout != ScaleLayout::kRowMajor && args.b.scale_layout != ScaleLayout::kSwizzled128x4) {
+  if (marlin) {
+    if (args.b.scale_layout != ScaleLayout::kMarlinPermuted) {
+      return detail::set_error(Status::kUnsupportedLayout, "fp4_gemm: Marlin tiles need scale_layout kMarlinPermuted (fp4_to_marlin output)");
+    }
+  } else if (args.b.scale_layout != ScaleLayout::kRowMajor && args.b.scale_layout != ScaleLayout::kSwizzled128x4) {
     return detail::set_error(Status::kUnsupportedLayout, "fp4_gemm: scales must be row-major or 128x4 swizzled");
   }
   if (args.batch != 1) return detail::set_error(Status::kNotImplemented, "fp4_gemm: batch > 1");
   if (args.m < 1 || args.n < 1 || args.k < 1) return detail::set_error(Status::kInvalidArgument, "fp4_gemm: empty problem");
-  if (args.m > 8) return detail::set_error(Status::kNotImplemented, "fp4_gemm: M > 8 needs the tensor-core path");
+  if (args.m > (marlin ? 16 : 8)) {
+    return detail::set_error(Status::kNotImplemented, marlin ? "fp4_gemm: M > 16 needs the tensor-core path (B7)"
+                                                             : "fp4_gemm: M > 8 needs the tensor-core path (kMarlin tiles take M <= 16)");
+  }
   if (args.k % 32 != 0) return detail::set_error(Status::kUnsupportedShape, "fp4_gemm: K must be a multiple of 32");
+  if (marlin && args.n % 64 != 0) return detail::set_error(Status::kUnsupportedShape, "fp4_gemm: Marlin tiles need N to be a multiple of 64");
   if (args.a.data == nullptr || args.b.data == nullptr || args.b.scale == nullptr || args.d == nullptr) {
     return detail::set_error(Status::kInvalidArgument, "fp4_gemm: null operand");
   }
-  if (args.a.ld < args.k || args.b.ld < args.k / 2 || args.ldd < args.n) {
+  // b.ld is the byte pitch of a packed [N, K/2] row; Marlin tiles have none.
+  if (args.a.ld < args.k || (!marlin && args.b.ld < args.k / 2) || args.ldd < args.n) {
     return detail::set_error(Status::kInvalidArgument, "fp4_gemm: leading dimensions smaller than the extents (b.ld is in bytes)");
   }
-  if (!aligned(args.a.data, 16) || (args.a.ld * 2) % 16 != 0 || !aligned(args.b.data, 16) || args.b.ld % 16 != 0) {
+  if (!aligned(args.a.data, 16) || (args.a.ld * 2) % 16 != 0 || !aligned(args.b.data, 16) || (!marlin && args.b.ld % 16 != 0)) {
     return detail::set_error(Status::kMisaligned, "fp4_gemm: operand base and row pitch must be 16 B aligned");
+  }
+  if (marlin && !aligned(args.b.scale, 8)) {
+    return detail::set_error(Status::kMisaligned, "fp4_gemm: Marlin-tile scales must be 8 B aligned");
   }
   if ((args.epi.ops & ~kFp4EpiAllowed) != 0u) {
     return detail::set_error(Status::kNotImplemented, "fp4_gemm: epilogue ops 0x%x are not implemented", args.epi.ops & ~kFp4EpiAllowed);

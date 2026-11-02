@@ -3,21 +3,15 @@
 // kernel-ops | csrc/common/device.cuh
 // Device building blocks: vector types, fast math, warp/block reductions,
 // online-softmax state. Declarations only; bodies live in device_impl.cuh.
-// Requires: common/macros.cuh, common/dtype.cuh, common/op_types.cuh.
+// Requires: common/macros.cuh, common/dtype.cuh, common/op_types.cuh, common/vec.cuh.
 // =============================================================================
+
+#include "csrc/common/vec.cuh"
 
 namespace kops {
 
-/// Register vector of N elements of T with natural alignment (N*sizeof(T) <= 16
-/// enables 128-bit LDG/STG). Used for VEC_SIZE template parameters.
-template <typename T, int N>
-struct alignas(sizeof(T) * N) Vec {
-  T data[N];
-};
+// Vec, load_vec, store_vec, vec_cast and pick_vec_size live in common/vec.cuh.
 
-/// 128-bit vectorized load/store; pointer must be 16-byte aligned.
-template <typename T, int N> KOPS_DEVICE Vec<T, N> load_vec(const T* __restrict__ ptr);
-template <typename T, int N> KOPS_DEVICE void store_vec(T* __restrict__ ptr, const Vec<T, N>& v);
 /// Load with L1 no-allocate / evict-first hint (streamed weights, KV pages).
 template <typename T, int N> KOPS_DEVICE Vec<T, N> load_vec_streaming(const T* __restrict__ ptr);
 

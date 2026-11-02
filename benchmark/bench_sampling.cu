@@ -6,9 +6,14 @@
 #include "benchmark/harness.h"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <random>
+#include <string>
 #include <vector>
 
 #include "csrc/common/op_types.cuh"
@@ -21,6 +26,49 @@
 namespace {
 
 using namespace kops_bench;
+
+// Benchmarks must not run on all-zero data: every element ties, so selection, sort and routing
+// kernels take their degenerate path. Values come from a hashed table of N(0, 1) samples.
+const std::vector<float>& normal_table() {
+  static const std::vector<float> table = [] {
+    std::vector<float> v(size_t{1} << 20);
+    std::mt19937 gen(1234u);
+    std::normal_distribution<float> dist;
+    for (auto& x : v) x = dist(gen);
+    return v;
+  }();
+  return table;
+}
+inline float rand_normal(uint64_t i) {
+  return normal_table()[static_cast<size_t>(((i + 1) * 0x9E3779B97F4A7C15ull) >> 44)];
+}
+
+inline void put(float& d, float v) { d = v; }
+inline void put(__half& d, float v) { d = __float2half(v); }
+inline void put(__nv_bfloat16& d, float v) { d = __float2bfloat16(v); }
+
+/// logits ~ N(0, sigma^2), the spread of a trained LM head.
+template <typename T>
+void fill_logits(T* dev, size_t n, float sigma) {
+  std::vector<T> h(n);
+  for (size_t i = 0; i < n; ++i) put(h[i], sigma * rand_normal(i));
+  cudaMemcpy(dev, h.data(), n * sizeof(T), cudaMemcpyHostToDevice);
+}
+
+/// probabilities = row softmax of such logits.
+void fill_probs(float* dev, size_t rows, size_t cols, float sigma) {
+  std::vector<float> h(rows * cols);
+  for (size_t r = 0; r < rows; ++r) {
+    double sum = 0.0;
+    for (size_t c = 0; c < cols; ++c) {
+      const float e = std::exp(sigma * rand_normal(r * cols + c));
+      h[r * cols + c] = e;
+      sum += e;
+    }
+    for (size_t c = 0; c < cols; ++c) h[r * cols + c] = static_cast<float>(h[r * cols + c] / sum);
+  }
+  cudaMemcpy(dev, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice);
+}
 
 constexpr int kWarmup = 10;
 constexpr int kIters = 80;
@@ -98,10 +146,14 @@ std::vector<Case> make_cases() {
   bias_case("sampling.bias.fp32.v32768.b256.nnz8", kops::DType::kFloat32, 256, 32768, 8);
 
 
+  // Minimum DRAM traffic: one read of the row, plus one write when the op emits a full row
+  // (renorm and mask). The multi-pass radix reads are not counted.
   auto sample_case = [&](const char* id, const char* op, kops::DType dt, int64_t rows, int64_t cols,
                          int64_t extra) {
     const int es = dtype_size(dt);
-    add_case(&cases, id, op, dt, rows, cols, rows * cols * es + rows * extra);
+    const bool writes_row = std::string(op) == "topk_renorm" || std::string(op) == "topp_renorm" ||
+                            std::string(op) == "topk_mask";
+    add_case(&cases, id, op, dt, rows, cols, rows * cols * es * (writes_row ? 2 : 1) + rows * extra);
   };
   sample_case("sampling.topk_topp.bf16.v131072.b32.k50.p0.9", "sample", kops::DType::kBFloat16, 32,
               131072, 16);
@@ -131,7 +183,7 @@ bool run_softmax(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
                           static_cast<size_t>(c.rows) * sizeof(float)), "malloc temperature")) {
     return false;
   }
-  cudaMemset(logits, 0, n * sizeof(T));
+  fill_logits(logits, n, 3.0f);
   cudaMemset(probs, 0, n * sizeof(float));
   std::vector<float> host_temperature(static_cast<size_t>(c.rows), 0.9f);
   cudaMemcpy(temperature, host_temperature.data(), host_temperature.size() * sizeof(float),
@@ -182,7 +234,7 @@ bool run_argmax(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
                           static_cast<size_t>(c.rows) * sizeof(float)), "malloc logprob")) {
     return false;
   }
-  cudaMemset(logits, 0, n * sizeof(T));
+  fill_logits(logits, n, 3.0f);
 
   const kops::Tensor t_logits = tensor2d(logits, c.dtype, c.rows, c.cols);
   const kops::Tensor t_ids = tensor1d(ids, kops::DType::kInt32, c.rows);
@@ -220,7 +272,7 @@ bool run_logprobs(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
                "malloc top logprobs")) {
     return false;
   }
-  cudaMemset(logits, 0, n * sizeof(T));
+  fill_logits(logits, n, 3.0f);
   cudaMemset(chosen, 0, static_cast<size_t>(c.rows) * sizeof(int32_t));
 
   const kops::Tensor t_logits = tensor2d(logits, c.dtype, c.rows, c.cols);
@@ -471,7 +523,7 @@ bool run_sample(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
       !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&ids), static_cast<size_t>(c.rows) * 4), "ids")) {
     return false;
   }
-  cudaMemset(logits, 0, n * sizeof(T));
+  fill_logits(logits, n, 3.0f);
   const kops::Tensor t_logits = tensor2d(logits, c.dtype, c.rows, c.cols);
   const kops::Tensor t_ids = tensor1d(ids, kops::DType::kInt32, c.rows);
   kops::sample::SamplingParams params{};
@@ -516,7 +568,7 @@ bool run_renorm(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
       !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&out), n * 4), "out")) {
     return false;
   }
-  cudaMemset(probs, 0, n * 4);
+  fill_probs(probs, static_cast<size_t>(c.rows), static_cast<size_t>(c.cols), 3.0f);
   const kops::Tensor t_p = tensor2d(probs, kops::DType::kFloat32, c.rows, c.cols);
   const kops::Tensor t_o = tensor2d(out, kops::DType::kFloat32, c.rows, c.cols);
   bool ok = false;
@@ -541,7 +593,7 @@ bool run_topk_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
       !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&out), n * sizeof(T)), "out")) {
     return false;
   }
-  cudaMemset(logits, 0, n * sizeof(T));
+  fill_logits(logits, n, 3.0f);
   const kops::Tensor t_l = tensor2d(logits, c.dtype, c.rows, c.cols);
   const kops::Tensor t_o = tensor2d(out, c.dtype, c.rows, c.cols);
   const auto call = [&] { (void)kops::sample::top_k_mask_logits(t_o, t_l, kops::Tensor{}, 50, ctx); };

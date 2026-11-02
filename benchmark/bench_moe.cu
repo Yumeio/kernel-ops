@@ -8,9 +8,12 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <random>
 #include <vector>
 
 #include "csrc/common/quant.cuh"
@@ -26,6 +29,33 @@
 namespace {
 
 using namespace kops_bench;
+
+// Benchmarks must not run on all-zero data: every element ties, so selection, sort and routing
+// kernels take their degenerate path. Values come from a hashed table of N(0, 1) samples.
+const std::vector<float>& normal_table() {
+  static const std::vector<float> table = [] {
+    std::vector<float> v(size_t{1} << 20);
+    std::mt19937 gen(1234u);
+    std::normal_distribution<float> dist;
+    for (auto& x : v) x = dist(gen);
+    return v;
+  }();
+  return table;
+}
+inline float rand_normal(uint64_t i) {
+  return normal_table()[static_cast<size_t>(((i + 1) * 0x9E3779B97F4A7C15ull) >> 44)];
+}
+
+void fill_f32(float* dev, size_t n, float sigma) {
+  std::vector<float> h(n);
+  for (size_t i = 0; i < n; ++i) h[i] = sigma * rand_normal(i);
+  cudaMemcpy(dev, h.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+}
+void fill_bf16(void* dev, size_t n, float sigma) {
+  std::vector<__nv_bfloat16> h(n);
+  for (size_t i = 0; i < n; ++i) h[i] = __float2bfloat16(sigma * rand_normal(i));
+  cudaMemcpy(dev, h.data(), n * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
+}
 using kops::Tensor;
 
 constexpr int kWarmup = 10;
@@ -50,23 +80,23 @@ std::vector<Case> make_cases() {
   add_case(&cases, "moe.fused_router.sigmoid.e256.h7168.k8.t32", "moe_fused_router",
            kops::DType::kBFloat16, 32, 7168, 32 * 7168 * 2 + 256 * 7168 * 2 + 32 * 8 * 8);
   add_case(&cases, "moe.hash.e256.k8.t4096", "moe_hash", kops::DType::kInt32, 4096, 256,
-           4096 * 8 * 8 + 32000 * 8 * 4);
+           4096 * 8 * 8 + 4096 * 8 + 4096 * 8 * 4);
   add_case(&cases, "moe.count_offsets.e256.align128.slots32768", "moe_count_offsets",
            kops::DType::kInt32, 32768, 256, 32768 * 4 + 256 * 12);
   add_case(&cases, "moe.align.e256.block128.slots32768", "moe_align", kops::DType::kInt32, 32768,
-           256, 32768 * 4 + (32768 + 256 * 127) * 4 * 2);
+           256, 32768 * 4 + (32768 + 256 * 64) * 4 + ((32768 + 256 * 64) / 128) * 4);
   add_case(&cases, "moe.permute.bf16.t256.h7168.k8.e256", "moe_permute", kops::DType::kBFloat16,
            256, 7168, 256 * 7168 * 2 * 9);
   add_case(&cases, "moe.permute_fp8.t256.h7168.k8.e256", "moe_permute_fp8", kops::DType::kBFloat16,
-           256, 7168, 256 * 7168 * 2 + 256 * 8 * 7168);
+           256, 7168, 256 * 7168 * 2 + 256 * 8 * 7168 + 256 * 8 * (7168 / 128) * 4);
   add_case(&cases, "moe.unpermute.bf16.t1024.h7168.k8", "moe_unpermute", kops::DType::kBFloat16,
-           1024, 7168, 1024 * 7168 * 2 * 10);
+           1024, 7168, 1024 * 7168 * 2 * (8 + 3));
   add_case(&cases, "moe.sum.bf16.t1024.k8.h7168", "moe_sum", kops::DType::kBFloat16, 1024, 7168,
-           1024 * 8 * 7168 * 2 * 2);
+           (1024 * 8 + 1024) * 7168 * 2);  // read [T,K,H], write [T,H]
   add_case(&cases, "moe.latent_combine.bf16.t1024.k8.l3584", "moe_latent", kops::DType::kBFloat16,
-           1024, 3584, 1024 * 8 * 3584 * 2 * 2);
+           1024, 3584, 1024 * 3584 * 2 * (8 + 1));
   add_case(&cases, "chain_moe_route_permute.bf16.t4096.h7168.e256.k8", "chain_moe_route_permute",
-           kops::DType::kBFloat16, 4096, 7168, 4096 * 256 * 4 + 4096 * 8 * 7168 * 2 * 2);
+           kops::DType::kBFloat16, 4096, 7168, 4096 * 256 * 4 + 4096 * 7168 * 2 * (1 + 8) + 4096 * 8 * 4 * 2);
   return cases;
 }
 
@@ -119,7 +149,7 @@ bool alloc(Buffers* b, const Case& c, bool grouped) {
       !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&b->cursor), 256 * 4), "cursor")) {
     return false;
   }
-  cudaMemset(b->logits, 0, c.rows * 256 * 4);
+  fill_f32(b->logits, static_cast<size_t>(c.rows) * 256, 2.0f);
   cudaMemset(b->bias, 0, 256 * 4);
   cudaMemset(b->topk_ids, 0, slots * 4);
   std::vector<int32_t> host_ids(static_cast<size_t>(slots));
@@ -205,7 +235,7 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
         !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&b.weights), slots * 4), "g weights")) {
       return false;
     }
-    cudaMemset(b.logits, 0, b.tokens * 256 * 4);
+    fill_f32(b.logits, static_cast<size_t>(b.tokens) * 256, 2.0f);
     cudaMemset(b.bias, 0, 256 * 4);
     auto p = router_params(b);
     p.num_expert_groups = 8;
@@ -230,8 +260,8 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
         !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&b.weights), b.tokens * b.topk * 4), "weights")) {
       return false;
     }
-    cudaMemset(b.h_bf, 0, b.tokens * b.hidden * 2);
-    cudaMemset(b.w_bf, 0, b.experts * b.hidden * 2);
+    fill_bf16(b.h_bf, static_cast<size_t>(b.tokens * b.hidden), 1.0f);
+    fill_bf16(b.w_bf, static_cast<size_t>(b.experts * b.hidden), 0.05f);
     cudaMemset(b.bias, 0, 256 * 4);
     if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&b.logits), b.tokens * b.experts * 4), "fused logits")) {
       return false;
@@ -334,6 +364,7 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
     p.apply_weight_on_input = false;
     p.expert_offsets = b.offsets;
     p.write_cursor = b.cursor;
+    p.num_local_experts = static_cast<int32_t>(b.experts);
     p.permuted = b.perm;
     p.permuted_stride = b.hidden;
     p.permuted_row_to_slot = b.row_slot;
@@ -460,6 +491,7 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
     pp.topk_ids = b.ids;
     pp.expert_offsets = b.offsets;
     pp.write_cursor = b.cursor;
+    pp.num_local_experts = static_cast<int32_t>(b.experts);
     pp.permuted = b.perm;
     pp.permuted_stride = hidden;
     pp.permuted_row_to_slot = b.row_slot;

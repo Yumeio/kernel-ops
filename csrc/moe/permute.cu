@@ -52,6 +52,84 @@ __device__ __forceinline__ int local_expert(int e, const int32_t* expert_map) {
   return expert_map[e];
 }
 
+// Stable parallel counting sort (the vLLM/sglang align kernels give every thread a contiguous chunk
+// and prefix the per-thread histograms; here each *warp* owns one contiguous segment of the slot
+// array so the histogram is [warps][experts] and fits shared memory for E <= 1024).
+//   1. count : warp w histograms its segment into cnt[w][e] (warp-private row, no atomics);
+//   2. scan  : cnt[w][e] becomes the exclusive prefix over warps, tot[e] the column sum;
+//   3. place : warp w walks its segment again; slot -> base[e] + cnt[w][e] + rank-in-step.
+// Rank inside a 32-slot step comes from __match_any_sync, so the order is ascending slot id inside
+// every expert, exactly as the old single-warp walk, with W warps working at once.
+constexpr int kSortSmemBytes = 48 * 1024;
+
+/// Warps for a block that sorts into `num_experts` bins: cnt[W][E] + one E-sized vector in 48 KiB.
+inline int sort_warps(int num_experts) {
+  const int w = (kSortSmemBytes / 4 - num_experts) / num_experts;
+  return w < 1 ? 1 : (w > 32 ? 32 : w);
+}
+inline int sort_smem_bytes(int num_experts, int warps) {
+  return (warps * num_experts + num_experts) * static_cast<int>(sizeof(int));
+}
+
+/// Slot range [lo, hi) of warp w: contiguous, 32-aligned so the loads coalesce.
+__device__ __forceinline__ void sort_segment(int64_t numel, int w, int W, int64_t* lo, int64_t* hi) {
+  const int64_t seg = (((numel + W - 1) / W) + 31) & ~static_cast<int64_t>(31);
+  const int64_t l = static_cast<int64_t>(w) * seg;
+  *lo = l < numel ? l : numel;
+  *hi = *lo + seg < numel ? *lo + seg : numel;
+}
+
+/// Pass 1/3 of the sort. `local(e)` maps a raw topk id to a bin in [0, E) or -1.
+template <typename BinFn>
+__device__ __forceinline__ void sort_count(int* cnt, const int32_t* __restrict__ topk_ids, int64_t numel,
+                                           int E, BinFn bin) {
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, W = blockDim.x >> 5;
+  int64_t lo, hi;
+  sort_segment(numel, w, W, &lo, &hi);
+  int* mine = cnt + w * E;
+  for (int64_t s = lo; s < hi; s += 32) {
+    const int64_t pos = s + lane;
+    const int b = pos < hi ? bin(topk_ids[pos]) : -1;
+    const unsigned mask = __match_any_sync(0xFFFFFFFFu, b);
+    if (b >= 0 && lane == __ffs(mask) - 1) mine[b] += __popc(mask);
+    __syncwarp();
+  }
+}
+
+/// Pass 2/3: cnt[w][e] <- exclusive prefix over w, tot[e] <- sum over w. Call after __syncthreads().
+__device__ __forceinline__ void sort_scan_columns(int* cnt, int* tot, int E) {
+  const int W = blockDim.x >> 5;
+  for (int e = threadIdx.x; e < E; e += blockDim.x) {
+    int run = 0;
+    for (int w = 0; w < W; ++w) {
+      const int c = cnt[w * E + e];
+      cnt[w * E + e] = run;
+      run += c;
+    }
+    tot[e] = run;
+  }
+}
+
+/// Pass 3/3: write `put(slot, bin, dest)` for every slot; base[bin] is the bin's first destination.
+template <typename BinFn, typename PutFn>
+__device__ __forceinline__ void sort_place(int* cnt, const int* base, const int32_t* __restrict__ topk_ids,
+                                           int64_t numel, int E, BinFn bin, PutFn put) {
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, W = blockDim.x >> 5;
+  int64_t lo, hi;
+  sort_segment(numel, w, W, &lo, &hi);
+  int* mine = cnt + w * E;
+  for (int64_t s = lo; s < hi; s += 32) {
+    const int64_t pos = s + lane;
+    const int b = pos < hi ? bin(topk_ids[pos]) : -1;
+    const unsigned mask = __match_any_sync(0xFFFFFFFFu, b);
+    const int rank = __popc(mask & ((1u << lane) - 1u));
+    if (b >= 0) put(pos, b, base[b] + mine[b] + rank);
+    __syncwarp();
+    if (b >= 0 && lane == __ffs(mask) - 1) mine[b] += __popc(mask);
+    __syncwarp();
+  }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -95,97 +173,109 @@ __global__ void moe_align_block_size_kernel(
     const int num_experts, const int block_size, const int64_t numel,
     const int max_num_tokens_padded) {
   extern __shared__ int smem[];
-  int* counts = smem;                 // [kMaxExperts]
-  int* base = smem + kMaxExperts;     // [kMaxExperts]
-  int* cursor = smem + 2 * kMaxExperts;
-  for (int i = threadIdx.x; i < kMaxExperts; i += blockDim.x) {
-    counts[i] = 0;
-    base[i] = 0;
-    cursor[i] = 0;
-  }
+  const int W = blockDim.x >> 5;
+  int* cnt = smem;                 // [W][num_experts]
+  int* base = smem + W * num_experts;  // [num_experts] first padded destination of each expert
+  __shared__ int s_total;
+  for (int i = threadIdx.x; i < W * num_experts; i += blockDim.x) cnt[i] = 0;
   __syncthreads();
-  for (int64_t i = threadIdx.x; i < numel; i += blockDim.x) {
-    const int e = topk_ids[i];
-    if (e < 0 || e >= num_experts) continue;
-    if (expert_map != nullptr && expert_map[e] < 0) continue;
-    atomicAdd(&counts[e], 1);
-  }
+  const auto bin = [&](int e) {
+    return (e >= 0 && e < num_experts && (expert_map == nullptr || expert_map[e] >= 0)) ? e : -1;
+  };
+  sort_count(cnt, topk_ids, numel, num_experts, bin);
   __syncthreads();
-  if (threadIdx.x == 0) {
-    const int bs = block_size > 0 ? block_size : 1;
-    int total = 0;
-    int block = 0;
-    for (int e = 0; e < num_experts; ++e) {
-      base[e] = total;
-      if (expert_map != nullptr && expert_map[e] < 0) continue;
-      const int n = counts[e];
-      const int blocks = (n + bs - 1) / bs;
-      for (int b = 0; b < blocks; ++b) {
-        if (block < max_num_tokens_padded / bs + 1) expert_ids[block] = expert_map ? expert_map[e] : e;
-        ++block;
-      }
-      total += blocks * bs;
+  sort_scan_columns(cnt, base, num_experts);  // base[e] temporarily holds the count of expert e
+  __syncthreads();
+  // Warp 0 scans the padded sizes: each lane owns `per` consecutive experts.
+  const int bs = block_size > 0 ? block_size : 1;
+  if (threadIdx.x < 32) {
+    const int lane = threadIdx.x;
+    const int per = (num_experts + 31) / 32;
+    const int e0 = min(lane * per, num_experts), e1 = min(e0 + per, num_experts);
+    int sum = 0;
+    for (int e = e0; e < e1; ++e) sum += (base[e] + bs - 1) / bs * bs;
+    int incl = sum;
+    #pragma unroll
+    for (int off = 1; off < 32; off <<= 1) {
+      const int v = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+      if (lane >= off) incl += v;
     }
+    int run = incl - sum;
+    for (int e = e0; e < e1; ++e) {
+      const int padded = (base[e] + bs - 1) / bs * bs;
+      base[e] = run;  // count -> first destination; padded size is recovered from the next base
+      run += padded;
+    }
+    if (lane == 31) s_total = incl;
+  }
+  __syncthreads();
+  const int total = s_total;
+  // Block table: expert e owns blocks [base[e]/bs, next base / bs).
+  for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+    const int end = e + 1 < num_experts ? base[e + 1] : total;
+    const int first = base[e] / bs, last = end / bs;
+    const int id = expert_map != nullptr ? expert_map[e] : e;
+    for (int b = first; b < last; ++b) {
+      if (b < max_num_tokens_padded / bs + 1) expert_ids[b] = id;
+    }
+  }
+  const int fill = min(total, max_num_tokens_padded);
+  for (int i = threadIdx.x; i < fill; i += blockDim.x) sorted_token_ids[i] = static_cast<int32_t>(numel);
+  if (threadIdx.x == 0) {
     num_tokens_post_pad[0] = total;
     cumsum_workspace[0] = total;
   }
   __syncthreads();
-  const int total = cumsum_workspace[0];
-  for (int i = threadIdx.x; i < total; i += blockDim.x) sorted_token_ids[i] = static_cast<int32_t>(numel);
-  __syncthreads();
-  if (threadIdx.x >= 32) return;
-  const int lane = threadIdx.x;
-  for (int64_t start = 0; start < numel; start += 32) {
-    const int64_t pos = start + lane;
-    const int e = pos < numel ? topk_ids[pos] : -1;
-    const bool local = e >= 0 && e < num_experts &&
-                       (expert_map == nullptr || expert_map[e] >= 0);
-    const int key = local ? e : -1;
-    const unsigned mask = __match_any_sync(0xFFFFFFFFu, key);
-    const int rank = __popc(mask & ((1u << lane) - 1u));
-    if (local) {
-      const int dest = base[e] + cursor[e] + rank;
-      if (dest < max_num_tokens_padded) sorted_token_ids[dest] = static_cast<int32_t>(pos);
-    }
-    __syncwarp();
-    if (local && lane == (__ffs(mask) - 1)) {
-      cursor[e] += __popc(mask);
-    }
-    __syncwarp();
-  }
+  sort_place(cnt, base, topk_ids, numel, num_experts, bin, [&](int64_t pos, int, int dest) {
+    if (dest < max_num_tokens_padded) sorted_token_ids[dest] = static_cast<int32_t>(pos);
+  });
 }
 
 // ---------------------------------------------------------------------------
 // Permute
 // ---------------------------------------------------------------------------
 
-/// Deterministic slot -> row map. Uses the caller's zeroed write_cursor[local].
+/// Deterministic slot -> row map: row = expert_offsets[l] + (rows of l from earlier slots). One block
+/// of sort_warps(E_local) warps runs the stable counting sort; write_cursor is no longer touched.
 __global__ void moe_permute_map_kernel(const int32_t* __restrict__ topk_ids,
                                        const int64_t* __restrict__ expert_offsets,
                                        const int32_t* __restrict__ expert_map,
-                                       int32_t* __restrict__ write_cursor,
                                        int32_t* __restrict__ permuted_row_to_slot,
                                        int32_t* __restrict__ slot_to_permuted_row,
-                                       const int num_tokens, const int topk) {
-  if (blockIdx.x != 0 || threadIdx.x >= 32) return;
-  const int lane = threadIdx.x;
+                                       const int num_tokens, const int topk,
+                                       const int num_local_experts) {
+  extern __shared__ int smem[];
+  const int E = num_local_experts;
+  const int W = blockDim.x >> 5;
+  int* cnt = smem;              // [W][E]
+  int* base = smem + W * E;     // [E] first row of each local expert
   const int64_t numel = static_cast<int64_t>(num_tokens) * topk;
-  volatile int* cursor = write_cursor;
-  for (int64_t start = 0; start < numel; start += 32) {
-    const int64_t pos = start + lane;
-    const int e = pos < numel ? topk_ids[pos] : -1;
+  for (int i = threadIdx.x; i < W * E; i += blockDim.x) cnt[i] = 0;
+  for (int e = threadIdx.x; e < E; e += blockDim.x) base[e] = static_cast<int>(expert_offsets[e]);
+  __syncthreads();
+  const auto bin = [&](int e) {
     const int l = e >= 0 ? local_expert(e, expert_map) : -1;
-    const unsigned mask = __match_any_sync(0xFFFFFFFFu, l >= 0 ? l : -1);
-    const int rank = __popc(mask & ((1u << lane) - 1u));
-    if (l >= 0) {
-      const int row = static_cast<int>(expert_offsets[l] + cursor[l] + rank);
-      slot_to_permuted_row[pos] = row;
-      permuted_row_to_slot[row] = static_cast<int32_t>(pos);
+    return (l >= 0 && l < E) ? l : -1;
+  };
+  // Rows come from expert_offsets, so only the within-expert rank is needed: count, scan over warps,
+  // then place with base = expert_offsets.
+  sort_count(cnt, topk_ids, numel, E, bin);
+  __syncthreads();
+  for (int e = threadIdx.x; e < E; e += blockDim.x) {
+    int run = 0;
+    for (int w = 0; w < W; ++w) {
+      const int c = cnt[w * E + e];
+      cnt[w * E + e] = run;
+      run += c;
     }
-    __syncwarp();
-    if (l >= 0 && lane == (__ffs(mask) - 1)) cursor[l] += __popc(mask);
-    __syncwarp();
   }
+  __syncthreads();
+  for (int64_t i = threadIdx.x; i < numel; i += blockDim.x) slot_to_permuted_row[i] = -1;
+  __syncthreads();
+  sort_place(cnt, base, topk_ids, numel, E, bin, [&](int64_t pos, int, int row) {
+    slot_to_permuted_row[pos] = row;
+    permuted_row_to_slot[row] = static_cast<int32_t>(pos);
+  });
 }
 
 template <typename scalar_t, int VEC>
@@ -341,6 +431,9 @@ __global__ void moe_unpermute_reduce_kernel(
   }
 }
 
+/// out[t] = sum_k input[t, k], fp32 accumulate in ascending k. One thread owns VEC_SIZE columns of
+/// one token: all TOPK 16-byte loads are issued before the first add (memory-level parallelism),
+/// then a single vector store. hidden % VEC_SIZE == 0 and 16-byte alignment are checked on the host.
 template <typename scalar_t, int TOPK, int VEC_SIZE>
 __global__ void moe_sum_kernel(scalar_t* __restrict__ out, const scalar_t* __restrict__ input,
                                const int num_tokens, const int hidden_size) {
@@ -348,22 +441,19 @@ __global__ void moe_sum_kernel(scalar_t* __restrict__ out, const scalar_t* __res
   if (token >= num_tokens) return;
   const int col = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
   if (col >= hidden_size) return;
-  const int n = min(VEC_SIZE, hidden_size - col);
-  float acc[VEC_SIZE];
+  const scalar_t* base = input + token * TOPK * static_cast<int64_t>(hidden_size) + col;
+  Vec<scalar_t, VEC_SIZE> in[TOPK];
   #pragma unroll
-  for (int i = 0; i < VEC_SIZE; ++i) acc[i] = 0.0f;
-  #pragma unroll
-  for (int k = 0; k < TOPK; ++k) {
-    const scalar_t* p = input + (static_cast<int64_t>(token) * TOPK + k) * hidden_size + col;
-    #pragma unroll
-    for (int i = 0; i < VEC_SIZE; ++i) {
-      if (i < n) acc[i] += dev::to_f(p[i]);
-    }
-  }
+  for (int k = 0; k < TOPK; ++k) in[k] = load_vec<scalar_t, VEC_SIZE>(base + static_cast<int64_t>(k) * hidden_size);
+  Vec<scalar_t, VEC_SIZE> r;
   #pragma unroll
   for (int i = 0; i < VEC_SIZE; ++i) {
-    if (i < n) dev::from_f(out[token * hidden_size + col + i], acc[i]);
+    float acc = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < TOPK; ++k) acc += dev::to_f(in[k][i]);
+    dev::from_f(r[i], acc);
   }
+  store_vec<scalar_t, VEC_SIZE>(out + token * hidden_size + col, r);
 }
 
 // ---------------------------------------------------------------------------
@@ -480,15 +570,17 @@ Status align_block_size(const Tensor& topk_ids, const Tensor& sorted_token_ids,
                              static_cast<long long>(expert_ids.shape[0]),
                              static_cast<long long>(max_blocks));
   }
+  const int sort_threads = 32 * sort_warps(num_experts);
+  const int sort_smem = sort_smem_bytes(num_experts, sort_threads / 32);
   if (numel == 0) {
-    moe_align_block_size_kernel<<<1, kAlignThreads, kAlignSmem, stream_of(ctx)>>>(
+    moe_align_block_size_kernel<<<1, sort_threads, sort_smem, stream_of(ctx)>>>(
         static_cast<const int32_t*>(topk_ids.data), static_cast<int32_t*>(sorted_token_ids.data),
         static_cast<int32_t*>(expert_ids.data), static_cast<int32_t*>(num_tokens_post_pad.data),
         static_cast<int32_t*>(ws.device_scratch), nullptr, num_experts, block_size, 0,
         static_cast<int>(max_padded));
     return launch_error("moe_align_block_size_kernel");
   }
-  moe_align_block_size_kernel<<<1, kAlignThreads, kAlignSmem, stream_of(ctx)>>>(
+  moe_align_block_size_kernel<<<1, sort_threads, sort_smem, stream_of(ctx)>>>(
       static_cast<const int32_t*>(topk_ids.data), static_cast<int32_t*>(sorted_token_ids.data),
       static_cast<int32_t*>(expert_ids.data), static_cast<int32_t*>(num_tokens_post_pad.data),
       static_cast<int32_t*>(ws.device_scratch),
@@ -527,8 +619,12 @@ Status permute(const PermuteParams& p, DType hidden_dtype, const LaunchContext& 
   }
   if (p.hidden == nullptr || p.topk_ids == nullptr || p.expert_offsets == nullptr ||
       p.permuted == nullptr || p.permuted_row_to_slot == nullptr ||
-      p.slot_to_permuted_row == nullptr || p.write_cursor == nullptr) {
+      p.slot_to_permuted_row == nullptr) {
     return detail::set_error(Status::kInvalidArgument, "permute: null operand");
+  }
+  if (p.num_local_experts < 1 || p.num_local_experts > kMaxExperts) {
+    return detail::set_error(Status::kInvalidArgument, "permute: num_local_experts %d not in [1, %d]",
+                             p.num_local_experts, kMaxExperts);
   }
   if (p.apply_weight_on_input && p.topk_weights == nullptr) {
     return detail::set_error(Status::kInvalidArgument, "permute: weight_on_input needs topk_weights");
@@ -546,9 +642,10 @@ Status permute(const PermuteParams& p, DType hidden_dtype, const LaunchContext& 
     return detail::set_error(Status::kMisaligned, "permute: rows must be 16 B aligned");
   }
   cudaStream_t s = stream_of(ctx);
-  moe_permute_map_kernel<<<1, 32, 0, s>>>(p.topk_ids, p.expert_offsets, p.expert_map, p.write_cursor,
-                                          p.permuted_row_to_slot, p.slot_to_permuted_row,
-                                          p.num_tokens, p.topk);
+  const int map_warps = sort_warps(p.num_local_experts);
+  moe_permute_map_kernel<<<1, 32 * map_warps, sort_smem_bytes(p.num_local_experts, map_warps), s>>>(
+      p.topk_ids, p.expert_offsets, p.expert_map, p.permuted_row_to_slot, p.slot_to_permuted_row,
+      p.num_tokens, p.topk, p.num_local_experts);
   Status st = launch_error("moe_permute_map_kernel");
   if (st != Status::kSuccess) return st;
 
@@ -594,7 +691,7 @@ Status launch_unpermute(const Tensor& out, const Tensor& expert_out,
                         const Tensor& shared_out, const Tensor& residual, float routed_scale,
                         bool weights_already_applied, int num_tokens, int topk, int hidden,
                         cudaStream_t s) {
-  const int threads = 256;
+  const int threads = 128;  // hidden 7168 / 8 = 896 vectors = 7 blocks, no idle lanes
   const int64_t cols = static_cast<int64_t>(threads) * VEC;
   const dim3 grid(static_cast<unsigned>((hidden + cols - 1) / cols),
                   static_cast<unsigned>(num_tokens));
@@ -679,7 +776,7 @@ Status unpermute_reduce(const Tensor& out, const Tensor& expert_out,
 template <typename scalar_t, int TOPK, int VEC>
 Status launch_sum(const Tensor& out, const Tensor& input, int num_tokens, int hidden,
                   cudaStream_t s) {
-  const int threads = 256;
+  const int threads = 128;  // hidden 7168 / 8 = 896 vectors = 7 blocks, no idle lanes
   const int64_t cols = static_cast<int64_t>(threads) * VEC;
   const dim3 grid(static_cast<unsigned>((hidden + cols - 1) / cols),
                   static_cast<unsigned>(num_tokens));
@@ -721,6 +818,9 @@ Status moe_sum(const Tensor& out, const Tensor& input, int32_t topk, const Launc
   }
   if (!tensor_is_contiguous(input)) {
     return detail::set_error(Status::kUnsupportedLayout, "moe_sum: input must be contiguous");
+  }
+  if (!is_aligned(out.data, 16) || !is_aligned(input.data, 16) || (out.stride[0] * dtype_bytes(out.dtype)) % 16 != 0) {
+    return detail::set_error(Status::kMisaligned, "moe_sum: out and input rows must be 16 B aligned");
   }
   const cudaStream_t s2 = stream_of(ctx);
   if (out.dtype == DType::kBFloat16) return dispatch_sum<__nv_bfloat16, 8>(out, input, topk, num_tokens, hidden, s2);

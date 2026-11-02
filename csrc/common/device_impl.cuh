@@ -80,17 +80,7 @@ __device__ __forceinline__ float e4m3_to_float_fast(uint8_t b) {
 
 }  // namespace dev
 
-// ---- Vector primitives (declared in device.cuh) ----------------------------
-template <typename T, int N>
-KOPS_DEVICE Vec<T, N> load_vec(const T* __restrict__ ptr) {
-  return *reinterpret_cast<const Vec<T, N>*>(ptr);
-}
-
-template <typename T, int N>
-KOPS_DEVICE void store_vec(T* __restrict__ ptr, const Vec<T, N>& v) {
-  *reinterpret_cast<Vec<T, N>*>(ptr) = v;
-}
-
+// ---- Vector primitives (load_vec / store_vec are in vec.cuh) ----------------------------
 template <typename T, int N>
 KOPS_DEVICE Vec<T, N> load_vec_streaming(const T* __restrict__ ptr) {
   return *reinterpret_cast<const Vec<T, N>*>(ptr);
@@ -393,6 +383,224 @@ __device__ __forceinline__ float gemm_epilogue(float acc, const EP& e, int64_t m
     acc = fmaf(e.beta, to_f(static_cast<const OutT*>(e.residual)[m * e.residual_stride + n]), acc);
   }
   return acc;
+}
+
+// ---- Marlin-tile GEMV on tensor cores (SM80+): weight = MMA operand A, tokens = operand B ----------
+// Shared by the W4A16 integer body (gemm/mixed_input_gemm.cu) and the MXFP4 / NVFP4 body
+// (gemm/fp4_gemm.cu); the arch guard is inside every asm, the hosts refuse arch < 80.
+//
+// quantization::{awq,fp4}_to_marlin write, per 16(k) x 64(n) tile, 128 words = 4 sub-tiles of 16
+// output columns.  Lane (r = lane / 4, c = lane % 4) owns one uint4 whose word w is sub-tile w and
+// whose nibbles {0,4} {1,5} {2,6} {3,7} are the pairs (k0,k1 @ n=r) (k8,k9 @ n=r) (k0,k1 @ n=r+8)
+// (k8,k9 @ n=r+8), with k0 = 2c and n relative to 16 w.  Those are the A fragment registers
+// {a0,a2,a1,a3} of mma.m16n8k16 (row r / r+8, k 2c.. / 2c+8..), so a word dequantises straight into
+// A, and the mma rows are output columns: rows r / r+8 of sub-tile w = columns 16 w + r / 16 w + r + 8.
+//
+// Numerics.  The dequantised weight is exact in bf16/fp16 (integer q - z, or an e2m1 code); the
+// products with the activations are exact in fp32; the block scale is applied in fp32 to the
+// block's accumulator.  Blocks are added in a fixed order per warp and the 8 warps in a fixed order,
+// so every output element depends only on its own token and weight column: a row alone and the same
+// row inside a batch are bit-identical, but the result is not bit-equal to a CUDA-core body.
+
+constexpr int kTcWarps = 8;      // warps splitting K inside one CTA (256 threads)
+constexpr int kTcTileN = 64;     // output columns of one CTA = one Marlin n-tile
+
+template <typename T>
+struct TcFrag;
+
+template <>
+struct TcFrag<__nv_bfloat16> {
+  static constexpr uint32_t kMagic = 0x43004300u;   // bf16x2 128.0 | q: 128 + q is exact for q < 128
+  static constexpr uint32_t kBase = 0x4300u;        // bf16 128.0
+  /// a - b for small integers, exact.  fma.rn.bf16x2 (SM80); sub.bf16x2 needs SM90.
+  __device__ static __forceinline__ uint32_t sub2(uint32_t a, uint32_t b) {
+    uint32_t d = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(0x3F803F80u), "r"(b ^ 0x80008000u));
+#endif
+    return d;
+  }
+  /// Two e2m1 codes (the low nibble of each 16-bit half of x, nothing else) -> two bf16, exact: the
+  /// magnitude bits (E1 E0 M) placed under the bf16 exponent give code * 2^-126, the sign goes to
+  /// bit 15, and the multiply by 2^126 (0x7E80) restores the subnormal code 0.5 as well.
+  __device__ static __forceinline__ uint32_t e2m1x2(uint32_t x) {
+    const uint32_t y = ((x << 6) & 0x01C001C0u) | ((x << 12) & 0x80008000u);
+    uint32_t d = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm("fma.rn.bf16x2 %0, %1, %2, %3;" : "=r"(d) : "r"(y), "r"(0x7E807E80u), "r"(0u));
+#endif
+    return d;
+  }
+  __device__ static __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+  }
+};
+
+template <>
+struct TcFrag<__half> {
+  static constexpr uint32_t kMagic = 0x64006400u;   // f16x2 1024.0 | q: 1024 + q is exact for q < 1024
+  static constexpr uint32_t kBase = 0x6400u;        // f16 1024.0
+  __device__ static __forceinline__ uint32_t sub2(uint32_t a, uint32_t b) {
+    uint32_t d = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm("sub.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+#endif
+    return d;
+  }
+  /// As the bf16 form: (E1 E0 M) under the f16 exponent (bit 9 = mantissa MSB) gives code * 2^-14,
+  /// times 2^14 (0x7400).
+  __device__ static __forceinline__ uint32_t e2m1x2(uint32_t x) {
+    const uint32_t y = ((x << 9) & 0x0E000E00u) | ((x << 12) & 0x80008000u);
+    uint32_t d = 0;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm("mul.f16x2 %0, %1, %2;" : "=r"(d) : "r"(y), "r"(0x74007400u));
+#endif
+    return d;
+  }
+  __device__ static __forceinline__ void mma(float (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+  }
+};
+
+/// One CTA = one 64-column n-tile; its 8 warps take units of BPI consecutive scale blocks
+/// (u = warp, warp + 8, ...), so every lane keeps TG * BPI >= 4 weight loads in flight.  M_TILE is
+/// 8 or 16 tokens; tokens past m re-read row m - 1 and are never stored.
+///
+/// Policy (scale blocks of Policy::kBlockK elements along K, a multiple of 16):
+///   State                       what one block needs per lane (raw scale words, zero points)
+///   State load(blk, nt, r)      issues the scale / zero loads of block blk for lane group r
+///   void unpack_scales(st, sf)  the eight fp32 scales j = 2 w + h: row r (h = 0) / r + 8 (h = 1) of sub-tile w
+///   void dequant(st, w, q, fa)  weight word q of sub-tile w -> A registers fa[0..3] (bf16x2 / f16x2)
+/// Epi: operator()(float sum, int token, int column) finishes and stores one output element.
+template <typename Policy, typename Epi, typename T, int M_TILE>
+__device__ __forceinline__ void tc_gemv_body(const T* __restrict__ a, const int64_t lda,
+                                             const uint32_t* __restrict__ qweight, const Policy& pol,
+                                             const Epi& epi, const int m, const int n, const int k) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  using Tc = TcFrag<T>;
+  constexpr int TT = M_TILE / 8;                          // token tiles (MMA N = 8)
+  constexpr int TG = Policy::kBlockK / 16;                // k16 tiles per scale block
+  constexpr int BPI = TG >= 4 ? 1 : 4 / TG;               // scale blocks per K-loop iteration
+  static_assert(Policy::kBlockK % 16 == 0 && (TG == 1 || TG == 2 || TG == 4 || TG == 8), "block is 16, 32, 64 or 128");
+  __shared__ float red[kTcWarps][TT * 16][32];
+
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int r = lane >> 2;
+  const int c = lane & 3;
+  const int nt = blockIdx.x;
+  const int nblocks = k / Policy::kBlockK;
+  const int nunits = (nblocks + BPI - 1) / BPI;
+  const int64_t kt_stride = static_cast<int64_t>(n) * 2;   // words per k16 row of tiles: [K/16, 2N]
+
+  const T* arow[TT];
+  #pragma unroll
+  for (int t = 0; t < TT; ++t) arow[t] = a + static_cast<int64_t>(min(8 * t + r, m - 1)) * lda + 2 * c;
+
+  float acc[TT][4][4];
+  #pragma unroll
+  for (int t = 0; t < TT; ++t) {
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) acc[t][w][i] = 0.0f;
+    }
+  }
+
+  for (int u = warp; u < nunits; u += kTcWarps) {
+    uint4 wv[BPI][TG];
+    typename Policy::State st[BPI];
+    #pragma unroll
+    for (int b = 0; b < BPI; ++b) {
+      const int blk = u * BPI + b;
+      if (blk < nblocks) {
+        #pragma unroll
+        for (int i = 0; i < TG; ++i) wv[b][i] = ld_stream16(qweight + (blk * TG + i) * kt_stride + nt * 128 + lane * 4);
+        st[b] = pol.load(blk, nt, r);
+      }
+    }
+    #pragma unroll
+    for (int b = 0; b < BPI; ++b) {
+      const int blk = u * BPI + b;
+      if (blk >= nblocks) break;
+      float cg[TT][4][4];
+      #pragma unroll
+      for (int t = 0; t < TT; ++t) {
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) cg[t][w][i] = 0.0f;
+        }
+      }
+      #pragma unroll
+      for (int i = 0; i < TG; ++i) {
+        const int kk = (blk * TG + i) * 16;
+        uint32_t ab[TT][2];
+        #pragma unroll
+        for (int t = 0; t < TT; ++t) {
+          ab[t][0] = *reinterpret_cast<const uint32_t*>(arow[t] + kk);
+          ab[t][1] = *reinterpret_cast<const uint32_t*>(arow[t] + kk + 8);
+        }
+        const uint32_t words[4] = {wv[b][i].x, wv[b][i].y, wv[b][i].z, wv[b][i].w};
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+          uint32_t fa[4];
+          pol.dequant(st[b], w, words[w], fa);
+          #pragma unroll
+          for (int t = 0; t < TT; ++t) Tc::mma(cg[t][w], fa, ab[t][0], ab[t][1]);
+        }
+      }
+      float sf[8];
+      pol.unpack_scales(st[b], sf);
+      #pragma unroll
+      for (int t = 0; t < TT; ++t) {
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+          acc[t][w][0] = fmaf(sf[2 * w], cg[t][w][0], acc[t][w][0]);
+          acc[t][w][1] = fmaf(sf[2 * w], cg[t][w][1], acc[t][w][1]);
+          acc[t][w][2] = fmaf(sf[2 * w + 1], cg[t][w][2], acc[t][w][2]);
+          acc[t][w][3] = fmaf(sf[2 * w + 1], cg[t][w][3], acc[t][w][3]);
+        }
+      }
+    }
+  }
+
+  // Fixed-order reduction over the 8 K slices (warp 0 first, then 1..7).
+  #pragma unroll
+  for (int t = 0; t < TT; ++t) {
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) {
+      #pragma unroll
+      for (int i = 0; i < 4; ++i) red[warp][t * 16 + w * 4 + i][lane] = acc[t][w][i];
+    }
+  }
+  __syncthreads();
+  for (int idx = threadIdx.x; idx < TT * 512; idx += blockDim.x) {
+    const int ln = idx & 31;
+    const int slot = idx >> 5;                    // t * 16 + w * 4 + i
+    float sum = red[0][slot][ln];
+    #pragma unroll
+    for (int wi = 1; wi < kTcWarps; ++wi) sum += red[wi][slot][ln];
+    const int t = slot >> 4;
+    const int w = (slot >> 2) & 3;
+    const int i = slot & 3;
+    const int col = nt * kTcTileN + 16 * w + (ln >> 2) + ((i >> 1) << 3);
+    const int tok = 8 * t + 2 * (ln & 3) + (i & 1);
+    if (tok < m) epi(sum, tok, col);
+  }
+#else
+  // Unreachable: the hosts refuse mma.sync bodies below SM80 (kUnsupportedArch).
+  (void)a; (void)lda; (void)qweight; (void)pol; (void)epi; (void)m; (void)n; (void)k;
+  if (threadIdx.x == 0) __trap();
+#endif
 }
 
 }  // namespace dev

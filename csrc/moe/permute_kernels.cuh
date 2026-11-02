@@ -48,7 +48,8 @@ struct PermuteParams {
   bool apply_weight_on_input;         // Llama-4: router weight multiplies the expert INPUT (top-1)
   const int64_t* expert_offsets;      // [E_local + 1] from moe_count_and_offsets_kernel
   const int32_t* expert_map;          // [E] or null
-  int32_t* write_cursor;              // [E_local] scratch, zero-initialized per launch (or epoch-tagged)
+  int32_t* write_cursor;              // unused since the parallel map; kept so existing callers still compile
+  int32_t num_local_experts;          // E_local, required (sizes the map kernel's shared memory)
   // outputs
   void* permuted;                     // [num_rows_padded, hidden] (or quantized payload)
   int64_t permuted_stride;

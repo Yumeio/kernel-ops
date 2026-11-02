@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <type_traits>
 #include <vector>
@@ -932,12 +933,14 @@ DType dt_of<float>() { return DType::kFloat32; }
 template <typename T>
 Status launch_w4(const LaunchContext& ctx, const W4Problem<T>& p, const T* da, const uint32_t* dqw,
                  const T* dsc, const uint32_t* dqz, const int32_t* dgi, const T* dbias, T* dout, int rows,
-                 int64_t row0) {
+                 int64_t row0, bool marlin = false) {
   kops::gemm::ScaledGemmArgs args{};
   args.recipe = kops::gemm::GemmRecipe::kW4A16Int;
   args.a.data = da + row0 * p.k; args.a.ld = p.k; args.a.dtype = dt_of<T>();
   args.b.data = dqw; args.b.dtype = DType::kUInt32;
-  args.b.packing = p.awq ? kops::WeightPacking::kAWQ : kops::WeightPacking::kGPTQ;
+  args.b.packing = marlin ? kops::WeightPacking::kMarlin
+                          : (p.awq ? kops::WeightPacking::kAWQ : kops::WeightPacking::kGPTQ);
+  if (marlin) args.b.scale_layout = kops::ScaleLayout::kMarlinPermuted;
   args.b.scale = dsc; args.b.scale_dtype = dt_of<T>(); args.b.group_k = static_cast<int16_t>(p.group);
   args.b.zero_points = p.zeros ? dqz : nullptr; args.b.zero_dtype = DType::kUInt32;
   args.b.g_idx = (p.actorder && !p.awq) ? dgi : nullptr;
@@ -947,9 +950,32 @@ Status launch_w4(const LaunchContext& ctx, const W4Problem<T>& p, const T* da, c
   return kops::gemm::mixed_input_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
 }
 
+/// Device copies of the AWQ problem as awq_to_marlin writes them (tiles, permuted scales, Marlin zeros).
+template <typename T>
+struct MarlinBufs {
+  DevBuf<uint32_t> w, z;
+  DevBuf<T> s;
+  MarlinBufs(const LaunchContext& ctx, const W4Problem<T>& p, const uint32_t* dqw, const T* dsc,
+             const uint32_t* dqz)
+      : w(static_cast<size_t>(p.k / 16) * p.n * 2),
+        z(static_cast<size_t>(p.k / p.group) * (p.n / 8)),
+        s(static_cast<size_t>(p.k / p.group) * p.n) {
+    const int64_t ng = p.k / p.group;
+    const Tensor tw = kops_test::tensor2d(const_cast<uint32_t*>(dqw), DType::kInt32, p.k, p.n / 8);
+    const Tensor ts = kops_test::tensor2d(const_cast<T*>(dsc), dt_of<T>(), ng, p.n);
+    const Tensor tz = kops_test::tensor2d(const_cast<uint32_t*>(dqz), DType::kInt32, ng, p.n / 8);
+    KOPS_EXPECT_OK(kops::quant::awq_to_marlin(kops_test::tensor2d(w.p, DType::kInt32, p.k / 16, p.n * 2),
+                                              kops_test::tensor2d(s.p, dt_of<T>(), ng, p.n),
+                                              kops_test::tensor2d(z.p, DType::kInt32, ng, p.n / 8), tw, ts,
+                                              tz, 4, p.group, ctx),
+                   "awq_to_marlin (test input)");
+    cudaDeviceSynchronize();
+  }
+};
+
 template <typename T>
 void run_w4a16(const LaunchContext& ctx, bool awq, int group, bool zeros, bool actorder, bool bias, int m,
-               int n, int k, const char* what, bool invariance = false) {
+               int n, int k, const char* what, bool invariance = false, bool marlin = false) {
   const W4Problem<T> p = make_w4<T>(awq, group, zeros, actorder, bias, m, n, k, 77u + m * 131u + n + k);
   auto da = upload(to_vec<T>(p.a));
   auto dsc = upload(to_vec<T>(p.scale));
@@ -958,14 +984,23 @@ void run_w4a16(const LaunchContext& ctx, bool awq, int group, bool zeros, bool a
   auto dgi = upload(p.g_idx);
   auto db = upload(to_vec<T>(p.bias_v));
   DevBuf<T> dout(static_cast<size_t>(m) * n);
-  KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, dqw.p, dsc.p, dqz.p, dgi.p, db.p, dout.p, m, 0), what);
+  // kMarlin: the operands the kernel reads are awq_to_marlin's output; zeros stay optional (z = 8).
+  std::unique_ptr<MarlinBufs<T>> mb;
+  const uint32_t* kw = dqw.p;
+  const T* ks = dsc.p;
+  const uint32_t* kz = dqz.p;
+  if (marlin) {
+    mb = std::make_unique<MarlinBufs<T>>(ctx, p, dqw.p, dsc.p, dqz.p);
+    kw = mb->w.p; ks = mb->s.p; kz = mb->z.p;
+  }
+  KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, kw, ks, kz, dgi.p, db.p, dout.p, m, 0, marlin), what);
   cudaDeviceSynchronize();
   const auto got = kops_test::copy_out(dout.p, static_cast<size_t>(m) * n);
   expect_close(got, p.ref, what);
   if (!invariance) return;
   // Bit-exactness: 100 repeats, and each row alone == the same row inside the batch.
   for (int rep = 0; rep < 100; ++rep) {
-    KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, dqw.p, dsc.p, dqz.p, dgi.p, db.p, dout.p, m, 0), what);
+    KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, kw, ks, kz, dgi.p, db.p, dout.p, m, 0, marlin), what);
     cudaDeviceSynchronize();
     if (!same_bits(kops_test::copy_out(dout.p, static_cast<size_t>(m) * n), got)) {
       kops_test::record_failure(what, "result changed between repeats", __FILE__, __LINE__);
@@ -974,7 +1009,7 @@ void run_w4a16(const LaunchContext& ctx, bool awq, int group, bool zeros, bool a
   }
   DevBuf<T> one(static_cast<size_t>(m) * n);
   for (int row = 0; row < m; ++row) {
-    KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, dqw.p, dsc.p, dqz.p, dgi.p, db.p, one.p, 1, row), what);
+    KOPS_EXPECT_OK(launch_w4<T>(ctx, p, da.p, kw, ks, kz, dgi.p, db.p, one.p, 1, row, marlin), what);
   }
   cudaDeviceSynchronize();
   if (!same_bits(kops_test::copy_out(one.p, static_cast<size_t>(m) * n), got)) {
@@ -995,6 +1030,139 @@ void test_w4a16(const LaunchContext& ctx) {
   run_w4a16<__nv_bfloat16>(ctx, false, 0, false, false, true, 2, 72, 192, "w4a16 gptq per-channel");
   run_w4a16<__nv_bfloat16>(ctx, true, 128, true, false, true, 8, 1024, 2048, "w4a16 awq batch invariance", true);
   run_w4a16<__half>(ctx, false, 128, true, false, true, 8, 1000, 2048, "w4a16 gptq batch invariance", true);
+}
+
+// ---- w4a16 on Marlin tiles (mma.sync m16n8k16, weight = operand A) ------------------------------
+
+/// Layout round trip, written from the PTX fragment description of mma.m16n8k16 (A, row-major) and not
+/// from the kernel: register 0 = (row g, k 2c..2c+1), 1 = (row g+8, k 2c..), 2 = (row g, k 2c+8..),
+/// 3 = (row g+8, k 2c+8..) with g = lane / 4, c = lane % 4.  Word w of a lane is the 16-column sub-tile
+/// w of the 64-column tile; nibble pair (p, p + 4) is register {0, 2, 1, 3}[p].  Also checks the scale
+/// (lane g reads columns g + 8 j at 8 g + j) and zero-point (j = 2 w + h at nibble w + 4 h) positions the
+/// kernel relies on.
+void test_w4a16_marlin_layout(const LaunchContext& ctx) {
+  using T = __nv_bfloat16;
+  const int n = 128, k = 64, group = 32;
+  const W4Problem<T> p = make_w4<T>(true, group, true, false, false, 1, n, k, 4242u);
+  auto dsc = upload(to_vec<T>(p.scale));
+  auto dqw = upload(p.qw);
+  auto dqz = upload(p.qz);
+  MarlinBufs<T> mb(ctx, p, dqw.p, dsc.p, dqz.p);
+  const auto words = kops_test::copy_out(mb.w.p, static_cast<size_t>(k / 16) * n * 2);
+  const auto zwords = kops_test::copy_out(mb.z.p, static_cast<size_t>(k / group) * (n / 8));
+  const auto sc = kops_test::copy_out(mb.s.p, static_cast<size_t>(k / group) * n);
+  auto q_at = [&](int kk, int c) {
+    return (p.qw[static_cast<size_t>(kk) * (n / 8) + c / 8] >> (4 * awq_pos(c & 7))) & 0xFu;
+  };
+  auto z_at = [&](int g, int c) {
+    return (p.qz[static_cast<size_t>(g) * (n / 8) + c / 8] >> (4 * awq_pos(c & 7))) & 0xFu;
+  };
+  const int row_off[4] = {0, 0, 8, 8};   // pair p -> (row offset, k offset)
+  const int k_off[4] = {0, 8, 0, 8};
+  size_t bad_w = 0, bad_s = 0, bad_z = 0;
+  for (int kt = 0; kt < k / 16; ++kt) {
+    for (int nt = 0; nt < n / 64; ++nt) {
+      for (int lane = 0; lane < 32; ++lane) {
+        const int g = lane >> 2, c = lane & 3;
+        for (int w = 0; w < 4; ++w) {
+          const uint32_t word = words[static_cast<size_t>(kt) * n * 2 + nt * 128 + lane * 4 + w];
+          for (int pr = 0; pr < 4; ++pr) {
+            for (int e = 0; e < 2; ++e) {
+              const uint32_t got = (word >> (4 * (pr + 4 * e))) & 0xFu;
+              const uint32_t want = q_at(kt * 16 + 2 * c + k_off[pr] + e, nt * 64 + 16 * w + g + row_off[pr]);
+              bad_w += got != want;
+            }
+          }
+        }
+      }
+    }
+  }
+  for (int gr = 0; gr < k / group; ++gr) {
+    for (int nt = 0; nt < n / 64; ++nt) {
+      for (int r = 0; r < 8; ++r) {
+        const uint32_t zw = zwords[static_cast<size_t>(gr) * (n / 8) + nt * 8 + r];
+        for (int j = 0; j < 8; ++j) {
+          const int col = nt * 64 + r + 8 * j;
+          bad_s += kops_test::to_float(sc[static_cast<size_t>(gr) * n + nt * 64 + 8 * r + j]) !=
+                   p.scale[static_cast<size_t>(gr) * n + col];
+          const int w = j >> 1, h = j & 1;
+          bad_z += ((zw >> (4 * (w + 4 * h))) & 0xFu) != z_at(gr, col);
+        }
+      }
+    }
+  }
+  char detail[160];
+  std::snprintf(detail, sizeof(detail), "mismatches: weight nibbles %zu, scales %zu, zeros %zu", bad_w, bad_s, bad_z);
+  if (bad_w + bad_s + bad_z != 0) kops_test::record_failure("w4a16 marlin layout", detail, __FILE__, __LINE__);
+}
+
+void test_w4a16_marlin(const LaunchContext& ctx) {
+  using bf = __nv_bfloat16;
+  for (int m : {1, 2, 3, 4, 8, 9, 13, 16}) {
+    run_w4a16<bf>(ctx, true, 128, true, false, true, m, 128, 256, "w4a16 marlin g128 zeros bias bf16", false, true);
+    run_w4a16<__half>(ctx, true, 32, true, false, false, m, 192, 96, "w4a16 marlin g32 zeros f16", false, true);
+    run_w4a16<bf>(ctx, true, 64, false, false, true, m, 64, 320, "w4a16 marlin g64 sym bf16", false, true);
+    run_w4a16<__half>(ctx, true, 128, false, false, false, m, 256, 256, "w4a16 marlin g128 sym f16", false, true);
+    run_w4a16<__half>(ctx, true, 64, false, false, false, m, 256, 128, "w4a16 marlin g64 sym f16", false, true);
+  }
+  // Decode shapes.  K = 4096 + 32 (g32) leaves 129 groups for 8 warps, so the warps get unequal
+  // group counts; K + 16 would need per-channel scales, which the Marlin-tile body does not take.
+  for (int m : {1, 2, 3, 4, 8, 16}) {
+    run_w4a16<bf>(ctx, true, 128, true, false, true, m, 4096, 4096, "w4a16 marlin decode g128 bf16", false, true);
+    run_w4a16<bf>(ctx, true, 32, true, false, false, m, 4096, 4096 + 32, "w4a16 marlin decode ragged K g32 bf16", false, true);
+  }
+  for (int m : {1, 16}) {
+    run_w4a16<bf>(ctx, true, 128, true, false, true, m, 14336, 4096, "w4a16 marlin decode N=14336 bf16", false, true);
+  }
+  run_w4a16<bf>(ctx, true, 128, true, false, true, 8, 1024, 2048, "w4a16 marlin batch invariance", true, true);
+  run_w4a16<__half>(ctx, true, 64, true, false, true, 16, 512, 1024, "w4a16 marlin batch invariance f16", true, true);
+}
+
+void test_w4a16_marlin_contracts(const LaunchContext& ctx) {
+  using T = __nv_bfloat16;
+  const W4Problem<T> p = make_w4<T>(true, 128, true, false, false, 2, 64, 256, 5);
+  auto da = upload(to_vec<T>(p.a));
+  auto dsc = upload(to_vec<T>(p.scale));
+  auto dqw = upload(p.qw);
+  auto dqz = upload(p.qz);
+  auto dgi = upload(p.g_idx);
+  MarlinBufs<T> mb(ctx, p, dqw.p, dsc.p, dqz.p);
+  DevBuf<T> dout(2 * 64 + 64);
+  auto call = [&](auto&& mutate, const LaunchContext& c) {
+    kops::gemm::ScaledGemmArgs args{};
+    args.recipe = kops::gemm::GemmRecipe::kW4A16Int;
+    args.a.data = da.p; args.a.ld = 256; args.a.dtype = DType::kBFloat16;
+    args.b.data = mb.w.p; args.b.dtype = DType::kUInt32; args.b.packing = kops::WeightPacking::kMarlin;
+    args.b.scale_layout = kops::ScaleLayout::kMarlinPermuted;
+    args.b.scale = mb.s.p; args.b.scale_dtype = DType::kBFloat16; args.b.group_k = 128;
+    args.b.zero_points = mb.z.p; args.d = dout.p; args.ldd = 64; args.d_dtype = DType::kBFloat16;
+    args.m = 2; args.n = 64; args.k = 256;
+    mutate(args);
+    return kops::gemm::mixed_input_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, c);
+  };
+  auto same = [](auto&) {};
+  KOPS_EXPECT_OK(call(same, ctx), "w4a16 marlin baseline call");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.k = 250; a.a.ld = 250; }, ctx), Status::kUnsupportedShape, "w4a16 marlin K % 16");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.n = 72; a.ldd = 72; }, ctx), Status::kUnsupportedShape, "w4a16 marlin N % 64");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.b.group_k = 0; }, ctx), Status::kUnsupportedShape, "w4a16 marlin per-channel");
+  // group_k == K: awq_to_marlin stores it channelwise (accumulator order), which this body does not read.
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.k = 128; a.a.ld = 128; }, ctx), Status::kUnsupportedShape, "w4a16 marlin one group");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.b.scale_layout = kops::ScaleLayout::kRowMajor; }, ctx), Status::kUnsupportedLayout,
+                     "w4a16 marlin scale layout");
+  KOPS_EXPECT_STATUS(call([&](auto& a) { a.b.g_idx = dgi.p; }, ctx), Status::kUnsupportedLayout, "w4a16 marlin act-order");
+  KOPS_EXPECT_STATUS(call([&](auto& a) { a.b.data = reinterpret_cast<const char*>(mb.w.p) + 4; }, ctx), Status::kMisaligned,
+                     "w4a16 marlin misaligned weights");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.m = 17; }, ctx), Status::kNotImplemented, "w4a16 marlin M > 16");
+  // The body is an mma.sync bf16/fp16 kernel: SM70 / SM75 are refused, kAuto (0) is not.
+  LaunchContext old = ctx;
+  old.arch_id = 750;
+  KOPS_EXPECT_STATUS(call(same, old), Status::kUnsupportedArch, "w4a16 marlin sm75");
+  old.arch_id = 700;
+  KOPS_EXPECT_STATUS(call(same, old), Status::kUnsupportedArch, "w4a16 marlin sm70");
+  LaunchContext any = ctx;
+  any.arch_id = 0;
+  KOPS_EXPECT_OK(call(same, any), "w4a16 marlin arch auto");
+  cudaDeviceSynchronize();
 }
 
 // ---- lut_gemv -----------------------------------------------------------------------------
@@ -1048,15 +1216,50 @@ void run_lut(const LaunchContext& ctx, int bs, bool dq, int m, int n, int k, con
   const Tensor tao = dq ? tensor1d(doff.p, DType::kFloat32, 1) : Tensor{};
   KOPS_EXPECT_OK(kops::gemm::lut_gemv(tout, ta, tq, tc, tam, tas, tao, bs, ctx), what);
   cudaDeviceSynchronize();
-  expect_close(kops_test::copy_out(dout.p, static_cast<size_t>(m) * n), ref, what);
+  const auto got = kops_test::copy_out(dout.p, static_cast<size_t>(m) * n);
+  expect_close(got, ref, what);
+
+  // Order of additions, bit for bit: lane l owns k = 32 l + 1024 i .. + 31 of every iteration i and chains
+  // fmaf(a, w, part) from 0 in k order, then acc = fmaf(absmax, part, acc); the 32 lane sums meet in the
+  // xor tree 16, 8, 4, 2, 1.  Any kernel that keeps this order gives the same bits for any row grouping.
+  std::vector<T> want(static_cast<size_t>(m) * n);
+  for (int row = 0; row < m; ++row) {
+    for (int c = 0; c < n; ++c) {
+      float lane_sum[32];
+      for (int l = 0; l < 32; ++l) {
+        float acc = 0.0f;
+        for (int kc = l * 32; kc < k; kc += 1024) {
+          const size_t blk = (static_cast<size_t>(c) * k + kc) / bs;
+          const float am = dq ? std::fmaf(static_cast<float>(amax_q[blk]), amax2[blk >> 8], offset) : amax_f[blk];
+          float part = 0.0f;
+          for (int e = 0; e < 32; ++e) {
+            part = std::fmaf(a[static_cast<size_t>(row) * k + kc + e],
+                             cbk[codes[static_cast<size_t>(c) * k + kc + e]], part);
+          }
+          acc = std::fmaf(am, part, acc);
+        }
+        lane_sum[l] = acc;
+      }
+      for (int o = 16; o > 0; o >>= 1) {
+        float next[32];
+        for (int l = 0; l < 32; ++l) next[l] = lane_sum[l] + lane_sum[l ^ o];
+        std::memcpy(lane_sum, next, sizeof(next));
+      }
+      want[static_cast<size_t>(row) * n + c] = cvt<T>(lane_sum[0]);
+    }
+  }
+  if (!same_bits(got, want)) kops_test::record_failure(what, "bits differ from the fixed order of additions", __FILE__, __LINE__);
 }
 
 void test_lut_gemv(const LaunchContext& ctx) {
-  for (int m : {1, 2, 3, 8, 11}) {
+  // m = 4 and 6 reach the M_TILE = 4 instantiation (rows go out in tiles of 8 / 4 / 2 / 1).
+  for (int m : {1, 2, 3, 4, 6, 8, 11}) {
     run_lut<__nv_bfloat16>(ctx, 64, false, m, 40, 1024, "lut gemv b64 bf16");
     run_lut<__half>(ctx, 64, true, m, 33, 2048, "lut gemv b64 double-quant f16");
     run_lut<__nv_bfloat16>(ctx, 32, false, m, 17, 96, "lut gemv b32 ragged k");
     run_lut<__nv_bfloat16>(ctx, 256, true, m, 9, 768, "lut gemv b256 double-quant");
+    run_lut<__nv_bfloat16>(ctx, 64, false, m, 130, 4096, "lut gemv b64 four iterations");
+    run_lut<__half>(ctx, 128, true, m, 67, 3072, "lut gemv b128 double-quant three iterations f16");
   }
 }
 
@@ -1086,7 +1289,7 @@ void test_w4a16_contracts(const LaunchContext& ctx) {
   KOPS_EXPECT_STATUS(call([](auto& a) { a.n = 60; a.ldd = 60; }), Status::kUnsupportedShape, "w4a16 N % 8");
   KOPS_EXPECT_STATUS(call([](auto& a) { a.k = 250; a.a.ld = 250; }), Status::kUnsupportedShape, "w4a16 K % 32");
   KOPS_EXPECT_STATUS(call([](auto& a) { a.m = 17; }), Status::kNotImplemented, "w4a16 M > 16");
-  KOPS_EXPECT_STATUS(call([](auto& a) { a.b.packing = kops::WeightPacking::kMarlin; }), Status::kUnsupportedLayout, "w4a16 packing");
+  KOPS_EXPECT_STATUS(call([](auto& a) { a.b.packing = kops::WeightPacking::kMachete; }), Status::kUnsupportedLayout, "w4a16 packing");
   KOPS_EXPECT_STATUS(call([](auto& a) { a.b.scale = nullptr; }), Status::kInvalidArgument, "w4a16 null scales");
   KOPS_EXPECT_STATUS(call([&](auto& a) { a.b.g_idx = dgi.p; }), Status::kUnsupportedLayout, "w4a16 awq act-order");
   KOPS_EXPECT_STATUS(call([](auto& a) { a.epi.ops = kops::gemm::kEpiResidualAdd; }), Status::kNotImplemented, "w4a16 epilogue");
@@ -1735,12 +1938,16 @@ int64_t swizzle_offset(int64_t row, int64_t blk, int64_t blocks) {
   return tile * 512 + (row & 31) * 16 + ((row >> 5) & 3) * 4 + (blk & 3);
 }
 
+/// marlin: the weights are fp4_to_marlin's tiles and scales (kMarlin, M <= 16, N % 64 == 0); bias adds
+/// kEpiBias; invariance re-runs 100 times and checks each row alone against the same row in the batch.
 template <typename T>
-void run_fp4(const LaunchContext& ctx, bool nv, bool swizzled, int m, int n, int k, bool global, const char* what) {
+void run_fp4(const LaunchContext& ctx, bool nv, bool swizzled, int m, int n, int k, bool global, const char* what,
+             bool marlin = false, bool bias = false, bool invariance = false) {
   Rng r(2024u + m + n + nv);
   const int blk = nv ? 16 : 32;
   const int blocks = k / blk;
   const auto a = random_t<T>(static_cast<size_t>(m) * k, &r, -1.0f, 1.0f);
+  const auto bv = random_t<T>(static_cast<size_t>(n), &r, -1.0f, 1.0f);
   std::vector<uint8_t> codes(static_cast<size_t>(n) * k), packed(static_cast<size_t>(n) * k / 2);
   for (auto& c : codes) c = static_cast<uint8_t>(r.range(16));
   for (size_t i = 0; i < packed.size(); ++i) packed[i] = static_cast<uint8_t>(codes[2 * i] | (codes[2 * i + 1] << 4));
@@ -1772,26 +1979,62 @@ void run_fp4(const LaunchContext& ctx, bool nv, bool swizzled, int m, int n, int
         const double w = (code & 8 ? -1.0 : 1.0) * kE2m1[code & 7] * sval[static_cast<size_t>(c) * blocks + kk / blk];
         acc += dval(a, static_cast<size_t>(row) * k + kk) * w;
       }
-      ref[static_cast<size_t>(row) * n + c] = acc / gscale;
+      ref[static_cast<size_t>(row) * n + c] = acc / gscale + (bias ? dval(bv, static_cast<size_t>(c)) : 0.0);
     }
   auto da = upload(a);
+  auto dbias = upload(bv);
   auto dw = upload(packed);
   auto dsc = upload(sc);
   auto dg = upload(std::vector<float>(1, gscale));
+  const DType sdt = nv ? DType::kFloat8E4M3 : DType::kFloat8E8M0;
+  DevBuf<uint32_t> mw(marlin ? static_cast<size_t>(k / 16) * n * 2 : 1);
+  DevBuf<uint8_t> ms(marlin ? static_cast<size_t>(n) * blocks : 1);
+  if (marlin) {
+    KOPS_EXPECT_OK(kops::quant::fp4_to_marlin(kops_test::tensor2d(mw.p, DType::kInt32, k / 16, n * 2),
+                                              kops_test::tensor2d(ms.p, sdt, blocks, n),
+                                              kops_test::tensor2d(dw.p, DType::kUInt8, n, k / 2),
+                                              kops_test::tensor2d(dsc.p, sdt, n, blocks), blk, !nv, ctx),
+                   "fp4_to_marlin (test input)");
+    cudaDeviceSynchronize();
+  }
   DevBuf<T> dout(ref.size());
-  ScaledGemmArgs args{};
-  args.recipe = nv ? GemmRecipe::kW4A16NVFP4 : GemmRecipe::kW4A16MXFP4;
-  args.a.data = da.p; args.a.ld = k; args.a.dtype = dt_of<T>();
-  args.b.data = dw.p; args.b.ld = k / 2; args.b.dtype = DType::kFloat4E2M1x2;
-  args.b.packing = kops::WeightPacking::kFP4E2M1;
-  args.b.scale = dsc.p; args.b.scale_dtype = nv ? DType::kFloat8E4M3 : DType::kFloat8E8M0; args.b.group_k = static_cast<int16_t>(blk);
-  args.b.scale_layout = swizzled ? kops::ScaleLayout::kSwizzled128x4 : kops::ScaleLayout::kRowMajor;
-  if (global) args.b.global_scale = dg.p;
-  args.d = dout.p; args.ldd = n; args.d_dtype = dt_of<T>();
-  args.m = m; args.n = n; args.k = k;
-  KOPS_EXPECT_OK(kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx), what);
+  auto launch = [&](int rows, int64_t row0, T* dst) {
+    ScaledGemmArgs args{};
+    args.recipe = nv ? GemmRecipe::kW4A16NVFP4 : GemmRecipe::kW4A16MXFP4;
+    args.a.data = da.p + row0 * k; args.a.ld = k; args.a.dtype = dt_of<T>();
+    if (marlin) {
+      args.b.data = mw.p; args.b.dtype = DType::kUInt32; args.b.packing = kops::WeightPacking::kMarlin;
+      args.b.scale = ms.p; args.b.scale_layout = kops::ScaleLayout::kMarlinPermuted;
+    } else {
+      args.b.data = dw.p; args.b.ld = k / 2; args.b.dtype = DType::kFloat4E2M1x2; args.b.packing = kops::WeightPacking::kFP4E2M1;
+      args.b.scale = dsc.p; args.b.scale_layout = swizzled ? kops::ScaleLayout::kSwizzled128x4 : kops::ScaleLayout::kRowMajor;
+    }
+    args.b.scale_dtype = sdt; args.b.group_k = static_cast<int16_t>(blk);
+    if (global) args.b.global_scale = dg.p;
+    if (bias) { args.epi.ops = kops::gemm::kEpiBias; args.epi.bias = dbias.p; args.epi.bias_dtype = dt_of<T>(); }
+    args.d = dst; args.ldd = n; args.d_dtype = dt_of<T>();
+    args.m = rows; args.n = n; args.k = k;
+    return kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, ctx);
+  };
+  KOPS_EXPECT_OK(launch(m, 0, dout.p), what);
   cudaDeviceSynchronize();
-  expect_close(kops_test::copy_out(dout.p, ref.size()), ref, what);
+  const auto got = kops_test::copy_out(dout.p, ref.size());
+  expect_close(got, ref, what);
+  if (!invariance) return;
+  for (int rep = 0; rep < 100; ++rep) {
+    KOPS_EXPECT_OK(launch(m, 0, dout.p), what);
+    cudaDeviceSynchronize();
+    if (!same_bits(kops_test::copy_out(dout.p, ref.size()), got)) {
+      kops_test::record_failure(what, "result changed between repeats", __FILE__, __LINE__);
+      break;
+    }
+  }
+  DevBuf<T> one(ref.size());
+  for (int row = 0; row < m; ++row) KOPS_EXPECT_OK(launch(1, row, one.p + static_cast<size_t>(row) * n), what);
+  cudaDeviceSynchronize();
+  if (!same_bits(kops_test::copy_out(one.p, ref.size()), got)) {
+    kops_test::record_failure(what, "row alone differs from the same row in a batch", __FILE__, __LINE__);
+  }
 }
 
 void test_fp4_gemv(const LaunchContext& ctx) {
@@ -1801,6 +2044,92 @@ void test_fp4_gemv(const LaunchContext& ctx) {
     run_fp4<__nv_bfloat16>(ctx, true, false, m, 77, 320, true, "nvfp4 row-major + global scale");
     run_fp4<__half>(ctx, true, true, m, 260, 1024, true, "nvfp4 swizzled + global scale");
   }
+}
+
+// ---- fp4 on Marlin tiles (mma.sync m16n8k16, weight = operand A) ---------------------------------
+
+void test_fp4_marlin(const LaunchContext& ctx) {
+  using bf = __nv_bfloat16;
+  for (int m : {1, 2, 3, 5, 8, 9, 13, 16}) {
+    run_fp4<bf>(ctx, false, false, m, 128, 256, false, "mxfp4 marlin bf16", true);
+    run_fp4<__half>(ctx, false, false, m, 192, 512, false, "mxfp4 marlin f16", true);
+    run_fp4<bf>(ctx, true, false, m, 64, 320, true, "nvfp4 marlin + global scale bf16", true);
+    run_fp4<__half>(ctx, true, false, m, 256, 1024, true, "nvfp4 marlin + global scale + bias f16", true, true);
+  }
+  // Decode shapes; K + 32 leaves a short last unit for the 4-block (NVFP4) and 2-block (MXFP4) K loop.
+  for (int m : {1, 4, 16}) {
+    run_fp4<bf>(ctx, false, false, m, 4096, 4096, false, "mxfp4 marlin decode bf16", true);
+    run_fp4<bf>(ctx, true, false, m, 4096, 4096, true, "nvfp4 marlin decode bf16", true);
+    run_fp4<bf>(ctx, false, false, m, 128, 4096 + 32, false, "mxfp4 marlin ragged K", true);
+    run_fp4<__half>(ctx, true, false, m, 128, 4096 + 32, false, "nvfp4 marlin ragged K f16", true);
+  }
+  run_fp4<bf>(ctx, false, false, 8, 512, 2048, false, "mxfp4 marlin batch invariance", true, true, true);
+  run_fp4<__half>(ctx, true, false, 16, 512, 1024, true, "nvfp4 marlin batch invariance f16", true, false, true);
+}
+
+void test_fp4_marlin_contracts(const LaunchContext& ctx) {
+  using T = __nv_bfloat16;
+  const int n = 64, k = 256, blk = 32, blocks = k / blk;
+  Rng r(7);
+  const auto a = random_t<T>(static_cast<size_t>(2) * k, &r, -1.0f, 1.0f);
+  std::vector<uint8_t> packed(static_cast<size_t>(n) * k / 2), sc(static_cast<size_t>(n) * blocks, 125);
+  for (auto& b : packed) b = static_cast<uint8_t>(r.range(256));
+  auto da = upload(a);
+  auto dw = upload(packed);
+  auto dsc = upload(sc);
+  DevBuf<uint32_t> mw(static_cast<size_t>(k / 16) * n * 2);
+  DevBuf<uint8_t> ms(sc.size() + 8);
+  KOPS_EXPECT_OK(kops::quant::fp4_to_marlin(kops_test::tensor2d(mw.p, DType::kInt32, k / 16, n * 2),
+                                            kops_test::tensor2d(ms.p, DType::kFloat8E8M0, blocks, n),
+                                            kops_test::tensor2d(dw.p, DType::kUInt8, n, k / 2),
+                                            kops_test::tensor2d(dsc.p, DType::kFloat8E8M0, n, blocks), blk, true, ctx),
+                 "fp4_to_marlin (contract input)");
+  cudaDeviceSynchronize();
+  DevBuf<T> dout(2 * n);
+  auto call = [&](bool marlin, auto&& mutate, const LaunchContext& c) {
+    ScaledGemmArgs args{};
+    args.recipe = GemmRecipe::kW4A16MXFP4;
+    args.a.data = da.p; args.a.ld = k; args.a.dtype = DType::kBFloat16;
+    if (marlin) {
+      args.b.data = mw.p; args.b.dtype = DType::kUInt32; args.b.packing = kops::WeightPacking::kMarlin;
+      args.b.scale = ms.p; args.b.scale_layout = kops::ScaleLayout::kMarlinPermuted;
+    } else {
+      args.b.data = dw.p; args.b.ld = k / 2; args.b.dtype = DType::kFloat4E2M1x2; args.b.packing = kops::WeightPacking::kFP4E2M1;
+      args.b.scale = dsc.p;
+    }
+    args.b.scale_dtype = DType::kFloat8E8M0; args.b.group_k = blk;
+    args.d = dout.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.m = 2; args.n = n; args.k = k;
+    mutate(args);
+    return kops::gemm::scaled_gemm(args, nullptr, kops::gemm::GemmBackend::kNative, kops::Workspace{}, c);
+  };
+  auto same = [](auto&) {};
+  KOPS_EXPECT_OK(call(true, same, ctx), "fp4 marlin baseline call");
+  KOPS_EXPECT_OK(call(true, [](auto& x) { x.m = 16; }, ctx), "fp4 marlin M = 16");
+  KOPS_EXPECT_STATUS(call(true, [](auto& x) { x.m = 17; }, ctx), Status::kNotImplemented, "fp4 marlin M > 16");
+  KOPS_EXPECT_STATUS(call(false, [](auto& x) { x.m = 9; }, ctx), Status::kNotImplemented, "fp4 CUDA-core M > 8 unchanged");
+  KOPS_EXPECT_STATUS(call(true, [](auto& x) { x.n = 72; x.ldd = 72; }, ctx), Status::kUnsupportedShape, "fp4 marlin N % 64");
+  KOPS_EXPECT_STATUS(call(true, [](auto& x) { x.k = 240; x.a.ld = 240; }, ctx), Status::kUnsupportedShape, "fp4 marlin K % 32");
+  KOPS_EXPECT_STATUS(call(true, [](auto& x) { x.b.scale_layout = kops::ScaleLayout::kRowMajor; }, ctx), Status::kUnsupportedLayout,
+                     "fp4 marlin scale layout");
+  KOPS_EXPECT_STATUS(call(true, [](auto& x) { x.b.dtype = DType::kFloat4E2M1x2; }, ctx), Status::kUnsupportedDtype, "fp4 marlin weight dtype");
+  KOPS_EXPECT_STATUS(call(true, [](auto& x) { x.d_dtype = DType::kFloat32; }, ctx), Status::kUnsupportedDtype, "fp4 marlin fp32 output");
+  KOPS_EXPECT_STATUS(call(true, [](auto& x) { x.epi.ops = kops::gemm::kEpiOutFp32; }, ctx), Status::kInvalidArgument,
+                     "fp4 marlin kEpiOutFp32 without fp32 output");
+  KOPS_EXPECT_STATUS(call(true, [&](auto& x) { x.b.data = reinterpret_cast<const char*>(mw.p) + 4; }, ctx), Status::kMisaligned,
+                     "fp4 marlin misaligned weights");
+  KOPS_EXPECT_STATUS(call(true, [&](auto& x) { x.b.scale = reinterpret_cast<const char*>(ms.p) + 4; }, ctx), Status::kMisaligned,
+                     "fp4 marlin misaligned scales");
+  LaunchContext old = ctx;
+  old.arch_id = 750;
+  KOPS_EXPECT_STATUS(call(true, same, old), Status::kUnsupportedArch, "fp4 marlin sm75");
+  old.arch_id = 700;
+  KOPS_EXPECT_STATUS(call(true, same, old), Status::kUnsupportedArch, "fp4 marlin sm70");
+  KOPS_EXPECT_OK(call(false, same, old), "fp4 CUDA-core body is not arch-gated");
+  LaunchContext any = ctx;
+  any.arch_id = 0;
+  KOPS_EXPECT_OK(call(true, same, any), "fp4 marlin arch auto");
+  cudaDeviceSynchronize();
 }
 
 // ---- GGUF mmvq -----------------------------------------------------------------------------
@@ -2202,9 +2531,14 @@ int main() {
   test_gemv_argmax(ctx);
   test_router(ctx);
   test_fp4_gemv(ctx);
+  test_fp4_marlin(ctx);
+  test_fp4_marlin_contracts(ctx);
   test_w4a16(ctx);
   test_lut_gemv(ctx);
   test_w4a16_contracts(ctx);
+  test_w4a16_marlin_layout(ctx);
+  test_w4a16_marlin(ctx);
+  test_w4a16_marlin_contracts(ctx);
   test_fp8_decode(ctx);
   test_fp8_gemv(ctx);
   test_fp8_invariance(ctx);

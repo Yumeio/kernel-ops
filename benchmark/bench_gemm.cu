@@ -68,6 +68,9 @@ void add_b5_cases(std::vector<Case>* cases) {
       const int64_t w4 = s.n * s.k / 2 + (s.k / 128) * s.n * 2 + (s.k / 128) * s.n / 2 + m * s.k * 2 + m * s.n * 2;
       std::snprintf(id, sizeof(id), "gemm.w4a16_awq.g128.m%lld.%s", static_cast<long long>(m), s.tag);
       add_b5_gemv(cases, id, "w4a16_awq", bf, s.n, s.k, m, w4);
+      // Same weight bytes as the AWQ case; the tiles are awq_to_marlin's, read on mma.sync (SM80+).
+      std::snprintf(id, sizeof(id), "gemm.w4a16_awq_marlin.g128.m%lld.%s", static_cast<long long>(m), s.tag);
+      add_b5_gemv(cases, id, "w4a16_awq_marlin", bf, s.n, s.k, m, w4);
       if (m != 1) continue;
       const int64_t w4g = s.n * s.k / 2 + (s.k / 128) * s.n * 2 + (s.k / 128) * s.n / 2 + m * s.k * 2 + m * s.n * 2;
       std::snprintf(id, sizeof(id), "gemm.w4a16_gptq.g128.m%lld.%s", static_cast<long long>(m), s.tag);
@@ -100,12 +103,34 @@ void add_b5_cases(std::vector<Case>* cases) {
       std::snprintf(id, sizeof(id), "gemm.fp4_gemv.%s.m1.%s", kind, s.tag);
       add_b5_gemv(cases, id, kind[0] == 'm' ? "fp4_gemv_mx" : "fp4_gemv_nv", bf, s.n, s.k, 1,
                   s.n * s.k / 2 + s.n * s.k / blk + s.k * 2 + s.n * 2);
+      // Same bytes; fp4_to_marlin tiles on mma.sync (SM80+).
+      std::snprintf(id, sizeof(id), "gemm.fp4_marlin.%s.m1.%s", kind, s.tag);
+      add_b5_gemv(cases, id, kind[0] == 'm' ? "fp4_marlin_mx" : "fp4_marlin_nv", bf, s.n, s.k, 1,
+                  s.n * s.k / 2 + s.n * s.k / blk + s.k * 2 + s.n * 2);
+      if (s.n != 4096 || s.k != 4096) continue;
+      for (int64_t mm : {4, 16}) {
+        std::snprintf(id, sizeof(id), "gemm.fp4_marlin.%s.m%lld.%s", kind, static_cast<long long>(mm), s.tag);
+        add_b5_gemv(cases, id, kind[0] == 'm' ? "fp4_marlin_mx" : "fp4_marlin_nv", bf, s.n, s.k, mm,
+                    s.n * s.k / 2 + s.n * s.k / blk + mm * s.k * 2 + mm * s.n * 2);
+      }
     }
     struct G { const char* name; const char* tag; int64_t qk, bytes; };
     for (const G& g : {G{"q4_0", "gguf_mmvq_q4_0", 32, 18}, G{"q8_0", "gguf_mmvq_q8_0", 32, 34}, G{"q4_k", "gguf_mmvq_q4_k", 256, 144}}) {
       std::snprintf(id, sizeof(id), "gemm.gguf_mmvq.%s.m1.%s", g.name, s.tag);
       add_b5_gemv(cases, id, g.tag, bf, s.n, s.k, 1, s.n * s.k / g.qk * g.bytes + s.k * 2 + s.n * 2);
     }
+  }
+  for (int64_t m : {2, 4, 8}) {
+    // NF4 with several tokens in one launch (kLutRows changes with M).
+    const int64_t n = 4096, k = 4096;
+    std::snprintf(id, sizeof(id), "gemm.nf4_lut.b64.m%lld.4096x4096", static_cast<long long>(m));
+    add_b5_gemv(cases, id, "nf4_lut", bf, n, k, m, n * k / 2 + (n * k / 64) * 4 + m * k * 2 + m * n * 2);
+  }
+  {
+    // Two token tiles of 8 inside one CTA.
+    const int64_t n = 4096, k = 4096, m = 16;
+    add_b5_gemv(cases, "gemm.w4a16_awq_marlin.g128.m16.4096x4096", "w4a16_awq_marlin", bf, n, k, m,
+                n * k / 2 + (k / 128) * n * 2 + (k / 128) * n / 2 + m * k * 2 + m * n * 2);
   }
   // Router logits (E x H), greedy LM head (V x H), grouped / MoE decode GEMV (E experts, N x K each).
   add_b5_gemv(cases, "gemm.router.fp32out.m8.256x7168", "router_gemm", bf, 256, 7168, 8, 256 * 7168 * 2 + 8 * 7168 * 2 + 8 * 256 * 4);
@@ -156,15 +181,17 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     if (!status_ok(op(), id)) return false;
     return measure(c, [&] { (void)op(); }, st);
   };
-  if (c.op == "w4a16_awq" || c.op == "w4a16_gptq") {
-    const bool awq = c.op == "w4a16_awq";
+  if (c.op == "w4a16_awq" || c.op == "w4a16_gptq" || c.op == "w4a16_awq_marlin") {
+    const bool marlin = c.op == "w4a16_awq_marlin";
+    const bool awq = c.op == "w4a16_awq" || marlin;
     Buf a(m * k * 2), qw(n * k / 2), sc((k / 128) * n * 2), qz((k / 128) * n / 2), out(m * n * 2);
     if (!a.p || !qw.p || !sc.p || !qz.p || !out.p) return false;
     ScaledGemmArgs args{};
     args.recipe = GemmRecipe::kW4A16Int;
     args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kBFloat16;
     args.b.data = qw.p; args.b.dtype = DType::kUInt32;
-    args.b.packing = awq ? kops::WeightPacking::kAWQ : kops::WeightPacking::kGPTQ;
+    args.b.packing = marlin ? kops::WeightPacking::kMarlin : (awq ? kops::WeightPacking::kAWQ : kops::WeightPacking::kGPTQ);
+    if (marlin) args.b.scale_layout = kops::ScaleLayout::kMarlinPermuted;
     args.b.scale = sc.p; args.b.scale_dtype = DType::kBFloat16; args.b.group_k = 128;
     args.b.zero_points = qz.p; args.b.zero_dtype = DType::kUInt32;
     args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
@@ -234,6 +261,20 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     args.b.data = w.p; args.b.ld = k / 2; args.b.dtype = DType::kFloat4E2M1x2;
     args.b.scale = sc.p; args.b.scale_dtype = nv ? DType::kFloat8E4M3 : DType::kFloat8E8M0;
     args.b.group_k = nv ? 16 : 32;
+    args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.m = m; args.n = n; args.k = k;
+    return go([&] { return scaled_gemm(args, nullptr, GemmBackend::kNative, kops::Workspace{}, ctx); });
+  }
+  if (c.op == "fp4_marlin_mx" || c.op == "fp4_marlin_nv") {
+    const bool nv = c.op == "fp4_marlin_nv";
+    Buf a(m * k * 2), w(n * k / 2), sc(n * k / (nv ? 16 : 32)), out(m * n * 2);
+    if (!a.p || !w.p || !sc.p || !out.p) return false;
+    ScaledGemmArgs args{};
+    args.recipe = nv ? GemmRecipe::kW4A16NVFP4 : GemmRecipe::kW4A16MXFP4;
+    args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kBFloat16;
+    args.b.data = w.p; args.b.dtype = DType::kUInt32; args.b.packing = kops::WeightPacking::kMarlin;
+    args.b.scale = sc.p; args.b.scale_dtype = nv ? DType::kFloat8E4M3 : DType::kFloat8E8M0;
+    args.b.scale_layout = kops::ScaleLayout::kMarlinPermuted; args.b.group_k = nv ? 16 : 32;
     args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
     args.m = m; args.n = n; args.k = k;
     return go([&] { return scaled_gemm(args, nullptr, GemmBackend::kNative, kops::Workspace{}, ctx); });

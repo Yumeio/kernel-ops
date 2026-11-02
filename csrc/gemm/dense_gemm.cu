@@ -946,9 +946,11 @@ Status launch_router_tile(const RouterGemmParams& p, bool two_term, cudaStream_t
 
 template <typename x_t, typename w_t>
 Status launch_router(const RouterGemmParams& p, bool two_term, cudaStream_t s) {
+  // L2 traffic is x: (E / EPC) * M * H and W: (M / M_TILE) * E * H; M_TILE * EPC = 32 accumulators is
+  // the register budget, so (8, 4) halves the traffic of the old (8, 2) and (16, 1) tiles. The k order
+  // of every output element is independent of the tile, so the logits stay bit-identical.
   if (p.m <= 4) return launch_router_tile<x_t, w_t, 4, 4>(p, two_term, s);
-  if (p.m <= 8) return launch_router_tile<x_t, w_t, 8, 2>(p, two_term, s);
-  return launch_router_tile<x_t, w_t, 16, 1>(p, two_term, s);
+  return launch_router_tile<x_t, w_t, 8, 4>(p, two_term, s);
 }
 
 }  // namespace

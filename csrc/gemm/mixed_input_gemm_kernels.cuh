@@ -78,8 +78,10 @@ template <typename Traits, GemmRecipe kRecipe>
 __global__ void mixed_input_gemm_tcgen05_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
- * w4a16_gemv_kernel — M <= 4 weight-only int4 GEMV with group scales/zeros (AWQ or GPTQ layout
+ * w4a16_gemv_kernel — M <= 16 weight-only int4 GEMV with group scales/zeros (AWQ or GPTQ layout
  * read directly, no Marlin repack). Decode fallback for consumer GPUs and odd shapes.
+ * kPacking == kMarlin reads quantization::awq_to_marlin output (tiles, permuted scales, Marlin zeros)
+ * on mma.sync m16n8k16 with the weight as operand A (SM80+; group 32/64/128, N % 64 == 0).
  */
 template <typename scalar_t, WeightPacking kPacking, int GROUP_SIZE, bool kHasZeros, int M_TILE>
 __global__ void w4a16_gemv_kernel(
@@ -96,6 +98,8 @@ __global__ void w4a16_gemv_kernel(
  * lut_gemv_kernel — 4-bit codebook weights (bitsandbytes NF4 / FP4, custom 16-entry LUTs) with
  * blockwise absmax that may itself be double-quantized (int8 absmax + fp32 second-level scale).
  * M <= 8; larger M dequantizes to bf16 tiles (quant::dequantize_kernel) + dense GEMM.
+ * One warp takes kLutRows<M_TILE> rows (4 for M_TILE <= 4, else 2), one CTA 8 warps and a 32 KB
+ * float2 table (256 byte-pairs x 16 bank-private copies; one LDS.64 per code byte, conflict free).
  */
 template <typename scalar_t, int BLOCK_SIZE, bool kDoubleQuant, int M_TILE>
 __global__ void lut_gemv_kernel(

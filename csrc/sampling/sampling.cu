@@ -31,6 +31,7 @@
 // =============================================================================
 #include <cmath>
 #include <cstdint>
+#include <type_traits>
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -1111,24 +1112,52 @@ __device__ __forceinline__ uint64_t block_exscan_u64(uint64_t v, uint64_t* sh) {
   return r;
 }
 
+/// 16-byte aligned rows with V % 4 == 0 take the float4 paths below; any other row stays scalar.
+__device__ __forceinline__ bool row_vec4(const float* x, int V) {
+  return (V & 3) == 0 && (reinterpret_cast<uintptr_t>(x) & 15) == 0;
+}
+
 /// k-th largest key (k is 1-based), deterministic tie handling by index is done
-/// by the boundary helper below. hist[256], sh[4].
+/// by the boundary helper below. hist[256], sh[4]. sh[2] returns how many elements share the
+/// returned key, so boundary_equals can skip its scan when every one of them is kept.
 template <int T>
 __device__ void select_kth_key(const float* x, int V, int k, bool is_logit, int* hist, int* sh,
                                uint32_t* out_key, int* out_need) {
   const int t = threadIdx.x;
+  const bool vec4 = row_vec4(x, V);
   uint32_t prefix = 0;
   int rank = k;
   for (int pass = 0; pass < 4; ++pass) {
     const int shift = 24 - 8 * pass;
     for (int b = t; b < 256; b += T) hist[b] = 0;
     __syncthreads();
-    for (int i = t; i < V; i += T) {
-      const float v = x[i];
+    // Equal digits of one thread's vector (probabilities of a row share an exponent byte) merge
+    // into a single shared atomic.
+    int prev = -1, run = 0;
+    const auto add = [&](float v) {
       const uint32_t key = is_logit ? logit_key(v) : prob_key(v);
-      if (pass > 0 && (key >> (shift + 8)) != (prefix >> (shift + 8))) continue;
-      atomicAdd(&hist[(key >> shift) & 255], 1);
+      int bin = static_cast<int>((key >> shift) & 255);
+      if (pass > 0 && (key >> (shift + 8)) != (prefix >> (shift + 8))) bin = -1;
+      if (bin == prev) {
+        ++run;
+      } else {
+        if (prev >= 0) atomicAdd(&hist[prev], run);
+        prev = bin;
+        run = 1;
+      }
+    };
+    if (vec4) {
+      for (int i = t; i < V / 4; i += T) {
+        const float4 q = reinterpret_cast<const float4*>(x)[i];
+        add(q.x);
+        add(q.y);
+        add(q.z);
+        add(q.w);
+      }
+    } else {
+      for (int i = t; i < V; i += T) add(x[i]);
     }
+    if (prev >= 0) atomicAdd(&hist[prev], run);
     __syncthreads();
     if (t == 0) {
       int run = 0;
@@ -1144,6 +1173,7 @@ __device__ void select_kth_key(const float* x, int V, int k, bool is_logit, int*
       }
       sh[0] = chosen;
       sh[1] = rem;
+      sh[2] = hist[chosen];
     }
     __syncthreads();
     prefix |= static_cast<uint32_t>(sh[0]) << shift;
@@ -1159,6 +1189,9 @@ template <int T>
 __device__ int32_t boundary_equals(const float* x, int V, bool is_logit, uint32_t tkey, int need,
                                    uint64_t* scan, int* sh) {
   const int t = threadIdx.x;
+  // select_kth_key left the number of elements sharing tkey in sh[2]: when `need` of them is all of
+  // them, the whole tie group is kept and no index scan is needed.
+  if (sh[2] == need) return INT32_MAX;
   if (t == 0) sh[0] = INT32_MAX;
   __syncthreads();
   const int chunk = (V + T - 1) / T;
@@ -1294,6 +1327,126 @@ __device__ __forceinline__ bool in_nucleus(uint32_t key, int i, uint32_t tkey, i
   return key > tkey || (key == tkey && i <= bound);
 }
 
+/// Candidate budget of the fast top-k path (value + index = 16 KiB of shared memory) and its
+/// first-pass histogram (top 11 key bits = exponent + 2 mantissa bits).
+constexpr int kTopkCand = 2048;
+constexpr int kTopkBins = 2048;
+
+/// Top-k threshold of a non-negative fp32 row in three reads instead of six: (1) an 11-bit
+/// histogram finds the bin that holds the k-th largest value, (2) everything above the bin is
+/// summed and the bin's elements (at most kTopkCand) are collected in shared memory, (3) the
+/// caller writes the row. The pivot is picked among the candidates by rank in the total order
+/// (key descending, index ascending), so the result does not depend on the collection order and
+/// matches select_kth_key + boundary_equals. Returns false (uniformly) when the bin is too large,
+/// e.g. a row dominated by zeros; the caller then takes the radix path.
+///   out_key / out_bound : the k-th element's key and index (in_nucleus semantics)
+///   out_sum             : sum of the kept values (block-reduced, deterministic)
+template <int T>
+__device__ bool topk_by_candidates(const float* x, int V, int k, int* hist, int* csum, float* cval,
+                                   int* cidx, int* sh, float* red, uint32_t* out_key,
+                                   int32_t* out_bound, float* out_sum) {
+  const int t = threadIdx.x;
+  const bool vec4 = row_vec4(x, V);
+  for (int b = t; b < kTopkBins; b += T) hist[b] = 0;
+  if (t == 0) sh[3] = 0;
+  __syncthreads();
+  int prev = -1, run = 0;
+  const auto count = [&](float v) {
+    const int bin = static_cast<int>(prob_key(v) >> 21);
+    if (bin == prev) {
+      ++run;
+    } else {
+      if (prev >= 0) atomicAdd(&hist[prev], run);
+      prev = bin;
+      run = 1;
+    }
+  };
+  if (vec4) {
+    for (int i = t; i < V / 4; i += T) {
+      const float4 q = reinterpret_cast<const float4*>(x)[i];
+      count(q.x);
+      count(q.y);
+      count(q.z);
+      count(q.w);
+    }
+  } else {
+    for (int i = t; i < V; i += T) count(x[i]);
+  }
+  if (prev >= 0) atomicAdd(&hist[prev], run);
+  __syncthreads();
+  if (t < kTopkBins / 32) {
+    int s = 0;
+    for (int j = 0; j < 32; ++j) s += hist[t * 32 + j];
+    csum[t] = s;
+  }
+  __syncthreads();
+  if (t == 0) {
+    int above = 0, c = kTopkBins / 32 - 1;
+    for (; c > 0; --c) {
+      if (above + csum[c] >= k) break;
+      above += csum[c];
+    }
+    int b = c * 32 + 31;
+    for (; b > c * 32; --b) {
+      if (above + hist[b] >= k) break;
+      above += hist[b];
+    }
+    sh[0] = b;
+    sh[1] = above;
+    sh[2] = hist[b];
+  }
+  __syncthreads();
+  const int bin = sh[0], above = sh[1], m = sh[2];
+  if (m > kTopkCand) return false;
+  float sa = 0.0f;
+  const auto gather = [&](float v, int i) {
+    const int d = static_cast<int>(prob_key(v) >> 21);
+    if (d > bin) {
+      sa += v;
+    } else if (d == bin) {
+      const int pos = atomicAdd(&sh[3], 1);
+      cval[pos] = v;
+      cidx[pos] = i;
+    }
+  };
+  if (vec4) {
+    for (int i = t; i < V / 4; i += T) {
+      const float4 q = reinterpret_cast<const float4*>(x)[i];
+      gather(q.x, 4 * i);
+      gather(q.y, 4 * i + 1);
+      gather(q.z, 4 * i + 2);
+      gather(q.w, 4 * i + 3);
+    }
+  } else {
+    for (int i = t; i < V; i += T) gather(x[i], i);
+  }
+  __syncthreads();
+  const int need = k - above;  // 1 <= need <= m
+  float sc = 0.0f;
+  for (int c = t; c < m; c += T) {
+    const float v = cval[c];
+    const int id = cidx[c];
+    const uint32_t kv = prob_key(v);
+    int rank = 0;
+    for (int j = 0; j < m; ++j) {
+      const uint32_t kj = prob_key(cval[j]);
+      rank += (kj > kv) || (kj == kv && cidx[j] < id);
+    }
+    if (rank < need) sc += v;
+    if (rank == need - 1) {
+      sh[0] = static_cast<int>(kv);
+      sh[1] = id;
+    }
+  }
+  const float total = block_reduce_sum<float, kRowWarps>(sa + sc, red);
+  __syncthreads();
+  *out_key = static_cast<uint32_t>(sh[0]);
+  *out_bound = sh[1];
+  *out_sum = total;
+  __syncthreads();
+  return true;
+}
+
 __device__ __forceinline__ float row_max(const float* p, int V, float* red) {
   float m = -INFINITY;
   for (int i = threadIdx.x; i < V; i += blockDim.x) m = fmaxf(m, p[i]);
@@ -1331,6 +1484,12 @@ __device__ __forceinline__ float row_min_p(const SamplingParams& params, int row
 // Declared kernels
 // ---------------------------------------------------------------------------
 
+/// Top-k mask by radix select on the logit key. Three costs of the old kernel are gone:
+///  * a 16-bit logit has only 16 significant key bits (bf16) or 24 (fp16, low 13 bits constant per sign),
+///    so 2 / 3 digit passes replace 4;
+///  * every pass reads 16-byte vectors; per-thread runs of equal digits (logits of one row share
+///    their exponent byte) become one shared atomic instead of eight;
+///  * the "k-th tie in index order" scan only runs when the last digit holds more rows than needed.
 template <typename in_t, int VEC_SIZE>
 __global__ void top_k_mask_logits_kernel(in_t* __restrict__ out, const in_t* __restrict__ logits,
                                          const int32_t* __restrict__ top_k, const int32_t default_top_k,
@@ -1338,30 +1497,48 @@ __global__ void top_k_mask_logits_kernel(in_t* __restrict__ out, const in_t* __r
   __shared__ int hist[256];
   __shared__ int sh[4];
   __shared__ uint64_t scan[256];
-  (void)VEC_SIZE;
+  constexpr int kKeyShift = sizeof(in_t) == 4 ? 0 : (std::is_same<in_t, __nv_bfloat16>::value ? 16 : 8);
+  constexpr int kPasses = (32 - kKeyShift) / 8;
   const int row = blockIdx.x;
   if (row >= batch_size) return;
   const int k = top_k != nullptr ? top_k[row] : default_top_k;
   const in_t* src = logits + static_cast<int64_t>(row) * vocab_size;
   in_t* dst = out + static_cast<int64_t>(row) * vocab_size;
+  const int nvec = vocab_size / VEC_SIZE;  // the host picks VEC_SIZE > 1 only when it divides vocab_size
   if (k <= 0 || k >= vocab_size) {
-    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) dst[i] = src[i];
+    for (int v = threadIdx.x; v < nvec; v += blockDim.x) {
+      store_vec<in_t, VEC_SIZE>(dst + static_cast<int64_t>(v) * VEC_SIZE,
+                                load_vec<in_t, VEC_SIZE>(src + static_cast<int64_t>(v) * VEC_SIZE));
+    }
     return;
   }
-  // Count-only radix over the 16/32-bit logits (keys are monotonic fp32 bits).
   uint32_t tkey = 0;
   int need = 0;
+  int eq_count = 0;
   {
     uint32_t prefix = 0;
     int rank = k;
-    for (int pass = 0; pass < 4; ++pass) {
-      const int shift = 24 - 8 * pass;
+    for (int pass = 0; pass < kPasses; ++pass) {
+      const int shift = 8 * (kPasses - 1 - pass);
       for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
       __syncthreads();
-      for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-        const uint32_t key = logit_key(dev::to_f(src[i]));
-        if (pass > 0 && (key >> (shift + 8)) != (prefix >> (shift + 8))) continue;
-        atomicAdd(&hist[(key >> shift) & 255], 1);
+      for (int v = threadIdx.x; v < nvec; v += blockDim.x) {
+        const Vec<in_t, VEC_SIZE> x = load_vec<in_t, VEC_SIZE>(src + static_cast<int64_t>(v) * VEC_SIZE);
+        int prev = -1, run = 0;
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          const uint32_t key = logit_key(dev::to_f(x[i])) >> kKeyShift;
+          int bin = static_cast<int>((key >> shift) & 255);
+          if (pass > 0 && (key >> (shift + 8)) != (prefix >> (shift + 8))) bin = -1;
+          if (bin == prev) {
+            ++run;
+          } else {
+            if (prev >= 0) atomicAdd(&hist[prev], run);
+            prev = bin;
+            run = 1;
+          }
+        }
+        if (prev >= 0) atomicAdd(&hist[prev], run);
       }
       __syncthreads();
       if (threadIdx.x == 0) {
@@ -1376,49 +1553,57 @@ __global__ void top_k_mask_logits_kernel(in_t* __restrict__ out, const in_t* __r
         }
         sh[0] = chosen;
         sh[1] = rem;
+        sh[2] = hist[chosen];
       }
       __syncthreads();
       prefix |= static_cast<uint32_t>(sh[0]) << shift;
       rank = sh[1];
+      eq_count = sh[2];
       __syncthreads();
     }
     tkey = prefix;
     need = rank;
   }
   int32_t boundary = INT32_MAX;
-  {
+  if (eq_count > need) {  // ties straddle the k-th place: keep the first `need` of them by index
     if (threadIdx.x == 0) sh[0] = INT32_MAX;
     __syncthreads();
-    const int chunk = (vocab_size + kRowThreads - 1) / kRowThreads;
-    const int beg = threadIdx.x * chunk;
-    const int end = min(vocab_size, beg + chunk);
+    const int chunk = (nvec + kRowThreads - 1) / kRowThreads;
+    const int vbeg = threadIdx.x * chunk;
+    const int vend = min(nvec, vbeg + chunk);
     uint64_t cnt = 0;
-    for (int i = beg; i < end; ++i) {
-      if (logit_key(dev::to_f(src[i])) == tkey) ++cnt;
+    for (int v = vbeg; v < vend; ++v) {
+      const Vec<in_t, VEC_SIZE> x = load_vec<in_t, VEC_SIZE>(src + static_cast<int64_t>(v) * VEC_SIZE);
+      #pragma unroll
+      for (int i = 0; i < VEC_SIZE; ++i) cnt += (logit_key(dev::to_f(x[i])) >> kKeyShift) == tkey;
     }
     const uint64_t before = block_exscan_u64<kRowThreads>(cnt, scan);
     if (before < static_cast<uint64_t>(need) && static_cast<uint64_t>(need) <= before + cnt) {
       uint64_t c = before;
-      for (int i = beg; i < end; ++i) {
-        if (logit_key(dev::to_f(src[i])) != tkey) continue;
-        ++c;
-        if (c == static_cast<uint64_t>(need)) {
-          sh[0] = i;
-          break;
+      for (int v = vbeg; v < vend && sh[0] == INT32_MAX; ++v) {
+        const Vec<in_t, VEC_SIZE> x = load_vec<in_t, VEC_SIZE>(src + static_cast<int64_t>(v) * VEC_SIZE);
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; ++i) {
+          if ((logit_key(dev::to_f(x[i])) >> kKeyShift) != tkey) continue;
+          if (++c == static_cast<uint64_t>(need)) {
+            sh[0] = v * VEC_SIZE + i;
+            break;
+          }
         }
       }
     }
     __syncthreads();
     boundary = sh[0];
   }
-  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-    const uint32_t key = logit_key(dev::to_f(src[i]));
-    const bool keep = key > tkey || (key == tkey && i <= boundary);
-    if (!keep) {
-      dev::from_f(dst[i], -INFINITY);
-    } else {
-      dst[i] = src[i];
+  for (int v = threadIdx.x; v < nvec; v += blockDim.x) {
+    const int64_t base = static_cast<int64_t>(v) * VEC_SIZE;
+    Vec<in_t, VEC_SIZE> x = load_vec<in_t, VEC_SIZE>(src + base);
+    #pragma unroll
+    for (int i = 0; i < VEC_SIZE; ++i) {
+      const uint32_t key = logit_key(dev::to_f(x[i])) >> kKeyShift;
+      if (!(key > tkey || (key == tkey && base + i <= boundary))) dev::from_f(x[i], -INFINITY);
     }
+    store_vec<in_t, VEC_SIZE>(dst + base, x);
   }
 }
 
@@ -1431,6 +1616,10 @@ __global__ void top_k_renorm_probs_kernel(float* __restrict__ out, const float* 
   __shared__ int sh[4];
   __shared__ uint64_t scan[256];
   __shared__ float red[8];
+  __shared__ int cbins[kTopkBins];
+  __shared__ int csum[kTopkBins / 32];
+  __shared__ float cval[kTopkCand];
+  __shared__ int cidx[kTopkCand];
   (void)VEC_SIZE;
   const int row = blockIdx.x;
   if (row >= batch_size) return;
@@ -1441,18 +1630,47 @@ __global__ void top_k_renorm_probs_kernel(float* __restrict__ out, const float* 
     for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) dst[i] = src[i];
     return;
   }
+  const bool vec4 = row_vec4(src, vocab_size) && row_vec4(dst, vocab_size);
   uint32_t tkey = 0;
-  int need = 0;
-  select_kth_key<kRowThreads>(src, vocab_size, k, false, hist, sh, &tkey, &need);
-  const int32_t bound = boundary_equals<kRowThreads>(src, vocab_size, false, tkey, need, scan, sh);
-  float s = 0.0f;
-  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-    if (in_nucleus(prob_key(src[i]), i, tkey, bound)) s += src[i];
+  int32_t bound = 0;
+  float sum = 0.0f;
+  if (!topk_by_candidates<kRowThreads>(src, vocab_size, k, cbins, csum, cval, cidx, sh, red,
+                                       &tkey, &bound, &sum)) {
+    int need = 0;
+    select_kth_key<kRowThreads>(src, vocab_size, k, false, hist, sh, &tkey, &need);
+    bound = boundary_equals<kRowThreads>(src, vocab_size, false, tkey, need, scan, sh);
+    float s = 0.0f;
+    if (vec4) {
+      for (int v = threadIdx.x; v < vocab_size / 4; v += blockDim.x) {
+        const float4 q = reinterpret_cast<const float4*>(src)[v];
+        const float e[4] = {q.x, q.y, q.z, q.w};
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          if (in_nucleus(prob_key(e[j]), 4 * v + j, tkey, bound)) s += e[j];
+        }
+      }
+    } else {
+      for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+        if (in_nucleus(prob_key(src[i]), i, tkey, bound)) s += src[i];
+      }
+    }
+    sum = block_reduce_sum<float, kRowWarps>(s, red);
   }
-  const float sum = block_reduce_sum<float, kRowWarps>(s, red);
   const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-    dst[i] = in_nucleus(prob_key(src[i]), i, tkey, bound) ? src[i] * inv : 0.0f;
+  if (vec4) {
+    for (int v = threadIdx.x; v < vocab_size / 4; v += blockDim.x) {
+      const float4 q = reinterpret_cast<const float4*>(src)[v];
+      const float e[4] = {q.x, q.y, q.z, q.w};
+      float4 o;
+      float* po = &o.x;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) po[j] = in_nucleus(prob_key(e[j]), 4 * v + j, tkey, bound) ? e[j] * inv : 0.0f;
+      reinterpret_cast<float4*>(dst)[v] = o;
+    }
+  } else {
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+      dst[i] = in_nucleus(prob_key(src[i]), i, tkey, bound) ? src[i] * inv : 0.0f;
+    }
   }
 }
 
@@ -1501,14 +1719,38 @@ __global__ void top_p_renorm_probs_kernel(float* __restrict__ out, const float* 
                               &tkey, &rem);
   const int32_t bound =
       boundary_equals_mass<kRowThreads>(src, vocab_size, tkey, rem, scan, sh);
+  const bool vec4 = row_vec4(src, vocab_size) && row_vec4(dst, vocab_size);
   float s = 0.0f;
-  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-    if (in_nucleus(prob_key(src[i]), i, tkey, bound)) s += src[i];
+  if (vec4) {
+    for (int v = threadIdx.x; v < vocab_size / 4; v += blockDim.x) {
+      const float4 q = reinterpret_cast<const float4*>(src)[v];
+      const float e[4] = {q.x, q.y, q.z, q.w};
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        if (in_nucleus(prob_key(e[j]), 4 * v + j, tkey, bound)) s += e[j];
+      }
+    }
+  } else {
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+      if (in_nucleus(prob_key(src[i]), i, tkey, bound)) s += src[i];
+    }
   }
   const float sum = block_reduce_sum<float, kRowWarps>(s, red);
   const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
-  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-    dst[i] = in_nucleus(prob_key(src[i]), i, tkey, bound) ? src[i] * inv : 0.0f;
+  if (vec4) {
+    for (int v = threadIdx.x; v < vocab_size / 4; v += blockDim.x) {
+      const float4 q = reinterpret_cast<const float4*>(src)[v];
+      const float e[4] = {q.x, q.y, q.z, q.w};
+      float4 o;
+      float* po = &o.x;
+      #pragma unroll
+      for (int j = 0; j < 4; ++j) po[j] = in_nucleus(prob_key(e[j]), 4 * v + j, tkey, bound) ? e[j] * inv : 0.0f;
+      reinterpret_cast<float4*>(dst)[v] = o;
+    }
+  } else {
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+      dst[i] = in_nucleus(prob_key(src[i]), i, tkey, bound) ? src[i] * inv : 0.0f;
+    }
   }
 }
 
@@ -1954,18 +2196,23 @@ Status top_k_mask_logits(const Tensor& out, const Tensor& logits, const Tensor& 
   if (batch == 0 || vocab == 0) return Status::kSuccess;
   const int32_t* kp = tensor_present(top_k) ? static_cast<const int32_t*>(top_k.data) : nullptr;
   cudaStream_t st = stream_of(ctx);
+  const auto launch_mask = [&](auto tag) {
+    using T = decltype(tag);
+    constexpr int kWide = max_vec_size_v<T>;
+    T* o = static_cast<T*>(out.data);
+    const T* l = static_cast<const T*>(logits.data);
+    if (pick_vec_size<T>(vocab, o, l) == kWide) {
+      top_k_mask_logits_kernel<T, kWide><<<batch, kRowThreads, 0, st>>>(o, l, kp, default_top_k, batch, vocab);
+    } else {
+      top_k_mask_logits_kernel<T, 1><<<batch, kRowThreads, 0, st>>>(o, l, kp, default_top_k, batch, vocab);
+    }
+  };
   if (logits.dtype == DType::kFloat32) {
-    top_k_mask_logits_kernel<float, 1><<<batch, kRowThreads, 0, st>>>(
-        static_cast<float*>(out.data), static_cast<const float*>(logits.data), kp, default_top_k,
-        batch, vocab);
+    launch_mask(float{});
   } else if (logits.dtype == DType::kFloat16) {
-    top_k_mask_logits_kernel<__half, 1><<<batch, kRowThreads, 0, st>>>(
-        static_cast<__half*>(out.data), static_cast<const __half*>(logits.data), kp, default_top_k,
-        batch, vocab);
+    launch_mask(__half{});
   } else {
-    top_k_mask_logits_kernel<__nv_bfloat16, 1><<<batch, kRowThreads, 0, st>>>(
-        static_cast<__nv_bfloat16*>(out.data),
-        static_cast<const __nv_bfloat16*>(logits.data), kp, default_top_k, batch, vocab);
+    launch_mask(__nv_bfloat16{});
   }
   const cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? Status::kSuccess

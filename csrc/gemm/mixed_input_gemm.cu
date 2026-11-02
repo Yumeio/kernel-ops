@@ -1,7 +1,8 @@
 // =============================================================================
 // kernel-ops | csrc/gemm/mixed_input_gemm.cu
-// B5 rows 7: weight-only 4-bit GEMV on CUDA cores.
-//   w4a16_gemv_kernel   AWQ [K, N/8] and GPTQ [K/8, N] int32 layouts read directly
+// B5 rows 7: weight-only 4-bit GEMV.
+//   w4a16_gemv_kernel   AWQ [K, N/8] and GPTQ [K/8, N] int32 layouts read directly (CUDA cores);
+//                       WeightPacking::kMarlin = awq_to_marlin tiles on mma.sync m16n8k16 (SM80+)
 //   lut_gemv_kernel     4-bit codebook weights (NF4 / FP4 LUT / custom) with block absmax
 // Host entries: mixed_input_gemm (kW4A16Int, M <= 16) and lut_gemv (M <= 16).
 //
@@ -12,6 +13,9 @@
 // (acc += s * sum_k a_k (q_k - z)).  Each output element is a function of (row of A, column of W)
 // only: the order of additions does not depend on M_TILE, the grid or the other rows, so one row
 // alone and the same row inside a batch are bit-identical (tests/unit/test_gemm.cc).
+// The kMarlin body is a different kernel: it sums a group on the tensor core, so it is NOT bit-equal
+// to kAWQ.  The reference for both is the fp64 oracle in the tests (kReference); "deterministic"
+// means same kernel, same geometry, same bits.
 //
 // Conventions.
 //   * AWQ column n = 8j + c lives at nibble awq_position(c) of word j (same table as
@@ -168,6 +172,90 @@ __device__ __forceinline__ void w4a16_awq_body(scalar_t* __restrict__ out,
 }
 
 // -----------------------------------------------------------------------------
+// Marlin tiles on tensor cores (SM80+): the weight is MMA operand A, the tokens are operand B
+// -----------------------------------------------------------------------------
+// The tile geometry, fragment mapping and numerics are in common/device_impl.cuh (dev::tc_gemv_body);
+// this file supplies the integer policy: quantization::awq_to_marlin tiles, permuted [G, N] scales and
+// Marlin zero words.  (q - z) is exact in bf16/fp16 (magic 128 + q, resp. 1024 + q, minus 128 + z),
+// and the group scale is applied in fp32 to the group's accumulator, as in the CUDA-core bodies.  The
+// order of additions differs from those, so results are not bit-equal to kAWQ; a row is still
+// bit-identical alone and inside a batch.  Idea and geometry after tinygemm (any4, CC BY-NC 4.0);
+// the body is written from the PTX fragment description, not from that source.
+
+template <typename scalar_t, int GROUP_SIZE, bool kHasZeros>
+struct MarlinIntPolicy {
+  using Tc = dev::TcFrag<scalar_t>;
+  static constexpr int kBlockK = GROUP_SIZE;
+  static_assert(GROUP_SIZE == 32 || GROUP_SIZE == 64 || GROUP_SIZE == 128, "marlin tiles need grouped scales");
+
+  const scalar_t* scales;    // [K/G, N], Marlin-permuted: lane r reads its columns {r + 8 j} as one uint4
+  const uint32_t* qzeros;    // [K/G, N/8], Marlin order (see unpack below)
+  int n;
+
+  struct State {
+    uint4 s;                 // eight scales, j = 2 w + h: row r (h = 0) or r + 8 (h = 1) of sub-tile w
+    uint32_t zlo[4];         // 128 (1024) + z of row r, both halves, per sub-tile w
+    uint32_t zhi[4];         // ... of row r + 8
+  };
+
+  __device__ __forceinline__ State load(int g, int nt, int r) const {
+    State st;
+    st.s = *reinterpret_cast<const uint4*>(scales + static_cast<int64_t>(g) * n + nt * dev::kTcTileN + 8 * r);
+    if constexpr (kHasZeros) {
+      // The zero word uses the weight nibble order (marlin_awq_zero_points_words_kernel): nibble i
+      // holds j = {0,2,4,6,1,3,5,7}[i], so j = 2 w + h sits at nibble w + 4 h.
+      const uint32_t zw = qzeros[static_cast<int64_t>(g) * (n >> 3) + nt * 8 + r];
+      #pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        st.zlo[w] = (Tc::kBase | ((zw >> (4 * w)) & 0xFu)) * 0x00010001u;
+        st.zhi[w] = (Tc::kBase | ((zw >> (4 * (w + 4))) & 0xFu)) * 0x00010001u;
+      }
+    } else {
+      #pragma unroll
+      for (int w = 0; w < 4; ++w) st.zlo[w] = st.zhi[w] = (Tc::kBase | 8u) * 0x00010001u;
+    }
+    return st;
+  }
+
+  __device__ __forceinline__ void unpack_scales(const State& st, float (&sf)[8]) const {
+    dev::unpack8<scalar_t>(st.s, sf);
+  }
+
+  __device__ __forceinline__ void dequant(const State& st, int w, uint32_t q, uint32_t (&fa)[4]) const {
+    fa[0] = Tc::sub2((q & 0x000F000Fu) | Tc::kMagic, st.zlo[w]);          // row r,     k 2c, 2c+1
+    fa[2] = Tc::sub2(((q >> 4) & 0x000F000Fu) | Tc::kMagic, st.zlo[w]);   // row r,     k 2c+8, 2c+9
+    fa[1] = Tc::sub2(((q >> 8) & 0x000F000Fu) | Tc::kMagic, st.zhi[w]);   // row r + 8, k 2c, 2c+1
+    fa[3] = Tc::sub2(((q >> 12) & 0x000F000Fu) | Tc::kMagic, st.zhi[w]);  // row r + 8, k 2c+8, 2c+9
+  }
+};
+
+template <typename scalar_t>
+struct MarlinBiasStore {
+  scalar_t* out;
+  const scalar_t* bias;
+  int n;
+  __device__ __forceinline__ void operator()(float v, int tok, int col) const {
+    if (bias != nullptr) v += dev::to_f(bias[col]);
+    dev::from_f(out[static_cast<int64_t>(tok) * n + col], v);
+  }
+};
+
+/// M_TILE is 8 or 16 tokens; the 8 warps of a CTA split K by group.
+template <typename scalar_t, int GROUP_SIZE, bool kHasZeros, int M_TILE>
+__device__ __forceinline__ void w4a16_marlin_body(scalar_t* __restrict__ out,
+                                                  const scalar_t* __restrict__ a,
+                                                  const uint32_t* __restrict__ qweight,
+                                                  const scalar_t* __restrict__ scales,
+                                                  const uint32_t* __restrict__ qzeros,
+                                                  const scalar_t* __restrict__ bias, const int m,
+                                                  const int n, const int k) {
+  const MarlinIntPolicy<scalar_t, GROUP_SIZE, kHasZeros> pol{scales, qzeros, n};
+  const MarlinBiasStore<scalar_t> epi{out, bias, n};
+  dev::tc_gemv_body<MarlinIntPolicy<scalar_t, GROUP_SIZE, kHasZeros>, MarlinBiasStore<scalar_t>, scalar_t, M_TILE>(
+      a, static_cast<int64_t>(k), qweight, pol, epi, m, n, k);
+}
+
+// -----------------------------------------------------------------------------
 // GPTQ: thread = one column, threadIdx.y = K slice (whole groups); act-order slow path
 // -----------------------------------------------------------------------------
 
@@ -268,20 +356,46 @@ __global__ void w4a16_gemv_kernel(scalar_t* __restrict__ out, const scalar_t* __
                                   const int32_t* __restrict__ g_idx,
                                   const scalar_t* __restrict__ bias, const int m, const int n,
                                   const int k) {
+  static_assert(kPacking == WeightPacking::kAWQ || kPacking == WeightPacking::kGPTQ ||
+                    kPacking == WeightPacking::kMarlin,
+                "w4a16_gemv_kernel reads AWQ, GPTQ or Marlin-tile layouts");
+  if constexpr (kPacking == WeightPacking::kMarlin) {
+    (void)g_idx;
+    w4a16_marlin_body<scalar_t, GROUP_SIZE, kHasZeros, M_TILE>(out, a, qweight, scales, qzeros, bias, m, n, k);
+    return;
+  }
   (void)m;
-  static_assert(kPacking == WeightPacking::kAWQ || kPacking == WeightPacking::kGPTQ,
-                "w4a16_gemv_kernel reads AWQ or GPTQ layouts");
   if constexpr (kPacking == WeightPacking::kAWQ) {
     (void)g_idx;
     w4a16_awq_body<scalar_t, GROUP_SIZE, kHasZeros, M_TILE>(out, a, qweight, scales, qzeros, bias, n, k);
-  } else {
+  } else if constexpr (kPacking == WeightPacking::kGPTQ) {
     w4a16_gptq_body<scalar_t, GROUP_SIZE, kHasZeros, M_TILE>(out, a, qweight, scales, qzeros, g_idx, bias, n, k);
   }
 }
 
 // =============================================================================
-// lut_gemv_kernel: warp per row, lane = 32 k (16 B of codes) per iteration
+// lut_gemv_kernel: warp per R rows, lane = 32 k (16 B of codes) per iteration and row
 // =============================================================================
+// Why this shape (profiled with Nsight Compute on the RTX 3050, NF4 4096 x 4096, M = 1).  The one-row,
+// one-LDS-per-weight kernel ran at ~90-100 GB/s.  It was not bound by memory, by shared-memory bank
+// conflicts (none) or by the 40 registers it uses, but by the LSU instruction pipe: every weight was one
+// LDS.32, and that pipe issues about one warp instruction per two cycles per SM (sm__inst_executed_pipe_lsu
+// at 81% of peak, ALU at 29%).  So the fix is fewer LDS instructions, not fewer ALU instructions:
+//   * one LDS.64 per code byte returns both weights of the byte (a 256-entry float2 table);
+//   * a 256-entry table indexed by random bytes would conflict ~3-way, so it is stored in 16 copies, copy c
+//     in bank pair c (row = byte, 128 B per row, 8 B per copy): lane l reads copy l % 16, a conflict-free
+//     access whatever the data (32 KB of shared memory, filled once per CTA);
+//   * R rows per warp share the activation unpack and give R independent fmaf chains.
+// History: a bank-replicated 16-entry table (cb[e][lane]) read with one LDS.32 per weight was tried first and
+// was slower (NF4 4096x4096: 0.085 ms -> 0.134 ms): it kept one LDS per weight and added a 2 KB refill per
+// CTA, so it paid for the replication without removing the instruction that was the limit.  (The FP4 body
+// in fp4_gemm.cu decodes e2m1 arithmetically instead of through a table for the same reason.)
+// The order of additions is that of the one-row kernel (per row and token: a 32-long fmaf chain from 0 in k
+// order per iteration, acc = fmaf(absmax, part, acc), then the xor tree 16, 8, 4, 2, 1), so every output is
+// bit-identical whatever R is; tests/unit/test_gemm.cc replays that order on the host.
+
+template <int M_TILE>
+constexpr int kLutRows = M_TILE <= 4 ? 4 : 2;   // rows per warp: more rows, fewer tokens in flight
 
 template <typename scalar_t, int BLOCK_SIZE, bool kDoubleQuant, int M_TILE>
 __global__ void lut_gemv_kernel(scalar_t* __restrict__ out, const scalar_t* __restrict__ a,
@@ -292,59 +406,101 @@ __global__ void lut_gemv_kernel(scalar_t* __restrict__ out, const scalar_t* __re
                                 const int k) {
   (void)m;
   constexpr int kWarps = 8;
-  // A bank-replicated table (cb[e][lane]) was tried and is slower: refilling 2 KB per block costs more
-  // than the lookup conflicts it removes (NF4 4096x4096: 0.085 ms -> 0.134 ms).
-  __shared__ float cb[16];
-  if (threadIdx.x < 16) cb[threadIdx.x] = codebook[threadIdx.x];
+  constexpr int R = kLutRows<M_TILE>;
+  // pair[byte][copy] = (cb[byte & 15], cb[byte >> 4]): element 2 j is the low nibble of byte j.
+  // Thread (copy c, entries e0 + 16 i): the low code is e0 and the high code is i, for every i.
+  __shared__ float2 pair[256][16];
+  {
+    const int c = threadIdx.x & 15;
+    const int e0 = threadIdx.x >> 4;
+    const float lo = codebook[e0];
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) pair[e0 + 16 * i][c] = make_float2(lo, codebook[i]);
+  }
   __syncthreads();
 
   const int lane = threadIdx.x & 31;
-  const int row = blockIdx.x * kWarps + (threadIdx.x >> 5);
-  if (row >= n) return;
+  const int row0 = (blockIdx.x * kWarps + (threadIdx.x >> 5)) * R;
+  if (row0 >= n) return;
 
+  const char* table = reinterpret_cast<const char*>(&pair[0][0]) + (lane & 15) * 8;   // this lane's copy
   const float off = kDoubleQuant ? absmax_offset[0] : 0.0f;
-  float acc[M_TILE];
+  float acc[M_TILE][R];
   #pragma unroll
-  for (int mm = 0; mm < M_TILE; ++mm) acc[mm] = 0.0f;
+  for (int mm = 0; mm < M_TILE; ++mm) {
+    #pragma unroll
+    for (int r = 0; r < R; ++r) acc[mm][r] = 0.0f;
+  }
 
-  const uint8_t* wrow = qweight + static_cast<int64_t>(row) * (k / 2);
+  // Rows past n re-read row n - 1 and are never stored.
+  const uint8_t* wrow[R];
+  int64_t rowi[R];
+  #pragma unroll
+  for (int r = 0; r < R; ++r) {
+    rowi[r] = row0 + r < n ? row0 + r : n - 1;
+    wrow[r] = qweight + rowi[r] * (k / 2);
+  }
   const int64_t blocks_per_row = k / BLOCK_SIZE;
   for (int kc = lane * 32; kc < k; kc += 32 * 32) {
-    const uint4 wv = dev::ld_stream16(wrow + kc / 2);
-    const int64_t blk = static_cast<int64_t>(row) * blocks_per_row + kc / BLOCK_SIZE;
-    float amax;
-    if constexpr (kDoubleQuant) {
-      amax = fmaf(static_cast<float>(static_cast<const uint8_t*>(absmax)[blk]), absmax_scale[blk >> 8], off);
-    } else {
-      amax = static_cast<const float*>(absmax)[blk];
-    }
-    float wf[32];
-    const uint32_t words[4] = {wv.x, wv.y, wv.z, wv.w};
+    uint4 wv[R];
     #pragma unroll
-    for (int wi = 0; wi < 4; ++wi) {
-      #pragma unroll
-      for (int i = 0; i < 8; ++i) wf[wi * 8 + i] = cb[(words[wi] >> (4 * i)) & 0xFu];
+    for (int r = 0; r < R; ++r) wv[r] = dev::ld_stream16(wrow[r] + kc / 2);
+    float amax[R];
+    #pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const int64_t blk = rowi[r] * blocks_per_row + kc / BLOCK_SIZE;
+      if constexpr (kDoubleQuant) {
+        amax[r] = fmaf(static_cast<float>(static_cast<const uint8_t*>(absmax)[blk]), absmax_scale[blk >> 8], off);
+      } else {
+        amax[r] = static_cast<const float*>(absmax)[blk];
+      }
     }
-    float part[M_TILE];
+    float part[M_TILE][R];
     #pragma unroll
     for (int mm = 0; mm < M_TILE; ++mm) {
-      part[mm] = 0.0f;
       #pragma unroll
-      for (int v = 0; v < 4; ++v) {
-        float af[8];
-        dev::unpack8<scalar_t>(*reinterpret_cast<const uint4*>(a + static_cast<int64_t>(mm) * k + kc + 8 * v), af);
-        #pragma unroll
-        for (int i = 0; i < 8; ++i) part[mm] = fmaf(af[i], wf[v * 8 + i], part[mm]);
+      for (int r = 0; r < R; ++r) part[mm][r] = 0.0f;
+    }
+    #pragma unroll
+    for (int v = 0; v < 4; ++v) {
+      float af[M_TILE][8];                      // unpacked once, used by all R rows
+      #pragma unroll
+      for (int mm = 0; mm < M_TILE; ++mm) {
+        dev::unpack8<scalar_t>(*reinterpret_cast<const uint4*>(a + static_cast<int64_t>(mm) * k + kc + 8 * v), af[mm]);
       }
-      acc[mm] = fmaf(amax, part[mm], acc[mm]);
+      #pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const uint32_t w = v == 0 ? wv[r].x : (v == 1 ? wv[r].y : (v == 2 ? wv[r].z : wv[r].w));
+        float wf[8];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const uint32_t byte = __byte_perm(w, 0u, 0x4440u | j);
+          const float2 p = *reinterpret_cast<const float2*>(table + (byte << 7));
+          wf[2 * j] = p.x;
+          wf[2 * j + 1] = p.y;
+        }
+        #pragma unroll
+        for (int mm = 0; mm < M_TILE; ++mm) {
+          #pragma unroll
+          for (int i = 0; i < 8; ++i) part[mm][r] = fmaf(af[mm][i], wf[i], part[mm][r]);
+        }
+      }
+    }
+    #pragma unroll
+    for (int mm = 0; mm < M_TILE; ++mm) {
+      #pragma unroll
+      for (int r = 0; r < R; ++r) acc[mm][r] = fmaf(amax[r], part[mm][r], acc[mm][r]);
     }
   }
   #pragma unroll
   for (int mm = 0; mm < M_TILE; ++mm) {
-    float v = acc[mm];
     #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, o);
-    if (lane == 0) dev::from_f(out[static_cast<int64_t>(mm) * n + row], v);
+    for (int r = 0; r < R; ++r) {
+      float v = acc[mm][r];
+      #pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xFFFFFFFFu, v, o);
+      if (lane == 0 && row0 + r < n) dev::from_f(out[static_cast<int64_t>(mm) * n + row0 + r], v);
+    }
   }
 }
 
@@ -381,9 +537,11 @@ Status launch_w4a16(scalar_t* out, const scalar_t* a, const uint32_t* qw, const 
                     const uint32_t* qz, const int32_t* gi, const scalar_t* bias, int m, int n, int k,
                     cudaStream_t stream) {
   constexpr bool kAwq = kPacking == WeightPacking::kAWQ;
-  const dim3 block(kAwq ? kAwqWords : kLanes, kAwq ? kAwqKS : kKS);
-  const int units = kAwq ? n / 8 : n;
-  const dim3 grid((units + block.x - 1) / block.x);
+  constexpr bool kMarlin = kPacking == WeightPacking::kMarlin;
+  // Marlin: one CTA of dev::kTcWarps warps per 64-column n-tile.
+  const dim3 block = kMarlin ? dim3(dev::kTcWarps * 32) : dim3(kAwq ? kAwqWords : kLanes, kAwq ? kAwqKS : kKS);
+  const int units = kMarlin ? n / dev::kTcTileN : (kAwq ? n / 8 : n);
+  const dim3 grid(kMarlin ? units : (units + block.x - 1) / block.x);
   w4a16_gemv_kernel<scalar_t, kPacking, G, kZ, MT><<<grid, block, 0, stream>>>(out, a, qw, sc, qz, gi, bias, m, n, k);
   return launch_error("w4a16_gemv_kernel");
 }
@@ -421,6 +579,20 @@ Status dispatch_w4a16_g(int group, bool zeros, int mt, scalar_t* out, const scal
   }
 }
 
+/// Marlin tiles: M <= 16 in one launch (token tiles of 8 live inside the CTA); group 32/64/128 only.
+template <typename scalar_t, int G>
+Status dispatch_marlin_z(bool zeros, scalar_t* out, const scalar_t* a, const uint32_t* qw,
+                         const scalar_t* sc, const uint32_t* qz, const scalar_t* bias, int m, int n,
+                         int k, cudaStream_t s) {
+  constexpr WeightPacking kP = WeightPacking::kMarlin;
+  if (zeros) {
+    return m <= 8 ? launch_w4a16<scalar_t, kP, G, true, 8>(out, a, qw, sc, qz, nullptr, bias, m, n, k, s)
+                  : launch_w4a16<scalar_t, kP, G, true, 16>(out, a, qw, sc, qz, nullptr, bias, m, n, k, s);
+  }
+  return m <= 8 ? launch_w4a16<scalar_t, kP, G, false, 8>(out, a, qw, sc, qz, nullptr, bias, m, n, k, s)
+                : launch_w4a16<scalar_t, kP, G, false, 16>(out, a, qw, sc, qz, nullptr, bias, m, n, k, s);
+}
+
 template <typename scalar_t>
 Status run_w4a16(const ScaledGemmArgs& args, const LaunchContext& ctx) {
   const int n = static_cast<int>(args.n);
@@ -433,6 +605,14 @@ Status run_w4a16(const ScaledGemmArgs& args, const LaunchContext& ctx) {
   const auto* qz = static_cast<const uint32_t*>(args.b.zero_points);
   const scalar_t* bias = (args.epi.ops & kEpiBias) != 0u ? static_cast<const scalar_t*>(args.epi.bias) : nullptr;
   auto* out = static_cast<scalar_t*>(args.d);
+  if (args.b.packing == WeightPacking::kMarlin) {
+    const int m = static_cast<int>(args.m);
+    switch (group) {
+      case 32: return dispatch_marlin_z<scalar_t, 32>(zeros, out, a, qw, sc, qz, bias, m, n, k, stream_of(ctx));
+      case 64: return dispatch_marlin_z<scalar_t, 64>(zeros, out, a, qw, sc, qz, bias, m, n, k, stream_of(ctx));
+      default: return dispatch_marlin_z<scalar_t, 128>(zeros, out, a, qw, sc, qz, bias, m, n, k, stream_of(ctx));
+    }
+  }
   Status st = Status::kSuccess;
   // Rows go out in tiles of 8/4/2/1; a tile never reads or writes past M.
   for (int64_t m0 = 0; m0 < args.m && st == Status::kSuccess;) {
@@ -450,7 +630,7 @@ Status run_w4a16(const ScaledGemmArgs& args, const LaunchContext& ctx) {
   return st;
 }
 
-Status check_w4a16(const ScaledGemmArgs& args) {
+Status check_w4a16(const ScaledGemmArgs& args, const LaunchContext& ctx) {
   const DType adt = args.a.dtype;
   if (adt != DType::kBFloat16 && adt != DType::kFloat16) {
     return detail::set_error(Status::kUnsupportedDtype, "w4a16_gemv: activations must be bf16 or fp16");
@@ -458,8 +638,15 @@ Status check_w4a16(const ScaledGemmArgs& args) {
   if (args.d_dtype != adt) {
     return detail::set_error(Status::kUnsupportedDtype, "w4a16_gemv: output dtype must equal the activation dtype");
   }
-  if (args.b.packing != WeightPacking::kAWQ && args.b.packing != WeightPacking::kGPTQ) {
-    return detail::set_error(Status::kUnsupportedLayout, "w4a16_gemv: weight packing must be kAWQ or kGPTQ");
+  if (args.b.packing != WeightPacking::kAWQ && args.b.packing != WeightPacking::kGPTQ &&
+      args.b.packing != WeightPacking::kMarlin) {
+    return detail::set_error(Status::kUnsupportedLayout, "w4a16_gemv: weight packing must be kAWQ, kGPTQ or kMarlin");
+  }
+  const bool marlin = args.b.packing == WeightPacking::kMarlin;
+  if (marlin && ctx.arch_id >= KOPS_TARGET_SM70 && ctx.arch_id < KOPS_TARGET_SM80) {
+    return detail::set_error(Status::kUnsupportedArch,
+                             "w4a16_gemv: the Marlin-tile body is mma.sync bf16/fp16 and needs SM80 or newer (arch %d)",
+                             ctx.arch_id);
   }
   if (args.batch != 1) return detail::set_error(Status::kNotImplemented, "w4a16_gemv: batch > 1");
   if (args.m < 1 || args.n < 1 || args.k < 1) return detail::set_error(Status::kInvalidArgument, "w4a16_gemv: empty problem");
@@ -474,6 +661,25 @@ Status check_w4a16(const ScaledGemmArgs& args) {
     return detail::set_error(Status::kUnsupportedShape, "w4a16_gemv: K must be a multiple of 32 and of the group size");
   }
   if (args.n % 8 != 0) return detail::set_error(Status::kUnsupportedShape, "w4a16_gemv: N must be a multiple of 8");
+  if (marlin) {
+    if (g == 0) {
+      return detail::set_error(Status::kUnsupportedShape,
+                               "w4a16_gemv: Marlin tiles need group_k 32, 64 or 128 (per-channel scales are stored in accumulator order)");
+    }
+    if (g >= args.k) {
+      // awq_to_marlin treats group_size >= K as channelwise and stores those scales in accumulator order.
+      return detail::set_error(Status::kUnsupportedShape,
+                               "w4a16_gemv: Marlin tiles need at least two groups (group_k < K); one group is a channelwise layout");
+    }
+    if (args.n % 64 != 0) return detail::set_error(Status::kUnsupportedShape, "w4a16_gemv: Marlin tiles need N to be a multiple of 64");
+    if (args.k % 16 != 0) return detail::set_error(Status::kUnsupportedShape, "w4a16_gemv: Marlin tiles need K to be a multiple of 16");
+    if (args.b.scale_layout != ScaleLayout::kMarlinPermuted) {
+      return detail::set_error(Status::kUnsupportedLayout, "w4a16_gemv: Marlin tiles need scale_layout kMarlinPermuted (awq_to_marlin output)");
+    }
+    if (args.b.g_idx != nullptr) {
+      return detail::set_error(Status::kUnsupportedLayout, "w4a16_gemv: Marlin tiles carry no act-order here (gptq_to_marlin perm is not applied)");
+    }
+  }
   if (args.a.ld != args.k || args.ldd != args.n) {
     return detail::set_error(Status::kUnsupportedLayout, "w4a16_gemv: activations and output must be contiguous");
   }
@@ -495,8 +701,8 @@ Status check_w4a16(const ScaledGemmArgs& args) {
   if ((args.epi.ops & kEpiBias) != 0u && (args.epi.bias == nullptr || args.epi.bias_dtype != adt)) {
     return detail::set_error(Status::kInvalidArgument, "w4a16_gemv: bias must be [N] with the activation dtype");
   }
-  if (!aligned(args.a.data, 16) || !aligned(args.b.scale, 16) || !aligned(args.b.data, 4)) {
-    return detail::set_error(Status::kMisaligned, "w4a16_gemv: operands must be 16 B (scales, activations) / 4 B (weights) aligned");
+  if (!aligned(args.a.data, 16) || !aligned(args.b.scale, 16) || !aligned(args.b.data, marlin ? 16 : 4)) {
+    return detail::set_error(Status::kMisaligned, "w4a16_gemv: operands must be 16 B (scales, activations) / 4 B (weights; 16 B for Marlin tiles) aligned");
   }
   return Status::kSuccess;
 }
@@ -513,7 +719,7 @@ Status mixed_input_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, Ge
     return detail::set_error(Status::kNotImplemented, "mixed_input_gemm: recipe %d has no native body yet",
                              static_cast<int>(args.recipe));
   }
-  st = check_w4a16(args);
+  st = check_w4a16(args, ctx);
   if (st != Status::kSuccess) return st;
   return args.a.dtype == DType::kBFloat16 ? run_w4a16<__nv_bfloat16>(args, ctx) : run_w4a16<__half>(args, ctx);
 }
@@ -524,7 +730,8 @@ template <typename scalar_t, int BS, bool kDQ, int MT>
 Status launch_lut(void* out, const void* a, const uint8_t* qw, const float* cb, const void* amax,
                   const float* ascale, const float* aoff, int m, int n, int k, cudaStream_t s) {
   constexpr int kWarps = 8;
-  const dim3 grid((n + kWarps - 1) / kWarps);
+  constexpr int kRowsPerBlock = kWarps * kLutRows<MT>;
+  const dim3 grid((n + kRowsPerBlock - 1) / kRowsPerBlock);
   lut_gemv_kernel<scalar_t, BS, kDQ, MT><<<grid, kWarps * 32, 0, s>>>(
       static_cast<scalar_t*>(out), static_cast<const scalar_t*>(a), qw, cb, amax, ascale, aoff, m, n, k);
   return launch_error("lut_gemv_kernel");

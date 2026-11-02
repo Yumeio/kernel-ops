@@ -1262,6 +1262,109 @@ void test_truncation_probs() {
   kops_test::device_free(d_logits);
 }
 
+// top_k_mask_logits on 16-bit logits: 2 (bf16) / 3 (fp16) radix passes, vector and scalar paths, and
+// heavy ties so the "first `need` equal keys by index" scan decides which rows survive.
+template <typename T>
+void test_top_k_mask_16bit(DType dtype, const char* name) {
+  struct Shape { int batch, vocab, levels; };
+  const Shape shapes[] = {{6, 4096, 0}, {6, 4099, 0}, {5, 8192, 9}, {5, 8195, 9}, {3, 12288, 3}};
+  const int ks[] = {1, 7, 50, 333};
+  std::mt19937 rng(2026u);
+  for (const Shape& sh : shapes) {
+    std::vector<T> logits(static_cast<size_t>(sh.batch) * sh.vocab);
+    for (auto& x : logits) {
+      const float f = sh.levels > 0 ? static_cast<float>(static_cast<int>(rng() % sh.levels) - sh.levels / 2) * 0.5f
+                                    : (static_cast<float>(rng() % 20001) - 10000.0f) / 700.0f;
+      kops_test::from_float(x, f);
+    }
+    T* d_in = kops_test::device_alloc<T>(logits.size());
+    T* d_out = kops_test::device_alloc<T>(logits.size());
+    kops_test::copy_in(d_in, logits);
+    const Tensor t_in = kops_test::tensor2d(d_in, dtype, sh.batch, sh.vocab);
+    const Tensor t_out = kops_test::tensor2d(d_out, dtype, sh.batch, sh.vocab);
+    kops::LaunchContext ctx{};
+    if (!kops_test::make_context(&ctx)) return;
+    for (int k : ks) {
+      KOPS_EXPECT_OK(kops::sample::top_k_mask_logits(t_out, t_in, Tensor{}, k, ctx), name);
+      const auto got = kops_test::copy_out(d_out, logits.size());
+      int bad = 0;
+      for (int r = 0; r < sh.batch; ++r) {
+        std::vector<int> order(static_cast<size_t>(sh.vocab));
+        for (int i = 0; i < sh.vocab; ++i) order[static_cast<size_t>(i)] = i;
+        const size_t base = static_cast<size_t>(r) * sh.vocab;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+          return kops_test::to_float(logits[base + a]) > kops_test::to_float(logits[base + b]);
+        });
+        std::vector<char> keep(static_cast<size_t>(sh.vocab), 0);
+        for (int i = 0; i < k; ++i) keep[static_cast<size_t>(order[static_cast<size_t>(i)])] = 1;
+        for (int i = 0; i < sh.vocab; ++i) {
+          const float g = kops_test::to_float(got[base + i]);
+          if (keep[static_cast<size_t>(i)]) bad += !(g == kops_test::to_float(logits[base + i]));
+          else bad += !(std::isinf(g) && g < 0.0f);
+        }
+      }
+      KOPS_TEST_CHECK(bad == 0);
+    }
+    kops_test::device_free(d_in);
+    kops_test::device_free(d_out);
+  }
+}
+
+// top_k_renorm_probs with tied probabilities: the float4 and scalar row paths must keep the same
+// k entries (largest value, lowest index among ties) and renormalise them.
+void test_top_k_renorm_ties() {
+  struct Shape { int batch, vocab, levels; };
+  const Shape shapes[] = {{4, 4096, 5}, {4, 4099, 5}, {3, 8192, 40}, {3, 8195, 0}, {2, 16384, 3}};  // last: bins > 2048 -> radix fallback
+  const int ks[] = {1, 9, 64, 500};
+  std::mt19937 rng(515u);
+  for (const Shape& sh : shapes) {
+    std::vector<float> probs(static_cast<size_t>(sh.batch) * sh.vocab);
+    for (int r = 0; r < sh.batch; ++r) {
+      double sum = 0.0;
+      const size_t base = static_cast<size_t>(r) * sh.vocab;
+      for (int i = 0; i < sh.vocab; ++i) {
+        const double v = sh.levels > 0 ? static_cast<double>(1 + rng() % sh.levels)
+                                       : static_cast<double>(1 + rng() % 100000);
+        probs[base + i] = static_cast<float>(v);
+        sum += v;
+      }
+      for (int i = 0; i < sh.vocab; ++i) probs[base + i] = static_cast<float>(probs[base + i] / sum);
+    }
+    float* d_in = kops_test::device_alloc<float>(probs.size());
+    float* d_out = kops_test::device_alloc<float>(probs.size());
+    kops_test::copy_in(d_in, probs);
+    const Tensor t_in = kops_test::tensor2d(d_in, DType::kFloat32, sh.batch, sh.vocab);
+    const Tensor t_out = kops_test::tensor2d(d_out, DType::kFloat32, sh.batch, sh.vocab);
+    kops::LaunchContext ctx{};
+    if (!kops_test::make_context(&ctx)) return;
+    for (int k : ks) {
+      KOPS_EXPECT_OK(kops::sample::top_k_renorm_probs(t_out, t_in, Tensor{}, k, ctx), "top_k_renorm ties");
+      const auto got = kops_test::copy_out(d_out, probs.size());
+      int bad = 0;
+      for (int r = 0; r < sh.batch; ++r) {
+        const size_t base = static_cast<size_t>(r) * sh.vocab;
+        std::vector<int> order(static_cast<size_t>(sh.vocab));
+        for (int i = 0; i < sh.vocab; ++i) order[static_cast<size_t>(i)] = i;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return probs[base + a] > probs[base + b]; });
+        std::vector<char> keep(static_cast<size_t>(sh.vocab), 0);
+        double kept = 0.0;
+        for (int i = 0; i < k; ++i) {
+          keep[static_cast<size_t>(order[static_cast<size_t>(i)])] = 1;
+          kept += probs[base + order[static_cast<size_t>(i)]];
+        }
+        for (int i = 0; i < sh.vocab; ++i) {
+          const double g = got[base + i];
+          const double w = keep[static_cast<size_t>(i)] ? probs[base + i] / kept : 0.0;
+          bad += std::fabs(g - w) > 1e-6 * std::fabs(w) + 1e-12 || ((g > 0.0) != (w > 0.0));
+        }
+      }
+      KOPS_TEST_CHECK(bad == 0);
+    }
+    kops_test::device_free(d_in);
+    kops_test::device_free(d_out);
+  }
+}
+
 double chi_square(const std::vector<double>& obs, const std::vector<double>& exp, int* df) {
   double chi = 0.0;
   int n = 0;
@@ -1417,6 +1520,9 @@ int main() {
   test_logit_bias<__nv_bfloat16>(DType::kBFloat16, "apply_logit_bias bf16", 2e-2, 2e-2);
   test_contracts();
   test_truncation_probs();
+  test_top_k_mask_16bit<__nv_bfloat16>(DType::kBFloat16, "top_k_mask bf16");
+  test_top_k_mask_16bit<__half>(DType::kFloat16, "top_k_mask fp16");
+  test_top_k_renorm_ties();
   test_sampling_distribution();
   return kops_test::finish("test_sampling");
 }

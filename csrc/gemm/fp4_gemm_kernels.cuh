@@ -66,9 +66,17 @@ template <typename Traits, ScaleGranularity kWeightBlock>
 __global__ void fp4_to_fp8_gemm_wgmma_kernel(const __grid_constant__ GemmTmaParams params);
 
 /**
- * fp4_gemv_kernel — M <= 8 decode GEMV for any FP4 weight (MXFP4 / NVFP4) on any arch: e2m1 decoded
- * in registers (cvt e2m1x2 on Sm100a/120a, 16-entry LUT elsewhere), block scales applied per 16/32,
- * activations bf16 (W4A16) or e4m3 / MXFP8 (W4A8). Weight-bandwidth bound; split-K for small N.
+ * fp4_gemv_kernel — M <= 8 decode GEMV for any FP4 weight (MXFP4 / NVFP4) on any arch: e2m1 is
+ * decoded arithmetically in registers, with no table (three magnitude bits placed under the fp32
+ * exponent, times 2^-126; exact for all 16 codes); block scales applied per 16/32; activations bf16
+ * (W4A16) or e4m3 / MXFP8 (W4A8). Weight-bandwidth bound; split-K for small N.
+ * A table lookup and an arch-specific e2m1 cvt were both considered: the NF4 measurement in
+ * mixed_input_gemm.cu (LUT refill slower than the ALU it removes) and the fact that SM100a/SM120a
+ * consume e2m1 natively (B13: fp4_gemm_sm120_kernel / fp4_gemm_tcgen05_kernel) keep this body
+ * arch-generic.
+ * ROWS_PER_WARP == 0 selects the tensor-core body instead: fp4_to_marlin tiles
+ * (WeightPacking::kMarlin) on mma.sync m16n8k16, SM80+, M <= 16 (M_TILE 8 or 16), N % 64 == 0,
+ * WARPS == 8; one CTA per 64-column n-tile.
  */
 template <typename a_t, GemmRecipe kRecipe, int M_TILE, int ROWS_PER_WARP, int WARPS>
 __global__ void fp4_gemv_kernel(const __grid_constant__ ScaledGemmArgs args);

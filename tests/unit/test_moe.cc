@@ -713,6 +713,157 @@ void test_align_and_offsets() {
   kops_test::device_free(scratch);
 }
 
+// Large randomized sorts: many slots per warp segment, several segments, experts not on this rank.
+// Reference is the plain stable counting sort the kernels must reproduce bit for bit.
+void check_large_sort(int experts, int block, bool with_map, uint32_t seed) {
+  const int tokens = 5000, topk = 8, hidden = 8;
+  const int64_t numel = static_cast<int64_t>(tokens) * topk;
+  std::mt19937 rng(seed);
+  std::vector<int32_t> slots(static_cast<size_t>(numel));
+  for (auto& v : slots) v = static_cast<int32_t>(rng() % static_cast<uint32_t>(experts));
+  std::vector<int32_t> map(static_cast<size_t>(experts));
+  int local = 0;
+  for (int e = 0; e < experts; ++e) map[static_cast<size_t>(e)] = (with_map && e % 4 == 3) ? -1 : local++;
+  const int sentinel = static_cast<int>(numel);
+  const size_t capacity = static_cast<size_t>(numel + static_cast<int64_t>(experts) * block);
+  int32_t* d_ids = kops_test::device_alloc<int32_t>(numel);
+  int32_t* d_map = kops_test::device_alloc<int32_t>(experts);
+  int32_t* d_sorted = kops_test::device_alloc<int32_t>(capacity);
+  int32_t* d_expert_ids = kops_test::device_alloc<int32_t>(capacity);
+  int32_t* d_post = kops_test::device_alloc<int32_t>(1);
+  int32_t* d_counts = kops_test::device_alloc<int32_t>(local);
+  int64_t* d_offsets = kops_test::device_alloc<int64_t>(local + 1);
+  int32_t* scratch = kops_test::device_alloc<int32_t>(experts + 1);
+  kops_test::copy_in(d_ids, slots);
+  kops_test::copy_in(d_map, map);
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  kops::Workspace ws{};
+  ws.device_scratch = scratch;
+  ws.device_scratch_bytes = static_cast<size_t>(experts + 1) * sizeof(int32_t);
+  const Tensor t_ids = tensor1d(d_ids, DType::kInt32, numel);
+  const Tensor t_map = tensor1d(d_map, DType::kInt32, experts);
+  KOPS_EXPECT_OK(kops::moe::align_block_size(t_ids, tensor1d(d_sorted, DType::kInt32, capacity),
+                                             tensor1d(d_expert_ids, DType::kInt32, capacity),
+                                             tensor1d(d_post, DType::kInt32, 1), t_map, experts, block,
+                                             ws, ctx),
+                 "large align_block_size");
+  std::vector<std::vector<int32_t>> per(static_cast<size_t>(experts));
+  for (int64_t i = 0; i < numel; ++i) {
+    const int e = slots[static_cast<size_t>(i)];
+    if (map[static_cast<size_t>(e)] >= 0) per[static_cast<size_t>(e)].push_back(static_cast<int32_t>(i));
+  }
+  std::vector<int32_t> want_sorted, want_blocks;
+  for (int e = 0; e < experts; ++e) {
+    if (map[static_cast<size_t>(e)] < 0) continue;
+    const int n = static_cast<int>(per[static_cast<size_t>(e)].size());
+    const int blocks = (n + block - 1) / block;
+    for (int b = 0; b < blocks; ++b) want_blocks.push_back(map[static_cast<size_t>(e)]);
+    for (int i = 0; i < blocks * block; ++i) {
+      want_sorted.push_back(i < n ? per[static_cast<size_t>(e)][static_cast<size_t>(i)] : sentinel);
+    }
+  }
+  const auto got_sorted = kops_test::copy_out(d_sorted, capacity);
+  const auto got_blocks = kops_test::copy_out(d_expert_ids, capacity);
+  const auto got_post = kops_test::copy_out(d_post, static_cast<size_t>(1));
+  KOPS_TEST_CHECK(got_post[0] == static_cast<int32_t>(want_sorted.size()));
+  int bad = 0;
+  for (size_t i = 0; i < want_sorted.size(); ++i) bad += got_sorted[i] != want_sorted[i];
+  for (size_t i = 0; i < want_blocks.size(); ++i) bad += got_blocks[i] != want_blocks[i];
+  KOPS_TEST_CHECK(bad == 0);
+
+  // Permute map on the same slots: row = expert_offsets[l] + rank of the slot inside l.
+  KOPS_EXPECT_OK(kops::moe::count_and_offsets(t_ids, tensor1d(d_counts, DType::kInt32, local),
+                                              tensor1d(d_offsets, DType::kInt64, local + 1), t_map,
+                                              local, 1, ctx),
+                 "large count_and_offsets");
+  const auto offsets = kops_test::copy_out(d_offsets, static_cast<size_t>(local + 1));
+  const int rows = static_cast<int>(offsets[static_cast<size_t>(local)]);
+  float* d_hidden = kops_test::device_alloc<float>(static_cast<size_t>(tokens) * hidden);
+  float* d_perm = kops_test::device_alloc<float>(static_cast<size_t>(rows) * hidden);
+  int32_t* d_slot_row = kops_test::device_alloc<int32_t>(numel);
+  int32_t* d_row_slot = kops_test::device_alloc<int32_t>(rows);
+  kops::moe::PermuteParams pp{};
+  pp.hidden = d_hidden;
+  pp.hidden_stride = hidden;
+  pp.topk_ids = d_ids;
+  pp.expert_offsets = d_offsets;
+  pp.expert_map = d_map;
+  pp.num_local_experts = local;
+  pp.permuted = d_perm;
+  pp.permuted_stride = hidden;
+  pp.permuted_row_to_slot = d_row_slot;
+  pp.slot_to_permuted_row = d_slot_row;
+  pp.num_tokens = tokens;
+  pp.topk = topk;
+  pp.hidden_size = hidden;
+  KOPS_EXPECT_OK(kops::moe::permute(pp, DType::kFloat32, ctx), "large permute");
+  const auto slot_row = kops_test::copy_out(d_slot_row, static_cast<size_t>(numel));
+  const auto row_slot = kops_test::copy_out(d_row_slot, static_cast<size_t>(rows));
+  std::vector<int64_t> next(offsets.begin(), offsets.end() - 1);
+  int bad_map = 0;
+  for (int64_t i = 0; i < numel; ++i) {
+    const int l = map[static_cast<size_t>(slots[static_cast<size_t>(i)])];
+    if (l < 0) {
+      bad_map += slot_row[static_cast<size_t>(i)] != -1;
+      continue;
+    }
+    const int64_t row = next[static_cast<size_t>(l)]++;
+    bad_map += slot_row[static_cast<size_t>(i)] != row;
+    bad_map += row_slot[static_cast<size_t>(row)] != static_cast<int32_t>(i);
+  }
+  KOPS_TEST_CHECK(bad_map == 0);
+  kops_test::device_free(d_ids);
+  kops_test::device_free(d_map);
+  kops_test::device_free(d_sorted);
+  kops_test::device_free(d_expert_ids);
+  kops_test::device_free(d_post);
+  kops_test::device_free(d_counts);
+  kops_test::device_free(d_offsets);
+  kops_test::device_free(scratch);
+  kops_test::device_free(d_hidden);
+  kops_test::device_free(d_perm);
+  kops_test::device_free(d_slot_row);
+  kops_test::device_free(d_row_slot);
+}
+
+void test_large_sorts() {
+  check_large_sort(256, 64, false, 11u);
+  check_large_sort(256, 128, true, 12u);
+  check_large_sort(1000, 16, true, 13u);  // 1000 bins leave only 11 warps of shared memory
+  check_large_sort(7, 4, false, 14u);
+}
+
+void test_moe_sum_bf16() {
+  const int tokens = 5, topk = 8, hidden = 1032;  // 129 vectors: the last block is partly idle
+  std::vector<__nv_bfloat16> in(static_cast<size_t>(tokens) * topk * hidden);
+  std::mt19937 rng(77u);
+  for (auto& v : in) kops_test::from_float(v, static_cast<float>(static_cast<int>(rng() % 2001) - 1000) / 256.0f);
+  __nv_bfloat16* d_in = kops_test::device_alloc<__nv_bfloat16>(in.size());
+  __nv_bfloat16* d_out = kops_test::device_alloc<__nv_bfloat16>(static_cast<size_t>(tokens) * hidden);
+  kops_test::copy_in(d_in, in);
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  KOPS_EXPECT_OK(kops::moe::moe_sum(kops_test::tensor2d(d_out, DType::kBFloat16, tokens, hidden),
+                                    kops_test::tensor3d(d_in, DType::kBFloat16, tokens, topk, hidden),
+                                    topk, ctx),
+                 "moe_sum bf16");
+  const auto out = kops_test::copy_out(d_out, static_cast<size_t>(tokens) * hidden);
+  int bad = 0;
+  for (int t = 0; t < tokens; ++t) {
+    for (int c = 0; c < hidden; ++c) {
+      float acc = 0.0f;  // same order and precision as the kernel: fp32 in ascending k
+      for (int k = 0; k < topk; ++k) acc += kops_test::to_float(in[static_cast<size_t>((t * topk + k) * hidden + c)]);
+      __nv_bfloat16 want;
+      kops_test::from_float(want, acc);
+      bad += out[static_cast<size_t>(t * hidden + c)] != want;
+    }
+  }
+  KOPS_TEST_CHECK(bad == 0);
+  kops_test::device_free(d_in);
+  kops_test::device_free(d_out);
+}
+
 void test_permute_unpermute() {
   const int tokens = 7;
   const int topk = 2;
@@ -760,6 +911,7 @@ void test_permute_unpermute() {
   pp.expert_offsets = d_offsets;
   pp.expert_map = d_map;
   pp.write_cursor = d_cursor;
+  pp.num_local_experts = experts;
   pp.permuted = d_perm;
   pp.permuted_stride = hidden;
   pp.permuted_row_to_slot = d_row_slot;
@@ -859,6 +1011,7 @@ void test_permute_quant() {
   pp.topk_ids = d_ids;
   pp.expert_offsets = d_offsets;
   pp.write_cursor = d_cursor;
+  pp.num_local_experts = experts;
   pp.permuted = d_q;
   pp.permuted_stride = hidden;
   pp.permuted_row_to_slot = d_row_slot;
@@ -1026,6 +1179,8 @@ int main() {
   test_route_fused();
   test_hash_route();
   test_align_and_offsets();
+  test_large_sorts();
+  test_moe_sum_bf16();
   test_permute_unpermute();
   test_permute_quant();
   test_moe_sum_and_latent();

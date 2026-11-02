@@ -515,6 +515,12 @@ CUDA 12.9 ở máy dev compile được 8 exact SM; log `ptxas -v` và SASS prob
 
 `ptxas` kiểm tính hợp lệ tĩnh của lệnh (hình dạng `tcgen05` và `wgmma`, kiểu dữ liệu, thanh ghi, smem), nên bắt được một lớp lỗi lớn trước khi chạy trên phần cứng thật. Nó không bắt được lỗi đồng bộ, layout hay số học: phần đó do twin (K3) và oracle (K1, K4) gánh.
 
+**Guard `mma.sync` dưới SM80.** `cmake/arch.cmake` vẫn nhận `70 75`, còn `mma.sync` bf16 và `fma.rn.bf16x2` cần `sm_80`. Mọi thân `mma.sync` theo cùng một khuôn:
+- *Device:* thân nằm trong `#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)`; nhánh còn lại chỉ `__trap()` ở `threadIdx.x == 0` và không bao giờ chạy, vì host đã chặn.
+- *Host:* `ctx.arch_id >= KOPS_TARGET_SM70 && ctx.arch_id < KOPS_TARGET_SM80` trả `kUnsupportedArch`. Mọi id GFX là `>= 9000` nên khoảng này không dương tính giả với AMD; `kAuto` (`arch_id == 0`) không bị chặn.
+- *Vị trí:* guard nằm trong `.cu`, không trong `.cuh`; header giữ vai trò hợp đồng thuần.
+- *Ví dụ đầu tiên:* nhánh `WeightPacking::kMarlin` của `w4a16_gemv_kernel` (`csrc/gemm/mixed_input_gemm.cu`) và nhánh `ROWS_PER_WARP == 0` của `fp4_gemv_kernel` (`csrc/gemm/fp4_gemm.cu`); cả hai gọi thân dùng chung `dev::tc_gemv_body` trong `csrc/common/device_impl.cuh`. `gemm_mma.cu` của B7 theo khuôn này.
+
 ---
 
 ## 3. Chiến lược 2026-10-31: C++-only trên một RTX 3050
@@ -991,31 +997,76 @@ Lưu ý khi đọc số: (1) cây làm việc chưa commit (`git.dirty = 1`), n�
 
 **Bằng chứng B5 dev (2026-11-01).** 16/16 kernel có thân. `test_gemm` (mở rộng từ B4) phủ: GEMV dense bf16/fp16/fp32 (M = 1…16, split-K tự chọn theo (N, K), epilogue Bias + SiLU + Residual), SIMT fp32/bf16/fp16/fp64 (B K-major và MN-major, batch), `gemv_argmax` (hòa lấy id nhỏ nhất, softcap, vocab padding, counter dùng lại không cần reset), router fp32/bf16 + bias và chế độ hai số hạng, W4A16 AWQ/GPTQ (g32/64/128/per-channel, có/không zero, act-order), NF4 LUT (absmax fp32 và double-quant), FP8 (giải mã đủ 256 mã kể cả NaN; tensorwise, rowwise, blockwise 1x128 × 128x128 với act bf16/fp16/e4m3, scale A row-major và TMA), INT8 (W8A8 tích lũy s32 so với oracle số nguyên, kể cả azp; W8A16), FP4 MXFP4/NVFP4 (scale row-major và swizzle 128x4, scale toàn cục), GGUF 10 kiểu (oracle trọng số là `quant::gguf_dequantize` của B4, đã khớp bit với llama.cpp; khối q8_1 khớp byte với bộ lượng tử viết lại trên host theo `quantize_q8_1` của ggml-cuda), GGUF MoE, grouped GEMV (3 layout × 4 recipe, expert rỗng và hàng padding không bị ghi) và MoE GEMV (block 1/2/4/8 × 5 chế độ trọng số, expert bị bỏ qua), cộng bảng lỗi hợp đồng cho W4A16, FP8, INT8 và GGUF. Oracle là vòng lặp fp64 trên host trên dữ liệu đã làm tròn về dtype activation. Bất biến batch (lặp 100 lần bit-exact và hàng đứng một mình == hàng trong batch) được kiểm cho GEMV dense, FP8 và W4A16; các kernel còn lại có cùng cấu trúc cộng (chuỗi FMA theo lane + xor-butterfly, không atomic) nhưng chưa có test riêng. Đột biến một dòng (thứ tự nibble AWQ, hằng e2m1, tie-break của argmax) đều làm test đỏ. `ctest` xanh 12/12; header check 74/74. Compile sạch cho `sm_80;sm_89;sm_90a` (nhánh `cvt` e4m3 của sm89 chỉ được compile ở đây, chưa chạy).
 
-**So với PyTorch 2.13.0+cu129 (WSL2) trên RTX 3050 Laptop (SM86).** Ba vòng xen kẽ C++ (Windows, Release) và PyTorch trong cùng phiên, lấy trung vị: 43 case B5 đạt **geometric mean 17.74x** (từng vòng 18.03x, 17.71x, 17.50x), **40/43 case ≥3x**. Baseline của mọi case lượng tử hóa là chuỗi eager mà một engine không có kernel fused phải chạy: dequant ra bf16 rồi `F.linear` hoặc `bmm` (PyTorch không có GEMV weight-only fused cho các format này trên SM86: `torch._scaled_mm` cần SM89, `torch._int_mm` cần M > 16); chưa đo `torch._weight_int4pack_mm` (tinygemm) nên tỉ lệ W4A16 là so với chuỗi eager, không phải so với tinygemm. M = 1, shape Llama-3-8B:
+**So với PyTorch 2.13.0+cu129 (WSL2) trên RTX 3050 Laptop (SM86), đo lại 2026-11-02 sau P1.5/P1.6/P1.6b (cắm sạc).** Ba vòng xen kẽ C++ (Windows, Release) và PyTorch trong cùng phiên, lấy trung vị (`out/kops-gemm-p1-r{1,2,3}.json`, `out/torch-gemm-p1-r{1,2,3}.json`): 60 case B5 đạt **geometric mean 27.28x** (từng vòng 27.39x, 27.43x, 26.79x), **57/60 case ≥3x**, **46/60 case ≥156 GB/s** (85% của trần 183). Số cũ (2026-11-01, 43 case, 17.74x) không còn dùng; cột cuối là GB/s của lần đo đó trên cùng case. Baseline của mọi case lượng tử hóa là chuỗi eager mà một engine không có kernel fused phải chạy: dequant ra bf16 rồi `F.linear` hoặc `bmm` (PyTorch không có GEMV weight-only fused cho các format này trên SM86: `torch._scaled_mm` cần SM89, `torch._int_mm` cần M > 16); chưa đo `torch._weight_int4pack_mm` (tinygemm) nên tỉ lệ W4A16 là so với chuỗi eager. Các case Marlin-tile (`w4a16_awq_marlin`, `fp4_marlin`) dùng cùng baseline eager với bản không Marlin. GB/s = byte weight + scale / thời gian kops. M = 1 nếu tên case không ghi khác; shape Llama-3-8B.
 
-| Case (N × K) | kops (ms) | PyTorch (ms) | Tỉ lệ | GB/s kops |
-|---|---|---|---|---|
-| W4A16 AWQ g128 4096x4096 | 0.054 | 5.19 | 95.4x | 161 |
-| W4A16 GPTQ g128 4096x4096 | 0.054 | 4.26 | 78.8x | 162 |
-| NF4 LUT block 64 4096x4096 | 0.108 | 4.19 | 38.9x | 88 |
-| FP8 rowwise 4096x4096 | 0.102 | 0.880 | 8.62x | 165 |
-| FP8 blockwise 128 4096x4096 | 0.102 | 1.545 | 15.2x | 165 |
-| INT8 W8A8 4096x4096 | 0.095 | 0.761 | 8.01x | 177 |
-| INT8 W8A16 4096x4096 | 0.096 | 0.764 | 7.95x | 175 |
-| MXFP4 W4A16 4096x4096 | 0.069 | 3.61 | 52.4x | 130 |
-| NVFP4 W4A16 4096x4096 | 0.076 | 3.60 | 47.2x | 124 |
-| GGUF Q4_0 / Q8_0 / Q4_K 4096x4096 | 0.059 / 0.105 / 0.074 | 3.66 / 2.72 / 4.07 | 62.0x / 25.8x / 55.4x | 160 / 169 / 129 |
-| Router fp32 logits, M = 8, 256 × 7168 | 0.0365 | 0.161 | 4.40x | 104 |
-| Grouped GEMV FP8, 32 expert × 2 hàng, 2048x2048 | 1.39 | 7.33 | 5.27x | 97 |
-| MoE GEMV FP8, 32 slot, 2048x2048 | 0.92 | 8.60 | 9.33x | 146 |
-| Dense bf16 GEMV 4096x4096 / 14336x4096 | 0.185 / 0.631 | 0.186 / 0.683 | 1.01x / 1.08x | 182 / 186 |
-| `gemv_argmax` 32000 × 4096 | 1.41 | 1.58 | 1.12x | 186 |
+| Case | kops (ms) | PyTorch (ms) | Tỉ lệ | GB/s | % trần 183 | GB/s trước P1 |
+|---|---|---|---|---|---|---|
+| `w4a16_awq.g128.m1.4096x4096` | 0.0505 | 4.954 | 97.37x | 173 | 94% | 163 |
+| `w4a16_awq_marlin.g128.m1.4096x4096` | 0.0491 | 4.920 | 100.59x | 178 | 97% | — |
+| `w4a16_gptq.g128.m1.4096x4096` | 0.0534 | 3.991 | 74.73x | 164 | 89% | 164 |
+| `nf4_lut.b64.m1.4096x4096` | 0.0554 | 4.115 | 74.29x | 171 | 93% | 102 |
+| `w4a16_awq.g128.m4.4096x4096` | 0.0938 | 4.960 | 53.38x | 94 | 51% | 83 |
+| `w4a16_awq_marlin.g128.m4.4096x4096` | 0.0496 | 4.977 | 100.80x | 177 | 97% | — |
+| `fp8_gemv.rowwise.m1.4096x4096` | 0.0966 | 0.799 | 8.27x | 174 | 95% | 167 |
+| `int8_gemv.w8a8.m1.4096x4096` | 0.0941 | 0.716 | 7.61x | 179 | 98% | 178 |
+| `fp8_gemv.blockwise.m1.4096x4096` | 0.0966 | 1.340 | 13.69x | 174 | 95% | 167 |
+| `int8_gemv.w8a16.m1.4096x4096` | 0.0944 | 0.708 | 7.49x | 178 | 97% | 175 |
+| `fp8_gemv.rowwise.m4.4096x4096` | 0.1117 | 0.827 | 7.14x | 151 | 82% | 125 |
+| `int8_gemv.w8a8.m4.4096x4096` | 0.0985 | 0.708 | 7.18x | 171 | 93% | 167 |
+| `dense_gemv.bf16.m1.4096x4096` | 0.1825 | 0.187 | 1.03x | 184 | 101% | 182 |
+| `fp4_gemv.mx.m1.4096x4096` | 0.0554 | 3.503 | 63.50x | 161 | 88% | 136 |
+| `fp4_marlin.mx.m1.4096x4096` | 0.0502 | 3.514 | 69.63x | 178 | 97% | — |
+| `fp4_marlin.mx.m4.4096x4096` | 0.0512 | 3.517 | 68.67x | 175 | 96% | — |
+| `fp4_marlin.mx.m16.4096x4096` | 0.0615 | 3.515 | 57.65x | 149 | 82% | — |
+| `fp4_gemv.nv.m1.4096x4096` | 0.0646 | 3.495 | 54.08x | 146 | 80% | 132 |
+| `fp4_marlin.nv.m1.4096x4096` | 0.0543 | 3.494 | 63.91x | 174 | 95% | — |
+| `fp4_marlin.nv.m4.4096x4096` | 0.0557 | 3.501 | 62.68x | 171 | 93% | — |
+| `fp4_marlin.nv.m16.4096x4096` | 0.0688 | 3.516 | 51.14x | 141 | 77% | — |
+| `gguf_mmvq.q4_0.m1.4096x4096` | 0.0582 | 3.569 | 61.14x | 163 | 89% | 158 |
+| `gguf_mmvq.q8_0.m1.4096x4096` | 0.1036 | 2.574 | 24.66x | 172 | 94% | 170 |
+| `gguf_mmvq.q4_k.m1.4096x4096` | 0.0592 | 3.953 | 65.81x | 160 | 87% | 131 |
+| `w4a16_awq.g128.m1.14336x4096` | 0.1838 | 16.850 | 91.62x | 166 | 91% | 127 |
+| `w4a16_awq_marlin.g128.m1.14336x4096` | 0.1688 | 16.824 | 100.00x | 181 | 99% | — |
+| `w4a16_gptq.g128.m1.14336x4096` | 0.1695 | 13.784 | 80.24x | 180 | 98% | 120 |
+| `nf4_lut.b64.m1.14336x4096` | 0.1894 | 14.371 | 76.13x | 175 | 95% | 87 |
+| `fp8_gemv.rowwise.m1.14336x4096` | 0.3223 | 2.816 | 8.74x | 183 | 100% | 172 |
+| `int8_gemv.w8a8.m1.14336x4096` | 0.3169 | 2.386 | 7.53x | 186 | 101% | 185 |
+| `fp8_gemv.blockwise.m1.14336x4096` | 0.3262 | 4.715 | 14.42x | 180 | 98% | 166 |
+| `int8_gemv.w8a16.m1.14336x4096` | 0.3189 | 2.378 | 7.46x | 184 | 101% | 184 |
+| `dense_gemv.bf16.m1.14336x4096` | 0.6295 | 0.635 | 1.01x | 187 | 102% | 186 |
+| `fp4_gemv.mx.m1.14336x4096` | 0.2054 | 12.285 | 59.87x | 152 | 83% | 127 |
+| `fp4_marlin.mx.m1.14336x4096` | 0.1762 | 12.286 | 69.61x | 177 | 97% | — |
+| `fp4_gemv.nv.m1.14336x4096` | 0.2411 | 12.218 | 50.89x | 137 | 75% | 120 |
+| `fp4_marlin.nv.m1.14336x4096` | 0.1910 | 12.234 | 64.15x | 173 | 95% | — |
+| `gguf_mmvq.q4_0.m1.14336x4096` | 0.1845 | 12.370 | 67.04x | 179 | 98% | 178 |
+| `gguf_mmvq.q8_0.m1.14336x4096` | 0.3446 | 8.918 | 25.94x | 181 | 99% | 180 |
+| `gguf_mmvq.q4_k.m1.14336x4096` | 0.2048 | 13.304 | 64.99x | 161 | 88% | 127 |
+| `w4a16_awq.g128.m1.4096x14336` | 0.1886 | 16.876 | 89.83x | 162 | 88% | 128 |
+| `w4a16_awq_marlin.g128.m1.4096x14336` | 0.1682 | 16.854 | 100.21x | 182 | 99% | — |
+| `w4a16_gptq.g128.m1.4096x14336` | 0.2007 | 13.893 | 69.24x | 152 | 83% | 119 |
+| `nf4_lut.b64.m1.4096x14336` | 0.1905 | 14.398 | 75.58x | 174 | 95% | 92 |
+| `w4a16_awq.g128.m4.4096x14336` | 0.3260 | 16.938 | 51.95x | 94 | 51% | 80 |
+| `w4a16_awq_marlin.g128.m4.4096x14336` | 0.1694 | 16.883 | 99.93x | 181 | 99% | — |
+| `fp8_gemv.rowwise.m1.4096x14336` | 0.3232 | 2.829 | 8.73x | 182 | 99% | 176 |
+| `int8_gemv.w8a8.m1.4096x14336` | 0.3174 | 2.390 | 7.54x | 185 | 101% | 185 |
+| `fp8_gemv.blockwise.m1.4096x14336` | 0.3259 | 4.727 | 14.50x | 180 | 99% | 175 |
+| `int8_gemv.w8a16.m1.4096x14336` | 0.3182 | 2.369 | 7.44x | 185 | 101% | 184 |
+| `fp8_gemv.rowwise.m4.4096x14336` | 0.3663 | 2.827 | 7.67x | 161 | 88% | 127 |
+| `int8_gemv.w8a8.m4.4096x14336` | 0.3231 | 2.390 | 7.40x | 182 | 99% | 181 |
+| `nf4_lut.b64.m2.4096x4096` | 0.0574 | 4.126 | 71.75x | 165 | 90% | — |
+| `nf4_lut.b64.m4.4096x4096` | 0.0913 | 4.135 | 45.18x | 104 | 57% | — |
+| `nf4_lut.b64.m8.4096x4096` | 0.2233 | 4.130 | 18.47x | 43 | 23% | — |
+| `w4a16_awq_marlin.g128.m16.4096x4096` | 0.0637 | 4.970 | 77.99x | 141 | 77% | — |
+| `router.fp32out.m8.256x7168` | 0.0324 | 0.159 | 4.87x | 117 | 64% | 108 |
+| `argmax.bf16.m1.32000x4096` | 1.4044 | 1.453 | 1.03x | 187 | 102% | 187 |
+| `grouped_gemv.fp8.e32x2rows.2048x2048` | 1.2486 | 6.485 | 5.22x | 108 | 59% | 99 |
+| `moe_gemv.fp8.s32.2048x2048` | 0.7906 | 7.891 | 9.99x | 170 | 93% | 152 |
 
-Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn chỗ để hơn: cuBLAS GEMV của PyTorch đã đọc weight đúng một lần ở 166–180 GB/s, sát trần đo được 183 GB/s của máy (xem B4), nên kernel tự viết chỉ có thể ngang. Mục tiêu "≥3x so với PyTorch" chỉ có nghĩa với các format mà PyTorch phải dựng lại weight bf16 ở mỗi lần gọi; với bf16/fp16 dense, mục tiêu đúng là roofline.
+Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn chỗ để hơn: cuBLAS GEMV của PyTorch đã đọc weight đúng một lần, sát trần đo được 183 GB/s của máy (xem B4), nên kernel tự viết chỉ có thể ngang. Mục tiêu "≥3x so với PyTorch" chỉ có nghĩa với các format mà PyTorch phải dựng lại weight bf16 ở mỗi lần gọi; với bf16/fp16 dense, mục tiêu đúng là roofline.
 
 **Gate còn mở (trung thực).**
-- ≥85% băng thông đọc weight (≥156 GB/s trên trần 183): đạt ở GEMV dense, `gemv_argmax`, INT8, FP8 (M = 1), GGUF Q4_0/Q8_0 và W4A16 AWQ/GPTQ shape 4096x4096. Chưa đạt: W4A16 AWQ/GPTQ shape lớn (119–127 GB/s) và AWQ M = 4 (72–79), NF4 (87–94), FP4 (118–130), GGUF Q4_K (123–129), FP8 M = 4 (123–126), router (104), grouped GEMV (97), MoE GEMV (146). Chưa profile bằng Nsight; số đo dao động vài phần trăm giữa các lần chạy (GPTQ 14336x4096 từ 124 đến 141 GB/s).
-- Phạm vi chưa phủ: GGUF IQ* (bảng lưới nằm trong `weight_repack.cu`, ngân sách file đã đóng) trả `kNotImplemented`; FP4 chỉ có W4A16 (W4A4/W4A8 cần activation FP4 hoặc tensor core); grouped/MoE GEMV chỉ có trọng số bf16/fp16/e4m3 (chưa có blockwise cho grouped, int4/FP4 expert, scatter/atomic finalize, GLU trong epilogue); split-K chỉ có ở GEMV dense; M > 16 (hoặc M > 8 cho FP4) trả `kNotImplemented` cho tới B7.
+- ≥85% băng thông đọc weight (≥156 GB/s trên trần 183): đạt ở 46/60 case, gồm mọi case M = 1 của GEMV dense, `gemv_argmax`, INT8, FP8 (trừ M = 4 shape nhỏ), GGUF Q4_0/Q8_0/Q4_K, NF4 (165–175, trước P1.6b là 87–102), W4A16 AWQ/GPTQ/AWQ-Marlin và FP4 Marlin M = 1…4 (171–182). Chưa đạt: AWQ không-Marlin M = 4 (94), NF4 M = 4/8 (104/43), FP4 Marlin M = 16 (141–149) và AWQ-Marlin M = 16 (141), FP4 `fp4_gemv` NVFP4 (137–146) và MXFP4 shape 14336x4096 (152), GPTQ 4096x14336 (152), FP8 M = 4 shape 4096x4096 (151), router (117), grouped GEMV (108). Chưa profile hết bằng Nsight; số đo dao động vài phần trăm giữa các lần chạy.
+- Phạm vi chưa phủ: GGUF IQ* (bảng lưới nằm trong `weight_repack.cu`, ngân sách file đã đóng) trả `kNotImplemented`; FP4 chỉ có W4A16 (W4A4/W4A8 cần activation FP4); grouped/MoE GEMV chỉ có trọng số bf16/fp16/e4m3 (chưa có blockwise cho grouped, int4/FP4 expert, scatter/atomic finalize, GLU trong epilogue); split-K chỉ có ở GEMV dense; M > 16 (hoặc M > 8 cho FP4 CUDA-core) trả `kNotImplemented` cho tới B7.
 - Quy ước đã chọn khi hàng bảng để mở: GPTQ `qzeros` lưu chính zero point (GPTQ v2 / compressed-tensors; checkpoint v1 lưu z − 1 phải cộng lại khi load); mã NF4 có nibble thấp là phần tử chẵn (bitsandbytes lưu ngược, loader hoán một lần); absmax double-quant tuyến tính (`q * scale + offset`); `NVFP4 global_scale` theo phía quantize nên kết quả nhân 1 / g; `gemv_argmax` trả id toàn cục và ghi max/sum-exp của shard vào slot 0 của `partial_max`/`partial_sumexp` để allgather TP; `moe_gemv` đòi `align_block_size` với block_size bằng `SLOTS_PER_CTA`.
 - Chưa chạy: nhánh `cvt` FP8 của sm89, lô `sm80`/`sm90a`, shape thật Llama-3-70B/DeepSeek-V3; cây làm việc chưa commit nên mọi số trên là `diagnostic_only` và registry chỉ lên `numerically_validated`.
 
@@ -1031,7 +1082,31 @@ Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn ch�
 
 **Phần cứng.** Máy dev chạy hết (CUDA-core). Lô `sm80` và `sm90a` chạy lại gate. Kiểm định chi-square ≥ 10^6 mẫu chạy được ở dev; benchmark sampling so với roofline, FlashInfer là tuỳ chọn.
 
-**Hiện trạng (2026-11-01).** 15/15 kernel có thân trong `csrc/moe/routing.cu`, `csrc/moe/permute.cu` và `csrc/sampling/sampling.cu`; `test_moe` + phần B6 của `test_sampling` xanh, `bench_moe` + case B6 của `bench_sampling` chạy được trên SM86. Bốn host entry mới (`route_fused`, `moe_sum`, `latent_combine_norm`, `gumbel_max_sample`) và `KOPS_ABI_VERSION = 5` nằm trong PR contract; `route_fused` dùng scratch `RouterParams::logits` [T, E] khi có, nếu không dùng thân fused một CTA (bit-equal cả hai đường). Alignment/permute deterministic theo slot id; sampling dùng radix + prefix scan chính xác, RNG counter. Benchmark so với PyTorch 2.14.1+cu126 nằm trong `out/b6-summary.txt`: 19 case geomean **3.04x**, 11/19 case ≥3x; suite fusion 17 case (bỏ hai case copy-bound) geomean **3.54x**. Hai case băng thông thuần `moe.permute` bf16 (1.18x) và `moe_sum` (0.58x) báo riêng theo roofline/parity đúng CONTRACTS §2.
+**Hiện trạng (2026-11-01).** 15/15 kernel có thân trong `csrc/moe/routing.cu`, `csrc/moe/permute.cu` và `csrc/sampling/sampling.cu`; `test_moe` + phần B6 của `test_sampling` xanh, `bench_moe` + case B6 của `bench_sampling` chạy được trên SM86. Bốn host entry mới (`route_fused`, `moe_sum`, `latent_combine_norm`, `gumbel_max_sample`) và `KOPS_ABI_VERSION = 5` nằm trong PR contract; `route_fused` dùng scratch `RouterParams::logits` [T, E] khi có, nếu không dùng thân fused một CTA (bit-equal cả hai đường). Alignment/permute deterministic theo slot id; sampling dùng radix + prefix scan chính xác, RNG counter. Benchmark so với PyTorch 2.14.1+cu126 nằm trong `out/b6-summary.txt`: 19 case geomean **3.77x**, 12/19 case ≥3x; suite fusion 17 case (bỏ hai case copy-bound) geomean **4.35x** (số đo lại 2026-11-02, kops 3 vòng và PyTorch cùng phiên; baseline PyTorch dao động giữa các phiên, ví dụ `fused_router` t32 đo 0,226 ms hôm trước và 0,146 ms lần này). **Dữ liệu bench:** trước 2026-11-02 `bench_sampling` và `bench_moe` khởi tạo logits, probs và logits router bằng 0, nên mọi phần tử trùng nhau và các kernel top-k, top-p, route chạy đường suy biến, trong khi baseline PyTorch dùng `randn`. Từ nay logits ~ N(0, 3²), probs là softmax của chúng, logits router ~ N(0, 2²); `topk_ids` của align/permute vốn đã băm ngẫu nhiên. Số cũ của `topp_renorm` (7,26x) là số của dữ liệu suy biến, số thật là 5,72x. **Byte count:** đã sửa lại theo traffic tối thiểu (đọc một lần, ghi một lần nếu op ghi cả hàng); `moe.sum` trước đây đếm gấp đôi (báo 184 GB/s, thực 104 trước khi sửa kernel), chain `route_permute` báo 241 GB/s vượt trần 183. Hai case băng thông thuần `moe.permute` bf16 (1.24x) và `moe_sum` (1.00x, 185 GB/s, sát trần 183) báo riêng theo roofline/parity đúng CONTRACTS §2. Đợt `vec.cuh` 2026-11-02: `moe_sum` dùng `load_vec`/`store_vec` (trước đó 64 lệnh `LDG.U16`, 0,58x → 1,00x), `align_block_size` và `moe_permute_map` đổi sang counting sort ổn định song song theo warp (`moe.align` 1,28x → 9,70x), `top_k_mask_logits` chạy 2/3 lượt radix cho bf16/fp16 với load 16 byte (1,04x → 2,30x), `top_k_renorm_probs` tìm ngưỡng bằng histogram 11 bit và gom ứng viên vào shared memory (ba lượt đọc thay vì sáu, fallback về radix khi bin quá 2048 phần tử; 1,18x → 2,64x, 1,46 ms, khoảng 184 GB/s trên 4 lượt traffic), `router_gemm` đổi tile (8, 4) cho M > 4 (`fused_router` t32 nhanh hơn bản cũ 1,48x: 0,194 → 0,131 ms; so với PyTorch cùng phiên chỉ 1,08x). `PermuteParams` có thêm trường `num_local_experts` (bắt buộc).
+
+**Bảng B6 (SM86, PyTorch 2.14.1+cu126; nguồn `out/kops-b6-*-v5-r{1,2,3}.json`, `out/torch-b6-*-v4.json`, tóm tắt `out/b6-summary.txt`; cột cuối là tỉ lệ của bản kernel trước đợt `vec.cuh` 2026-11-02 so với baseline PyTorch đo hôm trước, nên không so trực tiếp được với cột Tỉ lệ vì PyTorch dao động giữa các phiên).** 19 case, geomean **3.77x**, 12/19 ≥3x. Cột GB/s là byte tối thiểu của case / thời gian kops; với case bound bởi tính toán (top-k, top-p, route, align) con số thấp là bình thường.
+
+| Case | kops (ms) | PyTorch (ms) | Tỉ lệ | GB/s kops | Tỉ lệ trước |
+|---|---|---|---|---|---|
+| `moe.sum.bf16.t1024.k8.h7168` | 0.7158 | 0.7186 | 1.00x | 185 | 0.58x |
+| `moe.fused_router.sigmoid.e256.h7168.k8.t32` | 0.1341 | 0.1452 | 1.08x | 31 | 1.16x |
+| `chain_moe_route_permute.bf16.t4096.h7168.e256.k8` | 3.2219 | 3.6628 | 1.14x | 165 | 1.03x |
+| `moe.permute.bf16.t256.h7168.k8.e256` | 0.1989 | 0.2458 | 1.24x | 166 | 1.18x |
+| `sampling.gumbel.bf16.v131072.b32.k50` | 0.5486 | 1.0732 | 1.96x | 15 | 1.60x |
+| `sampling.topk_mask.bf16.v131072.b128.k50` | 1.1868 | 2.7249 | 2.30x | 57 | 1.04x |
+| `sampling.topk_renorm.fp32.v131072.b128.k50` | 1.4576 | 3.8410 | 2.64x | 92 | 1.18x |
+| `moe.fused_router.sigmoid.e256.h7168.k8.t8` | 0.0422 | 0.1411 | 3.34x | 90 | 4.17x |
+| `moe.permute_fp8.t256.h7168.k8.e256` | 0.7976 | 2.8150 | 3.53x | 24 | 3.21x |
+| `sampling.topp_renorm.fp32.v131072.b128.p0.9` | 4.5489 | 26.0208 | 5.72x | 30 | 6.97x |
+| `sampling.topk_topp.bf16.v131072.b32.k50.p0.9` | 1.3436 | 7.8418 | 5.84x | 6 | 5.24x |
+| `moe.hash.e256.k8.t4096` | 0.0076 | 0.0481 | 6.32x | 56 | 10.14x |
+| `moe.grouped.sigmoid.e256.g8.tg4.k8.t2048` | 0.1494 | 0.9482 | 6.35x | 15 | 6.13x |
+| `moe.route.sigmoid.e256.k8.t4096` | 0.1085 | 0.7004 | 6.46x | 41 | 6.86x |
+| `moe.unpermute.bf16.t1024.h7168.k8` | 0.8838 | 5.7989 | 6.56x | 183 | 7.59x |
+| `moe.latent_combine.bf16.t1024.k8.l3584` | 0.4110 | 3.0667 | 7.46x | 161 | 8.40x |
+| `sampling.topk_topp.bf16.v32768.b256.k20.p0.95` | 1.6843 | 16.0799 | 9.55x | 10 | 7.27x |
+| `moe.align.e256.block128.slots32768` | 0.0810 | 0.7854 | 9.70x | 4 | 1.28x |
+| `moe.count_offsets.e256.align128.slots32768` | 0.0155 | 0.1656 | 10.68x | 9 | 7.29x |
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1083,7 +1158,7 @@ Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn ch�
 - SM80, SM86, SM89, SM120a, SM121a.
 - SM90a chỉ cho `fp8_block_gemm_small_m_kernel` và làm fallback.
 
-**Nhịp.** 10 nhịp · 16 kernel · không mở gì, chỉ thêm vào file có sẵn · file mới: 0. Đích của cả 10 nhịp là các `.cu` của `gemm` (mở ở B4, B5) và của `moe` (B5). Đây là chỗ ngưỡng tách file (§1.5) dễ bị chạm nhất.
+**Nhịp.** 10 nhịp · 16 kernel · không mở gì, chỉ thêm vào file có sẵn · file mới: 3 (`gemm_mma.cu`, `marlin_dense.cu`, `marlin_moe.cu`). Đích của cả 10 nhịp là các `.cu` của `gemm` (mở ở B4, B5) và của `moe` (B5). Đây là chỗ ngưỡng tách file (§1.5) dễ bị chạm nhất.
 
 **Hiện trạng (2026-10-31).** 0/16 kernel có thân. Toàn bộ là declaration trong `csrc/gemm/*_kernels.cuh`; chưa có test, benchmark hay registry.
 
@@ -1743,7 +1818,7 @@ Cột "Bước có kernel" cho thấy mỗi family được chạm ở những b
 
 | # | File | Tạo ở | Vai trò |
 |---|---|---|---|
-| 1 | `csrc/common/device.cuh` | B0.1 | đã có; `Vec`, warp/block reduce, fast math |
+| 1 | `csrc/common/device.cuh`, `csrc/common/vec.cuh` | B0.1 | đã có; `Vec`/`load_vec`/`store_vec` (128 bit, 256 bit trên Blackwell `a`) và `pick_vec_size` ở `vec.cuh`; warp/block reduce, fast math ở `device.cuh` |
 | 2 | `csrc/common/status.h`, `csrc/common/tensor.h` | B0.1 | đã có; `Status`, `Tensor`, `LaunchContext`, `Workspace`, `check_tensor` |
 | 3 | `csrc/execution/launch.cc` | B0.1 | `launch_kernel` và `GraphHandle` cơ bản |
 | 4 | `csrc/runtime/registry.cc` | B0.1 | đã có; `select` / `explain` và nạp bảng registry sinh ra |
