@@ -29,6 +29,16 @@ Status gemm_workspace_requirements(const GemmProblem& problem, const GemmTactic*
                                    GemmBackend backend, const LaunchContext& ctx,
                                    WorkspaceRequirements* out);
 
+// ---- Tensor-core mainloop (gemm_mma.cu) -------------------------------------------------------
+/// bf16 / fp16 GEMM on mma.sync (SM80+). gemm() / scaled_gemm() dispatch here for M > 16, batched or
+/// swap_ab problems, when a tactic names kMultistageMmaSync, and when the tactic cache has an entry.
+/// tactic == nullptr: cache, then the static heuristic. Needs a Workspace only for split-K.
+Status mma_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, const Workspace& ws, const LaunchContext& ctx);
+/// True when mma_gemm would take this problem on a cache hit / explicit mma tactic (the GEMV owns the rest).
+bool mma_selects(const ScaledGemmArgs& args, const GemmTactic* tactic, const LaunchContext& ctx);
+Status mma_workspace(const GemmProblem& problem, const GemmTactic* tactic, const LaunchContext& ctx,
+                     WorkspaceRequirements* out);
+
 // ---- G01 dense 16/32-bit -------------------------------------------------------------
 /// Workspace is passed explicitly (not through GemmArgs) so every family has one
 /// convention: query gemm_workspace_requirements(), then pass the same lease here.

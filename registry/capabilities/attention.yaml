@@ -25,7 +25,7 @@
    "provider": "native",
    "arch_id": 860,
    "status": "benchmarked",
-   "predicates": "planned",
+   "predicates": "out f32/f16/bf16; partial fp32; head_dim 64/80/96/128/192/256; sink once; total_rows_ptr",
    "evidence": "test_merge;bench_chains"
   },
   {
@@ -54,6 +54,69 @@
    "status": "benchmarked",
    "predicates": "latent cache [rank|rope]; block table + ctx_start; native or e4m3 per-tensor",
    "evidence": "test_merge;bench_merge;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "A01.ragged_prefill",
+   "kernel_symbol": "ragged_prefill_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16; (Dqk,Dvo) 64,80,96,128,256,192/128; GQA packing; runtime mask none/causal/custom; window/softcap/ALiBi/sinks/chunk; LSE; split-KV + merge",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A02.paged_prefill",
+   "kernel_symbol": "paged_prefill_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "as A01 + paged NHD/HND, CSR or block table, any page size; FP8 e4m3/e5m2 K/V (per-tensor/per-head scale) for D 64/128/256; A06 verification via custom mask",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A02.prefill_plan",
+   "kernel_symbol": "prefill_plan_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "one CTA, B <= 2048; ctx.strategy kGraph: re-plans (request, q tile, kv chunk) items each replay from device lengths",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A03.paged_decode",
+   "kernel_symbol": "paged_decode_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "CUDA core; D 64,80,96,128,192,256; q_len 1..8 (8 packed rows per CTA); FP8 K/V; any page size; split-KV + merge",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A03.paged_decode_tc",
+   "kernel_symbol": "paged_decode_tc_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "mma.sync m16n8k16; D 64/128/256; G*q_len >= 4 (16 packed rows per CTA); FP8 K/V dequant on load; split-KV + merge",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A05.assign_decode_tasks",
+   "kernel_symbol": "assign_decode_tasks_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "one CTA, B <= 2048; tasks of ~total/(SMs x CTAs) keys in 256-key units, <= 32 splits per request",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A05.paged_decode_dynamic",
+   "kernel_symbol": "paged_decode_dynamic_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "persistent CTAs pull DecodeTask (self-resetting uint32[2] counter); D 64/128/256; every task writes partials, merge_split_kv finishes",
+   "evidence": "test_merge;bench_merge"
   }
  ]
 }

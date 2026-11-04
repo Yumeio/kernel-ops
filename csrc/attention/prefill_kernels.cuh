@@ -43,10 +43,11 @@ struct RaggedPrefillParams {
   void* o;                           // [total_q, Hq, Dvo]
   int64_t o_stride_n, o_stride_h;
   float* lse;                        // [total_q, Hq] or null
-  SplitKVBuffers split;              // used when plan.split_kv
-  WorkPlan plan;
+  SplitKVBuffers split;              // used when plan.split_kv (filled by ragged_prefill_run)
+  WorkPlan plan;                     // filled by ragged_prefill_run from the AttentionPlan
   int32_t batch_size, num_qo_heads, num_kv_heads;
   int32_t total_q;
+  MaskMode mask;                     // ABI 6: runtime mask mode (ragged_prefill_run sets it from the plan)
 };
 
 /**
@@ -54,8 +55,10 @@ struct RaggedPrefillParams {
  * in fp32 (base-2 exp internally), PV accumulation, optional LSE / split partials.
  * Supports Dqk != Dvo (MLA prefill: q/k 192 = 128 nope + 64 rope, v 128), GQA/MQA via head mapping.
  * Models : every model's prompt phase without prefix cache; vision/audio encoders (kNone mask).
+ * ABI 6: the mask mode is the runtime field params.mask (it was a template parameter); Variant
+ * flags compile a modifier in, its runtime value in params.mod switches it on (CONTRACTS §1e).
  */
-template <typename Traits, MaskMode kMask, typename Variant>
+template <typename Traits, typename Variant>
 __global__ void ragged_prefill_kernel(const __grid_constant__ RaggedPrefillParams params);
 
 /// Arguments of paged prefill (chunked prefill, prefix reuse, verification).
@@ -71,10 +74,11 @@ struct PagedPrefillParams {
   void* o;
   int64_t o_stride_n, o_stride_h;
   float* lse;
-  SplitKVBuffers split;
-  WorkPlan plan;
+  SplitKVBuffers split;              // filled by paged_prefill_run when plan.split_kv
+  WorkPlan plan;                     // filled by paged_prefill_run from the AttentionPlan
   int32_t batch_size, num_qo_heads, num_kv_heads;
   int32_t total_q;
+  MaskMode mask;                     // ABI 6: runtime mask mode (paged_prefill_run sets it from the plan)
 };
 
 /**
@@ -83,8 +87,10 @@ struct PagedPrefillParams {
  * MTP / EAGLE / DSpark-style drafts), A08 FP8 KV dequant on load (kFp8Kv) or FP8 tensor-core
  * compute (separate Traits with DTypeQ = f8e4m3_t).
  * Page tables: CSR or block table (PagedKVDesc::table_format), NHD or HND.
+ * ABI 6: mask mode is params.mask; kLayout = kNHD names the token-major strided loader, which also
+ * reads HND pages (the strides carry the difference).
  */
-template <typename Traits, MaskMode kMask, typename Variant, kv::KVLayout kLayout>
+template <typename Traits, typename Variant, kv::KVLayout kLayout>
 __global__ void paged_prefill_kernel(const __grid_constant__ PagedPrefillParams params);
 
 /// Block-sparse mask in BSR form over (R x C) blocks of the [qo_len, kv_len] score matrix.
@@ -109,6 +115,14 @@ __global__ void block_sparse_prefill_kernel(const __grid_constant__ PagedPrefill
  * prefill_plan_kernel — device-side planner (graph friendly): from qo_indptr / kv lengths builds
  * WorkPlan items (request, q tile, kv chunk) and merge_indptr without host sync, bounded by
  * padded_num_items (overflow flag set if exceeded -> caller replans outside the graph).
+ * One CTA; item i keeps the host planner's order (request, q tile, kv chunk), so a graph replay
+ * plans exactly what prefill_plan would plan for the same lengths and chunk size.
+ * ABI 6: kv lengths come from kv_lens[b] when non-null (block-table seq_lens), else from
+ * kv_indptr (ragged token indptr when kv_last_page_len is null, CSR page indptr otherwise, with
+ * page_size); kv_chunk_size is a device scalar (the plan's slot; null or <= 0 means one
+ * chunk per request, so the value is replay-stable); padded items beyond the plan get
+ * block_valid_mask = 0; total_rows_out[0] = qo_indptr[B] (row bound for merge_split_kv);
+ * max_partial_rows bounds merge_indptr[total_q] (overflow otherwise).
  */
 __global__ void prefill_plan_kernel(
     int32_t* __restrict__ request_indices, int32_t* __restrict__ qo_tile_indices,
@@ -116,7 +130,9 @@ __global__ void prefill_plan_kernel(
     int32_t* __restrict__ o_indptr, uint8_t* __restrict__ block_valid_mask,
     int32_t* __restrict__ num_items_out, int32_t* __restrict__ overflow_flag,
     const int32_t* __restrict__ qo_indptr, const int32_t* __restrict__ kv_lens,
-    const int batch_size, const int cta_tile_q, const int kv_chunk_size,
-    const int gqa_group_size, const int padded_num_items);
+    const int batch_size, const int cta_tile_q, const int32_t* __restrict__ kv_chunk_size,
+    const int gqa_group_size, const int padded_num_items,
+    const int32_t* __restrict__ kv_indptr, const int32_t* __restrict__ kv_last_page_len,
+    const int page_size, const int max_partial_rows, uint32_t* __restrict__ total_rows_out);
 
 }  // namespace kops::attn

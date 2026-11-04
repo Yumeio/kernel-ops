@@ -64,6 +64,9 @@ __global__ void paged_decode_tc_kernel(const __grid_constant__ DecodeParams para
  * tile count, not by request), so 1 x 64K + 31 x 4K style skew does not idle SMs. Writes partials
  * for split tasks; merge_split_kv_kernel (or an in-kernel last-arriver combine guarded by an epoch
  * counter) produces the final output.
+ * B8 (SM80 class): task_counter is uint32[2] = {next task, finished CTAs}, zero at plan time; the
+ * last CTA to finish resets both, so the counter is replay-safe without epochs (`epoch` unused).
+ * A task's math does not depend on which CTA runs it: the output is bit-reproducible.
  */
 template <int HEAD_DIM_QK, int HEAD_DIM_VO, int GQA_GROUP, int CTA_TILE_KV, int NUM_STAGES,
           typename DTypeQ, typename DTypeKV, typename DTypeO, typename Variant, kv::KVLayout kLayout,
@@ -77,14 +80,20 @@ __global__ void paged_decode_dynamic_kernel(const __grid_constant__ DecodeParams
  * from kv lengths, q_len, Hkv and a CTA budget (num_sms * ctas_per_sm) builds uniform-cost
  * DecodeTask buckets and merge_indptr. Runs inside the graph; capacity-bounded with overflow flag.
  * Cost of planning + combine is always reported together with attention time in benchmarks.
+ * ABI 6: kv lengths come from kv_lens[b] when non-null, else from the CSR page table
+ * (kv_indptr, kv_last_page_len, page_size); merge_indptr is per query row [B * q_len + 1] (the
+ * merge_split_kv convention) and every task writes partial rows (partial_row = 0, split_index);
+ * total_rows_out[0] = B * q_len; max_partial_rows bounds merge_indptr[B * q_len] (overflow).
  */
 __global__ void assign_decode_tasks_kernel(
     DecodeTask* __restrict__ tasks,             // [max_tasks]
     int32_t* __restrict__ num_tasks,            // [1]
-    int32_t* __restrict__ merge_indptr,         // [B * q_len * Hq + 1] or per (request, kv head)
+    int32_t* __restrict__ merge_indptr,         // [B * q_len + 1]
     int32_t* __restrict__ overflow_flag,        // [1]
-    const int32_t* __restrict__ kv_lens,        // [B]
+    const int32_t* __restrict__ kv_lens,        // [B] or null
     const int batch_size, const int num_kv_heads, const int q_len,
-    const int cta_budget, const int min_kv_tile, const int max_splits, const int max_tasks);
+    const int cta_budget, const int min_kv_tile, const int max_splits, const int max_tasks,
+    const int32_t* __restrict__ kv_indptr, const int32_t* __restrict__ kv_last_page_len,
+    const int page_size, const int max_partial_rows, uint32_t* __restrict__ total_rows_out);
 
 }  // namespace kops::attn

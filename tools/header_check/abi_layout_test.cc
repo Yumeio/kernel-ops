@@ -22,6 +22,7 @@
 #include "csrc/common/quant.cuh"
 #include "csrc/common/op_types.cuh"
 #include "csrc/common/sync.cuh"
+#include "csrc/common/rng.cuh"
 #include "csrc/kvcache/kv_layout.cuh"
 #include "csrc/gemm/gemm_params.cuh"
 #include "csrc/gemm/grouped_gemm_kernels.cuh"
@@ -39,6 +40,11 @@
 #include "csrc/execution/launch.h"
 #include "csrc/mega/mega_plan.cuh"
 #include "csrc/mega/mega_kernels.cuh"
+#include "csrc/sampling/sampling_kernels.cuh"
+#include "csrc/sampling/fused_sampler_kernels.cuh"
+#include "csrc/sampling/logits_processor_kernels.cuh"
+#include "csrc/sampling/speculative_kernels.cuh"
+#include "csrc/sampling/ops.h"
 #include "csrc/runtime/registry.h"
 #include "csrc/memory/ops.h"
 #include "csrc/load/ops.h"
@@ -84,6 +90,10 @@ KOPS_ABI_STANDARD_LAYOUT(kops::backend::AdapterEntry);
 KOPS_ABI_STANDARD_LAYOUT(kops::backend::AdapterTable);
 KOPS_ABI_STANDARD_LAYOUT(kops::backend::ConformanceCase);
 KOPS_ABI_STANDARD_LAYOUT(kops::backend::ConformanceResult);
+KOPS_ABI_STANDARD_LAYOUT(kops::sample::SamplingParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::sample::FusedSamplingParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::sample::SamplingPlan);
+KOPS_ABI_STANDARD_LAYOUT(kops::sample::FusedSplitDevice);
 
 // ---- 2. Enum width is ABI ------------------------------------------------
 static_assert(sizeof(kops::rope::InvFreqTable) ==
@@ -132,6 +142,21 @@ static_assert(offsetof(kops::LaunchContext, strategy) == offsetof(kops_launch_co
 
 static_assert(KOPS_C_ABI_VERSION == KOPS_ABI_VERSION, "C and C++ ABI versions must match");
 
+// C++-only sampler structs (no C mirror): pin the LP64 layout so a field change bumps the ABI.
+static_assert(sizeof(kops::sample::SamplingPlan) == 32, "SamplingPlan size");
+static_assert(offsetof(kops::sample::SamplingPlan, flags) == 16, "SamplingPlan.flags");
+static_assert(offsetof(kops::sample::SamplingPlan, capture_generation) == 24,
+              "SamplingPlan.capture_generation");
+static_assert(sizeof(kops::sample::SamplingParams) == 88, "SamplingParams size");
+static_assert(sizeof(kops::sample::FusedSamplingParams) == 144, "FusedSamplingParams size");
+static_assert(offsetof(kops::sample::FusedSamplingParams, penalty_mask) == 88, "");
+static_assert(offsetof(kops::sample::FusedSamplingParams, default_repetition_penalty) == 112, "");
+static_assert(offsetof(kops::sample::FusedSamplingParams, update_penalty_mask) == 116, "");
+static_assert(offsetof(kops::sample::FusedSamplingParams, token_counts) == 120, "");
+static_assert(offsetof(kops::sample::FusedSamplingParams, presence_penalty) == 136, "");
+static_assert(sizeof(kops::sample::FusedSplitDevice) == 24, "FusedSplitDevice size");
+static_assert(offsetof(kops::sample::FusedSplitDevice, barriers) == 16, "FusedSplitDevice.barriers");
+
 // ---- 4. Kernel parameter blocks fit the kernarg space --------------------
 #define KOPS_FITS_KERNARG(T)                                                        \
   static_assert(sizeof(T) <= static_cast<size_t>(kops::kKernargLimitBytes),          \
@@ -147,6 +172,7 @@ KOPS_FITS_KERNARG(kops::mega::MegaAttentionBlockParams);
 KOPS_FITS_KERNARG(kops::mega::MegaMoELocalParams);
 KOPS_FITS_KERNARG(kops::comm::EPDispatchParams);
 KOPS_FITS_KERNARG(kops::comm::EPCombineParams);
+KOPS_FITS_KERNARG(kops::sample::FusedSamplingParams);
 
 // ---- 5. Documented constants must not drift ------------------------------
 static_assert(kops::kMaxTensorDims == KOPS_MAX_TENSOR_DIMS, "kMaxTensorDims");

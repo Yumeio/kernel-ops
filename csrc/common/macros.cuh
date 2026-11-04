@@ -39,7 +39,12 @@
 // v2: backend-neutral stream/error/graph/tma types, arch_id + wave_size, Fp8Encoding.
 // v3: HybridBranches + merge_hybrid_branches host entry.
 // v4: by-value InvFreqTable and HybridBranchTable kernel parameters.
-#define KOPS_ABI_VERSION 5
+// v6: gemm::EpilogueOp kEpiRowSumSq / kEpiKvAppend + their EpilogueParams fields; ScaledGemmArgs carries
+//     the runtime tactic (split_k_mode, split_k_slices, raster, split_k_counters); SplitKMode/RasterOrder
+//     are declared before ScaledGemmArgs.
+//     sample::SamplingPlan, sample::FusedSamplingParams and the sample_fused / sampling_plan /
+//     sampling_fused_workspace_requirements entry points (C++ only, no C mirror).
+#define KOPS_ABI_VERSION 6
 
 // =============================================================================
 // Backend

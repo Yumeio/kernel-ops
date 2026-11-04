@@ -1,7 +1,10 @@
 // =============================================================================
 // kernel-ops | tests/unit/test_merge.cc
 // B1 attention merge kernels: merge_state (A14), merge_states (A14) and
-// merge_split_kv (A04).
+// merge_split_kv (A04); B8 native attention: ragged / paged prefill (A01, A02,
+// A06, A08) against kops::ref::attention_f64 over head dims, GQA, every
+// AttentionModifiers rule, page layouts / tables, FP8 K/V, split-KV,
+// determinism and batch invariance.
 //
 // Oracle: csrc/reference/reference.cc (merge_states_f64) for two- and N-state
 // merges, plus a local fp64 log-sum-exp reference for split-KV with a sink
@@ -29,31 +32,18 @@
 #include "csrc/common/op_types.cuh"
 #include "csrc/kvcache/kv_layout.cuh"
 #include "csrc/attention/attention_params.cuh"
+#include "csrc/attention/prefill_kernels.cuh"
+#include "csrc/attention/decode_kernels.cuh"
+#include "csrc/attention/merge_kernels.cuh"
+#include "csrc/attention/mla_kernels.cuh"
+#include "csrc/attention/sparse_kernels.cuh"
+#include "csrc/attention/ops.h"
 #include "csrc/reference/ops.h"
 
-// The public entry points are declared in csrc/attention/ops.h, which pulls in
-// kernel parameter types that only exist in a device pass. This test only calls
-// host launchers, so it repeats the three declarations it uses, plus the two
-// internal seams for the optional descriptors ops.h does not carry yet.
+// The public entry points come from csrc/attention/ops.h (this TU is compiled by
+// nvcc, so the kernel parameter headers it needs are available). The internal
+// seams below carry optional descriptors ops.h does not expose.
 namespace kops::attn {
-Status merge_state(const Tensor& o, const Tensor& lse, const Tensor& o_a, const Tensor& lse_a,
-                   const Tensor& o_b, const Tensor& lse_b, const LaunchContext& ctx);
-Status merge_states(const Tensor& o, const Tensor& lse, const Tensor& o_states,
-                    const Tensor& lse_states, const LaunchContext& ctx);
-Status merge_split_kv(const Tensor& o, const Tensor& lse, const SplitKVBuffers& split,
-                      const Tensor& sink_logits, const LaunchContext& ctx);
-struct HybridBranches {
-  const float* const* o = nullptr;
-  const float* const* lse = nullptr;
-  int32_t num_branches = 0;
-};
-Status merge_hybrid_branches(const Tensor& o, const Tensor& lse, const HybridBranches& branches,
-                             const Tensor& sink_logits, const LaunchContext& ctx);
-Status concat_mla_q(const Tensor& q_out, const Tensor& ql_nope, const Tensor& q_pe,
-                    const LaunchContext& ctx);
-Status mla_context_gather(const Tensor& c_kv_out, const Tensor& k_pe_out,
-                          const kv::PagedKVDesc& cache, const Tensor& ctx_token_indptr,
-                          const Tensor& ctx_start, const LaunchContext& ctx);
 namespace internal {
 Status merge_state_run(const Tensor& o, const Tensor& lse, const Tensor& o_a, const Tensor& lse_a,
                        const Tensor& o_b, const Tensor& lse_b, const Tensor& row_mask,
@@ -1370,9 +1360,10 @@ void test_contracts() {
   KOPS_EXPECT_STATUS(kops::attn::merge_split_kv(o, l, bad_partial, Tensor{}, ctx),
                      Status::kMisaligned, "merge_split_kv partial alignment");
 
-  Tensor o96 = kops_test::tensor3d(d.p, DType::kFloat32, 1, 4, 96);
-  KOPS_EXPECT_STATUS(kops::attn::merge_split_kv(o96, l, split, Tensor{}, ctx),
+  Tensor o72 = kops_test::tensor3d(d.p, DType::kFloat32, 1, 4, 72);
+  KOPS_EXPECT_STATUS(kops::attn::merge_split_kv(o72, l, split, Tensor{}, ctx),
                      Status::kUnsupportedShape, "merge_split_kv head_dim");
+  Tensor o96 = kops_test::tensor3d(d.p, DType::kFloat32, 1, 4, 96);
   Tensor a96 = kops_test::tensor3d(d.p, DType::kFloat32, 1, 4, 96);
   KOPS_EXPECT_STATUS(kops::attn::merge_state(o96, l, a96, l, a96, l, ctx),
                      Status::kUnsupportedShape, "merge_state head_dim");
@@ -1394,6 +1385,1076 @@ void test_contracts() {
   strided.stride[2] = 2;
   KOPS_EXPECT_STATUS(kops::attn::merge_split_kv(strided, l, split, Tensor{}, ctx),
                      Status::kUnsupportedLayout, "merge_split_kv last stride");
+}
+
+// -----------------------------------------------------------------------------
+// B8 attention: prefill (A01/A02/A06/A08) against kops::ref::attention_f64
+// -----------------------------------------------------------------------------
+
+using kops::attn::MaskMode;
+
+struct AttnCase {
+  const char* name = "";
+  std::vector<int> qo_lens, kv_lens;
+  int Hq = 4, Hkv = 1, dqk = 128, dvo = 128;
+  DType dt = DType::kBFloat16;
+  MaskMode mask = MaskMode::kCausal;
+  float softcap = 0.0f;
+  int window_left = -1, window_right = -1, chunk = 0, num_sink_tokens = 0;
+  bool alibi = false, sinks = false, q_pos_offset = false;
+  // paged (page_size > 0)
+  int page_size = 0;
+  bool hnd = false, block_table = false;
+  DType kv_dt = DType::kInvalid;  // kInvalid = same as dt; e4m3 / e5m2 = FP8 cache
+  bool per_head_scale = false;
+  float v_offset = 0.0f;  // added to every V value (makes an FP8 v_scale error visible)
+  // decode entry (decode_plan / decode_run): every qo_len equals q_len, paged K/V
+  bool decode = false, device_planner = false;
+  int q_len = 1;
+  // launch context
+  int compute_units = 1;  // 1: never split; large: split whenever the q tiles cannot fill the GPU
+  bool batch_invariant = false;
+  double atol = 1e-2, rtol = 1e-2, lse_atol = 2e-4;
+};
+
+/// Device-side result of one prefill run (o as float, lse) plus the plan it used.
+struct AttnRun {
+  std::vector<float> o, lse;
+  bool split = false;
+  uint64_t kernel_id = 0;
+  bool ok = false;
+};
+
+float round_to(DType dt, float x) {
+  if (dt == DType::kBFloat16) return __bfloat162float(__float2bfloat16_rn(x));
+  if (dt == DType::kFloat16) return __half2float(__float2half_rn(x));
+  if (dt == DType::kFloat8E4M3) return static_cast<float>(__nv_fp8_e4m3(x));
+  if (dt == DType::kFloat8E5M2) return static_cast<float>(__nv_fp8_e5m2(x));
+  return x;
+}
+
+/// Host image of a 16-bit tensor from rounded floats.
+std::vector<uint16_t> pack16(DType dt, const std::vector<float>& v) {
+  std::vector<uint16_t> out(v.size());
+  for (size_t i = 0; i < v.size(); ++i) {
+    if (dt == DType::kBFloat16) {
+      const __nv_bfloat16 b = __float2bfloat16_rn(v[i]);
+      std::memcpy(&out[i], &b, 2);
+    } else {
+      const __half h = __float2half_rn(v[i]);
+      std::memcpy(&out[i], &h, 2);
+    }
+  }
+  return out;
+}
+
+float unpack16(DType dt, uint16_t x) {
+  if (dt == DType::kBFloat16) {
+    __nv_bfloat16 b;
+    std::memcpy(&b, &x, 2);
+    return __bfloat162float(b);
+  }
+  __half h;
+  std::memcpy(&h, &x, 2);
+  return __half2float(h);
+}
+
+uint8_t fp8_bits(DType dt, float x) {
+  if (dt == DType::kFloat8E4M3) {
+    const __nv_fp8_e4m3 f(x);
+    return *reinterpret_cast<const uint8_t*>(&f);
+  }
+  const __nv_fp8_e5m2 f(x);
+  return *reinterpret_cast<const uint8_t*>(&f);
+}
+
+/// Shared inputs of a case: rounded q / k / v (k, v already dequantized for FP8) + reference.
+struct AttnData {
+  std::vector<int32_t> qo_indptr, kv_indptr;
+  std::vector<float> q, k, v;          // values the kernel sees (k, v: after dequant)
+  std::vector<float> k_raw, v_raw;     // FP8: the stored code values (before scale)
+  std::vector<float> k_scale, v_scale; // FP8: [1] or [Hkv]
+  std::vector<float> alibi, sinks;
+  std::vector<int32_t> q_pos;
+  std::vector<uint8_t> mask_bits;
+  std::vector<int64_t> mask_indptr;
+  std::vector<double> o_ref, lse_ref;
+  int total_q = 0, total_kv = 0;
+};
+
+AttnData make_attn_data(const AttnCase& c, unsigned seed) {
+  AttnData d;
+  const int B = static_cast<int>(c.qo_lens.size());
+  d.qo_indptr.assign(B + 1, 0);
+  d.kv_indptr.assign(B + 1, 0);
+  for (int b = 0; b < B; ++b) {
+    d.qo_indptr[b + 1] = d.qo_indptr[b] + c.qo_lens[b];
+    d.kv_indptr[b + 1] = d.kv_indptr[b] + c.kv_lens[b];
+  }
+  d.total_q = d.qo_indptr[B];
+  d.total_kv = d.kv_indptr[B];
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  d.q.resize(static_cast<size_t>(d.total_q) * c.Hq * c.dqk);
+  for (float& x : d.q) x = round_to(c.dt, u(rng));
+  const DType kvdt = c.kv_dt == DType::kInvalid ? c.dt : c.kv_dt;
+  const bool fp8 = kvdt == DType::kFloat8E4M3 || kvdt == DType::kFloat8E5M2;
+  const int nscale = c.per_head_scale ? c.Hkv : 1;
+  if (fp8) {
+    std::uniform_real_distribution<float> us(0.004f, 0.02f);
+    d.k_scale.resize(nscale);
+    d.v_scale.resize(nscale);
+    for (int i = 0; i < nscale; ++i) {
+      d.k_scale[i] = us(rng);
+      d.v_scale[i] = us(rng);
+    }
+  }
+  auto fill_kv = [&](std::vector<float>& out, std::vector<float>& raw, int dim,
+                     const std::vector<float>& scale, float off) {
+    out.resize(static_cast<size_t>(d.total_kv) * c.Hkv * dim);
+    raw.resize(out.size());
+    for (size_t i = 0; i < out.size(); ++i) {
+      const float x = u(rng) * 2.0f + off;
+      if (fp8) {
+        const int h = static_cast<int>((i / dim) % c.Hkv);
+        const float s = scale[c.per_head_scale ? h : 0];
+        raw[i] = round_to(kvdt, x / s);
+        out[i] = static_cast<float>(static_cast<double>(raw[i]) * s);
+      } else {
+        raw[i] = out[i] = round_to(c.dt, x * 0.5f);
+      }
+    }
+  };
+  fill_kv(d.k, d.k_raw, c.dqk, d.k_scale, 0.0f);
+  fill_kv(d.v, d.v_raw, c.dvo, d.v_scale, c.v_offset);
+  if (c.alibi) {
+    d.alibi.resize(c.Hq);
+    for (int h = 0; h < c.Hq; ++h) d.alibi[h] = std::pow(2.0f, -8.0f * (h + 1) / c.Hq);
+  }
+  if (c.sinks) {
+    d.sinks.resize(c.Hq);
+    for (float& x : d.sinks) x = u(rng) * 3.0f;
+  }
+  if (c.q_pos_offset) {
+    d.q_pos.resize(B);
+    for (int b = 0; b < B; ++b) d.q_pos[b] = std::max(0, c.kv_lens[b] - c.qo_lens[b] - 3 * b);
+  }
+  if (c.mask == MaskMode::kCustom) {
+    d.mask_indptr.assign(B + 1, 0);
+    for (int b = 0; b < B; ++b) {
+      d.mask_indptr[b + 1] = d.mask_indptr[b] + static_cast<int64_t>(c.qo_lens[b]) * c.kv_lens[b];
+    }
+    d.mask_bits.assign(static_cast<size_t>((d.mask_indptr[B] + 7) / 8 + 1), 0);
+    std::bernoulli_distribution keep(0.6);
+    for (int64_t i = 0; i < d.mask_indptr[B]; ++i) {
+      if (keep(rng)) d.mask_bits[static_cast<size_t>(i >> 3)] |= static_cast<uint8_t>(1u << (i & 7));
+    }
+  }
+  // fp64 reference on exactly the values the kernel reads
+  std::vector<double> q64(d.q.begin(), d.q.end()), k64(d.k.begin(), d.k.end()),
+      v64(d.v.begin(), d.v.end()), al64(d.alibi.begin(), d.alibi.end()),
+      sk64(d.sinks.begin(), d.sinks.end());
+  d.o_ref.assign(static_cast<size_t>(d.total_q) * c.Hq * c.dvo, 0.0);
+  d.lse_ref.assign(static_cast<size_t>(d.total_q) * c.Hq, 0.0);
+  kops::ref::AttentionRefArgs ra;
+  ra.q = q64.data();
+  ra.k = k64.data();
+  ra.v = v64.data();
+  ra.qo_indptr = d.qo_indptr.data();
+  ra.kv_indptr = d.kv_indptr.data();
+  ra.q_pos_offset = c.q_pos_offset ? d.q_pos.data() : nullptr;
+  ra.batch = B;
+  ra.q_heads = c.Hq;
+  ra.kv_heads = c.Hkv;
+  ra.head_dim_qk = c.dqk;
+  ra.head_dim_vo = c.dvo;
+  ra.sm_scale = 1.0 / std::sqrt(static_cast<double>(c.dqk));
+  ra.logits_softcap = c.softcap;
+  ra.window_left = c.window_left;
+  ra.window_right = c.window_right;
+  ra.chunk_size = c.chunk;
+  ra.num_sink_tokens = c.num_sink_tokens;
+  ra.sink_logits = c.sinks ? sk64.data() : nullptr;
+  ra.alibi_slopes = c.alibi ? al64.data() : nullptr;
+  ra.causal = c.mask == MaskMode::kCausal;
+  ra.custom_mask = c.mask == MaskMode::kCustom ? d.mask_bits.data() : nullptr;
+  ra.mask_indptr = c.mask == MaskMode::kCustom ? d.mask_indptr.data() : nullptr;
+  ra.o = d.o_ref.data();
+  ra.lse = d.lse_ref.data();
+  KOPS_EXPECT_OK(kops::ref::attention_f64(ra), "attention_f64");
+  return d;
+}
+
+kops::attn::AttentionSpec spec_of(const AttnCase& c) {
+  kops::attn::AttentionSpec s;
+  s.num_q_heads = c.Hq;
+  s.num_kv_heads = c.Hkv;
+  s.head_dim_qk = c.dqk;
+  s.head_dim_vo = c.dvo;
+  s.q_dtype = s.o_dtype = c.dt;
+  const DType kvdt = c.kv_dt == DType::kInvalid ? c.dt : c.kv_dt;
+  s.kv_dtype = kvdt;
+  if (kvdt != c.dt) {
+    s.k_codec = s.v_codec = c.per_head_scale ? kops::kv::KVCodec::kFP8PerHead
+                                             : kops::kv::KVCodec::kFP8PerTensor;
+  }
+  s.kv_layout = c.hnd ? kops::kv::KVLayout::kHND : kops::kv::KVLayout::kNHD;
+  s.page_size = c.page_size;
+  s.mask = c.mask;
+  s.sliding_window = c.window_left >= 0 || c.window_right >= 0;
+  s.softcap = c.softcap > 0.0f;
+  s.alibi = c.alibi;
+  s.sinks = c.sinks;
+  s.chunked = c.chunk > 0;
+  s.return_lse = true;
+  return s;
+}
+
+/// Device buffers of one attention problem (ragged or paged).
+struct AttnDev {
+  DevArray<uint16_t> q;
+  DevArray<uint16_t> o;
+  DevArray<float> lse;
+  DevArray<int32_t> qo_indptr, kv_indptr, q_pos;
+  DevArray<uint8_t> k8, v8;          // FP8 caches
+  DevArray<uint16_t> k16, v16;       // 16-bit K/V (ragged rows or pages)
+  DevArray<int32_t> page_ids, page_indptr, last_len, block_table, seq_lens;
+  DevArray<float> k_scale, v_scale, alibi, sinks;
+  DevArray<uint8_t> mask_bits;
+  DevArray<int64_t> mask_indptr;
+  kops::kv::PagedKVDesc desc;
+  kops::kv::RaggedKVDesc rdesc;
+  AttnDev(const AttnCase& c, const AttnData& d, size_t pool_tokens)
+      : q(d.q.size()), o(static_cast<size_t>(d.total_q) * c.Hq * c.dvo),
+        lse(static_cast<size_t>(d.total_q) * c.Hq), qo_indptr(d.qo_indptr.size()),
+        kv_indptr(d.kv_indptr.size()), q_pos(std::max<size_t>(d.q_pos.size(), 1)),
+        k8(pool_tokens * c.Hkv * c.dqk), v8(pool_tokens * c.Hkv * c.dvo),
+        k16(pool_tokens * c.Hkv * c.dqk), v16(pool_tokens * c.Hkv * c.dvo), page_ids(1),
+        page_indptr(1), last_len(1), block_table(1), seq_lens(1),
+        k_scale(std::max<size_t>(d.k_scale.size(), 1)), v_scale(std::max<size_t>(d.v_scale.size(), 1)),
+        alibi(std::max<size_t>(d.alibi.size(), 1)), sinks(std::max<size_t>(d.sinks.size(), 1)),
+        mask_bits(std::max<size_t>(d.mask_bits.size(), 1)),
+        mask_indptr(std::max<size_t>(d.mask_indptr.size(), 1)) {}
+};
+
+void upload(void* dst, const void* src, size_t bytes) {
+  if (bytes != 0) cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+}
+
+/// Run one case end to end; `only` restricts the batch to one request (batch-invariance test).
+AttnRun run_prefill(const AttnCase& c, const AttnData& d, unsigned page_seed) {
+  AttnRun res;
+  const int B = static_cast<int>(c.qo_lens.size());
+  const bool paged = c.page_size > 0;
+  const DType kvdt = c.kv_dt == DType::kInvalid ? c.dt : c.kv_dt;
+  const bool fp8 = kvdt != c.dt;
+  // Paged pool: requests get shuffled pages; two spare pages make ids non-contiguous.
+  std::vector<std::vector<int32_t>> pages(B);
+  int num_pages = 0;
+  if (paged) {
+    for (int b = 0; b < B; ++b) num_pages += (c.kv_lens[b] + c.page_size - 1) / c.page_size;
+    num_pages += 2;
+    std::vector<int32_t> perm(num_pages);
+    for (int i = 0; i < num_pages; ++i) perm[i] = i;
+    std::mt19937 rng(page_seed);
+    std::shuffle(perm.begin(), perm.end(), rng);
+    int at = 0;
+    for (int b = 0; b < B; ++b) {
+      const int np = (c.kv_lens[b] + c.page_size - 1) / c.page_size;
+      for (int i = 0; i < np; ++i) pages[b].push_back(perm[at++]);
+    }
+  }
+  const size_t pool_tokens = paged ? static_cast<size_t>(num_pages) * c.page_size : d.total_kv;
+  AttnDev dev(c, d, std::max<size_t>(pool_tokens, 1));
+  upload(dev.q.p, pack16(c.dt, d.q).data(), d.q.size() * 2);
+  upload(dev.qo_indptr.p, d.qo_indptr.data(), d.qo_indptr.size() * 4);
+  upload(dev.kv_indptr.p, d.kv_indptr.data(), d.kv_indptr.size() * 4);
+  if (!d.q_pos.empty()) upload(dev.q_pos.p, d.q_pos.data(), d.q_pos.size() * 4);
+  if (!d.alibi.empty()) upload(dev.alibi.p, d.alibi.data(), d.alibi.size() * 4);
+  if (!d.sinks.empty()) upload(dev.sinks.p, d.sinks.data(), d.sinks.size() * 4);
+  if (!d.mask_bits.empty()) upload(dev.mask_bits.p, d.mask_bits.data(), d.mask_bits.size());
+  if (!d.mask_indptr.empty()) upload(dev.mask_indptr.p, d.mask_indptr.data(), d.mask_indptr.size() * 8);
+  cudaMemset(dev.o.p, 0xFF, dev.o.n * 2);  // NaN-fill: every row must be written
+  cudaMemset(dev.lse.p, 0xFF, dev.lse.n * 4);
+
+  // K / V placement: element (token t of request b, head h, dim x).
+  auto place = [&](const std::vector<float>& src, int dim, bool is_k) {
+    const size_t n = pool_tokens * c.Hkv * dim;
+    std::vector<float> img(n, 0.0f);
+    for (int b = 0; b < B; ++b) {
+      for (int t = 0; t < c.kv_lens[b]; ++t) {
+        for (int h = 0; h < c.Hkv; ++h) {
+          const size_t s0 = (static_cast<size_t>(d.kv_indptr[b] + t) * c.Hkv + h) * dim;
+          size_t d0;
+          if (!paged) {
+            d0 = s0;
+          } else {
+            const size_t pg = pages[b][t / c.page_size], off = t % c.page_size;
+            d0 = c.hnd ? ((pg * c.Hkv + h) * c.page_size + off) * dim
+                       : ((pg * c.page_size + off) * c.Hkv + h) * dim;
+          }
+          for (int x = 0; x < dim; ++x) img[d0 + x] = src[s0 + x];
+        }
+      }
+    }
+    if (fp8) {
+      std::vector<uint8_t> b8(n);
+      for (size_t i = 0; i < n; ++i) b8[i] = fp8_bits(kvdt, img[i]);
+      upload(is_k ? dev.k8.p : dev.v8.p, b8.data(), n);
+    } else {
+      upload(is_k ? dev.k16.p : dev.v16.p, pack16(c.dt, img).data(), n * 2);
+    }
+  };
+  place(fp8 ? d.k_raw : d.k, c.dqk, true);
+  place(fp8 ? d.v_raw : d.v, c.dvo, false);
+
+  std::vector<int32_t> page_ids, page_indptr(B + 1, 0), last_len(B), bt, seq(c.kv_lens.begin(), c.kv_lens.end());
+  int max_pages = 1;
+  if (paged) {
+    for (int b = 0; b < B; ++b) {
+      page_indptr[b + 1] = page_indptr[b] + static_cast<int32_t>(pages[b].size());
+      for (int32_t p : pages[b]) page_ids.push_back(p);
+      last_len[b] = c.kv_lens[b] == 0 ? 0 : (c.kv_lens[b] - 1) % c.page_size + 1;
+      max_pages = std::max<int>(max_pages, static_cast<int>(pages[b].size()));
+    }
+    bt.assign(static_cast<size_t>(B) * max_pages, 0);
+    for (int b = 0; b < B; ++b) {
+      for (size_t i = 0; i < pages[b].size(); ++i) bt[static_cast<size_t>(b) * max_pages + i] = pages[b][i];
+    }
+  }
+  DevArray<int32_t> d_page_ids(std::max<size_t>(page_ids.size(), 1)), d_page_indptr(B + 1),
+      d_last(std::max(B, 1)), d_bt(std::max<size_t>(bt.size(), 1)), d_seq(std::max(B, 1));
+  upload(d_page_ids.p, page_ids.data(), page_ids.size() * 4);
+  upload(d_page_indptr.p, page_indptr.data(), page_indptr.size() * 4);
+  upload(d_last.p, last_len.data(), last_len.size() * 4);
+  upload(d_bt.p, bt.data(), bt.size() * 4);
+  upload(d_seq.p, seq.data(), seq.size() * 4);
+  if (fp8) {
+    upload(dev.k_scale.p, d.k_scale.data(), d.k_scale.size() * 4);
+    upload(dev.v_scale.p, d.v_scale.data(), d.v_scale.size() * 4);
+  }
+
+  LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return res;
+  ctx.compute_units = c.compute_units;
+  ctx.batch_invariant = c.batch_invariant;
+  const kops::attn::AttentionSpec spec = spec_of(c);
+  std::vector<int32_t> kvl(c.kv_lens.begin(), c.kv_lens.end());
+  std::vector<int32_t> qoi(d.qo_indptr);
+  Tensor qo_t = tensor1d(qoi.data(), DType::kInt32, B + 1);
+  qo_t.device = -1;
+  Tensor kv_t = tensor1d(kvl.data(), DType::kInt32, B);
+  kv_t.device = -1;
+  kops::attn::AttentionPlan plan;
+  kops::Workspace ws{};
+  const int max_kv = c.kv_lens.empty() ? 0 : *std::max_element(c.kv_lens.begin(), c.kv_lens.end());
+  auto do_plan = [&]() {
+    return c.decode ? kops::attn::decode_plan(spec, B, max_kv, c.q_len, c.device_planner, ctx, ws, &plan)
+                    : kops::attn::prefill_plan(spec, qo_t, kv_t, B, ctx, ws, &plan);
+  };
+  Status s = do_plan();
+  if (s != Status::kWorkspaceTooSmall) {
+    KOPS_EXPECT_STATUS(s, Status::kWorkspaceTooSmall, c.name);
+    return res;
+  }
+  DevArray<unsigned char> persistent(plan.workspace.device_persistent_bytes);
+  DevArray<unsigned char> scratch(std::max<size_t>(plan.workspace.device_scratch_bytes, 1));
+  ws.device_persistent = persistent.p;
+  ws.device_persistent_bytes = plan.workspace.device_persistent_bytes;
+  ws.device_scratch = scratch.p;
+  ws.device_scratch_bytes = plan.workspace.device_scratch_bytes;
+  s = do_plan();
+  KOPS_EXPECT_OK(s, c.name);
+  if (s != Status::kSuccess) return res;
+  res.split = plan.split_kv;
+  res.kernel_id = plan.kernel_id;
+
+  kops::attn::AttentionModifiers mod;
+  mod.sm_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(c.dqk)));
+  mod.logits_softcap = c.softcap;
+  mod.window_left = c.window_left;
+  mod.window_right = c.window_right;
+  mod.chunk_size = c.chunk;
+  mod.num_sink_tokens = c.num_sink_tokens;
+  mod.alibi_slopes = c.alibi ? dev.alibi.p : nullptr;
+  mod.sink_logits = c.sinks ? dev.sinks.p : nullptr;
+  auto common = [&](auto& p) {  // fields shared by the prefill and decode params
+    p.q = dev.q.p;
+    p.q_stride_n = static_cast<int64_t>(c.Hq) * c.dqk;
+    p.q_stride_h = c.dqk;
+    p.mod = mod;
+    p.o = dev.o.p;
+    p.o_stride_n = static_cast<int64_t>(c.Hq) * c.dvo;
+    p.o_stride_h = c.dvo;
+    p.lse = dev.lse.p;
+    p.batch_size = B;
+    p.num_qo_heads = c.Hq;
+    p.num_kv_heads = c.Hkv;
+  };
+  auto prefill_common = [&](auto& p) {
+    common(p);
+    p.qo_indptr = dev.qo_indptr.p;
+    p.q_pos_offset = c.q_pos_offset ? dev.q_pos.p : nullptr;
+    p.custom_mask = c.mask == MaskMode::kCustom ? dev.mask_bits.p : nullptr;
+    p.mask_indptr = c.mask == MaskMode::kCustom ? dev.mask_indptr.p : nullptr;
+    p.total_q = d.total_q;
+  };
+  if (!paged) {
+    kops::attn::RaggedPrefillParams p{};
+    prefill_common(p);
+    p.kv.k = dev.k16.p;
+    p.kv.v = dev.v16.p;
+    p.kv.k_stride_n = static_cast<int64_t>(c.Hkv) * c.dqk;
+    p.kv.k_stride_h = c.dqk;
+    p.kv.v_stride_n = static_cast<int64_t>(c.Hkv) * c.dvo;
+    p.kv.v_stride_h = c.dvo;
+    p.kv.kv_indptr = dev.kv_indptr.p;
+    s = kops::attn::ragged_prefill_run(plan, p, ws, ctx);
+  } else {
+    kops::attn::PagedPrefillParams p{};
+    prefill_common(p);
+    kops::kv::PagedKVDesc& k = p.kv;
+    k.k_data = fp8 ? static_cast<void*>(dev.k8.p) : static_cast<void*>(dev.k16.p);
+    k.v_data = fp8 ? static_cast<void*>(dev.v8.p) : static_cast<void*>(dev.v16.p);
+    k.k_dtype = k.v_dtype = kvdt;
+    k.k_codec = k.v_codec = spec.k_codec;
+    k.layout = spec.kv_layout;
+    k.page_size = c.page_size;
+    k.num_kv_heads = c.Hkv;
+    k.head_dim_k = c.dqk;
+    k.head_dim_v = c.dvo;
+    const int64_t ps = c.page_size;
+    k.k_stride_page = ps * c.Hkv * c.dqk;
+    k.v_stride_page = ps * c.Hkv * c.dvo;
+    k.k_stride_token = c.hnd ? c.dqk : static_cast<int64_t>(c.Hkv) * c.dqk;
+    k.v_stride_token = c.hnd ? c.dvo : static_cast<int64_t>(c.Hkv) * c.dvo;
+    k.k_stride_head = c.hnd ? ps * c.dqk : c.dqk;
+    k.v_stride_head = c.hnd ? ps * c.dvo : c.dvo;
+    if (c.block_table) {
+      k.table_format = kops::kv::PageTableFormat::kBlockTable;
+      k.block_table = d_bt.p;
+      k.block_table_stride = max_pages;
+      k.seq_lens = d_seq.p;
+    } else {
+      k.table_format = kops::kv::PageTableFormat::kCSR;
+      k.kv_indptr = d_page_indptr.p;
+      k.kv_page_indices = d_page_ids.p;
+      k.kv_last_page_len = d_last.p;
+    }
+    if (fp8) {
+      k.k_scale = dev.k_scale.p;
+      k.v_scale = dev.v_scale.p;
+      k.scale_head_stride = c.per_head_scale ? 1 : 0;
+    }
+    if (c.decode) {
+      kops::attn::DecodeParams dp{};
+      common(dp);
+      dp.q_len = c.q_len;
+      dp.kv = p.kv;
+      s = kops::attn::decode_run(plan, dp, ws, ctx);
+      if (c.device_planner && s == Status::kSuccess) {  // replay-safety of the task counter
+        s = kops::attn::decode_run(plan, dp, ws, ctx);
+      }
+    } else {
+      s = kops::attn::paged_prefill_run(plan, p, ws, ctx);
+    }
+  }
+  KOPS_EXPECT_OK(s, c.name);
+  const cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    kops_test::record_failure(c.name, cudaGetErrorString(err), __FILE__, __LINE__);
+    return res;
+  }
+  const std::vector<uint16_t> o16 = kops_test::copy_out(dev.o.p, dev.o.n);
+  res.o.resize(o16.size());
+  for (size_t i = 0; i < o16.size(); ++i) res.o[i] = unpack16(c.dt, o16[i]);
+  res.lse = kops_test::copy_out(dev.lse.p, dev.lse.n);
+  res.ok = s == Status::kSuccess;
+  return res;
+}
+
+void check_attn(const AttnCase& c, const AttnData& d, const AttnRun& r, const char* tag) {
+  if (!r.ok) return;
+  char what[160];
+  std::snprintf(what, sizeof(what), "%s%s o", c.name, tag);
+  kops_test::compare(r.o, d.o_ref, c.atol, c.rtol, what);
+  std::snprintf(what, sizeof(what), "%s%s lse", c.name, tag);
+  kops_test::compare(r.lse, d.lse_ref, c.lse_atol, 1e-5, what);
+  // compare() lets NaN through (NaN > tol is false): rows the kernel never wrote stay NaN-filled.
+  size_t lost = 0;
+  for (size_t i = 0; i < r.o.size(); ++i) lost += std::isfinite(d.o_ref[i]) && !std::isfinite(r.o[i]);
+  for (size_t i = 0; i < r.lse.size(); ++i) lost += !std::isnan(d.lse_ref[i]) && std::isnan(r.lse[i]);
+  std::snprintf(what, sizeof(what), "%s%s: %zu outputs not written (NaN)", c.name, tag, lost);
+  if (lost != 0) kops_test::record_failure(what, nullptr, __FILE__, __LINE__);
+}
+
+void run_attn_case(const AttnCase& c, unsigned seed) {
+  const AttnData d = make_attn_data(c, seed);
+  const AttnRun r = run_prefill(c, d, seed + 17);
+  check_attn(c, d, r, "");
+}
+
+AttnCase ragged_case(const char* name, int dqk, int dvo, int Hq, int Hkv) {
+  AttnCase c;
+  c.name = name;
+  c.qo_lens = {37, 1, 130, 64};
+  c.kv_lens = {37, 70, 200, 64};
+  c.Hq = Hq;
+  c.Hkv = Hkv;
+  c.dqk = dqk;
+  c.dvo = dvo;
+  return c;
+}
+
+void test_prefill_head_dims() {
+  const int dims[][2] = {{64, 64}, {80, 80}, {96, 96}, {128, 128}, {256, 256}, {192, 128}};
+  unsigned seed = 100;
+  for (const auto& dd : dims) {
+    for (int g : {1, 4}) {
+      char name[64];
+      std::snprintf(name, sizeof(name), "prefill ragged d%d/%d G%d", dd[0], dd[1], g);
+      AttnCase c = ragged_case(name, dd[0], dd[1], 2 * g, 2);
+      run_attn_case(c, seed++);
+    }
+  }
+  for (int d16 : {128, 80}) {  // fp16: tighter tolerance
+    AttnCase f = ragged_case(d16 == 128 ? "prefill ragged fp16 d128 G4" : "prefill ragged fp16 d80 G2", d16, d16,
+                             d16 == 128 ? 8 : 4, 2);
+    f.dt = DType::kFloat16;
+    f.atol = f.rtol = 2e-3;
+    run_attn_case(f, seed++);
+  }
+  // An FP8 v_scale error only shows on outputs with a large mean: fp16, V offset 3, tight tolerance.
+  AttnCase p8 = ragged_case("prefill paged e4m3 fp16 V+3", 128, 128, 8, 2);
+  p8.dt = DType::kFloat16;
+  p8.kv_dt = DType::kFloat8E4M3;
+  p8.page_size = 16;
+  p8.v_offset = 3.0f;
+  p8.atol = p8.rtol = 2e-3;
+  run_attn_case(p8, seed++);
+}
+
+/// One AttentionModifiers rule set (applied on top of a base case).
+struct ModRule {
+  const char* tag;
+  MaskMode mask;
+  int window_left, window_right, num_sink_tokens, chunk;
+  float softcap;
+  bool alibi, sinks;
+};
+const ModRule kModRules[] = {
+    {"window", MaskMode::kCausal, 37, -1, 0, 0, 0.0f, false, false},
+    {"window+sink tokens", MaskMode::kCausal, 50, -1, 4, 0, 0.0f, false, false},
+    {"softcap", MaskMode::kCausal, -1, -1, 0, 0, 3.0f, false, false},
+    {"alibi", MaskMode::kCausal, -1, -1, 0, 0, 0.0f, true, false},
+    {"sinks + SWA", MaskMode::kCausal, 127, -1, 0, 0, 0.0f, false, true},
+    {"chunked", MaskMode::kCausal, -1, -1, 0, 48, 0.0f, false, false},
+    {"no mask + bidir window", MaskMode::kNone, 20, 11, 0, 0, 0.0f, false, false},
+    {"custom mask", MaskMode::kCustom, -1, -1, 0, 0, 0.0f, false, false},
+};
+
+AttnCase with_rule(AttnCase c, const ModRule& m) {
+  c.mask = m.mask;
+  c.window_left = m.window_left;
+  c.window_right = m.window_right;
+  c.num_sink_tokens = m.num_sink_tokens;
+  c.chunk = m.chunk;
+  c.softcap = m.softcap;
+  c.alibi = m.alibi;
+  c.sinks = m.sinks;
+  return c;
+}
+
+void test_prefill_modifiers() {  // every rule x every compiled head-dim pair
+  unsigned seed = 200;
+  const int dims[][2] = {{64, 64}, {80, 80}, {96, 96}, {128, 128}, {256, 256}, {192, 128}};
+  for (const auto& dd : dims) {
+    for (const ModRule& m : kModRules) {
+      char name[96];
+      std::snprintf(name, sizeof(name), "prefill %s d%d/%d", m.tag, dd[0], dd[1]);
+      AttnCase c = with_rule(ragged_case(name, dd[0], dd[1], 8, 2), m);
+      c.qo_lens = {150, 9, 77};
+      c.kv_lens = {300, 9, 140};
+      run_attn_case(c, seed++);
+    }
+  }
+  AttnCase c = ragged_case("prefill q_pos_offset + all modifiers", 128, 128, 8, 2);
+  c.qo_lens = {40, 70};
+  c.kv_lens = {200, 90};
+  c.q_pos_offset = true;
+  c.window_left = 60;
+  c.num_sink_tokens = 3;
+  c.softcap = 5.0f;
+  c.alibi = true;
+  c.sinks = true;
+  c.chunk = 64;
+  run_attn_case(c, seed++);
+  // Fully masked rows: qo_len > kv_len puts the first rows at negative positions.
+  AttnCase m = ragged_case("prefill masked rows (qo > kv)", 64, 64, 2, 1);
+  m.qo_lens = {20};
+  m.kv_lens = {5};
+  run_attn_case(m, seed++);
+  m.name = "prefill masked rows + sinks";
+  m.sinks = true;
+  run_attn_case(m, seed++);
+}
+
+void test_prefill_paged() {
+  unsigned seed = 300;
+  struct P {
+    int ps;
+    bool hnd, bt;
+    DType kv;
+    bool per_head;
+    int dim;
+  };
+  const P cases[] = {
+      {16, false, false, DType::kInvalid, false, 128}, {1, false, true, DType::kInvalid, false, 64},
+      {64, true, false, DType::kInvalid, false, 128},  {32, true, true, DType::kInvalid, false, 96},
+      {16, false, false, DType::kFloat8E4M3, false, 128}, {16, true, true, DType::kFloat8E4M3, true, 128},
+      {32, false, true, DType::kFloat8E5M2, false, 64}, {16, false, false, DType::kFloat8E4M3, true, 256},
+  };
+  for (const P& pc : cases) {
+    char name[96];
+    std::snprintf(name, sizeof(name), "prefill paged ps%d %s %s %s%s d%d", pc.ps, pc.hnd ? "HND" : "NHD",
+                  pc.bt ? "block-table" : "CSR",
+                  pc.kv == DType::kInvalid ? "bf16" : (pc.kv == DType::kFloat8E4M3 ? "e4m3" : "e5m2"),
+                  pc.per_head ? " per-head" : "", pc.dim);
+    AttnCase c = ragged_case(name, pc.dim, pc.dim, 8, 2);
+    c.qo_lens = {17, 1, 90};
+    c.kv_lens = {120, 33, 90};
+    c.page_size = pc.ps;
+    c.hnd = pc.hnd;
+    c.block_table = pc.bt;
+    c.kv_dt = pc.kv;
+    c.per_head_scale = pc.per_head;
+    run_attn_case(c, seed++);
+  }
+  // Verification (A06): 5 draft tokens + tree mask over a cached prefix.
+  AttnCase v = ragged_case("prefill paged verify tree mask", 128, 128, 8, 1);
+  v.qo_lens = {6, 6};
+  v.kv_lens = {100, 260};
+  v.page_size = 16;
+  v.mask = MaskMode::kCustom;
+  run_attn_case(v, seed++);
+}
+
+void test_prefill_split_and_invariance() {
+  // Split-KV vs one pass: same request, tolerance only.
+  AttnCase c = ragged_case("prefill split-kv", 128, 128, 4, 1);
+  c.qo_lens = {16};
+  c.kv_lens = {3000};
+  c.sinks = true;
+  c.window_left = 2000;
+  c.compute_units = 64;
+  const AttnData d = make_attn_data(c, 401);
+  const AttnRun r1 = run_prefill(c, d, 9);
+  KOPS_TEST_CHECK(r1.split);
+  check_attn(c, d, r1, " (split)");
+  const AttnRun r2 = run_prefill(c, d, 9);
+  KOPS_TEST_CHECK(r1.o == r2.o && r1.lse == r2.lse);  // deterministic: bit-identical rerun
+  AttnCase nc = c;
+  nc.compute_units = 1;
+  const AttnRun r3 = run_prefill(nc, d, 9);
+  KOPS_TEST_CHECK(!r3.split);
+  check_attn(nc, d, r3, " (one pass)");
+
+  // batch_invariant: a request alone and inside a batch gives the same bits.
+  AttnCase big = ragged_case("prefill batch-invariant", 128, 128, 8, 2);
+  big.qo_lens = {33, 70, 5};
+  big.kv_lens = {5000, 70, 9000};
+  big.batch_invariant = true;
+  big.compute_units = 64;
+  const AttnData db = make_attn_data(big, 402);
+  const AttnRun rb = run_prefill(big, db, 3);
+  check_attn(big, db, rb, " (batch)");
+  AttnCase one = big;
+  one.qo_lens = {big.qo_lens[2]};
+  one.kv_lens = {big.kv_lens[2]};
+  AttnData d1 = make_attn_data(one, 403);
+  // Same inputs as request 2 of the batch.
+  const size_t qrow = static_cast<size_t>(big.Hq) * big.dqk;
+  d1.q.assign(db.q.begin() + db.qo_indptr[2] * qrow, db.q.begin() + db.qo_indptr[3] * qrow);
+  const size_t krow = static_cast<size_t>(big.Hkv) * big.dqk, vrow = static_cast<size_t>(big.Hkv) * big.dvo;
+  d1.k.assign(db.k.begin() + db.kv_indptr[2] * krow, db.k.begin() + db.kv_indptr[3] * krow);
+  d1.v.assign(db.v.begin() + db.kv_indptr[2] * vrow, db.v.begin() + db.kv_indptr[3] * vrow);
+  d1.k_raw = d1.k;
+  d1.v_raw = d1.v;
+  const AttnRun r_one = run_prefill(one, d1, 4);
+  const size_t orow = static_cast<size_t>(big.Hq) * big.dvo;
+  bool same = r_one.ok && rb.ok;
+  for (size_t i = 0; same && i < r_one.o.size(); ++i) {
+    const float a = r_one.o[i], b = rb.o[db.qo_indptr[2] * orow + i];
+    same = std::memcmp(&a, &b, 4) == 0;
+  }
+  KOPS_TEST_CHECK(same);
+}
+
+void test_prefill_models() {
+  unsigned seed = 500;
+  AttnCase g = ragged_case("model Gemma2 softcap 50 d256", 256, 256, 8, 4);
+  g.softcap = 50.0f;
+  g.window_left = 4096;
+  run_attn_case(g, seed++);
+  AttnCase o = ragged_case("model GPT-OSS sinks + SWA 128 d64", 64, 64, 8, 1);
+  o.qo_lens = {300, 20};
+  o.kv_lens = {300, 400};
+  o.sinks = true;
+  o.window_left = 127;  // HF sliding_window 128 covers the query and 127 keys before it
+  run_attn_case(o, seed++);
+  AttnCase l = ragged_case("model Llama4 chunk 8192", 128, 128, 4, 1);
+  l.qo_lens = {96};
+  l.kv_lens = {8192 + 40};
+  l.chunk = 8192;
+  l.page_size = 16;
+  run_attn_case(l, seed++);
+  AttnCase m = ragged_case("model Mistral SWA d128", 128, 128, 8, 2);
+  m.qo_lens = {200};
+  m.kv_lens = {600};
+  m.window_left = 255;
+  run_attn_case(m, seed++);
+  AttnCase p = ragged_case("model Phi-3 SWA d96", 96, 96, 4, 4);
+  p.qo_lens = {100, 3};
+  p.kv_lens = {300, 50};
+  p.window_left = 127;
+  run_attn_case(p, seed++);
+  AttnCase b = ragged_case("model BLOOM ALiBi d64", 64, 64, 8, 8);
+  b.alibi = true;
+  run_attn_case(b, seed++);
+}
+
+/// Graph strategy: plan at capacity, capture ragged_prefill_run once (device planner + kernel +
+/// merge), replay with different device lengths and data in the same buffers.
+void test_prefill_graph() {
+  for (int inv = 0; inv < 2; ++inv) {
+    AttnCase cap = ragged_case(inv ? "prefill graph batch-invariant" : "prefill graph split", 128, 128, 8, 2);
+    cap.qo_lens = {40, 10, 70};
+    cap.kv_lens = {300, 10, 5000};
+    cap.batch_invariant = inv != 0;
+    cap.compute_units = 64;
+    cap.sinks = true;
+    const int B = 3;
+    const AttnData dcap = make_attn_data(cap, 600 + inv);
+    DevArray<uint16_t> q(dcap.q.size()), k(dcap.k.size()), v(dcap.v.size()),
+        o(static_cast<size_t>(dcap.total_q) * cap.Hq * cap.dvo);
+    DevArray<float> lse(static_cast<size_t>(dcap.total_q) * cap.Hq), sinks(cap.Hq);
+    DevArray<int32_t> qo(B + 1), kvi(B + 1);
+    LaunchContext ctx{};
+    if (!kops_test::make_context(&ctx)) return;
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+    ctx.stream = reinterpret_cast<kops::kops_stream_t>(stream);
+    ctx.compute_units = cap.compute_units;
+    ctx.batch_invariant = cap.batch_invariant;
+    ctx.strategy = kops::ExecutionStrategy::kGraph;
+    ctx.capture_generation = 7;
+    std::vector<int32_t> qoi(dcap.qo_indptr), kvl(cap.kv_lens.begin(), cap.kv_lens.end());
+    Tensor qo_t = tensor1d(qoi.data(), DType::kInt32, B + 1);
+    qo_t.device = -1;
+    Tensor kv_t = tensor1d(kvl.data(), DType::kInt32, B);
+    kv_t.device = -1;
+    const kops::attn::AttentionSpec spec = spec_of(cap);
+    kops::attn::AttentionPlan plan;
+    kops::Workspace ws{};
+    KOPS_EXPECT_STATUS(kops::attn::prefill_plan(spec, qo_t, kv_t, B, ctx, ws, &plan),
+                       Status::kWorkspaceTooSmall, cap.name);
+    DevArray<unsigned char> pers(plan.workspace.device_persistent_bytes),
+        scr(std::max<size_t>(plan.workspace.device_scratch_bytes, 1));
+    ws.device_persistent = pers.p;
+    ws.device_persistent_bytes = plan.workspace.device_persistent_bytes;
+    ws.device_scratch = scr.p;
+    ws.device_scratch_bytes = plan.workspace.device_scratch_bytes;
+    KOPS_EXPECT_OK(kops::attn::prefill_plan(spec, qo_t, kv_t, B, ctx, ws, &plan), cap.name);
+    KOPS_TEST_CHECK(plan.split_kv && plan.num_launches == 3);
+
+    kops::attn::RaggedPrefillParams p{};
+    p.q = q.p;
+    p.q_stride_n = static_cast<int64_t>(cap.Hq) * cap.dqk;
+    p.q_stride_h = cap.dqk;
+    p.qo_indptr = qo.p;
+    p.kv.k = k.p;
+    p.kv.v = v.p;
+    p.kv.k_stride_n = static_cast<int64_t>(cap.Hkv) * cap.dqk;
+    p.kv.k_stride_h = cap.dqk;
+    p.kv.v_stride_n = static_cast<int64_t>(cap.Hkv) * cap.dvo;
+    p.kv.v_stride_h = cap.dvo;
+    p.kv.kv_indptr = kvi.p;
+    p.mod.sm_scale = static_cast<float>(1.0 / std::sqrt(128.0));
+    p.mod.sink_logits = sinks.p;
+    p.o = o.p;
+    p.o_stride_n = static_cast<int64_t>(cap.Hq) * cap.dvo;
+    p.o_stride_h = cap.dvo;
+    p.lse = lse.p;
+    p.batch_size = B;
+    p.num_qo_heads = cap.Hq;
+    p.num_kv_heads = cap.Hkv;
+    p.total_q = dcap.total_q;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    const Status rs = kops::attn::ragged_prefill_run(plan, p, ws, ctx);
+    cudaStreamEndCapture(stream, &graph);
+    KOPS_EXPECT_OK(rs, cap.name);
+    if (rs != Status::kSuccess || graph == nullptr ||
+        cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+      kops_test::record_failure(cap.name, "graph capture failed", __FILE__, __LINE__);
+      cudaStreamDestroy(stream);
+      return;
+    }
+    const std::vector<std::vector<int>> qlens = {cap.qo_lens, {5, 33, 1}, {0, 64, 12}};
+    const std::vector<std::vector<int>> klens = {cap.kv_lens, {4999, 40, 7}, {9, 64, 4096}};
+    for (size_t r = 0; r < qlens.size(); ++r) {
+      AttnCase sc = cap;
+      sc.qo_lens = qlens[r];
+      sc.kv_lens = klens[r];
+      const AttnData d = make_attn_data(sc, 610 + static_cast<unsigned>(r) + 10 * inv);
+      upload(q.p, pack16(sc.dt, d.q).data(), d.q.size() * 2);
+      upload(k.p, pack16(sc.dt, d.k).data(), d.k.size() * 2);
+      upload(v.p, pack16(sc.dt, d.v).data(), d.v.size() * 2);
+      upload(qo.p, d.qo_indptr.data(), (B + 1) * 4);
+      upload(kvi.p, d.kv_indptr.data(), (B + 1) * 4);
+      upload(sinks.p, d.sinks.data(), d.sinks.size() * 4);
+      cudaMemset(o.p, 0xFF, o.n * 2);
+      cudaGraphLaunch(exec, stream);
+      if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        kops_test::record_failure(cap.name, "graph replay failed", __FILE__, __LINE__);
+        break;
+      }
+      const std::vector<uint16_t> o16 = kops_test::copy_out(o.p, static_cast<size_t>(d.total_q) * sc.Hq * sc.dvo);
+      AttnRun res;
+      res.o.resize(o16.size());
+      for (size_t i = 0; i < o16.size(); ++i) res.o[i] = unpack16(sc.dt, o16[i]);
+      res.lse = kops_test::copy_out(lse.p, static_cast<size_t>(d.total_q) * sc.Hq);
+      res.ok = true;
+      char tag[32];
+      std::snprintf(tag, sizeof(tag), " replay %zu", r);
+      check_attn(sc, d, res, tag);
+    }
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+  }
+}
+
+// ---- decode (A03 / A05 / A06 / A08) -------------------------------------------------------------
+
+/// decode_plan path recorded in the plan's kernel_id: 0 CUDA core, 1 tensor core, 2 dynamic.
+int decode_path(const AttnRun& r) { return static_cast<int>((r.kernel_id >> 52) & 7); }
+
+AttnCase decode_case(const char* name, int dim, int Hq, int Hkv, int q_len, std::vector<int> kv_lens) {
+  AttnCase c;
+  c.name = name;
+  c.decode = true;
+  c.q_len = q_len;
+  c.kv_lens = std::move(kv_lens);
+  c.qo_lens.assign(c.kv_lens.size(), q_len);
+  c.Hq = Hq;
+  c.Hkv = Hkv;
+  c.dqk = c.dvo = dim;
+  c.page_size = 16;
+  return c;
+}
+
+void run_decode_case(const AttnCase& c, unsigned seed, int want_path) {
+  const AttnData d = make_attn_data(c, seed);
+  const AttnRun r = run_prefill(c, d, seed + 5);
+  if (r.ok && want_path >= 0 && decode_path(r) != want_path) {
+    char msg[96];
+    std::snprintf(msg, sizeof(msg), "path %d, expected %d", decode_path(r), want_path);
+    kops_test::record_failure(c.name, msg, __FILE__, __LINE__);
+  }
+  check_attn(c, d, r, "");
+}
+
+void test_decode_dims_and_paths() {
+  unsigned seed = 700;
+  for (int dim : {64, 80, 96, 128, 192, 256}) {
+    const bool tc = dim == 64 || dim == 128 || dim == 256;
+    char n1[64], n2[64], n3[64];
+    std::snprintf(n1, sizeof(n1), "decode simt d%d MHA", dim);
+    run_decode_case(decode_case(n1, dim, 4, 4, 1, {1, 37, 300, 129}), seed++, 0);
+    std::snprintf(n2, sizeof(n2), "decode d%d GQA8 q_len 1", dim);
+    run_decode_case(decode_case(n2, dim, 16, 2, 1, {5, 260, 17}), seed++, tc ? 1 : 0);
+    std::snprintf(n3, sizeof(n3), "decode d%d GQA4 verify q_len 3", dim);
+    run_decode_case(decode_case(n3, dim, 8, 2, 3, {3, 90, 400}), seed++, tc ? 1 : 0);
+  }
+  AttnCase m = decode_case("decode tc G16 x q_len 4 (4 row blocks)", 128, 32, 2, 4, {50, 777});
+  run_decode_case(m, seed++, 1);
+  AttnCase h = decode_case("decode fp16 tc d128", 128, 8, 1, 1, {1000, 3});
+  h.dt = DType::kFloat16;
+  h.atol = h.rtol = 2e-3;
+  run_decode_case(h, seed++, 1);
+  AttnCase hs = decode_case("decode fp16 simt d96", 96, 2, 2, 1, {1000, 3});
+  hs.dt = DType::kFloat16;
+  hs.atol = hs.rtol = 2e-3;
+  run_decode_case(hs, seed++, 0);
+  for (int g : {1, 8}) {  // FP8 v_scale check (fp16, V offset 3) on the CUDA-core and tensor-core paths
+    AttnCase f8 = decode_case(g == 1 ? "decode simt e4m3 fp16 V+3" : "decode tc e4m3 fp16 V+3", 128, 2 * g, 2, 1,
+                              {700, 5});
+    f8.dt = DType::kFloat16;
+    f8.kv_dt = DType::kFloat8E4M3;
+    f8.v_offset = 3.0f;
+    f8.atol = f8.rtol = 2e-3;
+    run_decode_case(f8, seed++, g == 1 ? 0 : 1);
+  }
+  AttnCase z = decode_case("decode empty request", 64, 4, 4, 1, {0, 9});
+  run_decode_case(z, seed++, 0);
+}
+
+void test_decode_modifiers_and_caches() {
+  unsigned seed = 800;
+  struct Cache {
+    const char* tag;
+    DType kv;
+    bool hnd, bt, per_head;
+    int ps;
+  };
+  const Cache caches[] = {{"fp8 e4m3 HND block-table", DType::kFloat8E4M3, true, true, false, 16},
+                          {"fp8 e5m2 per-head ps1", DType::kFloat8E5M2, false, false, true, 1},
+                          {"bf16 ps64", DType::kInvalid, false, false, false, 64}};
+  for (int g = 0; g < 2; ++g) {  // g = 0: CUDA core (MHA), 1: tensor core (GQA 8)
+    const int Hq = g ? 16 : 4, Hkv = g ? 2 : 4;
+    for (const ModRule& m : kModRules) {
+      if (m.mask != MaskMode::kCausal) continue;  // decode is causal among its q_len rows
+      char name[96];
+      std::snprintf(name, sizeof(name), "decode %s %s", g ? "tc" : "simt", m.tag);
+      AttnCase c = with_rule(decode_case(name, 128, Hq, Hkv, 2, {300, 41, 1}), m);
+      run_decode_case(c, seed++, g);
+    }
+    for (const Cache& k : caches) {
+      char name[96];
+      std::snprintf(name, sizeof(name), "decode %s %s + sinks", g ? "tc" : "simt", k.tag);
+      AttnCase c = decode_case(name, 128, Hq, Hkv, 2, {300, 41, 1});
+      c.kv_dt = k.kv;
+      c.hnd = k.hnd;
+      c.block_table = k.bt;
+      c.per_head_scale = k.per_head;
+      c.page_size = k.ps;
+      c.sinks = true;
+      run_decode_case(c, seed++, g);
+    }
+  }
+  AttnCase f = decode_case("decode simt fp8 d80", 80, 4, 4, 1, {200, 33});
+  f.kv_dt = DType::kFloat8E4M3;
+  run_decode_case(f, seed++, 0);
+}
+
+void test_decode_split_dynamic() {
+  unsigned seed = 900;
+  for (int g = 0; g < 2; ++g) {
+    AttnCase c = decode_case(g ? "decode tc split" : "decode simt split", 128, g ? 8 : 2, g ? 1 : 2, 1, {4000, 9, 2500});
+    c.compute_units = 64;
+    c.sinks = true;
+    const AttnData d = make_attn_data(c, seed++);
+    const AttnRun r1 = run_prefill(c, d, 3);
+    KOPS_TEST_CHECK(r1.split && decode_path(r1) == g);
+    check_attn(c, d, r1, " (split)");
+    const AttnRun r2 = run_prefill(c, d, 3);
+    KOPS_TEST_CHECK(r1.o == r2.o && r1.lse == r2.lse);
+    AttnCase nc = c;
+    nc.compute_units = 1;
+    const AttnRun r3 = run_prefill(nc, d, 3);
+    KOPS_TEST_CHECK(!r3.split);
+    check_attn(nc, d, r3, " (one pass)");
+  }
+  // batch_invariant: the last request alone vs in the batch.
+  AttnCase big = decode_case("decode batch-invariant", 128, 8, 2, 1, {5000, 30, 4500});
+  big.batch_invariant = true;
+  big.compute_units = 64;
+  const AttnData db = make_attn_data(big, seed++);
+  const AttnRun rb = run_prefill(big, db, 7);
+  check_attn(big, db, rb, " (batch)");
+  AttnCase one = big;
+  one.kv_lens = {big.kv_lens[2]};
+  one.qo_lens = {1};
+  AttnData d1 = make_attn_data(one, seed++);
+  const size_t qrow = static_cast<size_t>(big.Hq) * big.dqk, krow = static_cast<size_t>(big.Hkv) * big.dqk;
+  d1.q.assign(db.q.begin() + db.qo_indptr[2] * qrow, db.q.begin() + db.qo_indptr[3] * qrow);
+  d1.k.assign(db.k.begin() + db.kv_indptr[2] * krow, db.k.begin() + db.kv_indptr[3] * krow);
+  d1.v.assign(db.v.begin() + db.kv_indptr[2] * krow, db.v.begin() + db.kv_indptr[3] * krow);
+  d1.k_raw = d1.k;
+  d1.v_raw = d1.v;
+  const AttnRun r_one = run_prefill(one, d1, 8);
+  const size_t orow = static_cast<size_t>(big.Hq) * big.dvo;
+  bool same = r_one.ok && rb.ok;
+  for (size_t i = 0; same && i < r_one.o.size(); ++i) {
+    const float a = r_one.o[i], b = rb.o[2 * orow + i];
+    same = std::memcmp(&a, &b, 4) == 0;
+  }
+  KOPS_TEST_CHECK(same);
+
+  // A05 dynamic: one long request among short ones, q_len 1 and 2, every cache flavour.
+  AttnCase dy = decode_case("decode dynamic skewed", 128, 16, 2, 1, {20000, 300, 300, 1, 300, 4096, 300, 77});
+  dy.device_planner = true;
+  dy.compute_units = 16;
+  dy.sinks = true;
+  run_decode_case(dy, seed++, 2);
+  AttnCase dy2 = decode_case("decode dynamic verify q_len 2 fp8 block-table", 64, 8, 8, 2, {700, 3, 1500});
+  dy2.device_planner = true;
+  dy2.kv_dt = DType::kFloat8E4M3;
+  dy2.block_table = true;
+  dy2.window_left = 255;
+  run_decode_case(dy2, seed++, 2);
+  AttnCase dy3 = decode_case("decode dynamic d256 fp16", 256, 4, 1, 1, {900, 2});
+  dy3.device_planner = true;
+  dy3.dt = DType::kFloat16;
+  dy3.atol = dy3.rtol = 2e-3;
+  run_decode_case(dy3, seed++, 2);
+}
+
+void test_prefill_contracts() {
+  LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  kops::attn::AttentionSpec s = spec_of(ragged_case("x", 128, 128, 8, 2));
+  KOPS_EXPECT_OK(kops::attn::attention_supports(s, ctx, nullptr, 0, nullptr), "supports d128");
+  kops::attn::AttentionSpec bad = s;
+  bad.head_dim_qk = bad.head_dim_vo = 72;
+  KOPS_EXPECT_STATUS(kops::attn::attention_supports(bad, ctx, nullptr, 0, nullptr),
+                     Status::kUnsupportedShape, "supports d72");
+  bad = s;
+  bad.num_q_heads = 7;
+  KOPS_EXPECT_STATUS(kops::attn::attention_supports(bad, ctx, nullptr, 0, nullptr),
+                     Status::kUnsupportedShape, "supports Hq % Hkv");
+  bad = s;
+  bad.kv_dtype = DType::kFloat8E4M3;
+  bad.k_codec = bad.v_codec = kops::kv::KVCodec::kFP8PerTensor;
+  KOPS_EXPECT_STATUS(kops::attn::attention_supports(bad, ctx, nullptr, 0, nullptr),
+                     Status::kUnsupportedDtype, "supports ragged fp8");
+  bad.page_size = 16;
+  KOPS_EXPECT_OK(kops::attn::attention_supports(bad, ctx, nullptr, 0, nullptr), "supports paged fp8");
+  bad.head_dim_qk = bad.head_dim_vo = 96;
+  KOPS_EXPECT_STATUS(kops::attn::attention_supports(bad, ctx, nullptr, 0, nullptr),
+                     Status::kUnsupportedShape, "supports paged fp8 d96");
+  kops::attn::RejectReason why[4];
+  int32_t n = 0;
+  bad = s;
+  bad.q_dtype = DType::kFloat32;
+  bad.head_dim_qk = 72;
+  (void)kops::attn::attention_supports(bad, ctx, why, 4, &n);
+  KOPS_TEST_CHECK(n == 3);  // head dims, q dtype, K/V dtype
+  // Plan: host tensors only, two-call workspace protocol.
+  std::vector<int32_t> qo = {0, 10}, kvl = {10};
+  Tensor qo_t = tensor1d(qo.data(), DType::kInt32, 2);
+  qo_t.device = -1;
+  Tensor kv_t = tensor1d(kvl.data(), DType::kInt32, 1);
+  kv_t.device = -1;
+  kops::attn::AttentionPlan plan;
+  KOPS_EXPECT_STATUS(kops::attn::prefill_plan(s, qo_t, kv_t, 1, ctx, kops::Workspace{}, &plan),
+                     Status::kWorkspaceTooSmall, "prefill_plan empty workspace");
+  KOPS_TEST_CHECK(plan.workspace.device_persistent_bytes > 0);
+  KOPS_EXPECT_STATUS(kops::attn::prefill_plan(s, qo_t, kv_t, 0 + 1, ctx, kops::Workspace{}, nullptr),
+                     Status::kInvalidArgument, "prefill_plan null plan");
+  Tensor dev_qo = qo_t;
+  dev_qo.device = 0;
+  KOPS_EXPECT_STATUS(kops::attn::prefill_plan(s, dev_qo, kv_t, 1, ctx, kops::Workspace{}, &plan),
+                     Status::kInvalidArgument, "prefill_plan device qo_indptr");
+  // A ragged plan cannot run the paged entry point.
+  kops::attn::PagedPrefillParams pp{};
+  KOPS_EXPECT_STATUS(kops::attn::paged_prefill_run(plan, pp, kops::Workspace{}, ctx),
+                     Status::kInvalidArgument, "paged run without kv");
+  KOPS_EXPECT_STATUS(kops::attn::block_sparse_prefill_run(plan, pp, kops::attn::BlockSparseMask{},
+                                                          kops::Workspace{}, ctx),
+                     Status::kNotImplemented, "block sparse is A10");
 }
 
 }  // namespace
@@ -1422,5 +2483,16 @@ int main() {
   test_mla_context_gather();
 
   test_contracts();
+
+  test_prefill_head_dims();
+  test_prefill_modifiers();
+  test_prefill_paged();
+  test_prefill_split_and_invariance();
+  test_prefill_models();
+  test_prefill_graph();
+  test_decode_dims_and_paths();
+  test_decode_modifiers_and_caches();
+  test_decode_split_dynamic();
+  test_prefill_contracts();
   return kops_test::finish("test_merge");
 }

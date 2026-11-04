@@ -462,6 +462,15 @@ Status dispatch_merge_split_kv(const Tensor& o, const Tensor& lse, const SplitKV
     case 64:
       return dispatch_merge_split_kv_hpb<Out, 64>(o, lse, split, sink_logits, total_rows, rows,
                                                   heads, stream);
+    case 80:  // B8 attention head dims (Phi-2 / StableLM, Phi-3, MLA 192/128 prefill rows)
+      return dispatch_merge_split_kv_hpb<Out, 80>(o, lse, split, sink_logits, total_rows, rows,
+                                                  heads, stream);
+    case 96:
+      return dispatch_merge_split_kv_hpb<Out, 96>(o, lse, split, sink_logits, total_rows, rows,
+                                                  heads, stream);
+    case 192:
+      return dispatch_merge_split_kv_hpb<Out, 192>(o, lse, split, sink_logits, total_rows, rows,
+                                                   heads, stream);
     case 128:
       return dispatch_merge_split_kv_hpb<Out, 128>(o, lse, split, sink_logits, total_rows, rows,
                                                    heads, stream);

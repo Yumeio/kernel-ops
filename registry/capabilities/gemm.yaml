@@ -198,6 +198,33 @@
    "status": "numerically_validated",
    "predicates": "bf16/fp16 and e4m3 (tensorwise/rowwise) experts; kContiguous/kMasked/kIndexed; empty experts read nothing; bias/act/routing weight",
    "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G01.gemm_mma_sync",
+   "kernel_symbol": "gemm_mma_sync_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16 K-major A,B -> bf16/fp16/fp32; K%8==0, 16 B aligned; 6 tiles + swap_ab; split-K serial/parallel; 15 of 17 epilogue ops (no QuantOut, AzpCorrection); tactic cache + autotune; no tf32, MN-major, stream-K",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G01.dual_gemm",
+   "kernel_symbol": "dual_gemm_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16; gate B0 and up B1 [N,K] K-major, one pass over A; GLU with any ActFn + GluParams; epilogue alpha, row_scale, clamp, softcap, routing_weight, residual; no bias/FP8 (kNotImplemented); K%8==0, 16 B aligned",
+   "evidence": "test_gemm;bench_gemm"
+  },
+  {
+   "op_id": "G01.bmm",
+   "kernel_symbol": "bmm_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "numerically_validated",
+   "predicates": "bf16/fp16 -> same or fp32; B [N,K] or [K,N] (ldmatrix.trans); lda/ldd/batch strides for head-strided [T,H,*] views; K%8==0 (N%8==0 when B is [K,N]); no FP8 (fp8_bmm)",
+   "evidence": "test_gemm;bench_gemm"
   }
  ]
 }

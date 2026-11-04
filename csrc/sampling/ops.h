@@ -1,10 +1,22 @@
 #pragma once
 // =============================================================================
 // kernel-ops | csrc/sampling/ops.h                               Catalog: S01-S03
-// Requires: common/*, sampling/*.cuh.
+// Requires: common/*, sampling/*.cuh (including fused_sampler_kernels.cuh).
 // =============================================================================
 
 namespace kops::sample {
+
+/// Capture-stable plan for the fused sampler. Resolved by sampling_plan() before
+/// graph capture; run() must not re-resolve it. `splits == 1` is the one-CTA-per-
+/// row path; larger values split a row across CTAs for small batches.
+struct SamplingPlan {
+  int32_t splits = 1;
+  int32_t candidate_cap = 0;
+  int32_t hist_bins = 0;
+  int32_t block_threads = 256;
+  uint32_t flags = 0;
+  uint64_t capture_generation = 0;
+};
 
 /// Workspace for one sample() call: the CTAS_PER_ROW softmax state when the vocabulary
 /// is split, plus the per-row rejection-sampling scratch. Callers must query this
@@ -19,6 +31,38 @@ Status sampling_workspace_requirements(int32_t max_batch, int32_t max_vocab, int
 /// with no admissible token writes `out_ids = -1`.
 Status sample(const Tensor& out_ids, const Tensor& logits, const SamplingParams& params,
               const Workspace& ws, const LaunchContext& ctx);
+
+/// Resolve the fused-sampler plan before capture. The fused path implements greedy,
+/// unfiltered categorical, top-k, min-p and top-p (scalar or per-row, sequential or joint).
+/// The plan is a pure function of the logits/params metadata, the device and
+/// ctx.capture_generation, so it is stable across replay; sample_fused() rejects a plan
+/// resolved for other filter settings (kPlanInvalidated). `splits` (a power of two <= 16)
+/// splits each row over that many CTAs launched cooperatively, with tokens bit-identical to
+/// splits == 1; callers may lower it, not raise it past what stays co-resident. A split row must
+/// be 16-byte vectorizable and keep at least 4096 tokens per CTA, so the auto plan stops before
+/// the per-CTA shard gets too small to pay for the row barrier.
+Status sampling_plan(const Tensor& logits, const SamplingParams& params, const LaunchContext& ctx,
+                     SamplingPlan* out);
+
+/// Workspace for sample_fused(). One-CTA-per-row plans (splits == 1) keep their state in shared
+/// memory and need nothing. Split-row plans (splits > 1, chosen for small batches) need
+/// max_batch per-row exchange areas in device_scratch and one 8-byte barrier counter per row in
+/// device_persistent, zero-filled once before the first call (any split count may reuse it).
+/// One workspace serves one call at a time; concurrent streams need their own.
+Status sampling_fused_workspace_requirements(int32_t max_batch, int32_t max_vocab,
+                                             const SamplingPlan& plan,
+                                             WorkspaceRequirements* out);
+
+/// Fused sampler: greedy or unfiltered full-vocab categorical sampling in one
+/// launch, with optional penalty processors folded into the logits load. NaN/-inf
+/// policy and truncation order match sample(); top-k keeps the whole tie group and
+/// draws match sample() in distribution only (CONTRACTS.md §1c). Rows with only
+/// top-p active use a fixed-point mass histogram to find the boundary bin, then race
+/// the bins above it and refine the boundary candidates; the nucleus is unchanged.
+Status sample_fused(const Tensor& out_ids, const Tensor& logits,
+                    const FusedSamplingParams& params, const SamplingPlan& plan,
+                    const Workspace& ws, const LaunchContext& ctx);
+
 /// Gumbel-max sampler: out_ids[b] = argmax(logits[b] / T_b + Gumbel(u_id)) over the top-k/min-p
 /// admissible set. Same counter RNG and tie-break as the other samplers.
 Status gumbel_max_sample(const Tensor& out_ids, const Tensor& logits, const SamplingParams& params,

@@ -7,6 +7,8 @@
 //   splitk_reduce_kernel     fixed-order reduce of the split-K partials + epilogue
 //   gemv_argmax_kernel       greedy LM head without writing logits
 //   router_gemm_kernel       fp32 router logits (E = 8..1024), optional two-term bf16x2 weights
+//   dual_gemm_kernel         (B7 row 2, end of file) D = GLU(A.B0^T, A.B1^T) on mma.sync, one pass over A
+//   bmm_kernel               (B7 row 2, end of file) strided batched bf16/fp16 GEMM on mma.sync, B as [N,K] or [K,N]
 // Host entries: gemm, gemm_with_tactic, scaled_gemm, gemv_argmax, router_gemm,
 //               gemm_workspace_requirements.
 //
@@ -719,8 +721,13 @@ Status run_dense(const ScaledGemmArgs& args, const GemmTactic* tactic, const Wor
   }
   const bool a_k = args.a.major == MajorOrder::kKMajor;
   const bool b_k = args.b.major == MajorOrder::kKMajor;
-  if (args.a.ld < (a_k ? args.k : args.m) || args.b.ld < (b_k ? args.k : args.n) || args.ldd < args.n) {
+  const int64_t d_cols = !fp32 && !f64 && (args.epi.ops & kEpiGLU) != 0u ? args.n / 2 : args.n;   // GLU halves N
+  if (args.a.ld < (a_k ? args.k : args.m) || args.b.ld < (b_k ? args.k : args.n) || args.ldd < d_cols) {
     return detail::set_error(Status::kInvalidArgument, "gemm: leading dimensions smaller than the extents");
+  }
+  if (!fp32 && !f64) {
+    const bool small_gemv = args.m <= 16 && args.batch == 1 && a_k && b_k && adt == bdt;
+    if (!small_gemv || mma_selects(args, tactic, ctx)) return mma_gemm(args, tactic, ws, ctx);
   }
   Status st = Status::kSuccess;
   if (!f64) {
@@ -869,6 +876,10 @@ Status gemm_workspace_requirements(const GemmProblem& problem, const GemmTactic*
   if (out == nullptr) return detail::set_error(Status::kInvalidArgument, "gemm_workspace_requirements: null output");
   *out = WorkspaceRequirements{};
   const bool dense = problem.recipe == GemmRecipe::kBF16 || problem.recipe == GemmRecipe::kFP16 || problem.recipe == GemmRecipe::kFP32;
+  const bool mma16 = problem.recipe == GemmRecipe::kBF16 || problem.recipe == GemmRecipe::kFP16;
+  if (mma16 && (problem.m > 16 || problem.batch > 1 || (tactic != nullptr && tactic->mainloop == MainloopSchedule::kMultistageMmaSync))) {
+    return mma_workspace(problem, tactic, ctx, out);
+  }
   if (dense && problem.m <= 16 && problem.batch == 1) {
     const int split = tactic != nullptr && tactic->split_k_mode == SplitKMode::kParallel ? tactic->split_k_slices
                                                                                           : auto_split_k(problem.n, problem.k);
@@ -994,6 +1005,572 @@ Status router_gemm(const RouterGemmParams& params, bool two_term, DType x_dtype,
   }
   return w_dtype == DType::kBFloat16 ? launch_router<__nv_bfloat16, __nv_bfloat16>(params, false, s)
                                      : launch_router<__half, __half>(params, false, s);
+}
+
+
+// =============================================================================
+// B7 row 2: dual_gemm_kernel and bmm_kernel on mma.sync.m16n8k16 (SM80+)
+//   dual_gemm_kernel  D = GLU(A . B0^T, A . B1^T): one pass over the A tile feeds two accumulator sets.
+//   bmm_kernel        D[b] = A[b] . B[b] (B K-major [N, K] or [K, N] through ldmatrix.trans), head-strided
+//                     views of [T, H, *] through lda / stride_a_batch.
+// The tensor-core helpers below (tc_*) duplicate the small helpers of gemm_mma.cu (cp.async, ldmatrix,
+// the 64 B-row XOR swizzle) on purpose: this file does not depend on gemm_mma.cu internals.
+// Numerics: fp32 accumulation inside mma.sync, the K chain of one element is the same sequence of k16
+// steps in every tile, one rounding at the end.
+// =============================================================================
+namespace {
+
+__device__ __forceinline__ uint32_t tc_smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+
+__device__ __forceinline__ void tc_cp_async16(uint32_t dst, const void* src, bool pred) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  const int sz = pred ? 16 : 0;
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(sz));
+#endif
+}
+__device__ __forceinline__ void tc_cp_async_commit() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.commit_group;");
+#endif
+}
+template <int N>
+__device__ __forceinline__ void tc_cp_async_wait() {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.wait_group %0;" ::"n"(N));
+#endif
+}
+__device__ __forceinline__ void tc_ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
+#endif
+}
+__device__ __forceinline__ void tc_ldmatrix_x4_trans(uint32_t (&r)[4], uint32_t addr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+               : "r"(addr));
+#endif
+}
+
+/// K-major tile [NROWS][32] (64 B rows): 16 B chunk c of row r lives at chunk c ^ ((r >> 1) & 3).
+template <typename T, int NROWS, int THREADS>
+__device__ __forceinline__ void tc_load_kmajor(T* sdst, const T* g, int64_t ld, int rows_limit, int row0, int k0, int K, int tid) {
+  for (int c = tid; c < NROWS * 4; c += THREADS) {
+    const int row = c >> 2;
+    const int ch = c & 3;
+    const int gr = row0 + row;
+    const int gk = k0 + ch * 8;
+    const bool pred = gr < rows_limit && gk < K;
+    const T* src = g + static_cast<int64_t>(pred ? gr : 0) * ld + (pred ? gk : 0);
+    tc_cp_async16(tc_smem_u32(sdst + row * 32 + ((ch ^ ((row >> 1) & 3)) << 3)), src, pred);
+  }
+}
+
+/// N-major tile [32 k][BN n]: chunk c of row r lives at chunk c ^ (r & 7) (BN * 2 bytes per row).
+template <typename T, int BN, int THREADS>
+__device__ __forceinline__ void tc_load_nmajor(T* sdst, const T* g, int64_t ld, int N, int n0, int k0, int K, int tid) {
+  constexpr int CH = BN / 8;
+  for (int c = tid; c < 32 * CH; c += THREADS) {
+    const int row = c / CH;
+    const int ch = c % CH;
+    const int gk = k0 + row;
+    const int gn = n0 + ch * 8;
+    const bool pred = gk < K && gn < N;
+    const T* src = g + static_cast<int64_t>(pred ? gk : 0) * ld + (pred ? gn : 0);
+    tc_cp_async16(tc_smem_u32(sdst + row * BN + ((ch ^ (row & 7)) << 3)), src, pred);
+  }
+}
+
+/// Grouped tile order (8 row tiles per group) so neighbouring CTAs share B tiles in L2.
+__device__ __forceinline__ void tc_tile_map(int pid, int tiles_m, int tiles_n, int* tm, int* tn) {
+  constexpr int G = 8;
+  const int width = G * tiles_n;
+  const int first_m = (pid / width) * G;
+  const int gsz = min(tiles_m - first_m, G);
+  *tm = first_m + (pid % width) % gsz;
+  *tn = (pid % width) / gsz;
+}
+
+__device__ __forceinline__ float tc_glu_runtime(ActFn fn, float gate, float up, const GluParams& p) {
+  switch (fn) {
+    case ActFn::kSiLU: return apply_glu<ActFn::kSiLU>(gate, up, p);
+    case ActFn::kGeLUErf: return apply_glu<ActFn::kGeLUErf>(gate, up, p);
+    case ActFn::kGeLUTanh: return apply_glu<ActFn::kGeLUTanh>(gate, up, p);
+    case ActFn::kQuickGeLU: return apply_glu<ActFn::kQuickGeLU>(gate, up, p);
+    case ActFn::kReLU: return apply_glu<ActFn::kReLU>(gate, up, p);
+    case ActFn::kReLU2: return apply_glu<ActFn::kReLU2>(gate, up, p);
+    case ActFn::kSigmoid: return apply_glu<ActFn::kSigmoid>(gate, up, p);
+    case ActFn::kTanh: return apply_glu<ActFn::kTanh>(gate, up, p);
+    case ActFn::kSoftplus: return apply_glu<ActFn::kSoftplus>(gate, up, p);
+    case ActFn::kSiTU: return apply_glu<ActFn::kSiTU>(gate, up, p);
+    case ActFn::kFatReLU: return apply_glu<ActFn::kFatReLU>(gate, up, p);
+    default: return apply_glu<ActFn::kIdentity>(gate, up, p);
+  }
+}
+
+/// Stores one or two adjacent outputs (m, n), (m, n + 1): packed when the address allows.
+template <typename D>
+__device__ __forceinline__ void tc_store_pair(D* dp, float v0, float v1, bool has1) {
+  D s0, s1{};
+  dev::from_f(s0, v0);
+  if (has1) dev::from_f(s1, v1);
+  if (has1 && (reinterpret_cast<uintptr_t>(dp) & (2 * sizeof(D) - 1)) == 0) {
+    struct alignas(2 * sizeof(D)) Two { D a, b; } two{s0, s1};
+    *reinterpret_cast<Two*>(dp) = two;
+  } else {
+    dp[0] = s0;
+    if (has1) dp[1] = s1;
+  }
+}
+
+}  // namespace
+
+/// Compile-time shape of one dual_gemm_kernel instantiation: BM x BN output tile, BK = 32, ST stages,
+/// 2 x 2 warps. Per stage: A [BM, 32], B0 [BN, 32], B1 [BN, 32].
+template <typename T, int BM, int BN, int ST>
+struct DualTileTraits {
+  using a_type = T;
+  static constexpr int tile_m = BM, tile_n = BN, tile_k = 32, stages = ST;
+  static constexpr int warps_m = 2, warps_n = 2, threads = 128;
+  static constexpr size_t smem_bytes = static_cast<size_t>(ST) * (BM + 2 * BN) * 32 * sizeof(T);
+  static_assert(BM % 32 == 0 && BN % 32 == 0, "warp tile: m16 x (two n8 per ldmatrix)");
+};
+
+template <typename Traits>
+__global__ void __launch_bounds__(128) dual_gemm_kernel(const __grid_constant__ DualGemmParams p) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  using T = typename Traits::a_type;
+  using Tc = dev::TcFrag<T>;
+  constexpr int BM = Traits::tile_m, BN = Traits::tile_n, ST = Traits::stages;
+  constexpr int MT = BM / 32;        // m16 tiles per warp (two warp rows)
+  constexpr int NT = BN / 16;        // n8 tiles per warp (two warp columns)
+  constexpr int kThreads = 128;
+
+  extern __shared__ __align__(128) unsigned char smem_raw[];
+  T* const sA = reinterpret_cast<T*>(smem_raw);
+  T* const sB0 = sA + ST * BM * 32;
+  T* const sB1 = sB0 + ST * BN * 32;
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int M = p.m, N = p.n, K = p.k;
+  const int tiles_m = (M + BM - 1) / BM;
+  const int tiles_n = (N + BN - 1) / BN;
+  int tm, tn;
+  tc_tile_map(blockIdx.x, tiles_m, tiles_n, &tm, &tn);
+  const int row0 = tm * BM;
+  const int col0 = tn * BN;
+  const T* const gA = static_cast<const T*>(p.a);
+  const T* const gB0 = static_cast<const T*>(p.b0);
+  const T* const gB1 = static_cast<const T*>(p.b1);
+
+  const int nk = (K + 31) / 32;
+  auto load_stage = [&](int stage, int kt) {
+    tc_load_kmajor<T, BM, kThreads>(sA + stage * BM * 32, gA, p.lda, M, row0, kt * 32, K, tid);
+    tc_load_kmajor<T, BN, kThreads>(sB0 + stage * BN * 32, gB0, p.ldb0, N, col0, kt * 32, K, tid);
+    tc_load_kmajor<T, BN, kThreads>(sB1 + stage * BN * 32, gB1, p.ldb1, N, col0, kt * 32, K, tid);
+  };
+
+  float acc0[MT][NT][4];
+  float acc1[MT][NT][4];
+  #pragma unroll
+  for (int i = 0; i < MT; ++i) {
+    #pragma unroll
+    for (int j = 0; j < NT; ++j) {
+      #pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        acc0[i][j][q] = 0.0f;
+        acc1[i][j][q] = 0.0f;
+      }
+    }
+  }
+  #pragma unroll
+  for (int s = 0; s < ST - 1; ++s) {
+    if (s < nk) load_stage(s, s);
+    tc_cp_async_commit();
+  }
+
+  const int warp_r0 = (warp >> 1) * (BM / 2);
+  const int warp_c0 = (warp & 1) * (BN / 2);
+
+  for (int it = 0; it < nk; ++it) {
+    tc_cp_async_wait<ST - 2>();
+    __syncthreads();
+    const int nxt = it + ST - 1;
+    if (nxt < nk) load_stage(nxt % ST, nxt);
+    tc_cp_async_commit();
+
+    const T* const a_st = sA + (it % ST) * BM * 32;
+    const T* const b0_st = sB0 + (it % ST) * BN * 32;
+    const T* const b1_st = sB1 + (it % ST) * BN * 32;
+    #pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+      uint32_t af[MT][4];
+      uint32_t b0f[NT][2];
+      uint32_t b1f[NT][2];
+      #pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        const int row = warp_r0 + mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+        const int ch = kk * 2 + (lane >> 4);
+        tc_ldmatrix_x4(af[mt], tc_smem_u32(a_st + row * 32 + ((ch ^ ((row >> 1) & 3)) << 3)));
+      }
+      #pragma unroll
+      for (int np = 0; np < NT / 2; ++np) {
+        const int row = warp_c0 + np * 16 + (lane & 7) + (lane >> 4) * 8;
+        const int ch = kk * 2 + ((lane >> 3) & 1);
+        const int off = row * 32 + ((ch ^ ((row >> 1) & 3)) << 3);
+        uint32_t r[4];
+        tc_ldmatrix_x4(r, tc_smem_u32(b0_st + off));
+        b0f[2 * np][0] = r[0]; b0f[2 * np][1] = r[1]; b0f[2 * np + 1][0] = r[2]; b0f[2 * np + 1][1] = r[3];
+        tc_ldmatrix_x4(r, tc_smem_u32(b1_st + off));
+        b1f[2 * np][0] = r[0]; b1f[2 * np][1] = r[1]; b1f[2 * np + 1][0] = r[2]; b1f[2 * np + 1][1] = r[3];
+      }
+      #pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+          Tc::mma(acc0[mt][nt], af[mt], b0f[nt][0], b0f[nt][1]);
+          Tc::mma(acc1[mt][nt], af[mt], b1f[nt][0], b1f[nt][1]);
+        }
+      }
+    }
+  }
+  tc_cp_async_wait<0>();
+
+  // ---- epilogue: gate and up of one output stay together; stage both through shared memory ----
+  constexpr int PASS_ROWS = BM / 2;
+  constexpr int LDC = BN + 4;
+  static_assert(2u * PASS_ROWS * LDC * sizeof(float) <= Traits::smem_bytes, "epilogue staging fits the pipeline buffers");
+  float* const sG = reinterpret_cast<float*>(smem_raw);
+  float* const sU = sG + PASS_ROWS * LDC;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const EpilogueParams& e = p.epi;
+  const float alpha = e.alpha_ptr != nullptr ? *e.alpha_ptr : e.alpha;
+  T* const dbase = static_cast<T*>(p.d);
+  __syncthreads();
+  for (int wi = 0; wi < 2; ++wi) {
+    if ((warp >> 1) == wi) {
+      #pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) {
+          const int r = mt * 16 + g;
+          const int c = warp_c0 + nt * 8 + 2 * t;
+          *reinterpret_cast<float2*>(&sG[r * LDC + c]) = make_float2(acc0[mt][nt][0], acc0[mt][nt][1]);
+          *reinterpret_cast<float2*>(&sG[(r + 8) * LDC + c]) = make_float2(acc0[mt][nt][2], acc0[mt][nt][3]);
+          *reinterpret_cast<float2*>(&sU[r * LDC + c]) = make_float2(acc1[mt][nt][0], acc1[mt][nt][1]);
+          *reinterpret_cast<float2*>(&sU[(r + 8) * LDC + c]) = make_float2(acc1[mt][nt][2], acc1[mt][nt][3]);
+        }
+      }
+    }
+    __syncthreads();
+    const int per_row = BN / 2;
+    for (int idx = tid; idx < PASS_ROWS * per_row; idx += kThreads) {
+      const int r = idx / per_row;
+      const int c = (idx - r * per_row) * 2;
+      const int64_t m = row0 + wi * PASS_ROWS + r;
+      const int64_t n = col0 + c;
+      if (m >= M || n >= N) continue;
+      const bool has1 = n + 1 < N;
+      float out[2];
+      #pragma unroll
+      for (int j = 0; j < 2; ++j) {
+        float gate = sG[r * LDC + c + j] * alpha;
+        float up = sU[r * LDC + c + j] * alpha;
+        if (e.ops & kEpiRowScale) {
+          const float rs = e.row_scale[m];
+          gate *= rs;
+          up *= rs;
+        }
+        if (e.ops & kEpiClamp) {
+          gate = fminf(fmaxf(gate, -e.clamp_limit), e.clamp_limit);
+          up = fminf(fmaxf(up, -e.clamp_limit), e.clamp_limit);
+        }
+        if (e.ops & kEpiSoftcap) {
+          gate = softcap(gate, e.softcap);
+          up = softcap(up, e.softcap);
+        }
+        float v = tc_glu_runtime(p.act, gate, up, p.glu);
+        if (e.ops & kEpiRoutingWeight) v *= e.routing_weight[m];
+        if (e.ops & kEpiResidualAdd) v = fmaf(e.beta, dev::to_f(static_cast<const T*>(e.residual)[m * e.residual_stride + n + j]), v);
+        out[j] = v;
+        if (!has1) break;
+      }
+      tc_store_pair<T>(dbase + m * p.ldd + n, out[0], has1 ? out[1] : 0.0f, has1);
+    }
+    __syncthreads();
+  }
+#else
+  (void)p;
+  if (threadIdx.x == 0) __trap();
+#endif
+}
+
+/// bmm_kernel: BM x BN output tile of one batch (blockIdx.z), BK = 32, 2 x 2 warps. B is read as
+/// [N, K] (b_k_major) or as [K, N] through ldmatrix.trans; the choice is a uniform runtime branch.
+template <typename a_t, typename b_t, typename d_t, int TILE_M, int TILE_N, int TILE_K, typename ArchTag>
+__global__ void __launch_bounds__(128) bmm_kernel(const __grid_constant__ BmmParams p) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  static_assert(TILE_K == 32 && TILE_M % 32 == 0 && TILE_N % 32 == 0, "bmm tiles: BK 32, 2 x 2 warps");
+  static_assert(sizeof(a_t) == sizeof(b_t) && sizeof(a_t) == 2, "bmm: 16-bit operands");
+  using Tc = dev::TcFrag<a_t>;
+  constexpr int BM = TILE_M, BN = TILE_N;
+  constexpr int ST = BM * BN >= 128 * 128 ? 3 : 4;
+  constexpr int MT = BM / 32;
+  constexpr int NT = BN / 16;
+  constexpr int kThreads = 128;
+
+  extern __shared__ __align__(128) unsigned char smem_raw[];
+  a_t* const sA = reinterpret_cast<a_t*>(smem_raw);
+  b_t* const sB = reinterpret_cast<b_t*>(sA + ST * BM * 32);
+
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int M = p.m, N = p.n, K = p.k;
+  const int tiles_m = (M + BM - 1) / BM;
+  const int tiles_n = (N + BN - 1) / BN;
+  int tm, tn;
+  tc_tile_map(blockIdx.x, tiles_m, tiles_n, &tm, &tn);
+  const int row0 = tm * BM;
+  const int col0 = tn * BN;
+  const int64_t z = blockIdx.z;
+  const a_t* const gA = static_cast<const a_t*>(p.a) + z * p.stride_a_batch;
+  const b_t* const gB = static_cast<const b_t*>(p.b) + z * p.stride_b_batch;
+  const bool kmajor = p.b_k_major;
+
+  const int nk = (K + 31) / 32;
+  auto load_stage = [&](int stage, int kt) {
+    tc_load_kmajor<a_t, BM, kThreads>(sA + stage * BM * 32, gA, p.lda, M, row0, kt * 32, K, tid);
+    if (kmajor) tc_load_kmajor<b_t, BN, kThreads>(sB + stage * BN * 32, gB, p.ldb, N, col0, kt * 32, K, tid);
+    else tc_load_nmajor<b_t, BN, kThreads>(sB + stage * BN * 32, gB, p.ldb, N, col0, kt * 32, K, tid);
+  };
+
+  float acc[MT][NT][4];
+  #pragma unroll
+  for (int i = 0; i < MT; ++i) {
+    #pragma unroll
+    for (int j = 0; j < NT; ++j) {
+      #pragma unroll
+      for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.0f;
+    }
+  }
+  #pragma unroll
+  for (int s = 0; s < ST - 1; ++s) {
+    if (s < nk) load_stage(s, s);
+    tc_cp_async_commit();
+  }
+
+  const int warp_r0 = (warp >> 1) * (BM / 2);
+  const int warp_c0 = (warp & 1) * (BN / 2);
+
+  for (int it = 0; it < nk; ++it) {
+    tc_cp_async_wait<ST - 2>();
+    __syncthreads();
+    const int nxt = it + ST - 1;
+    if (nxt < nk) load_stage(nxt % ST, nxt);
+    tc_cp_async_commit();
+
+    const a_t* const a_st = sA + (it % ST) * BM * 32;
+    const b_t* const b_st = sB + (it % ST) * BN * 32;
+    #pragma unroll
+    for (int kk = 0; kk < 2; ++kk) {
+      uint32_t af[MT][4];
+      uint32_t bf[NT][2];
+      #pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        const int row = warp_r0 + mt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+        const int ch = kk * 2 + (lane >> 4);
+        tc_ldmatrix_x4(af[mt], tc_smem_u32(a_st + row * 32 + ((ch ^ ((row >> 1) & 3)) << 3)));
+      }
+      #pragma unroll
+      for (int np = 0; np < NT / 2; ++np) {
+        uint32_t r[4];
+        if (kmajor) {
+          const int row = warp_c0 + np * 16 + (lane & 7) + (lane >> 4) * 8;
+          const int ch = kk * 2 + ((lane >> 3) & 1);
+          tc_ldmatrix_x4(r, tc_smem_u32(b_st + row * 32 + ((ch ^ ((row >> 1) & 3)) << 3)));
+        } else {
+          // matrices: (k 0-7, n 0-7) (k 8-15, n 0-7) (k 0-7, n 8-15) (k 8-15, n 8-15), transposed on load
+          const int j = lane >> 3;
+          const int krow = kk * 16 + (j & 1) * 8 + (lane & 7);
+          const int ch = (warp_c0 + np * 16 + (j >> 1) * 8) >> 3;
+          tc_ldmatrix_x4_trans(r, tc_smem_u32(b_st + krow * BN + ((ch ^ (krow & 7)) << 3)));
+        }
+        bf[2 * np][0] = r[0]; bf[2 * np][1] = r[1]; bf[2 * np + 1][0] = r[2]; bf[2 * np + 1][1] = r[3];
+      }
+      #pragma unroll
+      for (int mt = 0; mt < MT; ++mt) {
+        #pragma unroll
+        for (int nt = 0; nt < NT; ++nt) Tc::mma(acc[mt][nt], af[mt], bf[nt][0], bf[nt][1]);
+      }
+    }
+  }
+  tc_cp_async_wait<0>();
+
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  d_t* const dbase = static_cast<d_t*>(p.d) + z * p.stride_d_batch;
+  #pragma unroll
+  for (int mt = 0; mt < MT; ++mt) {
+    #pragma unroll
+    for (int nt = 0; nt < NT; ++nt) {
+      #pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int64_t m = row0 + warp_r0 + mt * 16 + g + h * 8;
+        const int64_t n = col0 + warp_c0 + nt * 8 + 2 * t;
+        if (m < M && n < N) tc_store_pair<d_t>(dbase + m * p.ldd + n, acc[mt][nt][2 * h], acc[mt][nt][2 * h + 1], n + 1 < N);
+      }
+    }
+  }
+#else
+  (void)p;
+  if (threadIdx.x == 0) __trap();
+#endif
+}
+
+// ---- host: dual_gemm / bmm --------------------------------------------------------------------------
+namespace {
+
+template <typename T, int BM, int ST>
+Status launch_dual_tile(const DualGemmParams& p, cudaStream_t s) {
+  using Tr = DualTileTraits<T, BM, 64, ST>;
+  static const cudaError_t attr =
+      cudaFuncSetAttribute(dual_gemm_kernel<Tr>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Tr::smem_bytes));
+  if (attr != cudaSuccess) {
+    return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(attr), "dual_gemm_kernel: %s", cudaGetErrorString(attr));
+  }
+  const int64_t tiles = static_cast<int64_t>((p.m + BM - 1) / BM) * ((p.n + 63) / 64);
+  if (tiles > 0x7FFFFFFF) return detail::set_error(Status::kUnsupportedShape, "dual_gemm: too many tiles");
+  dual_gemm_kernel<Tr><<<static_cast<unsigned>(tiles), 128, Tr::smem_bytes, s>>>(p);
+  return launch_error("dual_gemm_kernel");
+}
+
+template <typename T>
+Status launch_dual(const DualGemmParams& p, cudaStream_t s) {
+  if (p.m <= 32) return launch_dual_tile<T, 32, 4>(p, s);
+  if (p.m <= 64) return launch_dual_tile<T, 64, 4>(p, s);
+  return launch_dual_tile<T, 128, 3>(p, s);
+}
+
+template <typename T, typename D, int TM, int TN>
+Status launch_bmm_tile(const BmmParams& p, cudaStream_t s) {
+  constexpr int ST = TM * TN >= 128 * 128 ? 3 : 4;
+  constexpr size_t smem = static_cast<size_t>(ST) * (TM + TN) * 32 * sizeof(T);
+  static const cudaError_t attr = cudaFuncSetAttribute(bmm_kernel<T, T, D, TM, TN, 32, Sm80>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));
+  if (attr != cudaSuccess) {
+    return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(attr), "bmm_kernel: %s", cudaGetErrorString(attr));
+  }
+  const int64_t tiles = static_cast<int64_t>((p.m + TM - 1) / TM) * ((p.n + TN - 1) / TN);
+  if (tiles > 0x7FFFFFFF) return detail::set_error(Status::kUnsupportedShape, "bmm: too many tiles");
+  // grid.z holds the batch (at most 65535 per launch)
+  constexpr int32_t kMaxZ = 65535;
+  for (int32_t b0 = 0; b0 < p.batch; b0 += kMaxZ) {
+    BmmParams q = p;
+    const int32_t nb = std::min(kMaxZ, p.batch - b0);
+    q.a = static_cast<const T*>(p.a) + static_cast<int64_t>(b0) * p.stride_a_batch;
+    q.b = static_cast<const T*>(p.b) + static_cast<int64_t>(b0) * p.stride_b_batch;
+    q.d = static_cast<D*>(p.d) + static_cast<int64_t>(b0) * p.stride_d_batch;
+    q.batch = nb;
+    bmm_kernel<T, T, D, TM, TN, 32, Sm80><<<dim3(static_cast<unsigned>(tiles), 1u, static_cast<unsigned>(nb)), 128, smem, s>>>(q);
+    Status st = launch_error("bmm_kernel");
+    if (st != Status::kSuccess) return st;
+  }
+  return Status::kSuccess;
+}
+
+template <typename T, typename D>
+Status launch_bmm(const BmmParams& p, cudaStream_t s) {
+  if (p.m <= 32) return launch_bmm_tile<T, D, 32, 64>(p, s);
+  if (p.m <= 64 || p.n < 128) return launch_bmm_tile<T, D, 64, 64>(p, s);
+  if (p.m >= 128) return launch_bmm_tile<T, D, 128, 128>(p, s);
+  return launch_bmm_tile<T, D, 64, 128>(p, s);
+}
+
+}  // namespace
+
+Status dual_gemm(const DualGemmParams& params, DType dtype, const LaunchContext& ctx) {
+  Status st = backend_ok(ctx, GemmBackend::kNative, "dual_gemm");
+  if (st != Status::kSuccess) return st;
+  if (ctx.arch_id >= KOPS_TARGET_SM70 && ctx.arch_id < KOPS_TARGET_SM80) {
+    return detail::set_error(Status::kUnsupportedArch, "dual_gemm: the tensor-core path needs SM80 or newer (arch %d)", ctx.arch_id);
+  }
+  if (dtype == DType::kFloat8E4M3 || dtype == DType::kFloat8E5M2) {
+    return detail::set_error(Status::kNotImplemented, "dual_gemm: FP8 operands (scaled dual GEMM) are not implemented");
+  }
+  if (dtype != DType::kBFloat16 && dtype != DType::kFloat16) {
+    return detail::set_error(Status::kUnsupportedDtype, "dual_gemm: bf16 or fp16 only");
+  }
+  if (params.a_scale != nullptr || params.b0_scale != nullptr || params.b1_scale != nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "dual_gemm: scale pointers are for FP8 operands; pass null for bf16 / fp16");
+  }
+  const EpilogueParams& e = params.epi;
+  constexpr uint32_t kAllowed = kEpiRowScale | kEpiSoftcap | kEpiAct | kEpiGLU | kEpiRoutingWeight | kEpiResidualAdd | kEpiClamp;
+  if ((e.ops & kEpiBias) != 0u) {
+    return detail::set_error(Status::kNotImplemented, "dual_gemm: bias0 / bias1 are unsupported; fold them into the weights");
+  }
+  if ((e.ops & ~kAllowed) != 0u) {
+    return detail::set_error(Status::kNotImplemented, "dual_gemm: epilogue ops 0x%x are not implemented", e.ops & ~kAllowed);
+  }
+  if (((e.ops & kEpiRowScale) != 0u && e.row_scale == nullptr) || ((e.ops & kEpiRoutingWeight) != 0u && e.routing_weight == nullptr) ||
+      ((e.ops & kEpiResidualAdd) != 0u && e.residual == nullptr)) {
+    return detail::set_error(Status::kInvalidArgument, "dual_gemm: epilogue operand missing (residual is read in the output dtype)");
+  }
+  if (params.m < 1 || params.n < 1 || params.k < 1) return detail::set_error(Status::kInvalidArgument, "dual_gemm: empty problem");
+  if (params.a == nullptr || params.b0 == nullptr || params.b1 == nullptr || params.d == nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "dual_gemm: null operand");
+  }
+  if (params.lda < params.k || params.ldb0 < params.k || params.ldb1 < params.k || params.ldd < params.n ||
+      ((e.ops & kEpiResidualAdd) != 0u && e.residual_stride < params.n)) {
+    return detail::set_error(Status::kInvalidArgument, "dual_gemm: leading dimensions smaller than the extents");
+  }
+  if (!aligned(params.a, 16) || !aligned(params.b0, 16) || !aligned(params.b1, 16) || (params.lda * 2) % 16 != 0 ||
+      (params.ldb0 * 2) % 16 != 0 || (params.ldb1 * 2) % 16 != 0 || params.k % 8 != 0) {
+    return detail::set_error(Status::kMisaligned, "dual_gemm: operands need 16 B alignment (pointers, ld) and K %% 8 == 0");
+  }
+  const cudaStream_t s = stream_of(ctx);
+  return dtype == DType::kBFloat16 ? launch_dual<__nv_bfloat16>(params, s) : launch_dual<__half>(params, s);
+}
+
+Status bmm(const BmmParams& params, DType a_dtype, DType b_dtype, DType d_dtype, const LaunchContext& ctx) {
+  Status st = backend_ok(ctx, GemmBackend::kNative, "bmm");
+  if (st != Status::kSuccess) return st;
+  if (ctx.arch_id >= KOPS_TARGET_SM70 && ctx.arch_id < KOPS_TARGET_SM80) {
+    return detail::set_error(Status::kUnsupportedArch, "bmm: the tensor-core path needs SM80 or newer (arch %d)", ctx.arch_id);
+  }
+  if (a_dtype == DType::kFloat8E4M3 || a_dtype == DType::kFloat8E5M2 || b_dtype == DType::kFloat8E4M3 || b_dtype == DType::kFloat8E5M2) {
+    return detail::set_error(Status::kNotImplemented, "bmm: FP8 operands belong to fp8_bmm");
+  }
+  if ((a_dtype != DType::kBFloat16 && a_dtype != DType::kFloat16) || a_dtype != b_dtype) {
+    return detail::set_error(Status::kUnsupportedDtype, "bmm: A and B must both be bf16 or both fp16");
+  }
+  if (d_dtype != a_dtype && d_dtype != DType::kFloat32) {
+    return detail::set_error(Status::kUnsupportedDtype, "bmm: the output is the operand dtype or fp32");
+  }
+  if (params.a_scale != nullptr || params.b_scale != nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "bmm: scales are for FP8 operands; pass null for bf16 / fp16");
+  }
+  if (params.m < 1 || params.n < 1 || params.k < 1 || params.batch < 1) return detail::set_error(Status::kInvalidArgument, "bmm: empty problem");
+  if (params.a == nullptr || params.b == nullptr || params.d == nullptr) return detail::set_error(Status::kInvalidArgument, "bmm: null operand");
+  if (params.lda < params.k || params.ldb < (params.b_k_major ? params.k : params.n) || params.ldd < params.n ||
+      params.stride_a_batch < 0 || params.stride_b_batch < 0 || params.stride_d_batch < 0) {
+    return detail::set_error(Status::kInvalidArgument, "bmm: leading dimensions smaller than the extents or negative batch strides");
+  }
+  if (params.batch > 1 && params.stride_d_batch == 0) return detail::set_error(Status::kInvalidArgument, "bmm: batched output needs stride_d_batch");
+  if (!aligned(params.a, 16) || !aligned(params.b, 16) || (params.lda * 2) % 16 != 0 || (params.ldb * 2) % 16 != 0 ||
+      (params.stride_a_batch * 2) % 16 != 0 || (params.stride_b_batch * 2) % 16 != 0 || params.k % 8 != 0 ||
+      (!params.b_k_major && params.n % 8 != 0)) {
+    return detail::set_error(Status::kMisaligned,
+                             "bmm: A / B need 16 B alignment (pointers, ld, batch strides), K %% 8 == 0 (and N %% 8 == 0 when B is [K, N])");
+  }
+  const cudaStream_t s = stream_of(ctx);
+  const bool bf = a_dtype == DType::kBFloat16;
+  if (d_dtype == DType::kFloat32) return bf ? launch_bmm<__nv_bfloat16, float>(params, s) : launch_bmm<__half, float>(params, s);
+  return bf ? launch_bmm<__nv_bfloat16, __nv_bfloat16>(params, s) : launch_bmm<__half, __half>(params, s);
 }
 
 }  // namespace kops::gemm

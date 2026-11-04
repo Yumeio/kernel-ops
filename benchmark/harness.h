@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -70,6 +71,7 @@ struct Stats {
   double median_ms = 0.0;
   double p10_ms = 0.0;
   double p90_ms = 0.0;
+  double p99_ms = 0.0;
   double min_ms = 0.0;
 };
 
@@ -242,6 +244,7 @@ inline bool measure(const Case& c, Fn fn, Stats* out) {
   out->median_ms = samples[n / 2];
   out->p10_ms = samples[n / 10];
   out->p90_ms = samples[std::min(n - 1, (n * 9) / 10)];
+  out->p99_ms = samples[std::min(n - 1, (n * 99) / 100)];
   return true;
 }
 
@@ -318,11 +321,11 @@ inline void write_results(const char* path, const std::vector<Result>& results,
     json_string(f, c.op.c_str());
     std::fprintf(f, ",\"dtype\":\"%s\",\"rows\":%lld,\"cols\":%lld,\"bytes\":%lld,"
                  "\"flops\":%lld,\"median_ms\":%.6f,\"p10_ms\":%.6f,\"p90_ms\":%.6f,"
-                 "\"min_ms\":%.6f,\"gbs\":%.2f,\"tflops\":%.4f}",
+                 "\"p99_ms\":%.6f,\"min_ms\":%.6f,\"gbs\":%.2f,\"tflops\":%.4f}",
                  dtype_label(c.dtype), static_cast<long long>(c.rows),
                  static_cast<long long>(c.cols), static_cast<long long>(c.bytes),
                  static_cast<long long>(c.flops), r.s.median_ms, r.s.p10_ms, r.s.p90_ms,
-                 r.s.min_ms, gbs, tflops);
+                 r.s.p99_ms, r.s.min_ms, gbs, tflops);
   }
   std::fprintf(f, "]}\n");
   std::fclose(f);
@@ -348,6 +351,9 @@ inline void print_table(const std::vector<Result>& results, const DeviceInfo& de
 
 struct Options {
   bool dump_cases = false;
+  bool split_sweep = false;
+  int iters = 0;
+  const char* only = nullptr;
   const char* json_path = nullptr;
 };
 
@@ -356,10 +362,18 @@ inline Options parse_options(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (std::strcmp(argv[i], "--dump-cases") == 0) {
       o.dump_cases = true;
+    } else if (std::strcmp(argv[i], "--split-sweep") == 0) {
+      o.split_sweep = true;
+    } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
+      o.iters = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
+      o.only = argv[++i];
     } else if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) {
       o.json_path = argv[++i];
     } else if (std::strcmp(argv[i], "--help") == 0) {
-      std::printf("usage: %s [--dump-cases] [--json out.json]\n", argv[0]);
+      std::printf("usage: %s [--dump-cases] [--only substr] [--iters N] [--split-sweep] "
+                  "[--json out.json]\n",
+                  argv[0]);
     }
   }
   return o;

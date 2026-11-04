@@ -139,6 +139,47 @@ void add_b5_cases(std::vector<Case>* cases) {
   add_b5_gemv(cases, "gemm.moe_gemv.fp8.s32.2048x2048", "moe_gemv_fp8", bf, 2048, 2048, 32, 32LL * 2048 * 2048 + 32 * 2048 * 4);
 }
 
+
+// ---- B7: tensor-core GEMM (gemm_mma_sync_kernel) -------------------------------------------------
+// rows = N, cols = K, M = flops / (2 N K).  Figure of merit: TFLOP/s; bytes is the compulsory A + B + D
+// traffic.  "mma_*" uses the static heuristic, "mma_*_tuned" autotunes the M bucket first (outside the timing).
+void add_b7_cases(std::vector<Case>* cases) {
+  char id[128];
+  struct S { int64_t m, n, k; const char* tag; };
+  const S shapes[] = {{32, 4096, 4096, "m32.4096x4096"},     {64, 4096, 4096, "m64.4096x4096"},
+                      {256, 4096, 4096, "m256.4096x4096"},   {1024, 4096, 4096, "m1024.4096x4096"},
+                      {4096, 4096, 4096, "m4096.4096x4096"}, {2048, 14336, 4096, "m2048.14336x4096"},
+                      {2048, 4096, 14336, "m2048.4096x14336"}};
+  for (const S& s : shapes) {
+    const int64_t bytes = (s.m * s.k + s.n * s.k + s.m * s.n) * 2;
+    for (const char* kind : {"bf16", "fp16", "bf16_tuned"}) {
+      if (kind[0] == 'f' && s.m != 1024 && s.m != 256) continue;
+      if (kind[4] == '_' && s.m != 64 && s.m != 256 && s.m != 1024 && s.m != 4096) continue;
+      std::snprintf(id, sizeof(id), "gemm.mma_%s.%s", kind, s.tag);
+      std::string op = std::string("mma_") + kind;
+      cases->push_back({id, op, kind[0] == 'f' ? kops::DType::kFloat16 : kops::DType::kBFloat16, s.n, s.k, bytes, 2 * s.m * s.n * s.k, 5, 50});
+    }
+  }
+}
+
+// ---- B7 row 2: dual_gemm (D = GLU(A.B0^T, A.B1^T)) and bmm (MLA absorption, 128 heads) ----------------
+// dual: rows = N, cols = K, M = flops / (4 N K).  bmm_mla_*: batch 128, A and D are [M, 128, *] head views.
+void add_b7_row2_cases(std::vector<Case>* cases) {
+  char id[128];
+  struct S { int64_t m, n, k; };
+  for (const S& s : {S{64, 4096, 4096}, S{512, 4096, 4096}, S{2048, 4096, 4096}, S{1024, 14336, 4096}}) {
+    std::snprintf(id, sizeof(id), "gemm.dual_bf16.m%lld.%lldx%lld", static_cast<long long>(s.m), static_cast<long long>(s.n), static_cast<long long>(s.k));
+    cases->push_back({id, "dual_bf16", kops::DType::kBFloat16, s.n, s.k, (s.m * s.k + 2 * s.n * s.k + s.m * s.n) * 2, 4 * s.m * s.n * s.k, 5, 50});
+  }
+  for (int64_t m : {1, 8, 64, 512}) {
+    for (int uv = 0; uv < 2; ++uv) {
+      const int64_t k = uv ? 512 : 128, n = uv ? 128 : 512, batch = 128;
+      std::snprintf(id, sizeof(id), "gemm.bmm_mla_%s.m%lld", uv ? "uv" : "uk", static_cast<long long>(m));
+      cases->push_back({id, uv ? "bmm_mla_uv" : "bmm_mla_uk", kops::DType::kBFloat16, n, k, batch * (m * k + k * n + m * n) * 2, 2 * batch * m * n * k, 5, 50});
+    }
+  }
+}
+
 std::vector<Case> make_cases() {
   std::vector<Case> cases;
   auto add = [&](const char* id, const char* op, kops::DType dt, int64_t rows, int64_t cols,
@@ -165,6 +206,8 @@ std::vector<Case> make_cases() {
   add("gemm.fp8_block_quant.ue8m0.bf16.4096x4096", "fp8_block_quant_ue8m0", kops::DType::kBFloat16,
       r, c, 3 * r * c);
   add_b5_cases(&cases);
+  add_b7_cases(&cases);
+  add_b7_row2_cases(&cases);
   return cases;
 }
 
@@ -354,6 +397,47 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     const bool ok = go([&] { return kops::moe::moe_gemv(p, E, 1, DType::kBFloat16, DType::kFloat8E4M3, ctx); });
     cudaFree(d_sorted); cudaFree(d_blk); cudaFree(d_pp);
     return ok;
+  }
+  if (c.op.rfind("mma_", 0) == 0) {
+    const bool f16 = c.dtype == DType::kFloat16;
+    const bool tuned = c.op.size() > 5 && c.op.compare(c.op.size() - 6, 6, "_tuned") == 0;
+    Buf a(m * k * 2), w(n * k * 2), out(m * n * 2), scratch(64u << 20);
+    if (!a.p || !w.p || !out.p || !scratch.p) return false;
+    ScaledGemmArgs args{};
+    args.recipe = f16 ? GemmRecipe::kFP16 : GemmRecipe::kBF16;
+    args.a.data = a.p; args.a.ld = k; args.a.dtype = c.dtype;
+    args.b.data = w.p; args.b.ld = k; args.b.dtype = c.dtype;
+    args.d = out.p; args.ldd = n; args.d_dtype = c.dtype;
+    args.m = m; args.n = n; args.k = k;
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p; ws.device_scratch_bytes = 64u << 20;
+    if (tuned) {
+      GemmProblem pr{};
+      pr.m = m; pr.n = n; pr.k = k; pr.recipe = args.recipe;
+      const int64_t bucket = m;
+      if (!status_ok(autotune(pr, &bucket, 1, GemmBackend::kNative, ws, ctx), id)) return false;
+    }
+    return go([&] { return scaled_gemm(args, nullptr, GemmBackend::kNative, ws, ctx); });
+  }
+  if (c.op == "dual_bf16") {
+    const int64_t dn = c.rows, dk = c.cols, dm = c.flops / (4 * dn * dk);
+    Buf a(dm * dk * 2), w0(dn * dk * 2), w1(dn * dk * 2), out(dm * dn * 2);
+    if (!a.p || !w0.p || !w1.p || !out.p) return false;
+    DualGemmParams p{};
+    p.a = a.p; p.lda = dk; p.b0 = w0.p; p.ldb0 = dk; p.b1 = w1.p; p.ldb1 = dk; p.d = out.p; p.ldd = dn;
+    p.act = kops::ActFn::kSiLU; p.m = static_cast<int32_t>(dm); p.n = static_cast<int32_t>(dn); p.k = static_cast<int32_t>(dk);
+    return go([&] { return dual_gemm(p, DType::kBFloat16, ctx); });
+  }
+  if (c.op == "bmm_mla_uk" || c.op == "bmm_mla_uv") {
+    const int64_t batch = 128, bk = c.cols, bn = c.rows, bm = c.flops / (2 * batch * bn * bk);
+    Buf a(bm * batch * bk * 2), w(batch * bk * bn * 2), out(bm * batch * bn * 2);
+    if (!a.p || !w.p || !out.p) return false;
+    BmmParams p{};
+    p.a = a.p; p.lda = batch * bk; p.stride_a_batch = bk;
+    p.b = w.p; p.ldb = bn; p.stride_b_batch = bk * bn;
+    p.d = out.p; p.ldd = batch * bn; p.stride_d_batch = bn;
+    p.b_k_major = false; p.batch = static_cast<int32_t>(batch); p.m = static_cast<int32_t>(bm); p.n = static_cast<int32_t>(bn); p.k = static_cast<int32_t>(bk);
+    return go([&] { return bmm(p, DType::kBFloat16, DType::kBFloat16, DType::kBFloat16, ctx); });
   }
   *handled = false;
   return true;

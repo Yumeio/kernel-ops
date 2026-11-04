@@ -151,6 +151,7 @@ add_library(kops_cuda STATIC
   csrc/position/rope.cu
   csrc/embedding/embedding.cu
   csrc/sampling/sampling.cu
+  csrc/sampling/fused_sampler.cu
   csrc/sampling/logits_processor.cu
   csrc/quantization/quant.cu
   csrc/quantization/weight_repack.cu
@@ -160,12 +161,15 @@ add_library(kops_cuda STATIC
   csrc/gemm/int8_gemm.cu
   csrc/gemm/fp4_gemm.cu
   csrc/gemm/dense_gemm.cu
+csrc/gemm/gemm_mma.cu
   csrc/gemm/gguf_gemm.cu
   csrc/gemm/grouped_gemm.cu
   csrc/moe/fused_moe.cu
   csrc/moe/routing.cu
   csrc/moe/permute.cu
   csrc/attention/merge.cu
+  csrc/attention/prefill.cu
+  csrc/attention/decode.cu
   csrc/attention/mla.cu
   csrc/kvcache/kvcache.cu
   csrc/state/state_cache.cu)

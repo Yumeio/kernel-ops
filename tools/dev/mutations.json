@@ -1,0 +1,460 @@
+{
+ "quantization": [
+  {
+   "name": "iq2xxs table first entry",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "kIq2xxsGrid[256] = {\n    0x0808080808080808ULL,",
+   "new": "kIq2xxsGrid[256] = {\n    0x0808080808080809ULL,"
+  },
+  {
+   "name": "iq1s table last entry",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "0x22222222u,\n};\n// ---- GGUF codebooks: END",
+   "new": "0x22222221u,\n};\n// ---- GGUF codebooks: END"
+  },
+  {
+   "name": "iq2xxs scale constant",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "static_cast<float>(aux >> 28))), 0.25f);",
+   "new": "static_cast<float>(aux >> 28))), 0.5f);"
+  },
+  {
+   "name": "iq2xxs sign shift",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "gguf_signs((aux >> (7 * l)) & 127u);\n    return __fmul_rn(__fmul_rn(db, grid_byte(kIq2xxsGrid",
+   "new": "gguf_signs((aux >> (6 * l)) & 127u);\n    return __fmul_rn(__fmul_rn(db, grid_byte(kIq2xxsGrid"
+  },
+  {
+   "name": "iq2xs scale byte",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "const int sc = b[66 + ib32];",
+   "new": "const int sc = b[67 + ib32];"
+  },
+  {
+   "name": "iq2s high index bits",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "<< (8 - 2 * l)) & 0x300u);",
+   "new": "<< (8 - 2 * l)) & 0x100u);"
+  },
+  {
+   "name": "iq2s sign bytes offset",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "gguf_sign(qs[32 + 4 * ib32 + l], j)",
+   "new": "gguf_sign(qs[28 + 4 * ib32 + l], j)"
+  },
+  {
+   "name": "iq3xxs scale constant",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "static_cast<float>(aux >> 28))), 0.5f);",
+   "new": "static_cast<float>(aux >> 28))), 0.25f);"
+  },
+  {
+   "name": "iq3s high bit shift",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "(8 - 2 * l - (j >> 2))) & 256u);",
+   "new": "(8 - 2 * l)) & 256u);"
+  },
+  {
+   "name": "iq3s scale nibble",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "(b[106 + (sub >> 1)] >> (4 * (sub & 1))) & 0xF;",
+   "new": "(b[106 + (sub >> 1)] >> (4 * (sub >> 1))) & 0xF;"
+  },
+  {
+   "name": "iq1s delta sign",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "const float delta = (qh & 0x8000u) ? -0.125f : 0.125f;",
+   "new": "const float delta = (qh & 0x8000u) ? 0.125f : -0.125f;"
+  },
+  {
+   "name": "iq1s nibble select",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "(8 * (j & 3) + 4 * (j >> 2))",
+   "new": "(8 * (j & 3) + 4 * (j & 1))"
+  },
+  {
+   "name": "iq1m scale assembly",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "((s1 >> 8) & 0x00F0u)",
+   "new": "((s1 >> 8) & 0x0F00u)"
+  },
+  {
+   "name": "iq1m delta bit",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "((l & 1) ? 0x80u : 0x08u)",
+   "new": "((l & 1) ? 0x08u : 0x80u)"
+  },
+  {
+   "name": "iq1m scale shift",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "6 * (ib & 1) + 3 * (l >> 1)",
+   "new": "6 * (ib & 1) + 3 * (l & 1)"
+  },
+  {
+   "name": "trtllm dst row map",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "return (i & 3) * 8 + (i >> 2); }",
+   "new": "return (i & 3) * 4 + (i >> 2); }"
+  },
+  {
+   "name": "trtllm src row map",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "return (j & 7) * 4 + (j >> 3); }",
+   "new": "return (j & 7) * 4 + (j >> 2); }"
+  },
+  {
+   "name": "trtllm scale sub-block",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "((within >> 2) & 3) * 32 + (within >> 4);",
+   "new": "((within >> 2) & 3) * 16 + (within >> 4);"
+  },
+  {
+   "name": "trtllm scale tile size",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "const int64_t tile = t >> 9;",
+   "new": "const int64_t tile = t >> 8;"
+  },
+  {
+   "name": "trtllm shape constraint",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "if (rows % 128 != 0 || groups % 4 != 0) {",
+   "new": "if (rows % 32 != 0 || groups % 4 != 0) {"
+  },
+  {
+   "name": "trtllm scale aliasing",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "(data_of(out_weight) == data_of(weight) || data_of(out_scales) == data_of(scales))",
+   "new": "(data_of(out_weight) == data_of(weight))"
+  },
+  {
+   "name": "marlin lane rows",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "constexpr int kOffsets[4] = {0, 1, 8, 9};",
+   "new": "constexpr int kOffsets[4] = {0, 1, 8, 8};"
+  },
+  {
+   "name": "marlin 4-bit interleave",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "constexpr int kPack4[8] = {0, 2, 4, 6, 1, 3, 5, 7};",
+   "new": "constexpr int kPack4[8] = {0, 2, 4, 6, 1, 3, 7, 5};"
+  },
+  {
+   "name": "marlin 8-bit interleave",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "constexpr int kPack8[4] = {0, 2, 1, 3};",
+   "new": "constexpr int kPack8[4] = {0, 1, 2, 3};"
+  },
+  {
+   "name": "awq zero 8-bit interleave",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "__constant__ int kMarlinPack8[4] = {0, 2, 1, 3};",
+   "new": "__constant__ int kMarlinPack8[4] = {0, 1, 2, 3};"
+  },
+  {
+   "name": "awq 4-bit nibble position",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "(((c & 1) << 2) | (c >> 1))",
+   "new": "(((c & 1) << 2) | (c >> 2))"
+  },
+  {
+   "name": "awq 8-bit byte position",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "(((c & 1) << 1) | (c >> 1))",
+   "new": "(((c & 1) << 1) | (c >> 2))"
+  },
+  {
+   "name": "scale permutation",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": ": (p >> 3) + 8 * (p & 7);",
+   "new": ": (p >> 3) + 8 * (p & 3);"
+  },
+  {
+   "name": "argsort tie-break",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "rank += (gj < gi) || (gj == gi && j < i);",
+   "new": "rank += (gj < gi);"
+  },
+  {
+   "name": "argsort scan range",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "const int j1 = min(size_k, j0 + chunk);",
+   "new": "const int j1 = min(size_k, j0 + chunk - 1);"
+  },
+  {
+   "name": "zero-point permutation",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "const int src_n = (m & ~63) + ((m & 63) >> 3) + 8 * (m & 7);",
+   "new": "const int src_n = (m & ~63) + ((m & 63) >> 3) + 8 * (m & 3);"
+  },
+  {
+   "name": "Q6_K scale index",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "static_cast<float>(sc[8 * ip + (l >> 4) + 2 * quad])",
+   "new": "static_cast<float>(sc[8 * ip + (l >> 4) + quad])"
+  },
+  {
+   "name": "ue8m0 floor instead of ceil",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "(bits & 0x7FFFFFu) != 0u ? 1u : 0u);\n  e = e < 1u ? 1u : (e > 254u ? 254u : e);\n  const float s_new",
+   "new": "0u);\n  e = e < 1u ? 1u : (e > 254u ? 254u : e);\n  const float s_new"
+  },
+  {
+   "name": "ue8m0 ratio inverted",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "const float ratio = __fdiv_rn(s_old, s_new);",
+   "new": "const float ratio = __fdiv_rn(s_new, s_old);"
+  },
+  {
+   "name": "smoothquant fold direction",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "from_f<scalar_t>(norm_weight[k], __fdiv_rn(to_f<scalar_t>(norm_weight[k]), s));",
+   "new": "from_f<scalar_t>(norm_weight[k], __fmul_rn(to_f<scalar_t>(norm_weight[k]), s));"
+  },
+  {
+   "name": "Q6_K bias",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "- 32;\n    return __fmul_rn(__fmul_rn(d, static_cast<float>(sc[8 * ip",
+   "new": "- 31;\n    return __fmul_rn(__fmul_rn(d, static_cast<float>(sc[8 * ip"
+  },
+  {
+   "name": "IQ4_XS scale bias",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "static_cast<float>(ls - 32)), static_cast<float>(kIq4nlValues",
+   "new": "static_cast<float>(ls - 31)), static_cast<float>(kIq4nlValues"
+  },
+  {
+   "name": "smoothquant alpha",
+   "file": "csrc/quantization/weight_repack.cu",
+   "old": "smooth[k] = fmaxf(powf(act_absmax[k], alpha)",
+   "new": "smooth[k] = fmaxf(powf(act_absmax[k], 1.0f - alpha)"
+  }
+ ],
+ "gemm": [
+  {
+   "name": "swizzle smem mapping",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "if (kg * 8 + tl < k_tiles) tiled_words[o] = tile[row * 8 + (tl ^ (row >> 5))];",
+   "new": "if (kg * 8 + tl < k_tiles) tiled_words[o] = tile[row * 8 + (tl ^ (row >> 4))];"
+  },
+  {
+   "name": "swizzle tile group offset",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "(static_cast<int64_t>(m_tile) * k_tiles + kg * 8) * 128;",
+   "new": "(static_cast<int64_t>(m_tile) * k_tiles + kg * 7) * 128;"
+  },
+  {
+   "name": "swizzle inner_m",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "const int row = (rem >> 2) + 32 * (rem & 3);\n      if (kg * 8 + tl < k_tiles) tiled_words",
+   "new": "const int row = (rem >> 2) + 32 * (rem & 1);\n      if (kg * 8 + tl < k_tiles) tiled_words"
+  },
+  {
+   "name": "ue8m0 pack",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "& 0xFFu) | (((__float_as_uint(v.y) >> 23)",
+   "new": "& 0xFFu) | (((__float_as_uint(v.y) >> 22)"
+  },
+  {
+   "name": "block quant floor",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "constexpr float kWeightAmaxFloor = 1e-4f;",
+   "new": "constexpr float kWeightAmaxFloor = 1e-10f;"
+  },
+  {
+   "name": "router split scale",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "lo[j] = __float2bfloat16_rn((x[j] - __bfloat162float(hi[j])) * 256.0f);",
+   "new": "lo[j] = __float2bfloat16_rn((x[j] - __bfloat162float(hi[j])) * 128.0f);"
+  },
+  {
+   "name": "e4m3 encode rebias",
+   "file": "csrc/common/device_impl.cuh",
+   "old": "code = (r >> 20) - 960u;",
+   "new": "code = (r >> 20) - 961u;"
+  },
+  {
+   "name": "e4m3 encode ties-to-even",
+   "file": "csrc/common/device_impl.cuh",
+   "old": "const uint32_t r = a + 0x7FFFFu + ((a >> 20) & 1u);",
+   "new": "const uint32_t r = a + 0x7FFFFu;"
+  },
+  {
+   "name": "e4m3 decode subnormal",
+   "file": "csrc/common/device_impl.cuh",
+   "old": "float v = m < 8u ? __uint2float_rn(m) * (1.0f / 512.0f)",
+   "new": "float v = m < 8u ? __uint2float_rn(m) * (1.0f / 256.0f)"
+  },
+  {
+   "name": "glu gate/up swap",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "if (src == 0) return j + (is_up ? inter : 0);",
+   "new": "if (src == 0) return j + (is_up ? 0 : inter);"
+  },
+  {
+   "name": "colsum last lane",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "acc = __dp4a(v.w, 0x01010101, acc);",
+   "new": "acc = __dp4a(v.w, 0x00010101, acc);"
+  },
+  {
+   "name": "transpose tile value",
+   "file": "csrc/gemm/gemm_prep.cu",
+   "old": "if (k < rows_k && n < cols_n) tile[threadIdx.y + i][threadIdx.x] = in[k * in_ld + n];",
+   "new": "if (k < rows_k && n < cols_n) tile[threadIdx.y + i][threadIdx.x] = in[k * in_ld + n + 0] ^ 1;"
+  }
+ ],
+ "sampling": [
+  {
+   "name": "greedy tie",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "      if (y > best) {\n        best = y;\n        best_index = token;",
+   "new": "      if (y >= best) {\n        best = y;\n        best_index = token;"
+  },
+  {
+   "name": "record re-read",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "const int it_end = min(seg.iters, (shi[0] + 1) * group);",
+   "new": "const int it_end = min(seg.iters, shi[0] * group + 1);"
+  },
+  {
+   "name": "freq/pres swap",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "x -= freq * static_cast<float>(c) + (c > 0 ? pres : 0.0f);",
+   "new": "x -= pres * static_cast<float>(c) + (c > 0 ? freq : 0.0f);"
+  },
+  {
+   "name": "element order",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "            token = c * VEC + i;\n            break;",
+   "new": "            token = c * VEC + (VEC - 1 - i);\n            break;"
+  },
+  {
+   "name": "minp threshold",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "use_mp ? m + logf(min_p) : inf_neg()",
+   "new": "use_mp ? m + 0.5f * logf(min_p) : inf_neg()"
+  },
+  {
+   "name": "gumbel upper half",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "    e = -log1pf(-s);",
+   "new": "    e = -logf(s);"
+  },
+  {
+   "name": "no mass_above",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "uint64_t cum = mass_above + block_incl_scan(s, sm.w64) - s;",
+   "new": "uint64_t cum = block_incl_scan(s, sm.w64) - s;"
+  },
+  {
+   "name": "keep bound no p",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "const float lim_keep = f.p * zl * (1.0f - 1e-3f) - 1e-6f;",
+   "new": "const float lim_keep = zl * (1.0f - 1e-3f) - 1e-6f;"
+  },
+  {
+   "name": "joint off",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "f.joint = joint && use_p;",
+   "new": "f.joint = false && joint && use_p;"
+  },
+  {
+   "name": "fallback no prefix",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "            if (pass > 0 && (key >> (shift + 8)) != (prefix >> (shift + 8))) continue;\n            const float y = v * f.inv_t;",
+   "new": "            const float y = v * f.inv_t;"
+  },
+  {
+   "name": "v3 tie group dropped",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "return y >= thr && (!use_k || key >= kth);",
+   "new": "return y >= thr && (!use_k || key > kth);"
+  },
+  {
+   "name": "v3 minp threshold",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "f.thr = use_mp ? m + logf(min_p) : inf_neg();",
+   "new": "f.thr = use_mp ? m + 0.5f * logf(min_p) : inf_neg();"
+  },
+  {
+   "name": "v3 three-pass boundary",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "if (in_mp && b > bstar) take |= 1u << i;",
+   "new": "if (in_mp && b >= bstar) take |= 1u << i;"
+  },
+  {
+   "name": "m4 no hist merge",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "  if (want_hist) rc.merge(sm.u.hist, kBins);",
+   "new": "  if (want_hist && false) rc.merge(sm.u.hist, kBins);"
+  },
+  {
+   "name": "m4 cat owner prefix",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "    if (j < rc.s) before += tab[j][0];",
+   "new": "    if (j <= rc.s) before += tab[j][0];"
+  },
+  {
+   "name": "m4 finish leader only",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "    for (int j = 0; j < c.S; ++j) {\n      const float v = __uint_as_float",
+   "new": "    for (int j = 0; j < 1; ++j) {\n      const float v = __uint_as_float"
+  },
+  {
+   "name": "m4 no bin-mass merge",
+   "file": "csrc/sampling/fused_sampler.cu",
+   "old": "  rc.merge(bm, nb);",
+   "new": "  if (false) rc.merge(bm, nb);"
+  }
+ ],
+ "merge": [
+  {
+   "name": "prefill sink window dropped",
+   "file": "csrc/attention/prefill.cu",
+   "old": "bool vis = j >= rlo[r] && j <= rhi[r] && (j >= rwlo[r] || j < nsink);",
+   "new": "bool vis = j >= rlo[r] && j <= rhi[r] && (j >= rwlo[r]);"
+  },
+  {
+   "name": "prefill causal full-tile uses qmax",
+   "file": "csrc/attention/prefill.cu",
+   "old": "if (causal) full = full && t0 + BKV - 1 <= qmin;",
+   "new": "if (causal) full = full && t0 + BKV - 1 <= qmax;"
+  },
+  {
+   "name": "plan kv_tile_indices = 0",
+   "file": "csrc/attention/prefill.cu",
+   "old": "kv_tile_indices[i] = local - (local / nc) * nc;",
+   "new": "kv_tile_indices[i] = 0;"
+  },
+  {
+   "name": "decode ALiBi sign",
+   "file": "csrc/attention/decode.cu",
+   "old": "s += slope2[r] * static_cast<float>(j - qpos[r]);\n      if (!tok",
+   "new": "s += slope2[r] * static_cast<float>(qpos[r] - j);\n      if (!tok"
+  },
+  {
+   "name": "decode TC alpha row index",
+   "file": "csrc/attention/decode.cu",
+   "old": "        o[2 * dp][2] *= alpha[1];",
+   "new": "        o[2 * dp][2] *= alpha[0];"
+  },
+  {
+   "name": "decode split kv_begin +1",
+   "file": "csrc/attention/decode.cu",
+   "old": "k.kv_begin = s * chunk[b];",
+   "new": "k.kv_begin = s * chunk[b] + 1;"
+  },
+  {
+   "name": "decode e4m3 v_scale 255",
+   "file": "csrc/attention/decode.cu",
+   "old": "    r.v_scale *= 256.0f;",
+   "new": "    r.v_scale *= 255.0f;"
+  },
+  {
+   "name": "decode one-row dispatch for rows<=2",
+   "file": "csrc/attention/decode.cu",
+   "old": "rows == 1 ? launch_simt<D, T, FP8, 1>",
+   "new": "rows <= 2 ? launch_simt<D, T, FP8, 1>"
+  }
+ ]
+}

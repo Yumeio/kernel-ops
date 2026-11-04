@@ -66,6 +66,14 @@
       }
     },
     {
+      "name": "bench-sm90a",
+      "displayName": "H100/H200 benchmarks",
+      "inherits": "bench",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "90a"
+      }
+    },
+    {
       "name": "release",
       "displayName": "Release: multi-arch, no tests",
       "inherits": "base",
@@ -135,6 +143,7 @@
     { "name": "dev-sm90a", "configurePreset": "dev-sm90a" },
     { "name": "dev-sm100a", "configurePreset": "dev-sm100a" },
     { "name": "bench", "configurePreset": "bench" },
+    { "name": "bench-sm90a", "configurePreset": "bench-sm90a" },
     { "name": "release", "configurePreset": "release" },
     { "name": "release-sm90a", "configurePreset": "release-sm90a" },
     { "name": "release-sm100a", "configurePreset": "release-sm100a" },

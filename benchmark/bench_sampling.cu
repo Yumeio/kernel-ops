@@ -9,9 +9,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -19,6 +21,7 @@
 #include "csrc/common/op_types.cuh"
 #include "csrc/common/rng.cuh"
 #include "csrc/sampling/sampling_kernels.cuh"
+#include "csrc/sampling/fused_sampler_kernels.cuh"
 #include "csrc/sampling/logits_processor_kernels.cuh"
 #include "csrc/sampling/speculative_kernels.cuh"
 #include "csrc/sampling/ops.h"
@@ -72,6 +75,57 @@ void fill_probs(float* dev, size_t rows, size_t cols, float sigma) {
 
 constexpr int kWarmup = 10;
 constexpr int kIters = 80;
+
+/// Mode token of a matrix case id: "sampling.<path>.<mode>.<dtype>.v<V>.b<B>".
+std::string case_mode(const std::string& id) {
+  const size_t a = id.find('.', 9) + 1;  // skip "sampling.<path>."
+  const size_t dt = id.find(".bf16") != std::string::npos ? id.find(".bf16") : id.find(".fp32");
+  return id.substr(a, dt - a);
+}
+
+/// Optional ".s<N>" suffix on a fused case id (the split sweep); 0 means "let the plan decide".
+int case_splits(const std::string& id) {
+  const size_t s = id.rfind(".s");
+  if (s == std::string::npos || s + 2 >= id.size()) return 0;
+  for (size_t i = s + 2; i < id.size(); ++i) {
+    if (id[i] < '0' || id[i] > '9') return 0;
+  }
+  return std::atoi(id.c_str() + s + 2);
+}
+
+bool fused_supports(const std::string& mode) {
+  (void)mode;  // every matrix mode runs on the fused path
+  return true;
+}
+
+/// Split-row sweep: the same case at a forced split count; an invalid count is refused by the API.
+void add_split_cases(std::vector<Case>* cases) {
+  for (int64_t b : {32, 64}) {
+    for (const char* mode : {"k50", "p0.95"}) {
+      for (int s : {1, 2, 4, 8}) {
+        char id[160];
+        std::snprintf(id, sizeof(id), "sampling.fused.%s.bf16.v151936.b%lld.s%d", mode,
+                      static_cast<long long>(b), s);
+        cases->push_back({id, "sample_fused", kops::DType::kBFloat16, b, 151936,
+                          b * 151936 * 2 + b * 16, 0, 10, 80});
+      }
+    }
+  }
+}
+
+kops::sample::SamplingParams mode_params(const std::string& mode) {
+  kops::sample::SamplingParams p{};
+  p.default_temperature = mode == "greedy" ? 0.0f : 1.0f;
+  p.default_top_k = (mode == "k50" || mode == "k50p0.9") ? 50 : 0;
+  p.default_top_p = mode == "k50p0.9" ? 0.9f
+                    : mode == "p0.95" ? 0.95f
+                    : mode == "p0.5" ? 0.5f
+                    : mode == "p0.99" ? 0.99f
+                                      : 1.0f;
+  p.default_min_p = mode == "minp0.05" ? 0.05f : 0.0f;
+  p.rng.global_seed = 7u;
+  return p;
+}
 
 void add_case(std::vector<Case>* cases, const char* id, const char* op, kops::DType dtype,
               int64_t rows, int64_t cols, int64_t bytes) {
@@ -167,6 +221,50 @@ std::vector<Case> make_cases() {
               128, 131072, 16);
   sample_case("sampling.topk_mask.bf16.v131072.b128.k50", "topk_mask", kops::DType::kBFloat16, 128,
               131072, 16);
+
+  // sample() vs sample_fused() on the same rows (Qwen2.5 vocab). Bytes = one read of the logits,
+  // so GB/s against the copy ceiling shows how many effective passes a path makes. The mode token
+  // selects the parameters (mode_params); fused cases exist only for the modes it implements.
+  static const char* const kModes[] = {"greedy", "t1", "k50", "k50p0.9", "p0.5", "p0.95", "p0.99",
+                                       "minp0.05"};
+  static const int64_t kBatches[] = {1, 32, 128, 512};
+  static const int64_t kFusedOnlyBatches[] = {16, 64, 256};
+  for (const char* mode : kModes) {
+    for (int64_t b : kBatches) {
+      for (const char* path : {"sample", "fused"}) {
+        const bool fused = std::string(path) == "fused";
+        if (fused && !fused_supports(mode)) continue;
+        char id[128];
+        std::snprintf(id, sizeof(id), "sampling.%s.%s.bf16.v151936.b%lld", path, mode,
+                      static_cast<long long>(b));
+        add_case(&cases, id, fused ? "sample_fused" : "sample_mode", kops::DType::kBFloat16, b,
+                 151936, b * 151936 * 2 + b * 16);
+      }
+    }
+    for (int64_t b : kFusedOnlyBatches) {
+      char id[128];
+      std::snprintf(id, sizeof(id), "sampling.fused.%s.bf16.v151936.b%lld", mode,
+                    static_cast<long long>(b));
+      add_case(&cases, id, "sample_fused", kops::DType::kBFloat16, b, 151936,
+               b * 151936 * 2 + b * 16);
+    }
+  }
+  // hpc-ops only accepts V=120832; keep a head-to-head subset on the same shape.
+  for (const char* mode : {"greedy", "k50", "k50p0.9", "p0.95"}) {
+    for (int64_t b : {32, 128, 512}) {
+      char id[128];
+      std::snprintf(id, sizeof(id), "sampling.fused.%s.bf16.v120832.b%lld", mode,
+                    static_cast<long long>(b));
+      add_case(&cases, id, "sample_fused", kops::DType::kBFloat16, b, 120832,
+               b * 120832 * 2 + b * 16);
+    }
+  }
+  for (const char* path : {"sample", "fused"}) {
+    char id[128];
+    std::snprintf(id, sizeof(id), "sampling.%s.t1.fp32.v151936.b128", path);
+    add_case(&cases, id, std::string(path) == "fused" ? "sample_fused" : "sample_mode",
+             kops::DType::kFloat32, 128, 151936, int64_t{128} * 151936 * 4 + 128 * 16);
+  }
 
   return cases;
 }
@@ -472,6 +570,8 @@ bool run_bias(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
 
 template <typename T>
 bool run_sample(const Case& c, const kops::LaunchContext& ctx, Stats* st);
+template <typename T>
+bool run_sample_matrix(const Case& c, const kops::LaunchContext& ctx, Stats* st);
 bool run_renorm(const Case& c, const kops::LaunchContext& ctx, Stats* st);
 template <typename T>
 bool run_topk_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st);
@@ -482,6 +582,10 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
     if (c.dtype == kops::DType::kBFloat16) return run_sample<__nv_bfloat16>(c, ctx, st);
     if (c.dtype == kops::DType::kFloat16) return run_sample<__half>(c, ctx, st);
     return run_sample<float>(c, ctx, st);
+  }
+  if (c.op == "sample_mode" || c.op == "sample_fused") {
+    if (c.dtype == kops::DType::kBFloat16) return run_sample_matrix<__nv_bfloat16>(c, ctx, st);
+    return run_sample_matrix<float>(c, ctx, st);
   }
   if (c.op == "topk_renorm" || c.op == "topp_renorm") return run_renorm(c, ctx, st);
   if (c.op == "topk_mask") {
@@ -547,14 +651,80 @@ bool run_sample(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   ws.device_scratch_bytes = req.device_scratch_bytes;
   const bool gumbel = c.op == "gumbel";
   const auto call = [&] {
-    if (gumbel) {
-      (void)kops::sample::gumbel_max_sample(t_ids, t_logits, params, ctx);
-    } else {
-      (void)kops::sample::sample(t_ids, t_logits, params, ws, ctx);
-    }
+    return gumbel ? kops::sample::gumbel_max_sample(t_ids, t_logits, params, ctx)
+                  : kops::sample::sample(t_ids, t_logits, params, ws, ctx);
   };
-  const bool ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+  const bool ok = status_ok(call(), c.id.c_str()) && measure(c, [&] { (void)call(); }, st);
   cudaFree(scratch);
+  cudaFree(logits);
+  cudaFree(ids);
+  return ok;
+}
+
+template <typename T>
+bool run_sample_matrix(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const size_t n = static_cast<size_t>(c.rows * c.cols);
+  T* logits = nullptr;
+  int32_t* ids = nullptr;
+  if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&logits), n * sizeof(T)), "logits") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&ids), static_cast<size_t>(c.rows) * 4), "ids")) {
+    return false;
+  }
+  fill_logits(logits, n, 3.0f);
+  const kops::Tensor t_logits = tensor2d(logits, c.dtype, c.rows, c.cols);
+  const kops::Tensor t_ids = tensor1d(ids, kops::DType::kInt32, c.rows);
+  const kops::sample::SamplingParams params = mode_params(case_mode(c.id));
+  const bool fused = c.op == "sample_fused";
+  kops::sample::FusedSamplingParams fp{};
+  fp.sampling = params;
+  fp.default_repetition_penalty = 1.0f;
+  kops::sample::SamplingPlan plan{};
+  kops::WorkspaceRequirements req{};
+  if (fused) {
+    if (!status_ok(kops::sample::sampling_plan(t_logits, params, ctx, &plan), "sampling_plan")) {
+      return false;
+    }
+    const int forced = case_splits(c.id);
+    if (forced > 0) plan.splits = forced;
+    if (!status_ok(kops::sample::sampling_fused_workspace_requirements(
+                       static_cast<int32_t>(c.rows), static_cast<int32_t>(c.cols), plan, &req),
+                   "fused workspace")) {
+      return false;
+    }
+  } else if (!status_ok(kops::sample::sampling_workspace_requirements(
+                            static_cast<int32_t>(c.rows), static_cast<int32_t>(c.cols), 0, &req),
+                        "sample workspace")) {
+    return false;
+  }
+  void* scratch = nullptr;
+  if (req.device_scratch_bytes > 0 &&
+      !cuda_ok(cudaMalloc(&scratch, req.device_scratch_bytes), "sample scratch")) {
+    return false;
+  }
+  void* persistent = nullptr;
+  if (req.device_persistent_bytes > 0 &&
+      (!cuda_ok(cudaMalloc(&persistent, req.device_persistent_bytes), "sample persistent") ||
+       !cuda_ok(cudaMemset(persistent, 0, req.device_persistent_bytes), "zero persistent"))) {
+    return false;
+  }
+  kops::Workspace ws{};
+  ws.device_scratch = scratch;
+  ws.device_scratch_bytes = req.device_scratch_bytes;
+  ws.device_persistent = persistent;
+  ws.device_persistent_bytes = req.device_persistent_bytes;
+  const auto call = [&] {
+    return fused ? kops::sample::sample_fused(t_ids, t_logits, fp, plan, ws, ctx)
+                 : kops::sample::sample(t_ids, t_logits, params, ws, ctx);
+  };
+  const kops::Status first = call();
+  bool ok = true;
+  if (first == kops::Status::kPlanInvalidated) {
+    std::fprintf(stderr, "[bench] %s skipped: %s\n", c.id.c_str(), kops::last_error_message());
+  } else {
+    ok = status_ok(first, c.id.c_str()) && measure(c, [&] { (void)call(); }, st);
+  }
+  if (scratch != nullptr) cudaFree(scratch);
+  if (persistent != nullptr) cudaFree(persistent);
   cudaFree(logits);
   cudaFree(ids);
   return ok;
@@ -573,11 +743,11 @@ bool run_renorm(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   const kops::Tensor t_o = tensor2d(out, kops::DType::kFloat32, c.rows, c.cols);
   bool ok = false;
   if (c.op == "topk_renorm") {
-    const auto call = [&] { (void)kops::sample::top_k_renorm_probs(t_o, t_p, kops::Tensor{}, 50, ctx); };
-    ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+    const auto call = [&] { return kops::sample::top_k_renorm_probs(t_o, t_p, kops::Tensor{}, 50, ctx); };
+    ok = status_ok(call(), c.id.c_str()) && measure(c, [&] { (void)call(); }, st);
   } else {
-    const auto call = [&] { (void)kops::sample::top_p_renorm_probs(t_o, t_p, kops::Tensor{}, 0.9f, ctx); };
-    ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+    const auto call = [&] { return kops::sample::top_p_renorm_probs(t_o, t_p, kops::Tensor{}, 0.9f, ctx); };
+    ok = status_ok(call(), c.id.c_str()) && measure(c, [&] { (void)call(); }, st);
   }
   cudaFree(probs);
   cudaFree(out);
@@ -596,8 +766,8 @@ bool run_topk_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   fill_logits(logits, n, 3.0f);
   const kops::Tensor t_l = tensor2d(logits, c.dtype, c.rows, c.cols);
   const kops::Tensor t_o = tensor2d(out, c.dtype, c.rows, c.cols);
-  const auto call = [&] { (void)kops::sample::top_k_mask_logits(t_o, t_l, kops::Tensor{}, 50, ctx); };
-  const bool ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
+  const auto call = [&] { return kops::sample::top_k_mask_logits(t_o, t_l, kops::Tensor{}, 50, ctx); };
+  const bool ok = status_ok(call(), c.id.c_str()) && measure(c, [&] { (void)call(); }, st);
   cudaFree(logits);
   cudaFree(out);
   return ok;
@@ -613,7 +783,21 @@ int main(int argc, char** argv) {
   DeviceInfo dev{};
   query_device(&dev);
 
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  if (opt.split_sweep) add_split_cases(&cases);
+  if (opt.only != nullptr) {
+    const std::string only = opt.only;
+    cases.erase(std::remove_if(cases.begin(), cases.end(),
+                               [&](const Case& c) { return c.id.find(only) == std::string::npos; }),
+                cases.end());
+    if (cases.empty()) {
+      std::fprintf(stderr, "[bench] no case matches '%s'\n", opt.only);
+      return 1;
+    }
+  }
+  if (opt.iters > 0) {
+    for (Case& c : cases) c.iters = opt.iters;
+  }
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

@@ -44,6 +44,7 @@
 #include "csrc/common/device_impl.cuh"
 #include "csrc/common/rng.cuh"
 #include "csrc/sampling/sampling_kernels.cuh"
+#include "csrc/sampling/fused_sampler_kernels.cuh"
 #include "csrc/sampling/logits_processor_kernels.cuh"
 #include "csrc/sampling/speculative_kernels.cuh"
 #include "csrc/sampling/ops.h"

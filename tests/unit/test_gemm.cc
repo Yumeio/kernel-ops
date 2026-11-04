@@ -2516,6 +2516,855 @@ void test_moe_gemv(const LaunchContext& ctx) {
   run_moe_gemv<__nv_bfloat16>(ctx, 2, 0, false, true, "moe gemv dropped expert");
 }
 
+// =============================================================================
+// B7 row 1: gemm_mma_sync_kernel (bf16 / fp16 mma.sync tile GEMM), tactics, epilogue ops, tactic cache.
+// Oracle: fp64 host loops over the rounded inputs and the epilogue in the documented order; only
+// the fp32 accumulation and the one final rounding differ.  Every case runs on every tactic that
+// get_tactics() offers (all tiles, swap_ab, split-K) so a tile-specific bug cannot hide.
+// =============================================================================
+
+using kops::gemm::GemmTactic;
+namespace kg = kops::gemm;
+
+struct MmaCaseOut {
+  std::vector<uint8_t> d_bytes;    // raw bytes of D
+  std::vector<float> sumsq;
+};
+
+double silu_ref(double x) { return x / (1.0 + std::exp(-x)); }
+double sigmoid_ref(double x) { return 1.0 / (1.0 + std::exp(-x)); }
+
+/// One GEMM through scaled_gemm_with a tactic, compared with the fp64 oracle.  `ops` is an OR of
+/// kg::EpilogueOp bits; the operand values are random but fixed by the shape.
+template <typename T, typename Dt>
+MmaCaseOut mma_case(const LaunchContext& ctx, const GemmTactic* tactic, int m, int n, int k, uint32_t ops, const char* what,
+                    int pad_a = 0, int pad_b = 0, int pad_d = 0, int glu_db = 1, int batch = 1, bool gate_is_acc = true) {
+  MmaCaseOut result;
+  Rng r(777u + m * 31u + n * 7u + k + ops);
+  const bool glu = (ops & kg::kEpiGLU) != 0u;
+  const int n_out = glu ? n / 2 : n;
+  const int lda = k + pad_a, ldb = k + pad_b, ldd = n_out + pad_d;
+  const auto a = random_t<T>(static_cast<size_t>(batch) * m * lda, &r, -1.0f, 1.0f);
+  const auto b = random_t<T>(static_cast<size_t>(batch) * n * ldb, &r, -0.5f, 0.5f);
+  const auto bias = random_t<Dt>(n, &r, -1.0f, 1.0f);
+  const auto res = random_t<Dt>(static_cast<size_t>(m) * n_out, &r, -1.0f, 1.0f);
+  const auto gate = random_t<Dt>(static_cast<size_t>(m) * n_out, &r, -1.0f, 1.0f);
+  const auto init = random_t<Dt>(static_cast<size_t>(batch) * m * ldd, &r, -1.0f, 1.0f);
+  std::vector<float> rs(m), cs(n), rw(m);
+  for (auto& v : rs) v = r.uni(0.5f, 1.5f);
+  for (auto& v : cs) v = r.uni(0.5f, 1.5f);
+  for (auto& v : rw) v = r.uni(0.5f, 1.5f);
+  std::vector<int32_t> scat(m), kv_slots(m);
+  for (int i = 0; i < m; ++i) scat[i] = (i % 11 == 5) ? -1 : m - 1 - i;
+  int kv_slot_count = m + 3;
+  while (true) {   // a prime slot count makes (5 i) mod count distinct for i < m
+    bool prime = true;
+    for (int d = 2; d * d <= kv_slot_count; ++d) prime = prime && kv_slot_count % d != 0;
+    if (prime) break;
+    ++kv_slot_count;
+  }
+  for (int i = 0; i < m; ++i) kv_slots[i] = (i % 7 == 3) ? -1 : (i * 5) % kv_slot_count;
+  const float alpha = 0.75f, softcap = 8.0f, clamp_limit = 3.0f, beta = 0.5f;
+  const int kv_begin = n_out > 16 ? 5 : 0, kv_cols = n_out > 16 ? n_out - 9 : n_out;
+
+  std::vector<double> ref(static_cast<size_t>(batch) * m * ldd, 7.0);
+  std::vector<char> written(ref.size(), 0);
+  std::vector<double> ref_sumsq(m, 0.0);
+  const bool scatter = (ops & kg::kEpiScatterRows) != 0u;
+  const bool atomic = (ops & kg::kEpiAtomicAdd) != 0u;
+  if (atomic) {
+    for (size_t i = 0; i < ref.size(); ++i) ref[i] = dval(init, i);
+  }
+  for (int z = 0; z < batch; ++z) {
+    for (int row = 0; row < m; ++row) {
+      auto linear = [&](int c) {
+        double acc = 0.0;
+        for (int kk = 0; kk < k; ++kk) {
+          acc += dval(a, (static_cast<size_t>(z) * m + row) * lda + kk) * dval(b, (static_cast<size_t>(z) * n + c) * ldb + kk);
+        }
+        acc *= alpha;
+        if (ops & kg::kEpiRowScale) acc *= rs[row];
+        if (ops & kg::kEpiColScale) acc *= cs[c];
+        if (ops & kg::kEpiBias) acc += dval(bias, c);
+        if (ops & kg::kEpiClamp) acc = std::min(std::max(acc, -static_cast<double>(clamp_limit)), static_cast<double>(clamp_limit));
+        if (ops & kg::kEpiSoftcap) acc = softcap * std::tanh(acc / softcap);
+        return acc;
+      };
+      for (int oc = 0; oc < n_out; ++oc) {
+        double v;
+        if (glu) {
+          const int gc = (oc / glu_db) * 2 * glu_db + oc % glu_db;
+          v = silu_ref(linear(gc)) * linear(gc + glu_db);
+        } else {
+          v = linear(oc);
+          if (ops & kg::kEpiAct) v = silu_ref(v);
+        }
+        if (ops & kg::kEpiRoutingWeight) v *= rw[row];
+        if (ops & kg::kEpiSigmoidGateMul) {
+          const double gs = dval(gate, static_cast<size_t>(row) * n_out + oc);
+          v = gate_is_acc ? gs * sigmoid_ref(v) : v * sigmoid_ref(gs);
+        }
+        if (ops & kg::kEpiResidualAdd) v += beta * dval(res, static_cast<size_t>(row) * n_out + oc);
+        const int drow = scatter ? scat[row] : row;
+        if (drow < 0) continue;
+        const size_t di = (static_cast<size_t>(z) * m + drow) * ldd + oc;
+        if (atomic) {
+          // the addend is rounded to the output dtype, then added exactly and rounded once more
+          const double addend = kops_test::to_float(cvt<Dt>(static_cast<float>(v)));
+          ref[di] = kops_test::to_float(cvt<Dt>(static_cast<float>(ref[di] + addend)));
+        } else {
+          ref[di] = v;
+        }
+        written[di] = 1;
+      }
+    }
+  }
+  for (int row = 0; row < m; ++row) {
+    double s = 0.0;
+    for (int kk = 0; kk < k; ++kk) s += dval(a, static_cast<size_t>(row) * lda + kk) * dval(a, static_cast<size_t>(row) * lda + kk);
+    ref_sumsq[row] = s;
+  }
+
+  auto da = upload(a);
+  auto db = upload(b);
+  auto dbias = upload(bias);
+  auto dres = upload(res);
+  auto dgate = upload(gate);
+  auto drs = upload(rs);
+  auto dcs = upload(cs);
+  auto drw = upload(rw);
+  auto dscat = upload(scat);
+  auto dslots = upload(kv_slots);
+  DevBuf<Dt> dout(ref.size());
+  kops_test::copy_in(dout.p, atomic ? init : std::vector<Dt>(ref.size(), cvt<Dt>(7.0f)));
+  DevBuf<Dt> dkv(static_cast<size_t>(kv_slot_count) * kv_cols);
+  kops_test::copy_in(dkv.p, std::vector<Dt>(static_cast<size_t>(kv_slot_count) * kv_cols, cvt<Dt>(7.0f)));
+  DevBuf<float> dsumsq(m);
+  kops_test::copy_in(dsumsq.p, std::vector<float>(m, -1.0f));
+
+  kg::ScaledGemmArgs args{};
+  args.recipe = recipe_of(dt_of<T>());
+  args.a.data = da.p; args.a.ld = lda; args.a.dtype = dt_of<T>(); args.a.batch_stride = static_cast<int64_t>(m) * lda;
+  args.b.data = db.p; args.b.ld = ldb; args.b.dtype = dt_of<T>(); args.b.batch_stride = static_cast<int64_t>(n) * ldb;
+  args.d = dout.p; args.ldd = ldd; args.d_dtype = dt_of<Dt>(); args.batch_stride_d = static_cast<int64_t>(m) * ldd;
+  args.m = m; args.n = n; args.k = k; args.batch = batch;
+  args.epi.ops = ops;
+  args.epi.alpha = alpha; args.epi.softcap = softcap; args.epi.clamp_limit = clamp_limit; args.epi.beta = beta;
+  args.epi.row_scale = drs.p; args.epi.col_scale = dcs.p; args.epi.routing_weight = drw.p;
+  args.epi.bias = dbias.p; args.epi.bias_dtype = dt_of<Dt>();
+  args.epi.act = kops::ActFn::kSiLU;
+  args.epi.glu_layout = kops::GateLayout::kInterleaved; args.epi.glu_interleave = glu_db;
+  args.epi.gate_src = dgate.p; args.epi.gate_src_stride = n_out; args.epi.gate_is_acc = gate_is_acc;
+  args.epi.residual = dres.p; args.epi.residual_stride = n_out;
+  args.epi.scatter_rows = dscat.p;
+  args.epi.row_sumsq = dsumsq.p;
+  args.epi.kv_dst = dkv.p; args.epi.kv_slots = dslots.p; args.epi.kv_stride = kv_cols; args.epi.kv_col_begin = kv_begin; args.epi.kv_cols = kv_cols;
+
+  kg::GemmProblem prob{};
+  prob.m = m; prob.n = n; prob.k = k; prob.batch = batch; prob.recipe = args.recipe; prob.epilogue_ops = ops;
+  kops::WorkspaceRequirements req{};
+  KOPS_EXPECT_OK(kg::gemm_workspace_requirements(prob, tactic, kg::GemmBackend::kNative, ctx, &req), what);
+  DevBuf<uint8_t> scratch(req.device_scratch_bytes + 256);
+  kops::Workspace ws{};
+  ws.device_scratch = scratch.p; ws.device_scratch_bytes = req.device_scratch_bytes;
+  const Status st = kg::scaled_gemm(args, tactic, kg::GemmBackend::kNative, ws, ctx);
+  if (st != Status::kSuccess) {
+    char buf[300];
+    std::snprintf(buf, sizeof(buf), "%s [tile %dx%d swap %d split %d mode %d]", what, tactic ? tactic->tile_m : -1, tactic ? tactic->tile_n : -1,
+                  tactic && tactic->swap_ab, tactic ? tactic->split_k_slices : -1, tactic ? static_cast<int>(tactic->split_k_mode) : -1);
+    KOPS_EXPECT_OK(st, buf);
+    return result;
+  }
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, ref.size());
+  std::vector<Dt> got_w;
+  std::vector<double> want_w;
+  size_t untouched_bad = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    if (written[i]) { got_w.push_back(got[i]); want_w.push_back(ref[i]); }
+    else if (!atomic && (i % ldd) < static_cast<size_t>(n_out)) untouched_bad += kops_test::to_float(got[i]) != 7.0f;
+  }
+  char label[300];
+  std::snprintf(label, sizeof(label), "%s [tile %dx%d swap %d split %d mode %d]", what, tactic ? tactic->tile_m : -1, tactic ? tactic->tile_n : -1,
+                tactic && tactic->swap_ab, tactic ? tactic->split_k_slices : -1, tactic ? static_cast<int>(tactic->split_k_mode) : -1);
+  if (untouched_bad != 0) kops_test::record_failure(label, "dropped rows were written", __FILE__, __LINE__);
+  expect_close(got_w, want_w, label);
+  // padding columns of D must be untouched
+  if (pad_d != 0) {
+    size_t pad_bad = 0;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if ((i % ldd) >= static_cast<size_t>(n_out)) pad_bad += kops_test::to_float(got[i]) != (atomic ? kops_test::to_float(init[i]) : 7.0f);
+    }
+    if (pad_bad != 0) kops_test::record_failure(label, "ld padding of D was written", __FILE__, __LINE__);
+  }
+  if (ops & kg::kEpiRowSumSq) {
+    const auto s = kops_test::copy_out(dsumsq.p, m);
+    for (int row = 0; row < m; ++row) {
+      if (!(std::fabs(s[row] - ref_sumsq[row]) <= 2e-6 * ref_sumsq[row] + 1e-9)) {
+        kops_test::record_failure(label, "row_sumsq differs from the fp64 sum", __FILE__, __LINE__);
+        break;
+      }
+    }
+    result.sumsq = s;
+  }
+  if (ops & kg::kEpiKvAppend) {
+    const auto kv = kops_test::copy_out(dkv.p, static_cast<size_t>(kv_slot_count) * kv_cols);
+    std::vector<char> slot_used(kv_slot_count, 0);
+    size_t kv_bad = 0;
+    for (int row = 0; row < m; ++row) {
+      const int slot = kv_slots[row];
+      if (slot < 0) continue;
+      slot_used[slot] = 1;
+      const int drow = scatter ? scat[row] : row;
+      if (drow < 0) continue;
+      for (int j = 0; j < kv_cols; ++j) {
+        // the appended value is exactly the value stored to D
+        if (std::memcmp(&kv[static_cast<size_t>(slot) * kv_cols + j], &got[static_cast<size_t>(drow) * ldd + kv_begin + j], sizeof(Dt)) != 0) ++kv_bad;
+      }
+    }
+    for (int slot = 0; slot < kv_slot_count; ++slot) {
+      if (slot_used[slot]) continue;
+      for (int j = 0; j < kv_cols; ++j) kv_bad += kops_test::to_float(kv[static_cast<size_t>(slot) * kv_cols + j]) != 7.0f;
+    }
+    if (kv_bad != 0) kops_test::record_failure(label, "kv append differs from the stored D value / touched a skipped slot", __FILE__, __LINE__);
+  }
+  result.d_bytes.resize(got.size() * sizeof(Dt));
+  std::memcpy(result.d_bytes.data(), got.data(), result.d_bytes.size());
+  return result;
+}
+
+std::vector<GemmTactic> tactics_for(const LaunchContext& ctx, GemmRecipe recipe, int m, int n, int k, uint32_t ops, int batch = 1) {
+  kg::GemmProblem p{};
+  p.m = m; p.n = n; p.k = k; p.batch = batch; p.recipe = recipe; p.epilogue_ops = ops;
+  std::vector<GemmTactic> t(64);
+  int32_t count = 0;
+  KOPS_EXPECT_OK(kg::get_tactics(p, kg::GemmBackend::kNative, ctx, t.data(), 64, &count), "get_tactics");
+  t.resize(static_cast<size_t>(count));
+  if (t.empty()) kops_test::record_failure("get_tactics", "no tactic offered", __FILE__, __LINE__);
+  return t;
+}
+
+template <typename T, typename Dt>
+void mma_all_tactics(const LaunchContext& ctx, int m, int n, int k, uint32_t ops, const char* what, int pad_a = 0, int pad_b = 0,
+                     int pad_d = 0, int glu_db = 1, int batch = 1, bool gate_is_acc = true) {
+  for (const GemmTactic& t : tactics_for(ctx, recipe_of(dt_of<T>()), m, n, k, ops, batch)) {
+    // a GLU pass must cover whole (gate block, up block) pairs: columns one epilogue pass covers
+    const int span = t.swap_ab ? (t.tile_m == 64 ? 64 : 32) : t.tile_n;
+    if ((ops & kg::kEpiGLU) != 0u && span % (2 * glu_db) != 0) continue;
+    mma_case<T, Dt>(ctx, &t, m, n, k, ops, what, pad_a, pad_b, pad_d, glu_db, batch, gate_is_acc);
+  }
+}
+
+void test_mma_sweep(const LaunchContext& ctx) {
+  for (int m : {1, 2, 3, 8, 16, 17, 31, 64, 127, 256, 1000, 4096}) {
+    mma_all_tactics<__nv_bfloat16, __nv_bfloat16>(ctx, m, 96, 72, 0, "mma bf16 M sweep");
+    mma_all_tactics<__half, __half>(ctx, m, 136, 64, 0, "mma fp16 M sweep");
+  }
+  mma_all_tactics<__nv_bfloat16, float>(ctx, 16384, 32, 64, kg::kEpiOutFp32, "mma bf16 -> fp32 M=16384");
+  mma_all_tactics<__half, float>(ctx, 131, 40, 40, kg::kEpiOutFp32, "mma fp16 -> fp32");
+}
+
+void test_mma_shapes(const LaunchContext& ctx) {
+  // N and K that no tile divides, ld padded past the extents (16 B granules)
+  mma_all_tactics<__nv_bfloat16, __nv_bfloat16>(ctx, 97, 201, 136, 0, "mma odd N, K tail", 8, 16, 24);
+  mma_all_tactics<__half, __half>(ctx, 130, 77, 40, 0, "mma odd N=77", 0, 8, 3);
+  mma_all_tactics<__nv_bfloat16, __nv_bfloat16>(ctx, 33, 65, 8, 0, "mma K=8");
+  mma_all_tactics<__nv_bfloat16, __nv_bfloat16>(ctx, 70, 128, 200, kg::kEpiBias, "mma batched", 0, 0, 0, 1, 3);
+}
+
+void test_mma_epilogues(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  const int m = 97, n = 200, k = 136;
+  const uint32_t single[] = {kg::kEpiRowScale, kg::kEpiColScale, kg::kEpiBias, kg::kEpiSoftcap, kg::kEpiAct, kg::kEpiRoutingWeight,
+                             kg::kEpiSigmoidGateMul, kg::kEpiResidualAdd, kg::kEpiScatterRows, kg::kEpiAtomicAdd, kg::kEpiClamp,
+                             kg::kEpiRowSumSq, kg::kEpiKvAppend};
+  for (uint32_t op : single) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "mma epilogue op 0x%x alone", op);
+    mma_all_tactics<B, B>(ctx, m, n, k, op, name);
+  }
+  mma_all_tactics<B, B>(ctx, m, n, k, kg::kEpiSigmoidGateMul, "mma sigmoid gate (acc gates src)", 0, 0, 0, 1, 1, false);
+  mma_all_tactics<__half, __half>(ctx, m, n, k, kg::kEpiBias | kg::kEpiAct, "mma fp16 bias + act");
+  // GLU: interleave 1 (adjacent pair), 8 and 16 (block of gate columns then up columns)
+  mma_all_tactics<B, B>(ctx, 97, 256, 64, kg::kEpiGLU, "mma GLU interleave 1", 0, 0, 0, 1);
+  mma_all_tactics<B, B>(ctx, 97, 256, 64, kg::kEpiGLU, "mma GLU interleave 8", 0, 0, 0, 8);
+  mma_all_tactics<B, B>(ctx, 97, 256, 64, kg::kEpiGLU | kg::kEpiBias, "mma GLU interleave 16 + bias", 0, 0, 0, 16);
+  mma_all_tactics<B, B>(ctx, 97, 256, 64, kg::kEpiGLU | kg::kEpiClamp, "mma GLU interleave 3", 0, 0, 0, 3);
+  mma_all_tactics<B, B>(ctx, 97, 256, 64, kg::kEpiGLU | kg::kEpiResidualAdd, "mma GLU interleave 64", 0, 0, 0, 64);
+  // common combinations
+  mma_all_tactics<B, B>(ctx, m, n, k, kg::kEpiBias | kg::kEpiAct, "mma Bias + Act");
+  mma_all_tactics<B, B>(ctx, m, n, k, kg::kEpiRoutingWeight | kg::kEpiScatterRows, "mma RoutingWeight + ScatterRows");
+  mma_all_tactics<B, float>(ctx, m, n, k, kg::kEpiResidualAdd | kg::kEpiOutFp32, "mma ResidualAdd + OutFp32");
+  mma_all_tactics<B, B>(ctx, m, n, k, kg::kEpiRowScale | kg::kEpiColScale | kg::kEpiBias | kg::kEpiClamp | kg::kEpiSoftcap | kg::kEpiAct |
+                                         kg::kEpiRoutingWeight | kg::kEpiSigmoidGateMul | kg::kEpiResidualAdd,
+                        "mma full chain");
+  mma_all_tactics<B, B>(ctx, 97, 256, 64, kg::kEpiGLU | kg::kEpiRoutingWeight | kg::kEpiKvAppend | kg::kEpiRowSumSq, "mma GLU + routing + kv + sumsq");
+  mma_all_tactics<B, B>(ctx, m, n, k, kg::kEpiScatterRows | kg::kEpiKvAppend | kg::kEpiRowSumSq, "mma scatter + kv + sumsq");
+}
+
+void test_mma_splitk(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  const int m = 64, n = 160, k = 4096;
+  const uint32_t ops = kg::kEpiBias | kg::kEpiAct | kg::kEpiResidualAdd;
+  std::vector<uint8_t> serial_bits, parallel_bits;
+  GemmTactic base{};
+  bool have = false;
+  for (const GemmTactic& t : tactics_for(ctx, GemmRecipe::kBF16, m, n, k, ops)) {
+    if (t.split_k_slices != 4) continue;
+    base = t;
+    have = true;
+    break;
+  }
+  if (!have) { kops_test::record_failure("split-K", "no 4-slice tactic offered for K=4096", __FILE__, __LINE__); return; }
+  serial_bits = mma_case<B, B>(ctx, &base, m, n, k, ops, "mma split-K serial").d_bytes;
+  GemmTactic par = base;
+  par.split_k_mode = kg::SplitKMode::kParallel;
+  parallel_bits = mma_case<B, B>(ctx, &par, m, n, k, ops, "mma split-K parallel").d_bytes;
+  if (serial_bits != parallel_bits) kops_test::record_failure("split-K", "serial and parallel reduction differ bitwise", __FILE__, __LINE__);
+  // repeat: the order is by slice id, not by arrival
+  for (int rep = 0; rep < 20; ++rep) {
+    if (mma_case<B, B>(ctx, &base, m, n, k, ops, "mma split-K repeat").d_bytes != serial_bits) {
+      kops_test::record_failure("split-K", "serial split-K changed between runs", __FILE__, __LINE__);
+      break;
+    }
+  }
+  // the full epilogue on the serial path, plus the data ops
+  mma_case<B, B>(ctx, &base, m, n, k, kg::kEpiRowSumSq | kg::kEpiKvAppend | kg::kEpiScatterRows | kg::kEpiRoutingWeight, "mma split-K data ops");
+  mma_case<__half, __half>(ctx, &base, 64, 256, k, kg::kEpiGLU, "mma split-K GLU");   // fp16 operands share the template
+  // parallel split-K only finishes the dense epilogue subset
+  {
+    GemmTactic p2 = base;
+    p2.split_k_mode = kg::SplitKMode::kParallel;
+    mma_case<B, B>(ctx, &p2, m, n, k, 0, "mma split-K parallel plain");
+  }
+}
+
+void test_mma_invariance(const LaunchContext& ctx) {
+  // Same slices, any tile / swap_ab: the K chain of one output element is the same sequence of mma steps.
+  using B = __nv_bfloat16;
+  const int m = 130, n = 128, k = 256;
+  std::vector<uint8_t> first;
+  for (const GemmTactic& t : tactics_for(ctx, GemmRecipe::kBF16, m, n, k, 0)) {
+    if (t.split_k_slices != 1) continue;
+    const auto bits = mma_case<B, B>(ctx, &t, m, n, k, kg::kEpiRowSumSq, "mma tile invariance");
+    if (first.empty()) first = bits.d_bytes;
+    else if (bits.d_bytes != first) {
+      char buf[160];
+      std::snprintf(buf, sizeof(buf), "tile %dx%d swap %d differs bitwise from the first tactic", t.tile_m, t.tile_n, t.swap_ab);
+      kops_test::record_failure("mma tile invariance", buf, __FILE__, __LINE__);
+    }
+  }
+  // row_sumsq does not depend on the tile either
+  std::vector<float> s0;
+  for (const GemmTactic& t : tactics_for(ctx, GemmRecipe::kBF16, 130, 64, 256, kg::kEpiRowSumSq)) {
+    const auto out = mma_case<B, B>(ctx, &t, 130, 64, 256, kg::kEpiRowSumSq, "mma sumsq invariance");
+    if (s0.empty()) s0 = out.sumsq;
+    else if (out.sumsq != s0) kops_test::record_failure("mma sumsq invariance", "row_sumsq differs between tactics", __FILE__, __LINE__);
+  }
+}
+
+void test_mma_dispatch(const LaunchContext& ctx) {
+  // gemm / scaled_gemm without a tactic: M > 16 takes the tensor-core path with the heuristic.
+  using B = __nv_bfloat16;
+  for (int m : {17, 40, 64, 300, 2048}) mma_case<B, B>(ctx, nullptr, m, 192, 128, kg::kEpiBias, "mma heuristic dispatch");
+  mma_case<__half, float>(ctx, nullptr, 200, 96, 64, kg::kEpiOutFp32, "mma heuristic fp16 -> fp32");
+  // small K with a long tile grid, and a long K with a tiny grid (heuristic split-K)
+  mma_case<B, B>(ctx, nullptr, 32, 64, 8192, 0, "mma heuristic split-K");
+}
+
+void test_mma_cache(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  kg::GemmProblem p{};
+  p.m = 64; p.n = 192; p.k = 512; p.recipe = GemmRecipe::kBF16;
+  kops::WorkspaceRequirements req{};
+  kg::GemmTactic probe{};
+  const int64_t buckets[] = {32, 64, 256};
+  const int64_t scratch_bytes = 8 << 20;
+  DevBuf<uint8_t> scratch(scratch_bytes);
+  kops::Workspace ws{};
+  ws.device_scratch = scratch.p; ws.device_scratch_bytes = scratch_bytes;
+  KOPS_EXPECT_STATUS(kg::tactic_cache_lookup(p, ctx, &probe), Status::kInvalidArgument, "cache empty before autotune");
+  KOPS_EXPECT_OK(kg::autotune(p, buckets, 3, kg::GemmBackend::kNative, ws, ctx), "autotune");
+  GemmTactic t1{}, t2{};
+  KOPS_EXPECT_OK(kg::tactic_cache_lookup(p, ctx, &t1), "cache lookup after autotune");
+  KOPS_EXPECT_OK(kg::tactic_cache_lookup(p, ctx, &t2), "cache lookup again");
+  if (std::memcmp(&t1, &t2, sizeof(t1)) != 0) kops_test::record_failure("tactic cache", "two lookups returned different tactics", __FILE__, __LINE__);
+  // any M in the same bucket sees the same tactic; a different bucket is its own entry
+  kg::GemmProblem p2 = p;
+  p2.m = 50;
+  GemmTactic t3{};
+  KOPS_EXPECT_OK(kg::tactic_cache_lookup(p2, ctx, &t3), "cache lookup, same bucket");
+  if (std::memcmp(&t1, &t3, sizeof(t1)) != 0) kops_test::record_failure("tactic cache", "same bucket, different tactic", __FILE__, __LINE__);
+  // the cached tactic drives gemm() when none is passed
+  mma_case<B, B>(ctx, nullptr, 64, 192, 512, kg::kEpiBias, "mma cached tactic");
+  // save / load round trip
+  const char* path = "kops_tactic_cache_test.txt";
+  KOPS_EXPECT_OK(kg::tactic_cache_save(path), "cache save");
+  KOPS_EXPECT_OK(kg::tactic_cache_load(path), "cache load");
+  GemmTactic t4{};
+  KOPS_EXPECT_OK(kg::tactic_cache_lookup(p, ctx, &t4), "lookup after load");
+  if (t4.tile_m != t1.tile_m || t4.tile_n != t1.tile_n || t4.swap_ab != t1.swap_ab || t4.split_k_slices != t1.split_k_slices ||
+      t4.split_k_mode != t1.split_k_mode) {
+    kops_test::record_failure("tactic cache", "save / load changed the tactic", __FILE__, __LINE__);
+  }
+  std::remove(path);
+  KOPS_EXPECT_STATUS(kg::tactic_cache_load("kops_no_such_cache.txt"), Status::kInvalidArgument, "load of a missing file");
+  // autotune must refuse during graph capture
+  cudaStream_t s = nullptr;
+  if (cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess) {
+    LaunchContext cctx = ctx;
+    cctx.stream = reinterpret_cast<kops::kops_stream_t>(s);
+    if (cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+      kg::GemmProblem q = p;
+      q.n = 224;
+      KOPS_EXPECT_STATUS(kg::autotune(q, buckets, 1, kg::GemmBackend::kNative, ws, cctx), Status::kInvalidArgument, "autotune during capture");
+      cudaGraph_t graph = nullptr;
+      cudaStreamEndCapture(s, &graph);
+      if (graph != nullptr) cudaGraphDestroy(graph);
+    }
+    cudaStreamDestroy(s);
+    cudaGetLastError();
+  }
+}
+
+void test_mma_contracts(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  const int m = 64, n = 128, k = 128;
+  Rng r(5);
+  const auto a = random_t<B>(static_cast<size_t>(m) * (k + 8), &r, -1.0f, 1.0f);
+  const auto b = random_t<B>(static_cast<size_t>(n) * (k + 8), &r, -1.0f, 1.0f);
+  auto da = upload(a);
+  auto db = upload(b);
+  DevBuf<B> dout(static_cast<size_t>(m) * n);
+  DevBuf<uint8_t> dummy(4096);
+  auto base = [&]() {
+    kg::ScaledGemmArgs x{};
+    x.recipe = GemmRecipe::kBF16;
+    x.a.data = da.p; x.a.ld = k; x.a.dtype = DType::kBFloat16;
+    x.b.data = db.p; x.b.ld = k; x.b.dtype = DType::kBFloat16;
+    x.d = dout.p; x.ldd = n; x.d_dtype = DType::kBFloat16;
+    x.m = m; x.n = n; x.k = k;
+    return x;
+  };
+  auto run = [&](const kg::ScaledGemmArgs& x, const kops::Workspace& w = kops::Workspace{}) {
+    return kg::scaled_gemm(x, nullptr, kg::GemmBackend::kNative, w, ctx);
+  };
+  KOPS_EXPECT_OK(run(base()), "contract baseline");
+  { auto x = base(); x.k = 100; x.a.ld = 104; x.b.ld = 104; KOPS_EXPECT_STATUS(run(x), Status::kMisaligned, "K % 8 != 0"); }
+  { auto x = base(); x.a.ld = k + 3; KOPS_EXPECT_STATUS(run(x), Status::kMisaligned, "unaligned lda"); }
+  { auto x = base(); x.b.major = kg::MajorOrder::kMNMajor; x.b.ld = n; KOPS_EXPECT_STATUS(run(x), Status::kNotImplemented, "MN-major B"); }
+  { auto x = base(); x.epi.ops = kg::kEpiQuantOut; KOPS_EXPECT_STATUS(run(x), Status::kNotImplemented, "QuantOut"); }
+  { auto x = base(); x.epi.ops = kg::kEpiAzpCorrection; KOPS_EXPECT_STATUS(run(x), Status::kNotImplemented, "AzpCorrection"); }
+  { auto x = base(); x.epi.ops = kg::kEpiBias; KOPS_EXPECT_STATUS(run(x), Status::kInvalidArgument, "Bias without bias pointer"); }
+  { auto x = base(); x.epi.ops = kg::kEpiRowSumSq; KOPS_EXPECT_STATUS(run(x), Status::kInvalidArgument, "RowSumSq without a buffer"); }
+  { auto x = base(); x.epi.ops = kg::kEpiOutFp32; KOPS_EXPECT_STATUS(run(x), Status::kInvalidArgument, "OutFp32 with a bf16 output"); }
+  { auto x = base(); x.epi.ops = kg::kEpiGLU; x.epi.glu_layout = kops::GateLayout::kGateUp; KOPS_EXPECT_STATUS(run(x), Status::kNotImplemented, "GLU with split halves"); }
+  { auto x = base(); x.epi.ops = kg::kEpiGLU; x.epi.glu_layout = kops::GateLayout::kInterleaved; x.n = 129; KOPS_EXPECT_STATUS(run(x), Status::kUnsupportedShape, "GLU with odd N"); }
+  { auto x = base(); x.d_dtype = DType::kFloat16; KOPS_EXPECT_STATUS(run(x), Status::kUnsupportedDtype, "bf16 -> fp16 output"); }
+  { auto x = base(); x.a.dtype = DType::kFloat16; KOPS_EXPECT_STATUS(run(x), Status::kUnsupportedDtype, "recipe / dtype mismatch"); }
+  {
+    LaunchContext det = ctx;
+    det.deterministic = true;
+    auto x = base();
+    x.epi.ops = kg::kEpiAtomicAdd;
+    KOPS_EXPECT_STATUS(kg::scaled_gemm(x, nullptr, kg::GemmBackend::kNative, kops::Workspace{}, det), Status::kInvalidArgument, "AtomicAdd under ctx.deterministic");
+  }
+  {
+    GemmTactic t = tactics_for(ctx, GemmRecipe::kBF16, 64, 128, 4096, 0).front();
+    for (const GemmTactic& c : tactics_for(ctx, GemmRecipe::kBF16, 64, 128, 4096, 0)) if (c.split_k_slices > 1) t = c;
+    auto x = base();
+    x.k = 4096; x.a.ld = 4096; x.b.ld = 4096;
+    auto bigA = upload(random_t<B>(static_cast<size_t>(m) * 4096, &r, -1.0f, 1.0f));
+    auto bigB = upload(random_t<B>(static_cast<size_t>(n) * 4096, &r, -1.0f, 1.0f));
+    x.a.data = bigA.p; x.b.data = bigB.p;
+    if (t.split_k_slices > 1) {
+      KOPS_EXPECT_STATUS(kg::scaled_gemm(x, &t, kg::GemmBackend::kNative, kops::Workspace{}, ctx), Status::kWorkspaceTooSmall, "split-K without workspace");
+      t.split_k_mode = kg::SplitKMode::kStreamK;
+      KOPS_EXPECT_STATUS(kg::scaled_gemm(x, &t, kg::GemmBackend::kNative, kops::Workspace{}, ctx), Status::kNotImplemented, "stream-K");
+    } else {
+      kops_test::record_failure("split-K contract", "no split-K tactic offered", __FILE__, __LINE__);
+    }
+  }
+}
+
+// =============================================================================
+// B7 row 2: dual_gemm (gate / up from two weights, GLU in the epilogue) and bmm (strided batched,
+// B as [N, K] or [K, N], head-strided views).  Oracle: fp64 host loops over the rounded inputs.
+// =============================================================================
+
+double dual_act_ref(kops::ActFn f, double x, const kops::GluParams& g) {
+  const double s2 = std::sqrt(2.0);
+  switch (f) {
+    case kops::ActFn::kSiLU: return x * sigmoid_ref(g.gate_alpha * x);
+    case kops::ActFn::kGeLUErf: return 0.5 * x * (1.0 + std::erf(x / s2));
+    case kops::ActFn::kGeLUTanh: return 0.5 * x * (1.0 + std::tanh(0.7978845608028654 * (x + 0.044715 * x * x * x)));
+    case kops::ActFn::kQuickGeLU: return x * sigmoid_ref(1.702 * x);
+    case kops::ActFn::kReLU: return x > 0 ? x : 0;
+    case kops::ActFn::kReLU2: return x > 0 ? x * x : 0;
+    case kops::ActFn::kSigmoid: return sigmoid_ref(x);
+    case kops::ActFn::kTanh: return std::tanh(x);
+    case kops::ActFn::kSoftplus: return x > 20 ? x : std::log1p(std::exp(x));
+    case kops::ActFn::kSiTU: return g.situ_beta * std::tanh(x / g.situ_beta) * sigmoid_ref(x);
+    case kops::ActFn::kFatReLU: return x > g.fatrelu_threshold ? x : 0;
+    default: return x;
+  }
+}
+
+double dual_glu_ref(kops::ActFn f, double gate, double up, const kops::GluParams& g) {
+  if (g.gate_clamp_max > 0 && gate > g.gate_clamp_max) gate = g.gate_clamp_max;
+  if (g.up_clamp > 0) up = std::min<double>(std::max<double>(up, -g.up_clamp), g.up_clamp);
+  up += g.up_offset;
+  if (g.situ_linear_beta > 0) up = g.situ_linear_beta * std::tanh(up / g.situ_linear_beta);
+  return dual_act_ref(f, gate, g) * up;
+}
+
+struct DualSpec {
+  int m, n, k;
+  kops::ActFn act = kops::ActFn::kSiLU;
+  kops::GluParams glu{};
+  uint32_t ops = 0;
+  int pad_a = 0, pad_b0 = 0, pad_b1 = 0, pad_d = 0;
+  bool alpha_ptr = false;
+};
+
+/// Runs one dual GEMM; returns the raw bytes of D (padding included) for bitwise comparisons.
+template <typename T>
+std::vector<uint8_t> dual_case(const LaunchContext& ctx, const DualSpec& sp, const char* what) {
+  Rng r(31u + sp.m * 13u + sp.n * 3u + sp.k + sp.ops);
+  const int lda = sp.k + sp.pad_a, ldb0 = sp.k + sp.pad_b0, ldb1 = sp.k + sp.pad_b1, ldd = sp.n + sp.pad_d;
+  const auto a = random_t<T>(static_cast<size_t>(sp.m) * lda, &r, -1.0f, 1.0f);
+  const auto b0 = random_t<T>(static_cast<size_t>(sp.n) * ldb0, &r, -0.5f, 0.5f);
+  const auto b1 = random_t<T>(static_cast<size_t>(sp.n) * ldb1, &r, -0.5f, 0.5f);
+  const auto res = random_t<T>(static_cast<size_t>(sp.m) * sp.n, &r, -1.0f, 1.0f);
+  std::vector<float> rs(sp.m), rw(sp.m);
+  for (auto& v : rs) v = r.uni(0.5f, 1.5f);
+  for (auto& v : rw) v = r.uni(0.5f, 1.5f);
+  const float alpha = 0.75f, softcap = 6.0f, clamp_limit = 2.5f, beta = 0.5f;
+  std::vector<double> ref(static_cast<size_t>(sp.m) * ldd, 7.0);
+  for (int row = 0; row < sp.m; ++row) {
+    for (int c = 0; c < sp.n; ++c) {
+      double g = 0.0, u = 0.0;
+      for (int kk = 0; kk < sp.k; ++kk) {
+        const double av = dval(a, static_cast<size_t>(row) * lda + kk);
+        g += av * dval(b0, static_cast<size_t>(c) * ldb0 + kk);
+        u += av * dval(b1, static_cast<size_t>(c) * ldb1 + kk);
+      }
+      g *= alpha;
+      u *= alpha;
+      if (sp.ops & kg::kEpiRowScale) { g *= rs[row]; u *= rs[row]; }
+      if (sp.ops & kg::kEpiClamp) {
+        g = std::min(std::max(g, -static_cast<double>(clamp_limit)), static_cast<double>(clamp_limit));
+        u = std::min(std::max(u, -static_cast<double>(clamp_limit)), static_cast<double>(clamp_limit));
+      }
+      if (sp.ops & kg::kEpiSoftcap) { g = softcap * std::tanh(g / softcap); u = softcap * std::tanh(u / softcap); }
+      double v = dual_glu_ref(sp.act, g, u, sp.glu);
+      if (sp.ops & kg::kEpiRoutingWeight) v *= rw[row];
+      if (sp.ops & kg::kEpiResidualAdd) v += beta * dval(res, static_cast<size_t>(row) * sp.n + c);
+      ref[static_cast<size_t>(row) * ldd + c] = v;
+    }
+  }
+  auto da = upload(a);
+  auto db0 = upload(b0);
+  auto db1 = upload(b1);
+  auto dres = upload(res);
+  auto drs = upload(rs);
+  auto drw = upload(rw);
+  auto dalpha = upload(std::vector<float>(1, alpha));
+  DevBuf<T> dout(ref.size());
+  kops_test::copy_in(dout.p, std::vector<T>(ref.size(), cvt<T>(7.0f)));
+  kg::DualGemmParams p{};
+  p.a = da.p; p.lda = lda;
+  p.b0 = db0.p; p.ldb0 = ldb0;
+  p.b1 = db1.p; p.ldb1 = ldb1;
+  p.d = dout.p; p.ldd = ldd;
+  p.act = sp.act; p.glu = sp.glu;
+  p.m = sp.m; p.n = sp.n; p.k = sp.k;
+  p.epi.ops = sp.ops;
+  p.epi.alpha = sp.alpha_ptr ? 123.0f : alpha;
+  p.epi.alpha_ptr = sp.alpha_ptr ? dalpha.p : nullptr;
+  p.epi.softcap = softcap; p.epi.clamp_limit = clamp_limit; p.epi.beta = beta;
+  p.epi.row_scale = drs.p; p.epi.routing_weight = drw.p;
+  p.epi.residual = dres.p; p.epi.residual_stride = sp.n;
+  char label[200];
+  std::snprintf(label, sizeof(label), "%s [m=%d n=%d k=%d act=%d]", what, sp.m, sp.n, sp.k, static_cast<int>(sp.act));
+  KOPS_EXPECT_OK(kg::dual_gemm(p, dt_of<T>(), ctx), label);
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, ref.size());
+  std::vector<T> got_w;
+  std::vector<double> want_w;
+  size_t pad_bad = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    if ((i % ldd) < static_cast<size_t>(sp.n)) { got_w.push_back(got[i]); want_w.push_back(ref[i]); }
+    else pad_bad += kops_test::to_float(got[i]) != 7.0f;
+  }
+  if (pad_bad != 0) kops_test::record_failure(label, "ld padding of D was written", __FILE__, __LINE__);
+  expect_close(got_w, want_w, label);
+  std::vector<uint8_t> bytes(got.size() * sizeof(T));
+  std::memcpy(bytes.data(), got.data(), bytes.size());
+  return bytes;
+}
+
+void test_dual(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  for (int m : {1, 3, 16, 32, 33, 64, 65, 130}) {
+    dual_case<B>(ctx, DualSpec{m, 200, 136}, "dual bf16 M sweep");
+    dual_case<__half>(ctx, DualSpec{m, 136, 72}, "dual fp16 M sweep");
+  }
+  // every activation function (m = 70 takes the 128-row tile)
+  kops::GluParams glu{};
+  glu.situ_beta = 4.0f;
+  glu.fatrelu_threshold = 0.1f;
+  for (int f = 0; f <= 11; ++f) {
+    DualSpec s{70, 136, 64};
+    s.act = static_cast<kops::ActFn>(f);
+    s.glu = glu;
+    dual_case<B>(ctx, s, "dual activation");
+  }
+  {  // GPT-OSS: gate clamp 7, up clamp 7, up + 1, alpha 1.702
+    DualSpec s{40, 136, 64};
+    s.glu.gate_alpha = 1.702f; s.glu.gate_clamp_max = 0.3f; s.glu.up_clamp = 0.2f; s.glu.up_offset = 1.0f;
+    dual_case<B>(ctx, s, "dual GPT-OSS glu");
+    s.act = kops::ActFn::kSiTU; s.glu = kops::GluParams{}; s.glu.situ_linear_beta = 1.5f;
+    dual_case<__half>(ctx, s, "dual SiTU-GLU");
+  }
+  // epilogue operands
+  for (uint32_t op : {kg::kEpiRowScale, kg::kEpiClamp, kg::kEpiSoftcap, kg::kEpiRoutingWeight, kg::kEpiResidualAdd}) {
+    DualSpec s{97, 200, 136};
+    s.ops = op;
+    char name[64];
+    std::snprintf(name, sizeof(name), "dual epilogue op 0x%x", op);
+    dual_case<B>(ctx, s, name);
+  }
+  {
+    DualSpec s{97, 200, 136};
+    s.ops = kg::kEpiRowScale | kg::kEpiClamp | kg::kEpiSoftcap | kg::kEpiRoutingWeight | kg::kEpiResidualAdd;
+    s.alpha_ptr = true;
+    dual_case<B>(ctx, s, "dual full epilogue chain, alpha from a device scalar");
+    dual_case<__half>(ctx, s, "dual full epilogue chain fp16");
+  }
+  // N, K that no tile divides; ld padding (16 B granules)
+  {
+    DualSpec s{97, 77, 40};
+    s.pad_a = 8; s.pad_b0 = 16; s.pad_b1 = 8; s.pad_d = 3;
+    dual_case<B>(ctx, s, "dual odd N, ld padding");
+    DualSpec t{33, 201, 8};
+    dual_case<__half>(ctx, t, "dual K = 8");
+  }
+  // a row alone equals the same row inside a larger batch (different tile, same K chain)
+  {
+    DualSpec big{70, 136, 136};
+    DualSpec one{1, 136, 136};
+    const auto bb = dual_case<B>(ctx, big, "dual invariance, batch");
+    const auto bo = dual_case<B>(ctx, one, "dual invariance, row");
+    // dual_case seeds from the shape, so compare the first row of two runs with identical operands:
+    // run the 70-row problem again through m = 3 on the same seed family is not possible; instead the
+    // check below uses explicit pointers.
+    (void)bb; (void)bo;
+  }
+}
+
+void test_dual_row_invariance(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  const int M = 70, N = 136, K = 136;
+  Rng r(2024);
+  const auto a = random_t<B>(static_cast<size_t>(M) * K, &r, -1.0f, 1.0f);
+  const auto b0 = random_t<B>(static_cast<size_t>(N) * K, &r, -0.5f, 0.5f);
+  const auto b1 = random_t<B>(static_cast<size_t>(N) * K, &r, -0.5f, 0.5f);
+  auto da = upload(a);
+  auto db0 = upload(b0);
+  auto db1 = upload(b1);
+  DevBuf<B> full(static_cast<size_t>(M) * N), one(static_cast<size_t>(M) * N);
+  kg::DualGemmParams p{};
+  p.a = da.p; p.lda = K; p.b0 = db0.p; p.ldb0 = K; p.b1 = db1.p; p.ldb1 = K; p.d = full.p; p.ldd = N;
+  p.act = kops::ActFn::kSiLU; p.m = M; p.n = N; p.k = K;
+  KOPS_EXPECT_OK(kg::dual_gemm(p, DType::kBFloat16, ctx), "dual full");
+  for (int row : {0, 17, 69}) {
+    kg::DualGemmParams q = p;
+    q.a = da.p + static_cast<size_t>(row) * K; q.d = one.p + static_cast<size_t>(row) * N; q.m = 1;
+    KOPS_EXPECT_OK(kg::dual_gemm(q, DType::kBFloat16, ctx), "dual one row");
+  }
+  cudaDeviceSynchronize();
+  const auto f = kops_test::copy_out(full.p, static_cast<size_t>(M) * N);
+  const auto o = kops_test::copy_out(one.p, static_cast<size_t>(M) * N);
+  for (int row : {0, 17, 69}) {
+    if (std::memcmp(&f[static_cast<size_t>(row) * N], &o[static_cast<size_t>(row) * N], N * sizeof(B)) != 0) {
+      kops_test::record_failure("dual invariance", "row alone differs from the same row in a batch", __FILE__, __LINE__);
+    }
+  }
+}
+
+void test_dual_contracts(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  const int m = 40, n = 64, k = 64;
+  Rng r(3);
+  auto da = upload(random_t<B>(static_cast<size_t>(m) * k, &r, -1.0f, 1.0f));
+  auto db0 = upload(random_t<B>(static_cast<size_t>(n) * k, &r, -1.0f, 1.0f));
+  auto db1 = upload(random_t<B>(static_cast<size_t>(n) * k, &r, -1.0f, 1.0f));
+  DevBuf<B> dout(static_cast<size_t>(m) * n);
+  DevBuf<float> dsc(8);
+  auto base = [&]() {
+    kg::DualGemmParams p{};
+    p.a = da.p; p.lda = k; p.b0 = db0.p; p.ldb0 = k; p.b1 = db1.p; p.ldb1 = k; p.d = dout.p; p.ldd = n;
+    p.act = kops::ActFn::kSiLU; p.m = m; p.n = n; p.k = k;
+    return p;
+  };
+  KOPS_EXPECT_OK(kg::dual_gemm(base(), DType::kBFloat16, ctx), "dual contract baseline");
+  KOPS_EXPECT_STATUS(kg::dual_gemm(base(), DType::kFloat8E4M3, ctx), Status::kNotImplemented, "dual fp8");
+  KOPS_EXPECT_STATUS(kg::dual_gemm(base(), DType::kFloat32, ctx), Status::kUnsupportedDtype, "dual fp32");
+  { auto p = base(); p.epi.ops = kg::kEpiBias; p.epi.bias = dsc.p; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kNotImplemented, "dual bias"); }
+  { auto p = base(); p.epi.ops = kg::kEpiScatterRows; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kNotImplemented, "dual scatter"); }
+  { auto p = base(); p.a_scale = dsc.p; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kInvalidArgument, "dual scale on bf16"); }
+  { auto p = base(); p.epi.ops = kg::kEpiResidualAdd; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kInvalidArgument, "dual residual missing"); }
+  { auto p = base(); p.k = 60; p.lda = 64; p.ldb0 = 64; p.ldb1 = 64; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kMisaligned, "dual K % 8"); }
+  { auto p = base(); p.lda = k + 3; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kMisaligned, "dual unaligned lda"); }
+  { auto p = base(); p.ldb1 = k - 8; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kInvalidArgument, "dual ldb1 < k"); }
+  { auto p = base(); p.b1 = nullptr; KOPS_EXPECT_STATUS(kg::dual_gemm(p, DType::kBFloat16, ctx), Status::kInvalidArgument, "dual null b1"); }
+}
+
+// ---- bmm ----------------------------------------------------------------------------------------------
+
+struct BmmSpec {
+  int batch, m, n, k;
+  bool kmajor = true;
+  int pad_a = 0, pad_b = 0, pad_d = 0;
+  bool head_view = false;   // A and D are [m, batch, *] views: lda = batch * k, stride_a_batch = k
+};
+
+template <typename T, typename D>
+std::vector<uint8_t> bmm_case(const LaunchContext& ctx, const BmmSpec& sp, const char* what, bool use_gemm = false) {
+  Rng r(900u + sp.batch * 5u + sp.m * 11u + sp.n + sp.k * 3u);
+  const int lda = sp.head_view ? sp.batch * sp.k : sp.k + sp.pad_a;
+  const int64_t sa = sp.head_view ? sp.k : static_cast<int64_t>(sp.m) * lda;
+  const int ldb = (sp.kmajor ? sp.k : sp.n) + sp.pad_b;
+  const int64_t sb = static_cast<int64_t>(sp.kmajor ? sp.n : sp.k) * ldb;
+  const int ldd = sp.head_view ? sp.batch * sp.n : sp.n + sp.pad_d;
+  const int64_t sd = sp.head_view ? sp.n : static_cast<int64_t>(sp.m) * ldd;
+  const size_t a_elems = sp.head_view ? static_cast<size_t>(sp.m) * lda : static_cast<size_t>(sp.batch) * sa;
+  const size_t d_elems = sp.head_view ? static_cast<size_t>(sp.m) * ldd : static_cast<size_t>(sp.batch) * sd;
+  const auto a = random_t<T>(a_elems, &r, -1.0f, 1.0f);
+  const auto b = random_t<T>(static_cast<size_t>(sp.batch) * sb, &r, -0.5f, 0.5f);
+  std::vector<double> ref(d_elems, 7.0);
+  std::vector<char> written(d_elems, 0);
+  for (int z = 0; z < sp.batch; ++z) {
+    for (int row = 0; row < sp.m; ++row) {
+      for (int c = 0; c < sp.n; ++c) {
+        double acc = 0.0;
+        for (int kk = 0; kk < sp.k; ++kk) {
+          const size_t bi = static_cast<size_t>(z * sb) + (sp.kmajor ? static_cast<size_t>(c) * ldb + kk : static_cast<size_t>(kk) * ldb + c);
+          acc += dval(a, static_cast<size_t>(z * sa) + static_cast<size_t>(row) * lda + kk) * dval(b, bi);
+        }
+        const size_t di = static_cast<size_t>(z * sd) + static_cast<size_t>(row) * ldd + c;
+        ref[di] = acc;
+        written[di] = 1;
+      }
+    }
+  }
+  auto da = upload(a);
+  auto db = upload(b);
+  DevBuf<D> dout(d_elems);
+  kops_test::copy_in(dout.p, std::vector<D>(d_elems, cvt<D>(7.0f)));
+  char label[200];
+  std::snprintf(label, sizeof(label), "%s [batch=%d m=%d n=%d k=%d kmajor=%d]", what, sp.batch, sp.m, sp.n, sp.k, sp.kmajor ? 1 : 0);
+  if (use_gemm) {
+    kg::ScaledGemmArgs args{};
+    args.recipe = recipe_of(dt_of<T>());
+    args.a.data = da.p; args.a.ld = lda; args.a.dtype = dt_of<T>(); args.a.batch_stride = sa;
+    args.b.data = db.p; args.b.ld = ldb; args.b.dtype = dt_of<T>(); args.b.batch_stride = sb;
+    args.d = dout.p; args.ldd = ldd; args.d_dtype = dt_of<D>(); args.batch_stride_d = sd;
+    args.m = sp.m; args.n = sp.n; args.k = sp.k; args.batch = sp.batch;
+    KOPS_EXPECT_OK(kg::scaled_gemm(args, nullptr, kg::GemmBackend::kNative, kops::Workspace{}, ctx), label);
+  } else {
+    kg::BmmParams p{};
+    p.a = da.p; p.lda = lda; p.stride_a_batch = sa;
+    p.b = db.p; p.ldb = ldb; p.stride_b_batch = sb;
+    p.d = dout.p; p.ldd = ldd; p.stride_d_batch = sd;
+    p.b_k_major = sp.kmajor;
+    p.batch = sp.batch; p.m = sp.m; p.n = sp.n; p.k = sp.k;
+    KOPS_EXPECT_OK(kg::bmm(p, dt_of<T>(), dt_of<T>(), dt_of<D>(), ctx), label);
+  }
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, d_elems);
+  std::vector<D> got_w;
+  std::vector<double> want_w;
+  size_t untouched = 0;
+  for (size_t i = 0; i < d_elems; ++i) {
+    if (written[i]) { got_w.push_back(got[i]); want_w.push_back(ref[i]); }
+    else untouched += kops_test::to_float(got[i]) != 7.0f;
+  }
+  if (untouched != 0) kops_test::record_failure(label, "elements outside D[b] (padding / other heads) were written", __FILE__, __LINE__);
+  expect_close(got_w, want_w, label);
+  std::vector<uint8_t> bytes(got.size() * sizeof(D));
+  std::memcpy(bytes.data(), got.data(), bytes.size());
+  return bytes;
+}
+
+void test_bmm(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  // M picks the four tiles (32x64, 64x64, 64x128, 128x128); both B layouts; K tails and N tails
+  for (int m : {1, 5, 32, 33, 64, 65, 100, 129, 300}) {
+    for (bool km : {true, false}) {
+      bmm_case<B, B>(ctx, BmmSpec{3, m, 136, 72, km}, "bmm bf16 sweep");
+      bmm_case<__half, __half>(ctx, BmmSpec{2, m, 200, 40, km}, "bmm fp16 sweep");
+    }
+  }
+  bmm_case<B, B>(ctx, BmmSpec{1, 70, 77, 40, true}, "bmm odd N (B is [N, K])");
+  bmm_case<B, B>(ctx, BmmSpec{4, 33, 64, 8, false}, "bmm K = 8");
+  bmm_case<B, float>(ctx, BmmSpec{3, 50, 136, 64, false}, "bmm -> fp32");
+  bmm_case<__half, float>(ctx, BmmSpec{3, 50, 99, 64, true}, "bmm fp16 -> fp32");
+  // ld padding, 16 B granules
+  { BmmSpec s{3, 41, 136, 72, true}; s.pad_a = 8; s.pad_b = 16; s.pad_d = 5; bmm_case<B, B>(ctx, s, "bmm padded ld, B [N, K]"); }
+  { BmmSpec s{3, 41, 136, 72, false}; s.pad_a = 16; s.pad_b = 8; s.pad_d = 2; bmm_case<B, B>(ctx, s, "bmm padded ld, B [K, N]"); }
+  // MLA absorption: q_nope[T, H, 128] x W_UK[H, 128, 512] and o_latent[T, H, 512] x W_UV[H, 512, 128]
+  for (int t : {1, 7, 64}) {
+    BmmSpec uk{16, t, 512, 128, false};
+    uk.head_view = true;
+    bmm_case<B, B>(ctx, uk, "bmm MLA W_UK (head-strided A and D)");
+    BmmSpec uv{16, t, 128, 512, false};
+    uv.head_view = true;
+    bmm_case<B, B>(ctx, uv, "bmm MLA W_UV (head-strided A and D)");
+  }
+  // same K chain as the batched tile GEMM (k-major B): bit-identical
+  {
+    const BmmSpec s{3, 130, 128, 256, true};
+    const auto x = bmm_case<B, B>(ctx, s, "bmm vs gemm_mma_sync_kernel: bmm");
+    const auto y = bmm_case<B, B>(ctx, s, "bmm vs gemm_mma_sync_kernel: scaled_gemm", true);
+    if (x != y) kops_test::record_failure("bmm", "differs bitwise from the batched tile GEMM", __FILE__, __LINE__);
+    // and the two B layouts agree when the data is the transpose
+  }
+}
+
+void test_bmm_contracts(const LaunchContext& ctx) {
+  using B = __nv_bfloat16;
+  const int batch = 2, m = 20, n = 64, k = 64;
+  Rng r(8);
+  auto da = upload(random_t<B>(static_cast<size_t>(batch) * m * k, &r, -1.0f, 1.0f));
+  auto db = upload(random_t<B>(static_cast<size_t>(batch) * n * k, &r, -1.0f, 1.0f));
+  DevBuf<B> dout(static_cast<size_t>(batch) * m * n);
+  DevBuf<float> dsc(4);
+  auto base = [&]() {
+    kg::BmmParams p{};
+    p.a = da.p; p.lda = k; p.stride_a_batch = static_cast<int64_t>(m) * k;
+    p.b = db.p; p.ldb = k; p.stride_b_batch = static_cast<int64_t>(n) * k;
+    p.d = dout.p; p.ldd = n; p.stride_d_batch = static_cast<int64_t>(m) * n;
+    p.b_k_major = true; p.batch = batch; p.m = m; p.n = n; p.k = k;
+    return p;
+  };
+  const DType bf = DType::kBFloat16;
+  KOPS_EXPECT_OK(kg::bmm(base(), bf, bf, bf, ctx), "bmm contract baseline");
+  KOPS_EXPECT_STATUS(kg::bmm(base(), DType::kFloat8E4M3, DType::kFloat8E4M3, bf, ctx), Status::kNotImplemented, "bmm fp8");
+  KOPS_EXPECT_STATUS(kg::bmm(base(), DType::kFloat32, DType::kFloat32, DType::kFloat32, ctx), Status::kUnsupportedDtype, "bmm fp32 operands");
+  KOPS_EXPECT_STATUS(kg::bmm(base(), bf, DType::kFloat16, bf, ctx), Status::kUnsupportedDtype, "bmm mixed operand dtypes");
+  KOPS_EXPECT_STATUS(kg::bmm(base(), bf, bf, DType::kFloat16, ctx), Status::kUnsupportedDtype, "bmm bf16 -> fp16");
+  { auto p = base(); p.a_scale = dsc.p; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kInvalidArgument, "bmm scale on bf16"); }
+  { auto p = base(); p.k = 60; p.lda = 64; p.ldb = 64; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kMisaligned, "bmm K % 8"); }
+  { auto p = base(); p.b_k_major = false; p.n = 60; p.ldb = 64; p.ldd = 64; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kMisaligned, "bmm N % 8 with B [K, N]"); }
+  { auto p = base(); p.lda = k + 3; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kMisaligned, "bmm unaligned lda"); }
+  { auto p = base(); p.ldd = n - 1; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kInvalidArgument, "bmm ldd < n"); }
+  { auto p = base(); p.batch = 0; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kInvalidArgument, "bmm batch 0"); }
+  { auto p = base(); p.stride_d_batch = 0; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kInvalidArgument, "bmm batched output without a stride"); }
+  { auto p = base(); p.d = nullptr; KOPS_EXPECT_STATUS(kg::bmm(p, bf, bf, bf, ctx), Status::kInvalidArgument, "bmm null d"); }
+}
+
 }  // namespace
 
 int main() {
@@ -2553,5 +3402,18 @@ int main() {
   test_e4m3_encode_exhaustive();
   test_block_quant(ctx);
   test_contracts(ctx);
+  test_mma_sweep(ctx);
+  test_mma_shapes(ctx);
+  test_mma_epilogues(ctx);
+  test_mma_splitk(ctx);
+  test_mma_invariance(ctx);
+  test_mma_dispatch(ctx);
+  test_mma_cache(ctx);
+  test_mma_contracts(ctx);
+  test_dual(ctx);
+  test_dual_row_invariance(ctx);
+  test_dual_contracts(ctx);
+  test_bmm(ctx);
+  test_bmm_contracts(ctx);
   return kops_test::finish("test_gemm");
 }

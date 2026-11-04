@@ -87,16 +87,32 @@ Status dequantize_f64(const double* q, const double* scales, const double* zero_
                       const QuantScheme& scheme, int64_t rows, int64_t cols, double* out);
 
 // ---- Attention ----------------------------------------------------------------
-/// Dense causal/window/softcap attention with optional sinks and ALiBi; the golden
-/// reference for A01/A02/A03/A06/A07/A08. `qkv` is [rows, heads, dim]; `k/v` are
-/// ragged [kv_rows, kv_heads, dim] with `kv_indptr[B+1]`. Writes o and lse (-inf row
-/// -> o = 0, lse = -inf).
-Status attention_f64(const double* q, const double* k, const double* v, const int32_t* qo_indptr,
-                     const int32_t* kv_indptr, int32_t batch, int32_t q_heads, int32_t kv_heads,
-                     int32_t head_dim_qk, int32_t head_dim_vo, double sm_scale,
-                     double logits_softcap, int32_t window_left, int32_t num_sinks,
-                     const double* sink_logits, const double* alibi_slopes, double* o,
-                     double* lse, bool causal);
+/// Arguments of attention_f64. Packed layouts: q [total_q, Hq, Dqk], k [total_kv, Hkv, Dqk],
+/// v [total_kv, Hkv, Dvo], o [total_q, Hq, Dvo], lse [total_q, Hq]. Optional pointers may be null.
+struct AttentionRefArgs {
+  const double* q = nullptr;
+  const double* k = nullptr;               // already dequantized (FP8 KV: k8 * k_scale)
+  const double* v = nullptr;
+  const int32_t* qo_indptr = nullptr;      // [B + 1]
+  const int32_t* kv_indptr = nullptr;      // [B + 1]
+  const int32_t* q_pos_offset = nullptr;   // [B] position of query row 0; null = kv_len - qo_len
+  int32_t batch = 0, q_heads = 0, kv_heads = 0, head_dim_qk = 0, head_dim_vo = 0;
+  double sm_scale = 0.0;
+  double logits_softcap = 0.0;             // > 0: s = cap * tanh(s / cap)
+  int32_t window_left = -1, window_right = -1, chunk_size = 0, num_sink_tokens = 0;
+  const double* sink_logits = nullptr;     // [Hq], natural-log units of s
+  const double* alibi_slopes = nullptr;    // [Hq]; s += slope * (k_pos - q_pos)
+  bool causal = true;
+  const uint8_t* custom_mask = nullptr;    // packed LSB-first bits over [qo_len, kv_len] per request
+  const int64_t* mask_indptr = nullptr;    // [B + 1] bit offsets
+  double* o = nullptr;
+  double* lse = nullptr;                   // may be null
+};
+/// Dense attention with every AttentionModifiers rule; the golden reference for
+/// A01/A02/A03/A06/A07/A08 (CONTRACTS §1e). Order per score: s = sm_scale * q.k, softcap,
+/// + ALiBi, mask; softmax denominator += exp(sink) once. Fully masked row without sink:
+/// o = 0, lse = -inf.
+Status attention_f64(const AttentionRefArgs& args);
 /// Merge (o, lse) states; mirrors merge_states_kernel's deterministic order.
 Status merge_states_f64(const double* o_states, const double* lse_states, int64_t rows, int64_t n,
                         int64_t heads, int64_t head_dim, double* o, double* lse);
@@ -119,14 +135,61 @@ Status permute_unpermute_f64(const double* in, const int32_t* topk_ids, int32_t 
                              int32_t hidden, int32_t topk, double* out);
 
 // ---- State / recurrent --------------------------------------------------------
-/// Causal depthwise conv1d (Mamba / short-conv), silu/identity activation optional.
-Status causal_conv1d_f64(const double* x, const double* w, const double* bias, int64_t batch,
-                         int64_t channels, int64_t length, int32_t width, ActFn act,
-                         double* y);
-/// Selective scan (Mamba-1) over a batch of sequences.
-Status selective_scan_f64(const double* u, const double* delta, const double* a, const double* b,
-                          const double* c, const double* d, int64_t batch, int64_t dim,
-                          int64_t dstate, int64_t length, double* y);
+// One sequence per call; every state is updated in place, so a varlen batch, initial states,
+// snapshots (call on a prefix) and resumed calls are composed by the test.
+/// Causal depthwise conv1d (Mamba / GDN / KDA / LFM2 short conv): x, y [len, dim] row-major,
+/// w [dim, width], bias [dim] or null, hist [dim, width - 1] oldest first (updated to the last
+/// width - 1 inputs). y = act(bias + sum_j w[j] * window[j]), act kSiLU or kIdentity.
+Status causal_conv1d_f64(const double* x, int64_t len, int64_t dim, const double* w,
+                         int32_t width, const double* bias, ActFn act, double* hist, double* y);
+
+/// Selective SSM recurrence (Mamba-1 selective scan / state update, Mamba-2 SSD) on state
+/// [H, P, N]: per token, dt' = clamp(softplus(dt + dt_bias)) (each step optional),
+/// state = state * exp(dt' A) + dt' B[g(h)] x[h, p];  y = state . C[g(h)] + D x;  y *= silu(z).
+struct SsmRefArgs {
+  const double* x = nullptr;        // [len, H, P]
+  const double* dt = nullptr;       // [len, H]
+  const double* dt_bias = nullptr;  // [H] or null
+  const double* A = nullptr;        // [H] or [H, N] (a_per_state)
+  const double* B = nullptr;        // [len, G, N]
+  const double* C = nullptr;        // [len, G, N]
+  const double* D = nullptr;        // [H] or [H, P] (d_per_p), or null
+  const double* z = nullptr;        // [len, H, P] or null
+  int64_t len = 0, nheads = 0, headdim = 0, dstate = 0, ngroups = 1;
+  bool a_per_state = false, d_per_p = false, dt_softplus = true, has_dt_limit = false;
+  double dt_min = 0.0, dt_max = 0.0;
+  double* state = nullptr;          // [H, P, N] in/out
+  double* y = nullptr;              // [len, H, P]
+};
+Status ssm_recurrence_f64(const SsmRefArgs& args);
+
+/// Decayed linear attention: S = exp(-slope[h]) S + k^T v, o = scale * q S. q, k [len, H, Dk],
+/// v, o [len, H, Dv], state [H, Dk, Dv] in/out.
+Status linear_attention_f64(const double* q, const double* k, const double* v,
+                            const double* slope, double scale, int64_t len, int64_t heads,
+                            int64_t dk, int64_t dv, double* state, double* o);
+
+/// Gated delta rule (GDN per-head / KDA per-channel decay) with optional L2 norm of q and k
+/// (x / sqrt(sum x^2 + 1e-6)), q scaled after the norm. Value head h uses key head h / (Hv / Hk).
+struct DeltaRuleRefArgs {
+  const double* q = nullptr;     // [len, Hk, Dk]
+  const double* k = nullptr;     // [len, Hk, Dk]
+  const double* v = nullptr;     // [len, Hv, Dv]
+  const double* g = nullptr;     // [len, Hv] or [len, Hv, Dk] (per_channel), log-decay
+  const double* beta = nullptr;  // [len, Hv]
+  int64_t len = 0, num_k_heads = 0, num_v_heads = 0, head_dim_k = 0, head_dim_v = 0;
+  bool per_channel = false, use_qk_l2norm = true;
+  double scale = 1.0;
+  double* state = nullptr;       // [Hv, Dk, Dv] in/out
+  double* o = nullptr;           // [len, Hv, Dv]
+};
+Status delta_rule_f64(const DeltaRuleRefArgs& args);
+/// Gate preparation: g = -exp(A_log) softplus(a + dt_bias) (or lower_bound * sigmoid(exp(A_log)
+/// (a + dt_bias)) when lower_bound < 0), beta = sigmoid(b). a, g are [rows, Hv, per] with per = Dk
+/// (KDA) or 1 (GDN); dt_bias [Hv, per]; b, beta [rows, Hv].
+Status delta_rule_gating_f64(const double* a, const double* b, const double* A_log,
+                             const double* dt_bias, double lower_bound, int64_t rows,
+                             int64_t num_v_heads, int64_t per, double* g, double* beta);
 
 // ---- Sampling -----------------------------------------------------------------
 /// softmax(logits / temperature) in fp64 with max subtraction.

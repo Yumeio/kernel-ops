@@ -15,6 +15,7 @@
 #include "csrc/common/tensor.h"
 #include "csrc/common/quant.cuh"
 #include "csrc/common/op_types.cuh"
+#include "csrc/common/vec.cuh"
 #include "csrc/common/device.cuh"
 #include "csrc/common/rng.cuh"
 #include "csrc/common/sync.cuh"
@@ -68,6 +69,7 @@
 #include "csrc/state/ops.h"
 // 7. sampling
 #include "csrc/sampling/sampling_kernels.cuh"
+#include "csrc/sampling/fused_sampler_kernels.cuh"
 #include "csrc/sampling/logits_processor_kernels.cuh"
 #include "csrc/sampling/speculative_kernels.cuh"
 #include "csrc/sampling/ops.h"

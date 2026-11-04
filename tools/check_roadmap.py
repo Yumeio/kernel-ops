@@ -15,6 +15,12 @@ Rules
 
 Exit code 1 on: a declared kernel not assigned, a kernel assigned twice, an assigned name
 that no header declares, a banned file name, or a `.cu` outside E.2.
+
+`--slice KEY` prints only part of the roadmap instead of checking it, so a session can read
+one step without loading the whole file:
+  * `--slice B8`: the B8 row of the §0.3 overview, the §1.1 beat cycle and the `## B8` section.
+  * `--slice 2.5`, `--slice E.2`, `--slice "Phụ lục B"`: the heading whose title starts with
+    KEY, up to the next heading of the same or a higher level.
 """
 import pathlib
 import re
@@ -81,10 +87,56 @@ def source_name_problems(roadmap_text):
     return problems
 
 
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)$")
+
+
+def heading_block(lines, key):
+    """Lines of the first heading whose title starts with `key`, up to the next heading of the
+    same or a higher level; None when no heading matches."""
+    for i, line in enumerate(lines):
+        match = HEADING_RE.match(line)
+        if not match or not re.match(re.escape(key) + r"\b", match.group(2)):
+            continue
+        level = len(match.group(1))
+        end = len(lines)
+        for j in range(i + 1, len(lines)):
+            other = HEADING_RE.match(lines[j])
+            if other and len(other.group(1)) <= level:
+                end = j
+                break
+        return lines[i:end]
+    return None
+
+
+def slice_roadmap(text, key):
+    lines = text.splitlines()
+    out = []
+    if re.fullmatch(r"B\d+", key):
+        overview = heading_block(lines, "0.3") or []
+        rows = [l for l in overview if l.startswith("|")]
+        out += ["### 0.3 (row)"] + rows[:2] + [l for l in rows if f"| {key} |" in l] + [""]
+        beat = heading_block(lines, "1.1") or []
+        start = next((i for i, l in enumerate(beat) if l.startswith("Mỗi nhịp theo cùng")), None)
+        stop = next((i for i, l in enumerate(beat) if l.startswith("Nhịp xong khi")), None)
+        if start is not None and stop is not None:
+            out += ["### 1.1 (vòng nhịp)"] + beat[start:stop + 1] + [""]
+        block = heading_block(lines, key)
+    else:
+        block = heading_block(lines, key)
+    if block is None:
+        print(f"no roadmap heading starts with '{key}'", file=sys.stderr)
+        return 1
+    sys.stdout.reconfigure(encoding="utf-8")
+    print("\n".join(out + block))
+    return 0
+
+
 def main():
     roadmap = ROOT / "ROADMAP.md"
     if not roadmap.exists():
         roadmap = ROOT / "docs" / "ROADMAP.md"
+    if len(sys.argv) == 3 and sys.argv[1] == "--slice":
+        return slice_roadmap(roadmap.read_text(encoding="utf-8"), sys.argv[2])
     declared = declared_kernels()
     assigned, order = assigned_kernels(roadmap.read_text(encoding="utf-8"))
 

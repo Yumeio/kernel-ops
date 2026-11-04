@@ -603,6 +603,62 @@ __device__ __forceinline__ void tc_gemv_body(const T* __restrict__ a, const int6
 #endif
 }
 
+// ---- B9 recurrent helpers (state/conv1d.cu, ssm.cu, linear_attention.cu, delta_rule*.cu) ----
+// Scalar gates and decays in fp32 with the fast exponential (relative error ~2^-21 plus 2^-23
+// per unit of |x|, far below the bf16/fp16 rounding they feed); softplus keeps log1p accurate.
+
+/// 1 / (1 + exp(-x)); 0 for x < -88 and 1 for large x, never NaN for finite x.
+__device__ __forceinline__ float sigmoid_f(float x) { return __frcp_rn(1.0f + __expf(-x)); }
+__device__ __forceinline__ float silu_f(float x) { return x * sigmoid_f(x); }
+/// torch softplus (threshold 20).
+__device__ __forceinline__ float softplus_f(float x) { return x > 20.0f ? x : log1pf(__expf(x)); }
+
+/// Deterministic xor-butterfly fp32 sum over the `Width` lanes of an aligned group; every lane
+/// of the group gets the same value.
+template <int Width = 32>
+__device__ __forceinline__ float group_sum(float v) {
+#pragma unroll
+  for (int off = Width / 2; off > 0; off >>= 1) v += __shfl_xor_sync(0xffffffffu, v, off, Width);
+  return v;
+}
+
+/// Register-tiled product of two k-major shared-memory operands (a row of either holds one k):
+/// acc[r][c] += sum_{k < K} A[k * lda + ra + r] * B[k * ldb + cb + c], in increasing k, fp32 FMA.
+/// ra, cb and both leading dimensions are multiples of 4 (of 2 for RN = 2): one 16- or 8-byte
+/// shared load per piece of a row.
+template <int RM, int RN>
+__device__ __forceinline__ void smem_gemm_kmajor(float (&acc)[RM][RN], const float* __restrict__ A,
+                                                 int lda, int ra, const float* __restrict__ B,
+                                                 int ldb, int cb, int K) {
+  static_assert(RM % 4 == 0 && (RN == 2 || RN % 4 == 0), "tile sides map onto 16/8-byte loads");
+#pragma unroll 4
+  for (int k = 0; k < K; ++k) {
+    float a[RM], b[RN];
+    const float* ap = A + k * lda + ra;
+    const float* bp = B + k * ldb + cb;
+#pragma unroll
+    for (int i = 0; i < RM; i += 4) {
+      const float4 v = *reinterpret_cast<const float4*>(ap + i);
+      a[i] = v.x, a[i + 1] = v.y, a[i + 2] = v.z, a[i + 3] = v.w;
+    }
+    if constexpr (RN == 2) {
+      const float2 v = *reinterpret_cast<const float2*>(bp);
+      b[0] = v.x, b[1] = v.y;
+    } else {
+#pragma unroll
+      for (int i = 0; i < RN; i += 4) {
+        const float4 v = *reinterpret_cast<const float4*>(bp + i);
+        b[i] = v.x, b[i + 1] = v.y, b[i + 2] = v.z, b[i + 3] = v.w;
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < RM; ++r) {
+#pragma unroll
+      for (int c = 0; c < RN; ++c) acc[r][c] = __fmaf_rn(a[r], b[c], acc[r][c]);
+    }
+  }
+}
+
 }  // namespace dev
 
 // ---- Counter RNG (declared in common/rng.cuh) -------------------------------

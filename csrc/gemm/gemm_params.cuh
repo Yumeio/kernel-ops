@@ -108,7 +108,8 @@ struct ScaledOperand {
 ///   acc(fp32) -> *alpha -> *row_scale[m] -> *col_scale[n] -> int8 azp correction -> +bias[n]
 ///   -> clamp -> softcap -> act / GLU (paired columns) -> *routing_weight[m]
 ///   -> sigmoid gate multiply -> +beta*residual[m,n] -> quantize or round to D dtype
-///   -> store (direct / scattered / atomically accumulated).
+///   -> store (direct / scattered / atomically accumulated)
+///   -> row_sumsq[m] (kEpiRowSumSq) -> KV append of the stored value (kEpiKvAppend).
 enum EpilogueOp : uint32_t {
   kEpiNone = 0u,
   kEpiRowScale = 1u << 0,       // per-token activation dequant scale (rowwise FP8/INT8)
@@ -127,6 +128,10 @@ enum EpilogueOp : uint32_t {
   kEpiClamp = 1u << 12,         // clamp(x, -clamp_limit, clamp_limit) (MPT / DBRX clip_qkv)
   kEpiAzpCorrection = 1u << 13, // INT8 asymmetric: acc -= azp[m] * colsum_b[n]
   kEpiOutFp32 = 1u << 14,       // keep D in fp32 (router logits, LM head logits for sampling)
+  // The two ops below do not change D. They produce data for a later op and run after D is written
+  // (CONTRACTS.md "Epilogue fusions"); ABI 6.
+  kEpiRowSumSq = 1u << 15,      // row_sumsq[m] = sum_k A[m, k]^2 (fp32; DeepGEMM tf32_hc_prenorm_gemm `sqr_sum`)
+  kEpiKvAppend = 1u << 16,      // copy the stored D[m, kv_col_begin .. +kv_cols) to kv_dst[kv_slots[m]]
 };
 
 struct EpilogueParams {
@@ -158,6 +163,18 @@ struct EpilogueParams {
   int64_t residual_stride = 0;
   const int32_t* scatter_rows = nullptr;   // [M] destination row in D (-1 = drop)
   ActQuantOut quant_out;                   // kEpiQuantOut (block amax computed inside the N tile)
+  // kEpiRowSumSq (ABI 6). Written, not accumulated: the launch needs no zeroed buffer. Rows are
+  // summed in a fixed order, so the value does not depend on the tactic's tile, split-K or swap_ab.
+  float* row_sumsq = nullptr;              // [M] fp32
+  // kEpiKvAppend (ABI 6). For every row m with kv_slots[m] >= 0 and every output column
+  // n in [kv_col_begin, kv_col_begin + kv_cols):
+  //   kv_dst[kv_slots[m] * kv_stride + (n - kv_col_begin)] = the value stored to D[m, n]
+  // (same dtype as D, after rounding; n counts output columns, i.e. N/2 after kEpiGLU).
+  void* kv_dst = nullptr;
+  const int32_t* kv_slots = nullptr;       // [M] destination slot (-1 = skip)
+  int64_t kv_stride = 0;                   // elements between slots
+  int32_t kv_col_begin = 0;
+  int32_t kv_cols = 0;
 };
 
 // -----------------------------------------------------------------------------
@@ -207,6 +224,17 @@ struct GemmArgs {
   int32_t* locks = nullptr;                        // Marlin / stream-K inter-CTA locks (zeroed, epoch-tagged)
 };
 
+enum class SplitKMode : uint8_t {
+  kNone = 0,
+  kSerial = 1,               // in-kernel: every slice writes its fp32 partial, the last CTA of the tile sums
+                             //   them in slice order (deterministic) and runs the full epilogue
+  kParallel = 2,             // fp32 partials in workspace + splitk_reduce_kernel
+  kStreamK = 3,              // stream-K with fix-up (persistent)
+  kStreamKHybrid = 4,        // data-parallel full waves + stream-K tail wave
+};
+
+enum class RasterOrder : uint8_t { kAlongM = 0, kAlongN = 1, kHeuristic = 2 };
+
 /// Full argument block for every scaled / quantized / mixed-input GEMM.
 struct ScaledGemmArgs {
   ScaledOperand a;                       // activations [M, K] (or [batch, M, K])
@@ -227,6 +255,12 @@ struct ScaledGemmArgs {
   void* workspace = nullptr;
   size_t workspace_bytes = 0;
   uint32_t epoch = 0;                    // epoch for semaphores / locks (graph replay safe)
+  // Runtime half of the tactic, read by gemm_mma_sync_kernel (ABI 6). The launcher fills them from
+  // the GemmTactic; split_k_slices is also gridDim.z / batch.
+  SplitKMode split_k_mode = SplitKMode::kNone;
+  int32_t split_k_slices = 1;
+  RasterOrder raster = RasterOrder::kHeuristic;
+  int32_t* split_k_counters = nullptr;   // [tiles_m * tiles_n] zeroed per launch by the host (kSerial)
 };
 
 // -----------------------------------------------------------------------------
@@ -251,16 +285,6 @@ enum class EpilogueSchedule : uint8_t {
   kTmaStore = 2,             // registers/TMEM -> smem -> TMA store
   kTmaStoreWarpSpecialized = 3,  // dedicated epilogue warps overlapping the next mainloop (SM90/SM100)
 };
-
-enum class SplitKMode : uint8_t {
-  kNone = 0,
-  kSerial = 1,               // in-kernel semaphore reduction into D (deterministic order by slice id)
-  kParallel = 2,             // fp32 partials in workspace + splitk_reduce_kernel
-  kStreamK = 3,              // stream-K with fix-up (persistent)
-  kStreamKHybrid = 4,        // data-parallel full waves + stream-K tail wave
-};
-
-enum class RasterOrder : uint8_t { kAlongM = 0, kAlongN = 1, kHeuristic = 2 };
 
 /// One compiled + tunable configuration. tile/cluster/stages are compile-time in the kernel
 /// instantiation; the rest is runtime. kernel_id ties the tactic to the registry row.
