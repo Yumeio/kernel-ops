@@ -233,6 +233,52 @@ remain the ABI and shape authority.
   request; every task writes partials, `merge_split_kv` finishes). The task counter is
   `uint32[2]` and resets itself at the end of each launch.
 
+## 1f. Recurrent state kernels (B9)
+
+- **Host API.** The B9 entries of `state/ops.h` take the kernel parameter structs (device
+  pointers, element strides) and validate every host-visible invariant before any launch (dims,
+  dtypes, strides >= 0, slot stride, snapshot rules, in-place aliasing); device indices and
+  lengths are never read on the host. No allocation, no synchronization: graph-capturable.
+- **Slots.** A sequence's slot is `cache_indices / state_indices / state_batch_indices[b]` (null:
+  slot b). A slot `< 0`, `>= num_slots` or `== pad_slot_id` skips the sequence: its outputs and
+  state stay untouched, except `ssd_chunked_scan`, which computes the output from a zero state and
+  writes no state. `has_initial_state[b] = 0` starts from zeros (conv: zero history); null means
+  "from the slot" for SSM / linear / delta and "zero history" for `causal_conv1d_fwd`.
+- **Snapshots** (prefix caching): the state after `(j + 1) * snapshot_interval` tokens goes to
+  `snapshot_slots[b * max_snapshots + j]`; destinations outside `[0, num_slots)` are dropped.
+  The interval is any positive value for conv1d and the recurrent delta rule, a multiple of 64
+  for lightning and the chunked delta rule, a multiple of `chunk_size` for SSD.
+  **Intermediate states** (speculative decoding): `intermediate_state_slots[b, i]` receives the
+  state after token i (conv update, SSM update, recurrent delta rule); B10's
+  `state_commit_accepted` picks one.
+- **Numerics.** States are fp32; every product is an fp32 FMA in a fixed order that does not
+  depend on the batch, so a sequence's result is independent of the others. Gates use the fast
+  exponential (`dev::sigmoid_f`, `softplus_f`: torch threshold 20). Every decay factor is the exp
+  of a difference of cumulative sums with the later position first (<= 0): nothing overflows,
+  KDA pairs are formed per channel. Conv histories are raw storage bits. Lightning, selective scan
+  (128-token tiles), SSD and the chunked delta rule reproduce the one-call result bitwise when a
+  call is cut at a block / tile / chunk boundary and resumed from the saved state.
+- **Delta rule.** `S = exp(g) S; S += k (beta (v - S^T k))^T; o = S^T (scale q)`, q and k
+  L2-normalized as `x / sqrt(sum x^2 + 1e-6)` when `use_qk_l2norm`. Gating:
+  `g = -exp(A_log) softplus(a + dt_bias)` (Kimi Linear, Qwen3-Next) or
+  `lower_bound * sigmoid(exp(A_log) (a + dt_bias))` when `lower_bound < 0` (FLA bounded variant),
+  `beta = sigmoid(b)`. `fused_delta_decode` = conv update (SiLU) -> gating -> L2 -> rule ->
+  `RMSNorm(o) * w * act(out_gate)` with the conv output and the rule output rounded to the
+  input dtype at the same boundaries as the unfused chain (Kimi Linear: sigmoid gate, eps 1e-5).
+  Projections (q/k/v, f_a/f_b, b, g_a/g_b, o_proj) stay outside.
+- **Chunked delta rule.** 64-token chunks from each sequence start; `h` row of a chunk =
+  `(first token >> 6) + b`. `ChunkMath::kFp32` (default) or `kTensorCore` (bf16 mma.sync for
+  kkt, w/u, state, output; cumsum and `solve_tril` stay fp32; bf16 inputs only, SM80+); the
+  tensor-core result differs from the fp32 one by the bf16 rounding of the operands (~4e-3 of
+  the oracle). `delta_rule_prefill` always runs the chunked pipeline; the recurrent kernel is
+  `delta_rule_decode`.
+- **Compiled cells.** conv1d width 2..4, x fp32/fp16/bf16 with weights in x's dtype or fp32,
+  SiLU / Identity. SSM update dstate 8..256 (powers of two); selective scan dstate 8/16/32
+  (`dim / ngroups` a multiple of 16, 8 for dstate 32); SSD chunk 64/128/256, P and N 1..256.
+  Linear attention Dk, Dv 1..256. Delta rule Dk 16/32/64/128, Dv 1..256; fused decode Dk 64/128,
+  Dv 16..128, Hv / Hk <= 8, (Hv / Hk) Dv <= 1024. Oracles: `ref::causal_conv1d_f64`,
+  `ssm_recurrence_f64`, `linear_attention_f64`, `delta_rule_f64`, `delta_rule_gating_f64`.
+
 ## 2. Benchmark protocol
 
 - Same GPU, driver, clocks, dtype and shape for kernel-ops and PyTorch.
@@ -263,8 +309,11 @@ remain the ABI and shape authority.
   fields and the runtime tactic fields of `ScaledGemmArgs`, and (B8) the runtime `mask` field of
   `RaggedPrefillParams` / `PagedPrefillParams` (the `kMask` template parameter of the two prefill
   kernels is gone) plus the kv-length / capacity arguments of `prefill_plan_kernel` and
-  `assign_decode_tasks_kernel` (§1e). `KOPS_C_ABI_VERSION` and `KOPS_ABI_VERSION` must move
-  together.
+  `assign_decode_tasks_kernel` (§1e), and (B9) the state parameter structs and kernel template
+  lists of `conv1d_kernels.cuh`, `ssm_kernels.cuh`, `linear_attention_kernels.cuh`,
+  `delta_rule_kernels.cuh` (head strides, slot counts, snapshot / intermediate tables,
+  `ChunkMath`, `DeltaGatingParams`; `delta_rule_gating` takes the struct) (§1f).
+  `KOPS_C_ABI_VERSION` and `KOPS_ABI_VERSION` must move together.
 - Split-row softmax uses `Workspace.device_scratch` as `[B, CTAS_PER_ROW, 2]`
   fp32. `sampling_workspace_requirements` reserves the policy maximum for the
   vocabulary; a smaller workspace returns `kWorkspaceTooSmall`.

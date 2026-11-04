@@ -456,5 +456,73 @@
    "old": "rows == 1 ? launch_simt<D, T, FP8, 1>",
    "new": "rows <= 2 ? launch_simt<D, T, FP8, 1>"
   }
+ ],
+ "state": [
+  {
+   "name": "lightning causal diagonal dropped",
+   "file": "csrc/state/linear_attention.cu",
+   "old": "col[r] = j <= i ? pacc[r][c] * pw[i - j] : 0.0f;",
+   "new": "col[r] = j < i ? pacc[r][c] * pw[i - j] : 0.0f;"
+  },
+  {
+   "name": "KDA recurrent decay skipped",
+   "file": "csrc/state/delta_rule.cu",
+   "old": "S[j] *= dsr[j];",
+   "new": "S[j] *= 1.0f;"
+  },
+  {
+   "name": "fused delta RMSNorm eps",
+   "file": "csrc/state/delta_rule.cu",
+   "old": "rsqrtf(ssq / float(dv) + fp.out_norm_eps)",
+   "new": "rsqrtf(ssq / float(dv) + 1e-2f)"
+  },
+  {
+   "name": "solve_tril substitution sign",
+   "file": "csrc/state/delta_rule_chunk.cu",
+   "old": "acc = __fmaf_rn(-L[(base + i) * kLd + base + j], x[j], acc);",
+   "new": "acc = __fmaf_rn(L[(base + i) * kLd + base + j], x[j], acc);"
+  },
+  {
+   "name": "TC bf16x2 pack order",
+   "file": "csrc/state/delta_rule_chunk.cu",
+   "old": "__floats2bfloat162_rn(lo, hi)",
+   "new": "__floats2bfloat162_rn(hi, lo)"
+  },
+  {
+   "name": "SSD chunk-state decay exponent",
+   "file": "csrc/state/ssm.cu",
+   "old": "__expf(dA_last - dA[l0 + l])",
+   "new": "__expf(dA_last - dA[l0 + l] + 0.01f)"
+  },
+  {
+   "name": "conv1d window update",
+   "file": "csrc/state/conv1d.cu",
+   "old": "win[c][kHist - 1] = xin[u][c];",
+   "new": "win[c][kHist - 1] = 0.5f * xin[u][c];"
+  },
+  {
+   "name": "selective scan warp-scan step 16",
+   "file": "csrc/state/ssm.cu",
+   "old": "affine_shfl_up(P, Q, 16, lane);",
+   "new": ""
+  },
+  {
+   "name": "lightning slope +0.1%",
+   "file": "csrc/state/linear_attention.cu",
+   "old": "pw[tid] = __expf(-p.slope[h] * float(tid));",
+   "new": "pw[tid] = __expf(-p.slope[h] * 1.001f * float(tid));"
+  },
+  {
+   "name": "recurrent delta beta +0.1%",
+   "file": "csrc/state/delta_rule.cu",
+   "old": "const float delta = beta * (vv - kv);",
+   "new": "const float delta = 1.001f * beta * (vv - kv);"
+  },
+  {
+   "name": "SSM dt +0.1%",
+   "file": "csrc/state/ssm.cu",
+   "old": "dtv = softplus_f(dtv);",
+   "new": "dtv = 1.001f * softplus_f(dtv);"
+  }
  ]
 }

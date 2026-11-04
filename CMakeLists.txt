@@ -172,7 +172,12 @@ csrc/gemm/gemm_mma.cu
   csrc/attention/decode.cu
   csrc/attention/mla.cu
   csrc/kvcache/kvcache.cu
-  csrc/state/state_cache.cu)
+  csrc/state/state_cache.cu
+  csrc/state/conv1d.cu
+  csrc/state/ssm.cu
+  csrc/state/linear_attention.cu
+  csrc/state/delta_rule.cu
+  csrc/state/delta_rule_chunk.cu)
 target_link_libraries(kops_cuda PUBLIC kops_host CUDA::cudart)
 target_include_directories(kops_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 set_target_properties(kops_cuda PROPERTIES

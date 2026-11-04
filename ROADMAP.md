@@ -543,7 +543,7 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B6 | 15 / 15 | 0 |
 | B7 | 1 / 16 | 15 |
 | B8 | 7 / 7 | 0 |
-| B9 | 0 / 20 | 20 |
+| B9 | 20 / 20 | 0 |
 | B10 | 0 / 4 | 4 |
 | B11 | 0 / 12 | 12 |
 | B12 | 0 / 11 | 11 |
@@ -552,9 +552,9 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B15 | 0 / 8 | 8 |
 | B16 | 0 / 6 | 6 |
 | B17 | 0 / 5 | 5 |
-| **Tổng** | **132 / 233** | **101** |
+| **Tổng** | **152 / 233** | **81** |
 
-B0, B1, B2, B3, B4, B5, B6 và B8 đã đủ thân; B7 có nhịp 1. Các launcher còn lại của B7 và B9+ vẫn trả `kNotImplemented`; 233 kernel / 125 nhịp / 112 file không đổi. B0–B4 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
+B0, B1, B2, B3, B4, B5, B6, B8 và B9 đã đủ thân; B7 có nhịp 1. Các launcher còn lại của B7 và B10+ vẫn trả `kNotImplemented`; 233 kernel / 125 nhịp / 112 file không đổi. B0–B4 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
 
 Không còn "nợ hiệu năng" hay report cũ trong checkout này: mọi số đo sẽ được sinh lại bằng benchmark C++ khi kernel tương ứng có thân.
 
@@ -1279,7 +1279,14 @@ Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn ch�
 - SM80+: phần matmul trong chunk dùng `mma.sync`.
 - Instantiation SM90a làm thêm nếu benchmark cần.
 
-**Nhịp.** 7 nhịp · 20 kernel · không mở family hay ô arch · file mới: 5 (5 `.cu`, gồm `delta_rule_chunk.cu`). Hiện trạng (2026-10-31): 0/20 kernel có thân; toàn bộ là declaration.
+**Nhịp.** 7 nhịp · 20 kernel · không mở family hay ô arch · file mới: 5 (5 `.cu`, gồm `delta_rule_chunk.cu`).
+
+**Hiện trạng (2026-11-03).** 20/20 kernel có thân (chưa commit), ô SM86 `numerically_validated` (build dirty nên chưa `benchmarked`).
+- Thân port từ bản ayaka (`3rd/csrc/state/*.cu`) sang contract kops: header `csrc/state/*_kernels.cuh` mang struct tham số của bản đó (stride theo head, `num_slots`, bảng snapshot / intermediate, `ChunkMath`, `DeltaGatingParams`) — đổi ABI trong v6 chưa phát hành, ghi ở CONTRACTS §1f/§3. Launcher host nhận struct, kiểm mọi bất biến phía host, trả `Status`; helper dùng chung (`sigmoid_f`, `softplus_f`, `group_sum`, `smem_gemm_kmajor`) ở `common/device_impl.cuh`.
+- Đường tensor core của chunked delta rule (`*_tc_*`, bảng biến thể §1.6) chỉ instantiate cho bf16: đủ 90 s/TU (`delta_rule_chunk.cu` ~35 s, các TU khác 9–34 s ở sm_86).
+- Test (`tests/unit/test_state.cc`) so với oracle fp64 mới trong `csrc/reference` (`causal_conv1d_f64`, `ssm_recurrence_f64`, `linear_attention_f64`, `delta_rule_f64`, `delta_rule_gating_f64`): varlen, slot pad, initial state, snapshot, intermediate (spec decode), in-place; chunked ↔ recurrent; cắt ở biên tile/chunk rồi chạy tiếp = bit-exact (selective scan); CUDA graph replay của `delta_rule_prefill` / `ssd_chunked_scan` = bit-exact chạy eager; chuỗi 65 536 token (chunked GDN/KDA fp32 + TC so với recurrent, lightning và SSD so với oracle fp64) không tràn, không NaN. Dung sai theo thang đầu ra: 16-bit ~1 ULP của max, fp32 ~1e-6, TC 7e-3. 11 đột biến cố định (`tools/dev/mutations.json` họ `state`, kể cả lệch 0.1% ở slope, beta, dt) đều làm suite đỏ.
+- Benchmark `bench_state` (`tools/dev/kops.py bench state --rounds 3`, RTX 3050 Laptop, sạc điện, build dirty, median): decode `ssm_update` 180 GB/s, `linear_decode` 181, `delta_decode` GDN/KDA 171/180, `fused_delta_decode` 160/138 (trần memcpy 183); `conv1d_fwd` 144 GB/s, `conv1d_update` 59; prefill T = 4096: chunked delta rule TC 7.8 ms GDN / 11.4 ms KDA (fp32 20.1 / 33.9 ms), SSD 4.9 ms, lightning 17.0 ms, selective scan (D 8192, N 16) 10.7 ms.
+- Còn mở: selective scan và lightning còn xa trần FP32 (25–40 %); Kimi Linear layer fidelity với HF `KimiLinearDeltaAttention` (T1–T4) và đối chiếu FLA / mamba_ssm / MiniMax (cần Linux + các thư viện đó); chuỗi ≥ 64k và state theo shape model thật (`large`); benchmark so với FLA Triton ở handoff `sm80`/`sm90a`; build sạch để lên `benchmarked`.
 
 **Phần cứng.** Máy dev chạy hết. Chuỗi dài (≥ 64k; KDA tới 1M token) và state theo shape model thật không vừa 4 GB: gắn `large`/`mem_gb`, chạy khi có GPU VRAM lớn. Đối chiếu FLA (Triton) và mamba_ssm cần Linux và các thư viện đó; benchmark "so với FLA Triton" ở handoff kit `sm80`, `sm90a`.
 
@@ -1848,6 +1855,8 @@ Cột "Bước có kernel" cho thấy mỗi family được chạm ở những b
 **Provider:** 0 file. Không có `csrc/providers/`, không có `python/`.
 
 **Tổng trần:** **112 file nguồn mới** (46 `.cu` + 14×3 file family + 7 ô arch + 17 hạ tầng). Đã có 3 `.cu` và 5 file hạ tầng; còn khoảng 104 file phải tạo. Không tính `CMakeLists.txt`, `ROADMAP.md` và các file build tooling đã có.
+
+**Dev tooling ngoài trần (chủ repo duyệt 2026-11-02).** `tools/dev/kops.py` (build/test/bench/mutate với output rút gọn, khoá GPU, cảnh báo TU > 60 s và GB/s vượt trần) và `tools/dev/mutations.json` (danh sách mutation cố định theo family). Giống `benchmark/compare/*.py`: không build, không ship, không phải nhịp. `python tools/check_roadmap.py --slice B<n>` in riêng phần của một bước.
 
 ### E.3 Không còn sổ tách
 
