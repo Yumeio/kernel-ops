@@ -12,16 +12,16 @@ the arch-specific ports.
 | Kernel | File | Status on SM120 |
 |---|---|---|
 | `mla_get_metadata_kernel` | `csrc/attention/mla.cu` | bit-exact host oracle, passed |
-| `mla_decode_kernel` (T1) | `csrc/attention/mla.cu` | `mma.sync`, native + 656 B, split-KV, sink, gate, 1M passed |
+| `mla_decode_kernel` (T1) | `csrc/attention/mla.cu` | `mma.sync`, double-buffered K tile, QK computed once/CTA, native + 656 B, split-KV, sink, gate; 64k and 1M passed |
 | `machete_prepack_kernel` | `csrc/gemm/gemm_prep.cu` | byte-exact CUTE-derived golden, passed |
 | `grouped_gemm_prepare_kernel` | `csrc/gemm/grouped_gemm.cu` | generic contiguous/masked/ptr-array + task map, passed |
-| `lightning_indexer_kernel` | `csrc/attention/sparse.cu` | weighted ReLU MQA, ragged/paged, passed |
-| `sparse_topk_kernel` | `csrc/attention/sparse.cu` | exact radix, 512/1024/2048, passed |
-| `sparse_mla_kernel` | `csrc/attention/sparse.cu` | two scopes, topk_length, sink, native tested; codec reader shared with B3 |
+| `lightning_indexer_kernel` | `csrc/attention/sparse.cu` | tensor-core `mma.sync` QK, shared Q/K tiles, weighted ReLU MQA, ragged/paged, passed |
+| `sparse_topk_kernel` | `csrc/attention/sparse.cu` | exact radix, 512/1024/2048 + cooperative multi-CTA `sparse_topk_ws` fast path, passed |
+| `sparse_mla_kernel` | `csrc/attention/sparse.cu` | tensor-core QK/PV, latent K shared across 16 heads, two scopes, topk_length, sink, native tested; codec reader shared with B3 |
 | `kv_compressor_kernel` | `csrc/attention/sparse.cu` | CSA overlap / HCA, RMSNorm, passed |
 | `compressed_attention_kernel` | `csrc/attention/sparse.cu` | selected CSA + sink, passed |
-| `hc_expand/head/coeff/pre/post` | `csrc/model_ops/hyper_connection.cu` | official V4 mHC, passed |
-| `mega_mhc_kernel` | `csrc/model_ops/hyper_connection.cu` | generic chain parity, passed |
+| `hc_expand/head/coeff/pre/post` | `csrc/model_ops/hyper_connection.cu` | official V4 mHC + TF32 tensor-core tile projection (`raw_logits`), passed |
+| `mega_mhc_kernel` | `csrc/model_ops/hyper_connection.cu` | generic chain parity + fused TF32 tile body, passed |
 | `attn_res_kernel/commit` | `csrc/model_ops/attn_res.cu` | K3 block AttnRes, MXFP8, passed |
 
 KV records added: V4.0 584 B, V4.1 528 B, V4.1 FP4 288 B, in addition to the

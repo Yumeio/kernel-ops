@@ -56,6 +56,12 @@ __global__ void lightning_indexer_kernel(const __grid_constant__ IndexerParams p
  * 512), no workspace, CUDA-graph capturable. row_starts / row_ends / token_to_request are device
  * data: the caller guarantees 0 <= start <= end <= max_kv and 0 <= token_to_request[row] <
  * block_table rows.
+ *
+ * Host side, `sparse_topk_ws` may instead select an internal cooperative kernel for one very wide
+ * row (rows == 1, max_kv >= 256 Ki, caller workspace): it runs the same exact selection body
+ * across a grid of CTAs (chunked radix passes) and falls back to this per-row launch when the row
+ * is tie-heavy. That body is file-local to attention/sparse.cu on purpose - it is not part of the
+ * family device ABI and carries no declaration here, so the launcher contract above is unchanged.
  */
 template <int TOPK>
 __global__ void sparse_topk_kernel(
