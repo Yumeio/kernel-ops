@@ -88,10 +88,17 @@ struct GroupedGemmParams {
 };
 
 /**
- * grouped_gemm_prepare_kernel — device-side argument preparation (graph-safe, no host sync):
- * from expert_offsets / m_indices / masked_m computes GroupedProblem[g] (shapes, pointers, per-group
- * alpha from per-expert scales), patches per-group tensor maps from templates (tensormap.replace on
- * Sm90a/Sm100a), and builds the persistent tile list. Groups with m == 0 get no tiles.
+ * grouped_gemm_prepare_kernel — device-side argument preparation (graph-safe, no host sync, no allocation):
+ * from expert_offsets / masked_m / problem_m it computes GroupedProblem[g] (m, n, k, first tile id,
+ * per-group A/B/D pointers, A/B scale bases, per-group alpha from the per-expert scales, lda/ldb/ldd) and
+ * the group's tile counts.  Layouts: kContiguous / kIndexed (expert_offsets), kMasked (masked_m clamped
+ * to max_m), kPtrArray (problem_m + a_ptrs/b_ptrs/d_ptrs).  Groups with m == 0 get no tiles and
+ * *num_tasks = min(total, task_capacity) / *overflow_flag = total > task_capacity.
+ * The tile list entries come from grouped_gemm_task_map_kernel (the host launches it right after this
+ * kernel for the same tile_m / n_tiles, so both agree); the kernel that consumes GroupedProblem may
+ * instead use problems[g].tile_offset with its own persistent schedule.
+ * Per-group tensor maps (tensormap.replace, Sm90a/Sm100a only) are optional and not built here:
+ * group_tma / tma_templates stay untouched, and nothing in this path requires TMA.
  */
 __global__ void grouped_gemm_prepare_kernel(
     GroupedProblem* __restrict__ problems,         // [G]

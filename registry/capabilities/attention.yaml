@@ -20,6 +20,15 @@
    "evidence": "test_merge;bench_chains"
   },
   {
+   "op_id": "A14.merge_state",
+   "kernel_symbol": "merge_state_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "dtype out in {f32,f16,bf16}; partial fp32; head_dim 64/128/256",
+   "evidence": "test_merge;bench_chains"
+  },
+  {
    "op_id": "A14.merge_states",
    "kernel_symbol": "merge_states_kernel",
    "provider": "native",
@@ -33,6 +42,15 @@
    "kernel_symbol": "merge_states_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A14.merge_states",
+   "kernel_symbol": "merge_states_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "planned",
    "evidence": "test_merge;bench_merge"
@@ -56,6 +74,15 @@
    "evidence": "test_merge;bench_chains"
   },
   {
+   "op_id": "A04.merge_split_kv",
+   "kernel_symbol": "merge_split_kv_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "out f32/f16/bf16; partial fp32; head_dim 64/80/96/128/192/256; sink once; total_rows_ptr",
+   "evidence": "test_merge;bench_chains"
+  },
+  {
    "op_id": "A14.merge_hybrid_branches",
    "kernel_symbol": "merge_hybrid_branches_kernel",
    "provider": "native",
@@ -69,6 +96,15 @@
    "kernel_symbol": "merge_hybrid_branches_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "numerically_validated",
+   "predicates": "planned",
+   "evidence": "test_merge"
+  },
+  {
+   "op_id": "A14.merge_hybrid_branches",
+   "kernel_symbol": "merge_hybrid_branches_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "numerically_validated",
    "predicates": "planned",
    "evidence": "test_merge"
@@ -92,6 +128,15 @@
    "evidence": "test_merge;bench_merge;docs/KV_CACHE_PARITY.md"
   },
   {
+   "op_id": "A12.concat_mla_q",
+   "kernel_symbol": "concat_mla_q_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/f16/f32; q_pe width 64; strided ql_nope/q_pe inputs",
+   "evidence": "test_merge;bench_merge;docs/KV_CACHE_PARITY.md"
+  },
+  {
    "op_id": "A12.mla_context_gather",
    "kernel_symbol": "mla_context_gather_kernel",
    "provider": "native",
@@ -105,6 +150,15 @@
    "kernel_symbol": "mla_context_gather_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "latent cache [rank|rope]; block table + ctx_start; native or e4m3 per-tensor",
+   "evidence": "test_merge;bench_merge;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "A12.mla_context_gather",
+   "kernel_symbol": "mla_context_gather_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "latent cache [rank|rope]; block table + ctx_start; native or e4m3 per-tensor",
    "evidence": "test_merge;bench_merge;docs/KV_CACHE_PARITY.md"
@@ -128,6 +182,15 @@
    "evidence": "test_merge;bench_merge"
   },
   {
+   "op_id": "A01.ragged_prefill",
+   "kernel_symbol": "ragged_prefill_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16; (Dqk,Dvo) 64,80,96,128,256,192/128; GQA packing; runtime mask none/causal/custom; window/softcap/ALiBi/sinks/chunk; LSE; split-KV + merge",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
    "op_id": "A02.paged_prefill",
    "kernel_symbol": "paged_prefill_kernel",
    "provider": "native",
@@ -141,6 +204,15 @@
    "kernel_symbol": "paged_prefill_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "as A01 + paged NHD/HND, CSR or block table, any page size; FP8 e4m3/e5m2 K/V (per-tensor/per-head scale) for D 64/128/256; A06 verification via custom mask",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A02.paged_prefill",
+   "kernel_symbol": "paged_prefill_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "as A01 + paged NHD/HND, CSR or block table, any page size; FP8 e4m3/e5m2 K/V (per-tensor/per-head scale) for D 64/128/256; A06 verification via custom mask",
    "evidence": "test_merge;bench_merge"
@@ -164,6 +236,15 @@
    "evidence": "test_merge;bench_merge"
   },
   {
+   "op_id": "A02.prefill_plan",
+   "kernel_symbol": "prefill_plan_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "one CTA, B <= 2048; ctx.strategy kGraph: re-plans (request, q tile, kv chunk) items each replay from device lengths",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
    "op_id": "A03.paged_decode",
    "kernel_symbol": "paged_decode_kernel",
    "provider": "native",
@@ -177,6 +258,15 @@
    "kernel_symbol": "paged_decode_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "CUDA core; D 64,80,96,128,192,256; q_len 1..8 (8 packed rows per CTA); FP8 K/V; any page size; split-KV + merge",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A03.paged_decode",
+   "kernel_symbol": "paged_decode_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "CUDA core; D 64,80,96,128,192,256; q_len 1..8 (8 packed rows per CTA); FP8 K/V; any page size; split-KV + merge",
    "evidence": "test_merge;bench_merge"
@@ -200,6 +290,15 @@
    "evidence": "test_merge;bench_merge"
   },
   {
+   "op_id": "A03.paged_decode_tc",
+   "kernel_symbol": "paged_decode_tc_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "mma.sync m16n8k16; D 64/128/256; G*q_len >= 4 (16 packed rows per CTA); FP8 K/V dequant on load; split-KV + merge",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
    "op_id": "A05.assign_decode_tasks",
    "kernel_symbol": "assign_decode_tasks_kernel",
    "provider": "native",
@@ -213,6 +312,15 @@
    "kernel_symbol": "assign_decode_tasks_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "one CTA, B <= 2048; tasks of ~total/(SMs x CTAs) keys in 256-key units, <= 32 splits per request",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A05.assign_decode_tasks",
+   "kernel_symbol": "assign_decode_tasks_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "one CTA, B <= 2048; tasks of ~total/(SMs x CTAs) keys in 256-key units, <= 32 splits per request",
    "evidence": "test_merge;bench_merge"
@@ -234,6 +342,231 @@
    "status": "benchmarked",
    "predicates": "persistent CTAs pull DecodeTask (self-resetting uint32[2] counter); D 64/128/256; every task writes partials, merge_split_kv finishes",
    "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A05.paged_decode_dynamic",
+   "kernel_symbol": "paged_decode_dynamic_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "persistent CTAs pull DecodeTask (self-resetting uint32[2] counter); D 64/128/256; every task writes partials, merge_split_kv finishes",
+   "evidence": "test_merge;bench_merge"
+  },
+  {
+   "op_id": "A09.lowbit_kv_store",
+   "kernel_symbol": "lowbit_kv_store_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "experimental; D 64/128/256; bf16/fp16 K,V; kUniform3/4, kTurboMse2-4, kTurboProd2-4 K; V no TurboProd; slot < 0 skipped; NHD/HND byte strides",
+   "evidence": "test_merge;bench_merge (out/b17/lowbit-bench.json; dirty diagnostic)"
+  },
+  {
+   "op_id": "A09.lowbit_decode",
+   "kernel_symbol": "lowbit_decode_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "experimental; CUDA-core; D 64/128/256; q_len 1..8; GQA; CSR/block table; NHD/HND; causal/window/chunk/softcap/ALiBi/sink; split-KV + merge",
+   "evidence": "test_merge;bench_merge (out/b17/lowbit-bench.json; dirty diagnostic)"
+  },
+  {
+   "op_id": "A09.lowbit_prefill",
+   "kernel_symbol": "lowbit_prefill_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "experimental; mma.sync fp16 QK/PV over dequantized records; paged; D 64/128/256; causal/window/chunk/softcap/ALiBi/sink/custom mask; split-KV",
+   "evidence": "test_merge;bench_merge (out/b17/lowbit-bench.json; dirty diagnostic)"
+  },
+  {
+   "op_id": "A10.lightning_indexer",
+   "kernel_symbol": "lightning_indexer_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "T1 tensor-core mma.sync m16n8k16; bf16/fp16/FP8; 64 heads x 128; shared Q/K tiles; ragged/paged; weighted ReLU MQA logits",
+   "evidence": "test_indexer;bench_sparse"
+  },
+  {
+   "op_id": "A11.sparse_topk",
+   "kernel_symbol": "sparse_topk_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "exact radix; 64/1M rows; cooperative multi-CTA fast path for rows==1 and max_kv>=256Ki; ties lower index; page-slot conversion",
+   "evidence": "test_sparse;bench_sparse"
+  },
+  {
+   "op_id": "A12.mla_get_metadata",
+   "kernel_symbol": "mla_get_metadata_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "FlashMLA dense scheduler; B/seq_lens/num_sm_parts/block_size/overhead; bit-exact host port",
+   "evidence": "test_mla_metadata;test_mla"
+  },
+  {
+   "op_id": "A12.mla_decode",
+   "kernel_symbol": "mla_decode_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "T1 mma.sync; latent 512+64; native bf16 + 656 FP8; q_len 1..8; split-KV; sink; gate",
+   "evidence": "test_mla;bench_mla"
+  },
+  {
+   "op_id": "A13.sparse_mla",
+   "kernel_symbol": "sparse_mla_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "T1 tensor-core QK/PV; 16 heads/CTA; shared latent K; 656/584/528/288; two scopes; topk_length; sink",
+   "evidence": "test_sparse_mla;bench_sparse"
+  },
+  {
+   "op_id": "A12.kv_compressor",
+   "kernel_symbol": "kv_compressor_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "implemented",
+   "predicates": "CSA overlap / HCA; ratio window; Z+bias softmax; C^a/C^b; RMSNorm; paged write; WARNING spec from vLLM/header, official V4 inference code not checked",
+   "evidence": "test_kv_compressor"
+  },
+  {
+   "op_id": "A13.compressed_attention",
+   "kernel_symbol": "compressed_attention_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "selected/dense compressed entries + SWA + sink; one online softmax",
+   "evidence": "test_compressed_attention"
+  },
+  {
+   "op_id": "A10.lightning_indexer",
+   "kernel_symbol": "lightning_indexer_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "A10.lightning_indexer",
+   "kernel_symbol": "lightning_indexer_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "A11.sparse_topk",
+   "kernel_symbol": "sparse_topk_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "A11.sparse_topk",
+   "kernel_symbol": "sparse_topk_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "A12.mla_get_metadata",
+   "kernel_symbol": "mla_get_metadata_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "A12.mla_get_metadata",
+   "kernel_symbol": "mla_get_metadata_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "A12.mla_decode",
+   "kernel_symbol": "mla_decode_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "A12.mla_decode",
+   "kernel_symbol": "mla_decode_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "A13.sparse_mla",
+   "kernel_symbol": "sparse_mla_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "A13.sparse_mla",
+   "kernel_symbol": "sparse_mla_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "A12.kv_compressor",
+   "kernel_symbol": "kv_compressor_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "A12.kv_compressor",
+   "kernel_symbol": "kv_compressor_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "A13.compressed_attention",
+   "kernel_symbol": "compressed_attention_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "A13.compressed_attention",
+   "kernel_symbol": "compressed_attention_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
   }
  ]
 }

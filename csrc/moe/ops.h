@@ -69,3 +69,30 @@ Status moe_forward(const MoELayerParams& params, const Workspace& ws, const Laun
                    int32_t* num_launches);
 
 }  // namespace kops::moe
+
+// ---- M04 experimental: 2-bit experts (B17, opt-in only) -----------------------------------------
+// Weight format: one 2-bit code per element (four per byte, little-endian) into the four levels
+// {-4, -1, +1, +4}, with one fp32 dequant multiplier per `group_size` consecutive K elements.
+// `pack` accepts bf16 weights (WeightPacking::kNone) or packed e2m1 pairs
+// (WeightPacking::kFP4E2M1, element 2i in the low nibble).  `gemm` consumes block-sorted slots
+// from moe::align_block_size with block_size == 8 (A row = slot when a_rows_are_slots, else
+// slot / top_k; C row = slot; padding slots and expert_ids < 0 untouched).  Opt-in: no routing
+// or model path selects these entries.  Quality/PPL is a model-level gate (ROADMAP B17).
+namespace kops::experimental::moe_w2 {
+
+/// Pack expert weights into [E, N, K/4] u8 codes + [E, N, K/group_size] fp32 scales.
+/// `weight` is bf16 [E, N, K] for kNone or packed e2m1 [E, N, K/2] u8 for kFP4E2M1.
+Status pack(const Tensor& packed, const Tensor& scales, const Tensor& weight,
+            WeightPacking source, int32_t group_size, const LaunchContext& ctx);
+
+/// W2/W13 expert GEMM over block-sorted slots.  Weight params in `FusedMoEGemmParams`:
+/// `w` = packed codes [E, N, K/4] (byte stride), `w_scale` = fp32 [E, N, K/group],
+/// `w_expert_stride` = N*K/4 bytes, `w_scale_expert_stride` = N*(K/group) floats,
+/// `w_quant.packing = kW2`, `w_quant.granularity = kPerGroup`, `w_quant.group_k = group`.
+/// a_dtype / c_dtype are bf16, fp16 or fp32.  `bias` (if set) is [E, N] in c_dtype.
+/// block_size is 16 (small-M WMMA, K % 64 == 0) or 64 (one expert tile, K % 64 == 0);
+/// fp32 activations or K % 64 != 0 take the scalar path at block_size 16.
+Status gemm(const moe::FusedMoEGemmParams& params, int32_t num_local_experts, int32_t block_size,
+            DType a_dtype, DType c_dtype, const LaunchContext& ctx);
+
+}  // namespace kops::experimental::moe_w2

@@ -477,6 +477,9 @@ Status dispatch_merge_split_kv(const Tensor& o, const Tensor& lse, const SplitKV
     case 256:
       return dispatch_merge_split_kv_hpb<Out, 256>(o, lse, split, sink_logits, total_rows, rows,
                                                    heads, stream);
+    case 512:
+      return dispatch_merge_split_kv_hpb<Out, 512>(o, lse, split, sink_logits, total_rows, rows,
+                                                   heads, stream);
     default:
       return detail::set_error(Status::kUnsupportedShape, "merge_split_kv: head_dim %d", head_dim);
   }

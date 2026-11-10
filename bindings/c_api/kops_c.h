@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-#define KOPS_C_ABI_VERSION 6u
+#define KOPS_C_ABI_VERSION 7u
 
 /* ---- Status (== kops::Status) ------------------------------------------- */
 typedef int32_t kops_status_t;

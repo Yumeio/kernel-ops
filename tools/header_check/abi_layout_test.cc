@@ -36,6 +36,9 @@
 #include "csrc/position/rope_kernels.cuh"
 #include "csrc/attention/decode_kernels.cuh"
 #include "csrc/attention/mla_kernels.cuh"
+#include "csrc/attention/sparse_kernels.cuh"
+#include "csrc/model_ops/hyper_connection_kernels.cuh"
+#include "csrc/model_ops/attn_res_kernels.cuh"
 #include "csrc/communication/allreduce_kernels.cuh"
 #include "csrc/communication/ep_kernels.cuh"
 #include "csrc/execution/persistent.cuh"
@@ -81,6 +84,14 @@ KOPS_ABI_STANDARD_LAYOUT(kops::attn::AttentionSpec);
 KOPS_ABI_STANDARD_LAYOUT(kops::attn::AttentionModifiers);
 KOPS_ABI_STANDARD_LAYOUT(kops::attn::DecodeParams);
 KOPS_ABI_STANDARD_LAYOUT(kops::attn::MLADecodeParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::attn::IndexerParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::attn::SparseMLAScope);
+KOPS_ABI_STANDARD_LAYOUT(kops::attn::SparseMLAParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::attn::KVCompressorParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::attn::CompressedAttentionParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::model_ops::HCStreamParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::model_ops::HCParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::model_ops::AttnResParams);
 KOPS_ABI_STANDARD_LAYOUT(kops::mega::MegaPlanDevice);
 KOPS_ABI_STANDARD_LAYOUT(kops::comm::EPBuffers);
 KOPS_ABI_STANDARD_LAYOUT(kops::exec::LaunchConfig);
@@ -175,6 +186,12 @@ KOPS_FITS_KERNARG(kops::gemm::GroupedGemmParams);
 KOPS_FITS_KERNARG(kops::moe::MoELayerParams);
 KOPS_FITS_KERNARG(kops::attn::DecodeParams);
 KOPS_FITS_KERNARG(kops::attn::MLADecodeParams);
+KOPS_FITS_KERNARG(kops::attn::IndexerParams);
+KOPS_FITS_KERNARG(kops::attn::SparseMLAParams);
+KOPS_FITS_KERNARG(kops::attn::KVCompressorParams);
+KOPS_FITS_KERNARG(kops::attn::CompressedAttentionParams);
+KOPS_FITS_KERNARG(kops::model_ops::HCParams);
+KOPS_FITS_KERNARG(kops::model_ops::AttnResParams);
 KOPS_FITS_KERNARG(kops::mega::MegaAttentionBlockParams);
 KOPS_FITS_KERNARG(kops::mega::MegaMoELocalParams);
 KOPS_FITS_KERNARG(kops::comm::EPDispatchParams);

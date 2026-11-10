@@ -1,0 +1,76 @@
+{
+ "family": "mega",
+ "rows": [
+  {
+   "op_id": "E02.task_queue_reset",
+   "kernel_symbol": "task_queue_reset_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "implemented",
+   "strategy": "persistent",
+   "predicates": "cursor + counters reset; launched once before each megakernel (captured in the graph)",
+   "mutations": "cursor and counters",
+   "evidence": "test_mega (1500 graph replays);bench_mega"
+  },
+  {
+   "op_id": "E04.mega_mlp",
+   "kernel_symbol": "mega_mlp_kernel",
+   "provider": "native",
+   "template_args": "bf16,bf16,16,64,64,64,2,Sm80",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "strategy": "megakernel",
+   "predicates": "bf16 activations/weights, unscaled K-major weights; m <= plan max_m; pre_norm optional; gate/up/down tile dependency via epoch counters; SIMT body (not B7 mma.sync)",
+   "mutations": "out, intermediate; residual is read-only",
+   "evidence": "test_mega: ref/modular/graph replay/1-2 CTA; bench_mega (slower than modular+graph on SM120, release gate not met)"
+  },
+  {
+   "op_id": "E05.mega_attention_block",
+   "kernel_symbol": "mega_attention_block_kernel",
+   "provider": "native",
+   "template_args": "bf16,128,0,16,Sm80",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "strategy": "megakernel",
+   "predicates": "bf16, one request (q_len = m), native bf16 KV, kNHD, block-table or CSR; causal, window_left, sinks, softcap, ALiBi; no window_right/chunked/FP8/HND/MLA",
+   "mutations": "KV pages named by slot_mapping; out and residual",
+   "evidence": "test_mega vs fp64 reference and appended-page check; bench_mega (slower than modular+graph on SM120, release gate not met)"
+  },
+  {
+   "op_id": "E06.mega_moe_local",
+   "kernel_symbol": "mega_moe_local_kernel",
+   "provider": "native",
+   "template_args": "bf16,bf16,16,64,64,64,false,Sm80",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "strategy": "megakernel",
+   "predicates": "bf16, precomputed topk_ids/topk_weights (fused router is a separate capability; MegaMoELocalParams has no RouterScore); latent_dim == 0",
+   "mutations": "out (all rows written)",
+   "evidence": "test_mega vs fp64 reference (incl. shared_out and routed_scaling_factor); bench_mega (mega only; moe_forward has no body in this snapshot)"
+  },
+  {
+   "op_id": "E07.mega_moe_ep",
+   "kernel_symbol": "mega_moe_ep_kernel",
+   "provider": "native",
+   "template_args": "bf16,bf16,16,64,64,1,Sm80",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "strategy": "megakernel",
+   "predicates": "single virtual rank only (num_ranks == 1, rank == 0, nvl_buffers[0]); bf16 payload (payload_quant == kNone); multi-rank EP dispatch/combine is not implemented",
+   "mutations": "nvl_buffers[0] staging rows; out",
+   "evidence": "test_mega vs fp64 reference through the EP staging buffer; multi-rank rejected with kUnsupportedBackend"
+  },
+  {
+   "op_id": "E08.mega_decoder_layer",
+   "kernel_symbol": "mega_decoder_layer_kernel",
+   "provider": "native",
+   "template_args": "bf16,Sm80",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "strategy": "megakernel",
+   "predicates": "one layer; v1 MHA + dense MLP or local MoE (precomputed routes); MLA/Kimi Linear follow-on; one plan one stream",
+   "mutations": "attention residual stream, KV pages, out; MLP intermediate",
+   "evidence": "test_mega decoder dense vs standalone chain; decoder MoE vs standalone norm+MoE chain; bench_mega (slower than modular+graph on SM120, release gate not met)"
+  }
+ ]
+}

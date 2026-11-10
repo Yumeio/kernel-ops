@@ -70,7 +70,11 @@ launch `ceil(num_tokens / 8) + 2*num_reqs` CTAs; CTAs without a row exit.
 | `kNative` (bf16/f16/f32) | implemented | bit-preserving copy |
 | `kFP8PerTensor` (e4m3 OCP) | implemented | `stored = satfinite(x / scale)`, `scale` is a device dequant multiplier |
 | `kFP8PerHead` (e4m3 OCP) | implemented | `scale_head_stride == 1`; `reshape` uses the same code path as per-tensor with a per-head scale |
-| `kMLAFp8DS` / `kMLANvfp4DS` | B3 | record layouts and upconversion land with B3 |
+| `kMLAFp8DS` | implemented (B3) | 656 B V3.2 MLA record (512 e4m3 + 4 fp32 scales + 64 bf16 RoPE) |
+| `kMLAFp8DSV40` | implemented (B14) | 584 B/token DeepSeek-V4.0 record, side scale array |
+| `kMLAFp8DSV41` | implemented (B14) | 528 B/token DeepSeek-V4.1 FP8 record, inline UE8M0 scales |
+| `kMLAFp8DSV41Fp4` | implemented (B14) | 288 B/token V4.1 FP4 `extra_kv` record, inline E4M3 scales |
+| `kMLAFp8DSFNUZ` / `kMLANvfp4DS` | B3/B8 | AMD FNUZ 656 B twin and the provider-owned 352 B NVFP4 record still return `kNotImplemented` |
 | per-token-head FP8/INT8/INT4, NVFP4, low-bit WHT | B3 | declared, rejected with `kNotImplemented` by the B2 entry points |
 | `kIndexerFP8`/`kIndexerFP4` | B3 | split-page codec |
 | e5m2 / FNUZ payloads | not compiled in B2 | rejected explicitly; B3/B8 add the paths and twin tests |
@@ -78,6 +82,59 @@ launch `ceil(num_tokens / 8) + 2*num_reqs` CTAs; CTAs without a row exit.
 If a scale is per-tensor, `scale_head_stride` is 0; per-head requires 1 and a
 non-null `k_scale`/`v_scale`. Graph replay with a new scale is supported because
 the scale pointer is read from device memory by the kernel.
+
+### 3.1 DeepSeek-V4 MLA records (`mla_kv_format`)
+
+The V4 formats are **not** backward compatible with the 656 B V3.2 record, so the
+`KVCodec` value carries the version. All three are latent, single-head caches
+(`layout == kLatent`, `num_kv_heads <= 1`, `head_dim_k == head_dim_v == 512`,
+`v_data == nullptr`, `v_codec == kNative`).
+
+| | V4.0 `kMLAFp8DSV40` | V4.1 `kMLAFp8DSV41` | V4.1 FP4 `kMLAFp8DSV41Fp4` |
+|---|---|---|---|
+| `entry_bytes` | 576 (data only) | 528 | 288 |
+| `scale_bytes_per_token` | 8, in `k_scale_pages` | 0 (inline) | 0 (inline) |
+| data layout | `[0,448)` 7×64 e4m3 NoPE, `[448,576)` 64 bf16 RoPE | `[0,512)` 16×32 e4m3 covering NoPE + RoPE | `[0,256)` 512 e2m1, element `2i` in the low nibble of byte `i` |
+| scale layout | 7 UE8M0 + 1 zero pad at `k_scale_pages + page*k_scale_stride_page + off*k_scale_stride_token` | 16 UE8M0 at `[512,528)` | 32 E4M3 at `[256,288)`, one per 16 dims |
+| FP8 tile scale | `2^ceil(log2(max(amax/448, 1e-4)))`, byte = exponent + 127 | same | n/a |
+| FP4 tile scale | n/a | n/a | `clamp(amax/6, 2^-9, 448)` cast to e4m3 |
+| page bytes | `align16(round_up(page_size*584, 576))` | `align16(page_size*528)` | `align16(page_size*288)` |
+
+The 576-byte V4.0 page padding is FlashMLA's MODEL1 rule: the page (data region
+`page_size*576` followed by the `page_size*8` scale region) is rounded up to a
+multiple of 576, so a 16-token page occupies 9792 B and a 64-token page 37440 B.
+`kv_physical_bytes` counts the out-of-record scale region **once** inside that
+padded page; a `k_stride_page` larger than the formula wins but is never summed
+with the scale array. `k_scale_stride_page`/`k_scale_stride_token` describe where
+`k_scale_pages` lives, not extra bytes to add.
+
+Scale semantics:
+
+* UE8M0 is `2^(byte - 127)`; `0xFF` is NaN and is never emitted for finite input.
+* V4.1 FP8 scales every 32 consecutive logical dims over the full 512 (tiles
+  0..13 are NoPE, tiles 14..15 are RoPE). V4.0 scales only the 448 NoPE dims in
+  7 tiles of 64 and keeps RoPE in bf16.
+* FP4 quantizes with `cvt.rn.satfinite.e2m1x2.f32` semantics: nearest, ties to
+  the **even code**, saturating at ±6, NaN mapped to zero magnitude. One NaN or
+  Inf element poisons the whole 16-value tile: the scale byte becomes the E4M3
+  NaN `0x7F` and every code in the tile is zero (FlashMLA `tests/quant.py`).
+* A tile whose `amax` is zero floors at `1e-4` (FP8 → `2^-13`, byte 114) or at
+  the `2^-9` E4M3 minimum (FP4 → byte `0x01`).
+
+Writers: `concat_and_cache_mla` dispatches to `concat_and_cache_ds_mla_kernel`
+with the record version as a template parameter (one CTA per token, 256 threads;
+V4.0 warps 0..6 quantize the seven NoPE tiles and warp 7 copies the bf16 RoPE,
+V4.1 walks 16 tiles over 8 warps, FP4 uses one 8-lane group per tile). Readers:
+`cp_gather_and_upconvert_ds_mla` uses `cp_gather_and_upconvert_ds_mla_fp8_kernel`
+for all four records — V4.0 produces `[T,512]` bf16 (448 dequantized + 64 RoPE
+copied), V4.1/FP4 produce `[T,512]`; a 576-wide destination is accepted and its
+`[512,576)` tail is zeroed. The 656 B path is unchanged.
+
+`kMLAFp8DSV41Fp4` is only a valid *pair* next to a 528 B V4.1 FP8 cache
+(`is_valid_kv_format_pair` in FlashMLA `kv_cache_format.h`); the descriptor sees
+one cache at a time, so `kv_desc_validate` cannot enforce the pairing and the
+engine owns it.
+
 
 ## 4. Test matrix
 
@@ -101,6 +158,18 @@ the scale pointer is read from device memory by the kernel.
 * Status contract: null pointers, dtype mismatch, bad descriptor, FP8 without
   scales, B3 codecs, empty gather spec, zero conversion scale, relayout batch
   mismatch.
+* V4 MLA records: byte-exact V4.0 (584), V4.1 (528) and V4.1 FP4 (288) writes
+  for `page_size` 16 and 64 against a host oracle built from the formulas above
+  (tile scales, e4m3 payload, bf16 RoPE, the zero scale-pad byte, and untouched
+  page padding / unwritten slots), `kv_physical_bytes` equality, 16-byte
+  alignment and the stride-override path, block-table gather back to bf16 with
+  exact bit comparison, the 576-wide zero tail, and the V4.1 FP4 E2M1 midpoint
+  ties (`0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0`) plus NaN/Inf tile poisoning
+  and the 448 E4M3 scale clamp.
+* V4 descriptor contract: wrong record width, missing V4.0 scale array or
+  `scale_bytes_per_token`, side scales on an inline codec, non-e4m3 payload,
+  576 head dim, non-latent layout, non-native V codec, more than one latent
+  head, short token stride, and a wrong `kv_c` width.
 
 `tests/unit/test_merge.cc` adds `concat_mla_q` (exact copy, `pe == 64`
 contract) and `mla_context_gather` (two requests, shared block table, graph
@@ -155,6 +224,21 @@ large copy/gather cases are the relevant ones for the B1 bandwidth target. The
 one-sequence prefill; decode batches (`T <= window`) skip it entirely. The
 relayout case is a fallback path (layout conversion), not a hot inference path.
 
+V4 MLA record cases on `RTX 5060 Ti (36 SMs, 448 GB/s)`, same build, page 64:
+
+| Case | ms | GB/s |
+|---|---:|---:|
+| V4.0 write, T=256, rank=448 | 0.0030 | 139 |
+| V4.1 FP8 write, T=1024, rank=448 | 0.0120 | 133 |
+| V4.1 FP4 write, T=1024, rank=448 | 0.0078 | 173 |
+| V4.0 gather → bf16, T=256 | 0.0040 | 112 |
+| V4.1 FP8 gather → bf16, T=1024 | 0.0031 | 520 |
+| V4.1 FP4 gather → bf16, T=1024 | 0.0030 | 454 |
+
+The two small write cases are latency-bound (256 and 1024 CTAs of 256 threads,
+one token each); the V4.1 gather cases reach about half of peak because the
+dequantized bf16 destination is twice the record width.
+
 ## 7. Known deviations / follow-ups
 
 1. **e5m2 and FNUZ are not compiled in B2.** `PagedKVDesc::fp8` is validated and
@@ -175,6 +259,21 @@ relayout case is a fallback path (layout conversion), not a hot inference path.
    least one per token of a sequence). A caller that interleaves one sequence's
    tokens arbitrarily with more than `window` other tokens per position step
    would need an external epoch/counter; the engine owns that policy.
+5. **The generic page entries do not decode MLA records.** `gather_pages`,
+   `scatter_pages`, `relayout_pages` and `convert_cache` treat a `kLatent`
+   record as `head_dim_k` elements of `k_dtype`; they are not valid for the
+   656/584/528/288 records (as before this change for 656). Use
+   `cp_gather_cache` for byte-exact record movement and
+   `cp_gather_and_upconvert_ds_mla` for the bf16 read path. A guard that rejects
+   these codecs there is a follow-up.
+6. **V4.1 FP4 must be paired with a V4.1 FP8 cache.** `kv_desc_validate` checks
+   one descriptor; the `(V41, V41_FP4)` pair rule from FlashMLA is enforced by
+   the engine that allocates both caches.
+7. **V4.0 partial host offload keeps its scale rows on device.**
+   `cp_gather_and_upconvert_ds_mla` addresses `k_scale_pages` by the block-table
+   page and offset; `host_cache` rows are `entry_bytes` (576 B) wide and do not
+   carry the 8 B scale region. Offloading only the data rows is supported, but
+   the engine must keep the whole scale array resident.
 
 ## 8. Evidence
 
@@ -187,5 +286,10 @@ relayout case is a fallback path (layout conversion), not a hot inference path.
   per-head absmax and both RoPE append fusions. `bench_kvcache` adds
   `reshape_per_token_head`, `ds_mla`, `indexer_fp8`, `fused_qkv_append`,
   `requantize_pages`, `kv_scale_update` and `mla_rope_fused` cases.
+* B14: `kops_test_kvcache` adds `test_ds_mla_v4` / `test_ds_mla_v4_contracts`
+  (byte-exact 584/528/288 writes, block-table upconvert, physical bytes and the
+  descriptor contract); `bench_kvcache` adds the six `ds_mla_v4*` cases.
+  Passed on `build/dev-sm120a` (RTX 5060 Ti, CUDA 13.4, sm_120a); header, ABI
+  layout and `check_roadmap.py` checks pass with `g++ -std=c++17`.
 * Compiled for the native SM86 target with CUDA 12.9; the code is
   architecture-generic and compiles for every exact SM in `KOPS_CUDA_ARCHS`.

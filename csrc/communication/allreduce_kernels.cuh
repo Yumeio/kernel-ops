@@ -12,6 +12,47 @@ namespace kops::comm {
 
 inline constexpr int kMaxRanks = 16;
 
+// ---- Signal area and scratch (ABI 6, B12) ---------------------------------------------------------
+// Every rank owns three kinds of memory, all passed in PeerBuffers and all caller-allocated:
+//   data[r]     staging buffer, written only by rank r, read by the peers (device memory, a P2P mapping
+//               or, without P2P, pinned *write-combined* host memory: SM stores to write-back host memory
+//               run at half the PCIe rate);
+//   flags[r]    kSignalWords words of arrival flags, written only by rank r (device memory or pinned host
+//               memory, 16 B aligned, zeroed by comm_configure);
+//   scratch     kScratchWords words of rank-local *device* memory (never shared): error word, timeout,
+//               call counter and the CTA arrival counters. It is what makes a call independent of how many
+//               CTAs run and what keeps the epoch on the device.
+// The pull protocol of every collective: stage, publish one flag with a system-scope release, wait for
+// the peers' flags with system-scope acquire, read their staging. A system fence costs about 1.5 us and
+// the GPU serialises them across CTAs, so each call posts exactly one flag per phase: the last CTA to
+// finish staging (device-scope arrival counter in scratch) posts it. The epoch of a call is
+// `epoch + calls + 1`; the last CTA to finish advances `calls`, so a captured graph replays any number of
+// times with no host update. The staging slot of a call is its epoch & 1.
+inline constexpr int kCommCtas = 16;      // upper bound on CTAs of one call (host picks 1..16 by size)
+inline constexpr int kCommThreads = 256;
+inline constexpr int kSignalWords = 256;
+inline constexpr int kSigReady1 = 0;      // phase-1 arrival flag (value = call epoch); own 128 B line
+inline constexpr int kSigReady2 = 32;     // phase-2 arrival flag; own 128 B line
+inline constexpr int kScratchWords = 64;
+inline constexpr int kScrError = 0;       // CommError of the last failed call on this rank
+inline constexpr int kScrTimeoutUs = 1;   // per-wait timeout; 0 selects the 20 s default
+inline constexpr int kScrCalls = 2;       // completed calls (epoch base)
+inline constexpr int kScrArrive1 = 3;     // CTAs that finished phase-1 staging
+inline constexpr int kScrArrive2 = 4;     // CTAs that finished phase-2 staging
+inline constexpr int kScrDone = 5;        // CTAs that finished the call
+
+/// Value stored in the error word (kScrError) by the kernel that gave up.
+enum class CommError : int32_t {
+  kNone = 0,
+  kPeerTimeout = 1,    // a peer flag did not reach the call epoch within the timeout
+  kDataTimeout = 2,    // Lamport packets did not arrive within the timeout
+  kBadArgument = 3,
+};
+
+/// Staging layout and capacity: two slots (call parity) of `slot_bytes` each. The kernels need
+/// PeerBuffers::buffer_bytes >= 2 * slot_bytes; see the *_staging_bytes() helpers in ops.h.
+inline constexpr size_t kStagingAlign = 128;
+
 /// Peer-mapped buffers of one communicator (prepared by the engine's handle exchange).
 /// kMaxRanks is the maximum ranks *in one group* (intra-node NVLink domain or one
 /// multi-node group). Multi-node groups also set num_nodes/node_rank; the transport
@@ -25,6 +66,8 @@ struct PeerBuffers {
   int32_t num_nodes;               // 1 = intra-node only
   int32_t node_rank;
   size_t buffer_bytes;
+  uint32_t* scratch;               // this rank's private device scratch (kScratchWords words, zeroed by
+                                   //   comm_configure); see the protocol note above
 };
 
 enum class AllReduceAlgo : uint8_t {

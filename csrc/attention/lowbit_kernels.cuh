@@ -1,23 +1,57 @@
 #pragma once
 // =============================================================================
 // kernel-ops | csrc/attention/lowbit_kernels.cuh           Catalog: A09 (EXPERIMENTAL, P2/R)
-// Low-bit / rotated KV codecs and attention over them (attention.rs TurboQuant-
-// derived K8V4 / K4V4 / K3V4). Names describe the implementation, not a paper:
-// codec = (transform, bits, scale granularity, packing version).
-// Opt-in only (namespace kops::experimental). Physical bytes come from
-// kv::kv_physical_bytes(), never from nominal bit width.
-// Requires: common/*, kvcache/kv_layout.cuh, attention/attention_params.cuh.
+// Low-bit rotated KV codecs and attention over them (B17, CONTRACTS §1h).
+// Opt-in only (namespace kops::experimental). Names describe the implementation:
+// codec = (transform, level table, scale rule, packing version).
+//
+//   kTurboMse<b>   TurboQuant_mse (Zandieh et al., arXiv:2504.19874, Alg. 1): signed-Hadamard
+//                  rotation, b-bit Lloyd-Max code per coordinate, one fp32 scale ||x|| / sqrt(d).
+//   kTurboProd<b>  TurboQuant_prod (Alg. 2): kTurboMse<b-1> plus one QJL sign bit per coordinate
+//                  of the residual and one fp32 gain; <q, k~> is an unbiased estimate of <q, k>.
+//   kUniform<b>    attention.rs "turbo4 / turbo3": signed-Hadamard rotation, uniform mid-rise
+//                  levels, one fp32 scale absmax / (2^b - 1).
+//
+// Record of one (token, head) vector, little-endian, 4-byte aligned:
+//   [codes: d * code_bits / 8 bytes][signs: d / 8 bytes, kTurboProd only][scale: fp32]
+//   [gain: fp32, kTurboProd only]
+//   code of element i = bits [i * code_bits, (i + 1) * code_bits) of the code bit stream, an index
+//   into the ascending level table; sign bit i = 1 when the sketched residual is >= 0.
+// Dequantization (x_rot = Hn (s .* x), Hn = Sylvester Hadamard / sqrt(d), s = sign stream):
+//   x_rot[i] ~= scale * levels[code_i]  (+ gain * (s' .* Hn sgn)[i] for kTurboProd, s' = sketch
+//   stream).  Attention never materializes x: the query is rotated once per step
+//   (q_rot = Hn (s .* q), q_sk = Hn (s' .* q_rot)) and the score is
+//   scale * <q_rot, levels[code]> + gain * <q_sk, sgn>; V is accumulated in the rotated basis and
+//   the output is rotated back once.
+// Physical bytes come from kv::kv_physical_bytes() on a byte-stride descriptor, never from the
+// nominal bit width.
+// Requires: common/*, kvcache/kv_layout.cuh, attention/attention_params.cuh,
+//           attention/prefill_kernels.cuh, attention/decode_kernels.cuh.
 // =============================================================================
 
 namespace kops::experimental::lowbit {
 
 /// Element codec for one of K or V.
 enum class LowBitFormat : uint8_t {
-  kFP8 = 0,          // e4m3, per (token, head) absmax scale, no rotation      (K of K8V4)
+  kFP8 = 0,          // e4m3, per (token, head) absmax scale, no rotation      (K of K8V4; not compiled)
   kUniform4 = 1,     // signed 4-bit uniform, per (token, head) fp32 absmax
   kUniform3 = 2,     // signed 3-bit uniform, bit-packed 8 values / 3 bytes
-  kNVFP4 = 3,        // e2m1 + E4M3 per 16 (tracked separately from uniform int4)
+  kNVFP4 = 3,        // e2m1 + E4M3 per 16 (tracked separately from uniform int4; not compiled)
+  kTurboMse2 = 4,    // Lloyd-Max 2 / 3 / 4 bit + fp32 norm scale
+  kTurboMse3 = 5,
+  kTurboMse4 = 6,
+  kTurboProd2 = 7,   // Lloyd-Max 1 / 2 / 3 bit + 1 QJL sign bit: 2 / 3 / 4 bits per element (K only)
+  kTurboProd3 = 8,
+  kTurboProd4 = 9,
 };
+
+/// Version of the record layout, the level tables below and lowbit_sign_word().
+inline constexpr uint16_t kLowBitPackingVersion = 1;
+
+/// Sign streams of one transform_seed (lowbit_sign_word).
+inline constexpr uint32_t kSignStreamKey = 0;     // K and Q rotation
+inline constexpr uint32_t kSignStreamSketch = 1;  // QJL sketch of the K residual (and of q_rot)
+inline constexpr uint32_t kSignStreamValue = 2;   // V rotation
 
 /// Codec descriptor (versioned; stored next to the cache so readers never guess).
 struct LowBitCodec {
@@ -26,48 +60,113 @@ struct LowBitCodec {
   QuantTransform k_transform;    // kSignedHadamard over head_dim for rotated codecs, or kNone
   QuantTransform v_transform;
   uint32_t transform_seed;       // sign convention; must be identical for Q and K
-  uint16_t packing_version;
-  int16_t head_dim;
+  uint16_t packing_version;      // kLowBitPackingVersion
+  int16_t head_dim;              // 64, 128 or 256 (the Hadamard size)
+};
+
+/// 32 sign bits of elements [32 * word, 32 * word + 32) of a sign stream: bit i set means element
+/// 32 * word + i is negated before the Hadamard transform (murmur3 finalizer, twice).
+KOPS_HOST_DEVICE_INLINE uint32_t lowbit_sign_word(uint32_t seed, uint32_t stream, uint32_t word) {
+  uint32_t x = seed + 0x9E3779B9u * (stream + 1u);
+  x ^= x >> 16; x *= 0x85EBCA6Bu; x ^= x >> 13; x *= 0xC2B2AE35u; x ^= x >> 16;
+  x ^= 0x85EBCA6Bu * (word + 1u);
+  x ^= x >> 16; x *= 0x85EBCA6Bu; x ^= x >> 13; x *= 0xC2B2AE35u; x ^= x >> 16;
+  return x;
+}
+
+// ---- Lloyd-Max level tables (packing version 1) ------------------------------------------------
+// Positive centroids, ascending, of the symmetric b-bit Lloyd-Max quantizer of one coordinate of a
+// uniform point on S^(d-1), in units of 1 / sqrt(d) (variance 1); the full table is
+// {-c[n-1], ..., -c[0], c[0], ..., c[n-1]} and the decision thresholds are the midpoints.
+// Generated by benchmark/compare/lowbit_codebook.py; the Lloyd-Max fixed point is re-derived in
+// fp64 by tests/unit/test_merge.cc.  The comment gives the normalized MSE of the b-bit code.
+inline constexpr float kLloydMax64B1[1] = {0.801007265f};                                // 0.358387
+inline constexpr float kLloydMax64B2[2] = {0.452118950f, 1.499974795f};                  // 0.114526
+inline constexpr float kLloydMax64B3[4] = {0.243753431f, 0.750658106f, 1.329342871f,     // 0.033391
+                                           2.111311447f};
+inline constexpr float kLloydMax64B4[8] = {0.127352180f, 0.384718266f, 0.650494148f,     // 0.009132
+                                           0.931894019f, 1.239404222f, 1.590849129f,
+                                           2.023309826f, 2.646370491f};
+inline constexpr float kLloydMax128B1[1] = {0.799444436f};                               // 0.360889
+inline constexpr float kLloydMax128B2[2] = {0.452453250f, 1.505192978f};                 // 0.116000
+inline constexpr float kLloydMax128B3[4] = {0.244424873f, 0.753330160f, 1.336598886f,    // 0.033966
+                                            2.131470844f};
+inline constexpr float kLloydMax128B4[8] = {0.127873152f, 0.386380916f, 0.653618948f,    // 0.009315
+                                            0.937097021f, 1.247770458f, 1.604342660f,
+                                            2.045925380f, 2.688859257f};
+inline constexpr float kLloydMax256B1[1] = {0.798664124f};                               // 0.362136
+inline constexpr float kLloydMax256B2[2] = {0.452617583f, 1.507804514f};                 // 0.116740
+inline constexpr float kLloydMax256B3[4] = {0.244759803f, 0.754667365f, 1.340247310f,    // 0.034256
+                                            2.141668641f};
+inline constexpr float kLloydMax256B4[8] = {0.128133987f, 0.387214043f, 0.655187152f,    // 0.009408
+                                            0.939713725f, 1.251989019f, 1.611168121f,
+                                            2.057411210f, 2.710566995f};
+
+/// One side (K or V) of a codec as the kernels read it; lowbit_resolve() derives it.
+struct LowBitSide {
+  int32_t code_bits;       // 1..4 bits per element
+  int32_t qjl;             // 1: sign plane + gain follow the codes (kTurboProd*)
+  int32_t rotated;         // 1: signed Hadamard (sign_stream) before quantization
+  int32_t absmax;          // 1: scale = absmax / levels[top] (kUniform*); 0: scale = ||x|| / sqrt(d)
+  int32_t entry_bytes;     // record size
+  uint32_t sign_stream;    // kSignStreamKey | kSignStreamValue
+  float levels[16];        // ascending; entries past 2^code_bits are 0
+  float thresholds[16];    // ascending midpoints; code = number of thresholds below the value;
+                           // entries past 2^code_bits - 1 are +inf
+};
+
+/// Resolved codec: the by-value kernel argument next to the attention parameters.
+struct LowBitTables {
+  LowBitSide k;
+  LowBitSide v;
+  uint32_t seed;           // LowBitCodec::transform_seed
+  int32_t head_dim;
+  int32_t io_fp16;         // q / o (decode, prefill) or key / value (store) are fp16; 0 = bf16
+};
+
+/// Arguments of lowbit_kv_store_kernel.
+struct LowBitStoreParams {
+  const void* key;                   // [num_tokens, Hkv, D] bf16 / fp16
+  const void* value;                 // [num_tokens, Hkv, D]
+  int64_t k_stride_n, k_stride_h;    // elements
+  int64_t v_stride_n, v_stride_h;
+  kv::PagedKVDesc cache;             // codec kLowBitWHT, byte strides, scales inline in the record
+  const int64_t* slot_mapping;       // [num_tokens]; slot = page * page_size + offset, < 0 skipped
+  LowBitTables tables;
+  int32_t num_tokens;
 };
 
 /**
- * lowbit_kv_store_kernel — quantize + (optionally) rotate new K/V and write them into low-bit pages
- * with per-(token, head) scales. Q must be rotated with the same transform at attention time.
+ * lowbit_kv_store_kernel — rotate + quantize new K/V and write their records into low-bit pages.
+ * One warp per (token, kv head): head_dim / 32 elements per lane, Hadamard stages inside the lane
+ * and across lanes (shuffles), scale by warp reduction. Q must be rotated with the same sign
+ * stream at attention time (the attention kernels below do it).
+ * Launch : grid = ceil(num_tokens * Hkv / 4), block = 128.
  */
-template <typename scalar_t, LowBitFormat kKFormat, LowBitFormat kVFormat, int HEAD_DIM>
-__global__ void lowbit_kv_store_kernel(
-    const scalar_t* __restrict__ key,           // [num_tokens, Hkv, HEAD_DIM]
-    const scalar_t* __restrict__ value,         // [num_tokens, Hkv, HEAD_DIM]
-    const kv::PagedKVDesc cache,                // codec kLowBitWHT, side scales in k/v_token_scales
-    const int64_t* __restrict__ slot_mapping,   // [num_tokens]
-    const LowBitCodec codec, const int num_tokens);
+template <int HEAD_DIM>
+__global__ void lowbit_kv_store_kernel(const __grid_constant__ LowBitStoreParams params);
 
 /**
- * lowbit_decode_kernel — decode attention reading low-bit K/V, dequantizing in registers;
- * rotated codecs compute scores in the rotated basis (q rotated once per step) and apply the
- * inverse transform to the output when V is rotated.
+ * lowbit_decode_kernel — CUDA-core decode reading low-bit K/V records and dequantizing in
+ * registers. Scores are computed in the rotated basis (q rotated once per CTA; for kTurboProd the
+ * sketched query scores the sign plane); V is accumulated in its rotated basis and the output is
+ * rotated back once. Modifiers, split-KV partials, LSE and the row packing follow
+ * attn::paged_decode_kernel (ROWS_PER_CTA packed q_len x G rows per CTA).
+ * Launch : grid = (B, Hkv * ceil(G * q_len / ROWS_PER_CTA), splits), block = 128.
  */
-template <int HEAD_DIM, int GQA_GROUP, int PAGE_SIZE, LowBitFormat kKFormat, LowBitFormat kVFormat,
-          typename DTypeQ, typename DTypeO>
-__global__ void lowbit_decode_kernel(
-    const void* __restrict__ q,                 // [B, Hq, HEAD_DIM]
-    const kv::PagedKVDesc cache,
-    const LowBitCodec codec,
-    const attn::AttentionModifiers mod,
-    void* __restrict__ o,                       // [B, Hq, HEAD_DIM]
-    const attn::SplitKVBuffers split,
-    const int batch_size, const int num_q_heads, const int num_kv_heads);
+template <int HEAD_DIM, int ROWS_PER_CTA>
+__global__ void lowbit_decode_kernel(const __grid_constant__ attn::DecodeParams params,
+                                     const __grid_constant__ LowBitTables tables);
 
-/// lowbit_prefill_kernel — paged prefill over low-bit KV (dequantize tiles into smem).
-template <typename Traits, attn::MaskMode kMask, LowBitFormat kKFormat, LowBitFormat kVFormat>
-__global__ void lowbit_prefill_kernel(
-    const void* __restrict__ q,                 // [total_q, Hq, D]
-    const int32_t* __restrict__ qo_indptr,
-    const kv::PagedKVDesc cache,
-    const LowBitCodec codec,
-    const attn::AttentionModifiers mod,
-    void* __restrict__ o, float* __restrict__ lse,
-    const attn::WorkPlan plan, const attn::SplitKVBuffers split,
-    const int batch_size, const int num_q_heads, const int num_kv_heads);
+/**
+ * lowbit_prefill_kernel — paged FA2 prefill over low-bit KV: K / V tiles are dequantized into
+ * shared memory as fp16 in the rotated basis, QK and PV run on mma.sync fp16 (whatever the q / o
+ * dtype). kQjl widens the QK tile to [levels | signs] against [q_rot | q_sk]. Mask modes and
+ * modifiers follow attn::paged_prefill_kernel.
+ * Launch : grid = (plan.padded_num_items, Hkv), block = 2 * CTA_TILE_Q.
+ */
+template <int HEAD_DIM, int CTA_TILE_Q, bool kQjl>
+__global__ void lowbit_prefill_kernel(const __grid_constant__ attn::PagedPrefillParams params,
+                                      const __grid_constant__ LowBitTables tables);
 
 }  // namespace kops::experimental::lowbit

@@ -11,6 +11,10 @@
 //   bmm_kernel               (B7 row 2, end of file) strided batched bf16/fp16 GEMM on mma.sync, B as [N,K] or [K,N]
 // Host entries: gemm, gemm_with_tactic, scaled_gemm, gemv_argmax, router_gemm,
 //               gemm_workspace_requirements.
+// B13: scaled_gemm routes an explicit SM120a tactic (kSm120WarpSpecialized /
+//      kSm120BlockScaledWS) to the sm120a cells of sm120a_impl.cuh for bf16 / fp16 and
+//      tensorwise / rowwise FP8, and reports kNotImplemented for the recipes with no
+//      SM120a body. gemm() / gemm_with_tactic() without such a tactic keep the B7 path.
 //
 // Contract: csrc/gemm/dense_gemm_kernels.cuh + csrc/gemm/ops.h.
 //
@@ -25,6 +29,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <type_traits>
 
 #include <cuda.h>
@@ -54,6 +60,7 @@
 #include "csrc/gemm/grouped_gemm_kernels.cuh"
 #include "csrc/gemm/gemm_prep_kernels.cuh"
 #include "csrc/gemm/ops.h"
+#include "csrc/gemm/sm120a_impl.cuh"
 
 namespace kops::gemm {
 namespace {
@@ -799,6 +806,499 @@ ScaledGemmArgs to_scaled(const GemmProblem& p, const GemmArgs& a) {
   return s;
 }
 
+// =============================================================================
+// SM120a (B13) host: dense bf16/fp16 and FP8 tiles of sm120a_impl.cuh
+// =============================================================================
+// Reached only through an explicit tactic whose mainloop is kSm120WarpSpecialized or
+// kSm120BlockScaledWS on a KOPS_TARGET_SM120A context; every other path keeps the B7
+// mma.sync body. One CTA per output tile (no persistent scheduler, no split-K), so the
+// launch needs no workspace.
+
+bool sm120_mainloop(MainloopSchedule m) {
+  return m == MainloopSchedule::kSm120WarpSpecialized || m == MainloopSchedule::kSm120BlockScaledWS;
+}
+
+/// Shapes instantiated in this build. tile_k is in elements (64 / element size), stages the ring depth.
+struct Sm120Tile {
+  int16_t tm, tn, tk;
+  int8_t stages;
+};
+constexpr Sm120Tile kSm120DenseTiles[] = {{64, 128, 32, 4}, {128, 128, 32, 3}};
+constexpr Sm120Tile kSm120Fp8Tiles[] = {{64, 128, 64, 4}, {128, 128, 64, 3}};
+constexpr Sm120Tile kSm120Fp4Tiles[] = {{64, 128, 32, 4}, {128, 128, 32, 3}};
+constexpr int kSm120NumDenseTiles = static_cast<int>(sizeof(kSm120DenseTiles) / sizeof(kSm120DenseTiles[0]));
+constexpr int kSm120NumFp8Tiles = static_cast<int>(sizeof(kSm120Fp8Tiles) / sizeof(kSm120Fp8Tiles[0]));
+constexpr int kSm120NumFp4Tiles = static_cast<int>(sizeof(kSm120Fp4Tiles) / sizeof(kSm120Fp4Tiles[0]));
+
+constexpr size_t sm120_tile_smem(const Sm120Tile& t) {
+  return static_cast<size_t>(t.stages) * (static_cast<size_t>(t.tm) + t.tn) * 64;
+}
+
+/// Largest dynamic shared memory one block may opt into on this device (cached).
+int sm120_smem_limit(int device) {
+  static std::mutex mu;
+  static std::map<int, int> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = cache.find(device);
+  if (it != cache.end()) return it->second;
+  int v = 48 * 1024;
+  cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  cache[device] = v;
+  return v;
+}
+
+/// Tile of a tactic. Only the compiled shapes exist; a caller asking for another one gets the list.
+/// tile_k is not part of the geometry (it is 64 / element size, fixed by the atom) and is ignored, exactly
+/// as on the B7 path, so a tactic that only names tile_m / tile_n keeps GemmTactic's default tile_k.
+Status sm120_tile_of(const Sm120Tile* table, int n, const GemmTactic& t, const char* who, int* out_id) {
+  int id = -1;
+  for (int i = 0; i < n; ++i) {
+    if (table[i].tm == t.tile_m && table[i].tn == t.tile_n) id = i;
+  }
+  if (id < 0) {
+    return detail::set_error(Status::kUnsupportedShape,
+                             "%s: no SM120a tile %dx%d (compiled: 64x128, 128x128)", who, t.tile_m, t.tile_n);
+  }
+  if (t.stages != 0 && t.stages != table[id].stages) {
+    return detail::set_error(Status::kUnsupportedShape, "%s: tile %dx%d is compiled with %d stages, not %d", who,
+                             t.tile_m, t.tile_n, table[id].stages, t.stages);
+  }
+  *out_id = id;
+  return Status::kSuccess;
+}
+
+/// Epilogue ops of the SM120a cells: the dense subset plus the operand scales of the FP8 recipes. The
+/// grouped / fused-MoE / quantizing / KV-append epilogues belong to the B7 body and are refused here
+/// instead of being dropped.
+constexpr uint32_t kSm120EpiAllowed = kEpiRowScale | kEpiColScale | kEpiBias | kEpiSoftcap | kEpiAct |
+                                      kEpiResidualAdd | kEpiClamp | kEpiOutFp32;
+
+Status sm120_check_epilogue(const EpilogueParams& e, DType d_dtype, const char* who) {
+  if ((e.ops & ~kSm120EpiAllowed) != 0u) {
+    return detail::set_error(Status::kNotImplemented, "%s: epilogue ops 0x%x have no SM120a body (B7 mma.sync serves them)",
+                             who, e.ops & ~kSm120EpiAllowed);
+  }
+  if (((e.ops & kEpiRowScale) != 0u && e.row_scale == nullptr) || ((e.ops & kEpiColScale) != 0u && e.col_scale == nullptr) ||
+      ((e.ops & kEpiBias) != 0u && e.bias == nullptr) || ((e.ops & kEpiResidualAdd) != 0u && e.residual == nullptr)) {
+    return detail::set_error(Status::kInvalidArgument, "%s: epilogue operand missing (residual is read in the output dtype)", who);
+  }
+  if ((e.ops & kEpiBias) != 0u && e.bias_dtype != DType::kBFloat16 && e.bias_dtype != DType::kFloat16 &&
+      e.bias_dtype != DType::kFloat32) {
+    return detail::set_error(Status::kUnsupportedDtype, "%s: bias must be bf16, fp16 or fp32", who);
+  }
+  if ((e.ops & kEpiOutFp32) != 0u && d_dtype != DType::kFloat32) {
+    return detail::set_error(Status::kInvalidArgument, "%s: kEpiOutFp32 needs an fp32 output", who);
+  }
+  return Status::kSuccess;
+}
+
+/// Operand / problem validation shared by the SM120a tiles, then the tile choice. The order is the B7
+/// one: argument errors first (they are meaningful on any GPU), the exact-SM check last.
+Status sm120_check_args(const ScaledGemmArgs& a, const GemmTactic& t, int eb, const Sm120Tile* table, int ntiles,
+                        const char* who, int* tile_id) {
+  if (a.m < 1 || a.n < 1 || a.k < 1 || a.batch < 1) {
+    return detail::set_error(Status::kInvalidArgument, "%s: empty problem", who);
+  }
+  if (a.m > 0x7FFFFFFF || a.n > 0x7FFFFFFF || a.k > 0x7FFFFFFF) {
+    return detail::set_error(Status::kUnsupportedShape, "%s: extents beyond int32", who);
+  }
+  if (a.a.data == nullptr || a.b.data == nullptr || a.d == nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "%s: null operand", who);
+  }
+  if (a.a.major != MajorOrder::kKMajor || a.b.major != MajorOrder::kKMajor) {
+    return detail::set_error(Status::kNotImplemented, "%s: MN-major operands (weight_transpose first)", who);
+  }
+  if (a.a.ld < a.k || a.b.ld < a.k || a.ldd < a.n) {
+    return detail::set_error(Status::kInvalidArgument, "%s: leading dimensions smaller than the extents", who);
+  }
+  if (a.workspace != nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "%s: pass workspace through the Workspace argument", who);
+  }
+  if (a.batch > 1 && (a.a.batch_stride == 0 || a.b.batch_stride == 0 || a.batch_stride_d == 0)) {
+    return detail::set_error(Status::kInvalidArgument, "%s: batched problems need batch strides", who);
+  }
+  if (a.batch > 65535) return detail::set_error(Status::kUnsupportedShape, "%s: batch > 65535", who);
+  const int kmul = 16 / eb;   // K elements of one 16-byte chunk (the loader's granularity)
+  const bool a16 = aligned(a.a.data, 16) && aligned(a.b.data, 16) && aligned(a.d, 16);
+  if (!a16 || (a.a.ld * eb) % 16 != 0 || (a.b.ld * eb) % 16 != 0 || (a.a.batch_stride * eb) % 16 != 0 ||
+      (a.b.batch_stride * eb) % 16 != 0 || a.k % kmul != 0) {
+    return detail::set_error(Status::kMisaligned,
+                             "%s: SM120a operands need 16 B alignment (pointers, ld, batch stride) and K %% %d == 0",
+                             who, kmul);
+  }
+  if (t.split_k_mode != SplitKMode::kNone || t.split_k_slices > 1) {
+    return detail::set_error(Status::kNotImplemented, "%s: the SM120a cell has no split-K yet", who);
+  }
+  if (t.swap_ab) return detail::set_error(Status::kNotImplemented, "%s: swap_ab has no SM120a body yet", who);
+  if (t.persistent) {
+    return detail::set_error(Status::kNotImplemented, "%s: the SM120a persistent tile scheduler is not implemented (one CTA per tile)",
+                             who);
+  }
+  return sm120_tile_of(table, ntiles, t, who, tile_id);
+}
+
+GemmTmaParams sm120_params(const ScaledGemmArgs& args, const Sm120Tile& cfg) {
+  GemmTmaParams p{};
+  p.args = args;
+  p.args.split_k_mode = SplitKMode::kNone;
+  p.args.split_k_slices = 1;
+  p.num_tiles_m = static_cast<int32_t>((args.m + cfg.tm - 1) / cfg.tm);
+  p.num_tiles_n = static_cast<int32_t>((args.n + cfg.tn - 1) / cfg.tn);
+  p.num_tiles_k = static_cast<int32_t>((args.k + cfg.tk - 1) / cfg.tk);
+  return p;
+}
+
+template <typename T, typename Dt, int TM, int TN, int TK, int ST>
+Status launch_sm120_tile(const GemmTmaParams& p, cudaStream_t s) {
+  using Tr = GemmTraits<T, T, Dt, float, TM, TN, TK, 1, 1, ST, MainloopSchedule::kSm120WarpSpecialized,
+                        EpilogueSchedule::kDirectStore, Sm120a>;
+  constexpr size_t kSmem = static_cast<size_t>(ST) * (TM + TN) * 64;
+  static const cudaError_t attr = cudaFuncSetAttribute(gemm_sm120_kernel<Tr>,
+                                                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                       static_cast<int>(kSmem));
+  if (attr != cudaSuccess) {
+    return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(attr), "gemm_sm120_kernel: %s",
+                                     cudaGetErrorString(attr));
+  }
+  const unsigned tiles = static_cast<unsigned>(p.num_tiles_m) * static_cast<unsigned>(p.num_tiles_n);
+  gemm_sm120_kernel<Tr><<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), static_cast<unsigned>(32 * 2 * (TN / 64)),
+                          kSmem, s>>>(p);
+  return launch_error("gemm_sm120_kernel");
+}
+
+template <typename T, typename Dt, int TM, int TN, int TK, int ST>
+Status launch_fp8_sm120_tile(const GemmTmaParams& p, cudaStream_t s, GemmRecipe recipe) {
+  using Tr = GemmTraits<T, T, Dt, float, TM, TN, TK, 1, 1, ST, MainloopSchedule::kSm120WarpSpecialized,
+                        EpilogueSchedule::kDirectStore, Sm120a>;
+  constexpr size_t kSmem = static_cast<size_t>(ST) * (TM + TN) * 64;
+  const cudaError_t attr = cudaFuncSetAttribute(
+      recipe == GemmRecipe::kFP8Tensorwise ? fp8_gemm_sm120_kernel<Tr, GemmRecipe::kFP8Tensorwise>
+                                           : fp8_gemm_sm120_kernel<Tr, GemmRecipe::kFP8Rowwise>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem));
+  if (attr != cudaSuccess) {
+    return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(attr), "fp8_gemm_sm120_kernel: %s",
+                                     cudaGetErrorString(attr));
+  }
+  const unsigned tiles = static_cast<unsigned>(p.num_tiles_m) * static_cast<unsigned>(p.num_tiles_n);
+  const unsigned threads = static_cast<unsigned>(32 * 2 * (TN / 64));
+  if (recipe == GemmRecipe::kFP8Tensorwise) {
+    fp8_gemm_sm120_kernel<Tr, GemmRecipe::kFP8Tensorwise>
+        <<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), threads, kSmem, s>>>(p);
+  } else {
+    fp8_gemm_sm120_kernel<Tr, GemmRecipe::kFP8Rowwise>
+        <<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), threads, kSmem, s>>>(p);
+  }
+  return launch_error("fp8_gemm_sm120_kernel");
+}
+
+template <typename T, typename Dt>
+Status sm120_dense_tile_id(int id, const GemmTmaParams& p, cudaStream_t s) {
+  switch (id) {
+    case 0: return launch_sm120_tile<T, Dt, 64, 128, 32, 4>(p, s);
+    case 1: return launch_sm120_tile<T, Dt, 128, 128, 32, 3>(p, s);
+    default: return detail::set_error(Status::kInternal, "gemm: SM120a dense tile id %d", id);
+  }
+}
+
+// ---- SM120a FP4 (B13): software-decode body ---------------------------------
+// Packed e2m1 operands are decoded to bf16 while staging (sm120a::fp4_tile), so tile_k stays 32 K
+// elements per stage (64 decoded bytes per row) and the atom is m16n8k16 bf16.
+
+template <typename Dt, int TM, int TN, int ST>
+Status launch_fp4_sm120_tile(const GemmTmaParams& p, cudaStream_t s, GemmRecipe recipe) {
+  using Tr = GemmTraits<f4e2m1x2_t, f4e2m1x2_t, Dt, float, TM, TN, 32, 1, 1, ST,
+                        MainloopSchedule::kSm120BlockScaledWS, EpilogueSchedule::kDirectStore, Sm120a>;
+  constexpr size_t kSmem = static_cast<size_t>(ST) * (TM + TN) * 64;
+  const cudaError_t attr = cudaFuncSetAttribute(
+      recipe == GemmRecipe::kNVFP4 ? fp4_gemm_sm120_kernel<Tr, GemmRecipe::kNVFP4>
+                                   : fp4_gemm_sm120_kernel<Tr, GemmRecipe::kMXFP4>,
+      cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSmem));
+  if (attr != cudaSuccess) {
+    return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(attr), "fp4_gemm_sm120_kernel: %s",
+                                     cudaGetErrorString(attr));
+  }
+  const unsigned tiles = static_cast<unsigned>(p.num_tiles_m) * static_cast<unsigned>(p.num_tiles_n);
+  const unsigned threads = static_cast<unsigned>(32 * 2 * (TN / 64));
+  if (recipe == GemmRecipe::kNVFP4) {
+    fp4_gemm_sm120_kernel<Tr, GemmRecipe::kNVFP4>
+        <<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), threads, kSmem, s>>>(p);
+  } else {
+    fp4_gemm_sm120_kernel<Tr, GemmRecipe::kMXFP4>
+        <<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), threads, kSmem, s>>>(p);
+  }
+  return launch_error("fp4_gemm_sm120_kernel");
+}
+
+template <typename Dt>
+Status fp4_sm120_tile_id(int id, const GemmTmaParams& p, cudaStream_t s, GemmRecipe recipe) {
+  switch (id) {
+    case 0: return launch_fp4_sm120_tile<Dt, 64, 128, 4>(p, s, recipe);
+    case 1: return launch_fp4_sm120_tile<Dt, 128, 128, 3>(p, s, recipe);
+    default: return detail::set_error(Status::kInternal, "gemm: SM120a FP4 tile id %d", id);
+  }
+}
+
+Status fp4_sm120_out(int id, const GemmTmaParams& p, cudaStream_t s, GemmRecipe recipe) {
+  switch (p.args.d_dtype) {
+    case DType::kFloat32: return fp4_sm120_tile_id<float>(id, p, s, recipe);
+    case DType::kFloat16: return fp4_sm120_tile_id<__half>(id, p, s, recipe);
+    default: return fp4_sm120_tile_id<__nv_bfloat16>(id, p, s, recipe);
+  }
+}
+
+template <typename T, typename Dt>
+Status fp8_sm120_tile_id(int id, const GemmTmaParams& p, cudaStream_t s, GemmRecipe recipe) {
+  switch (id) {
+    case 0: return launch_fp8_sm120_tile<T, Dt, 64, 128, 64, 4>(p, s, recipe);
+    case 1: return launch_fp8_sm120_tile<T, Dt, 128, 128, 64, 3>(p, s, recipe);
+    default: return detail::set_error(Status::kInternal, "gemm: SM120a FP8 tile id %d", id);
+  }
+}
+
+/// Output dtype dispatch (bf16 / fp16 / fp32); the operand type is fixed by the recipe.
+template <typename T>
+Status sm120_dense_out(int id, const GemmTmaParams& p, cudaStream_t s) {
+  switch (p.args.d_dtype) {
+    case DType::kFloat32: return sm120_dense_tile_id<T, float>(id, p, s);
+    case DType::kFloat16: return sm120_dense_tile_id<T, __half>(id, p, s);
+    default: return sm120_dense_tile_id<T, __nv_bfloat16>(id, p, s);
+  }
+}
+
+template <typename T>
+Status fp8_sm120_out(int id, const GemmTmaParams& p, cudaStream_t s, GemmRecipe recipe) {
+  switch (p.args.d_dtype) {
+    case DType::kFloat32: return fp8_sm120_tile_id<T, float>(id, p, s, recipe);
+    case DType::kFloat16: return fp8_sm120_tile_id<T, __half>(id, p, s, recipe);
+    default: return fp8_sm120_tile_id<T, __nv_bfloat16>(id, p, s, recipe);
+  }
+}
+
+Status sm120_dense_gemm(const ScaledGemmArgs& args, const GemmTactic& t, const LaunchContext& ctx) {
+  const DType want = args.recipe == GemmRecipe::kFP16 ? DType::kFloat16 : DType::kBFloat16;
+  if (args.a.dtype != want || args.b.dtype != want) {
+    return detail::set_error(Status::kUnsupportedDtype,
+                             "gemm: the SM120a 16-bit tile takes bf16 x bf16 (kBF16) or fp16 x fp16 (kFP16)");
+  }
+  if (args.d_dtype != want && args.d_dtype != DType::kFloat32) {
+    return detail::set_error(Status::kUnsupportedDtype, "gemm: SM120a output is the operand dtype or fp32");
+  }
+  if (args.a.scale != nullptr || args.b.scale != nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "gemm: 16-bit operands carry no operand scales");
+  }
+  int id = -1;
+  Status st = sm120_check_args(args, t, 2, kSm120DenseTiles, kSm120NumDenseTiles, "gemm", &id);
+  if (st != Status::kSuccess) return st;
+  st = sm120_check_epilogue(args.epi, args.d_dtype, "gemm");
+  if (st != Status::kSuccess) return st;
+  if (sm120_tile_smem(kSm120DenseTiles[id]) > static_cast<size_t>(sm120_smem_limit(ctx.device))) {
+    return detail::set_error(Status::kUnsupportedShape, "gemm: the SM120a tile needs %zu B of shared memory",
+                             sm120_tile_smem(kSm120DenseTiles[id]));
+  }
+  if (ctx.arch_id != KOPS_TARGET_SM120A) {
+    return detail::set_error(Status::kUnsupportedArch,
+                             "gemm: the mainloop %d is the SM120a cell and needs KOPS_TARGET_SM120A, found arch %d",
+                             static_cast<int>(t.mainloop), ctx.arch_id);
+  }
+  const GemmTmaParams p = sm120_params(args, kSm120DenseTiles[id]);
+  const cudaStream_t s = stream_of(ctx);
+  if (want == DType::kBFloat16) return sm120_dense_out<__nv_bfloat16>(id, p, s);
+  return sm120_dense_out<__half>(id, p, s);
+}
+
+/// SM120a FP4 (B13): kNVFP4 (block 16, E4M3 block scales + per-tensor global scales) and kMXFP4
+/// (block 32, UE8M0 block scales). Packed e2m1 operands: `ld` and the batch stride are byte pitches,
+/// as in gemm/fp4_gemm.cu. Block scales are read per block boundary in the mainloop; only the
+/// row-major and 128x4 swizzled layouts exist (the swizzled one is the output of
+/// block_scale_swizzle_kernel with cols_blocks = K / block).
+Status sm120_fp4_gemm(const ScaledGemmArgs& args, const GemmTactic& t, const LaunchContext& ctx) {
+  const bool nv = args.recipe == GemmRecipe::kNVFP4;
+  const int block = nv ? 16 : 32;
+  if (args.a.dtype != DType::kFloat4E2M1x2 || args.b.dtype != DType::kFloat4E2M1x2) {
+    return detail::set_error(Status::kUnsupportedDtype, "fp4_gemm: the SM120a FP4 tile takes packed e2m1 (kFloat4E2M1x2) operands");
+  }
+  for (const ScaledOperand* op : {&args.a, &args.b}) {
+    if (op->packing != WeightPacking::kNone && op->packing != WeightPacking::kFP4E2M1) {
+      return detail::set_error(Status::kUnsupportedLayout,
+                               "fp4_gemm: SM120a reads plain packed e2m1 rows (packing kNone / kFP4E2M1); repack Marlin / "
+                               "TRT-LLM layouts first");
+    }
+  }
+  if (args.d_dtype != DType::kBFloat16 && args.d_dtype != DType::kFloat16 && args.d_dtype != DType::kFloat32) {
+    return detail::set_error(Status::kUnsupportedDtype, "fp4_gemm: SM120a output is bf16, fp16 or fp32");
+  }
+  // Block scales: one byte per (row, block) on both operands, E4M3 for NVFP4 and UE8M0 for MXFP4.
+  const DType want_scale = nv ? DType::kFloat8E4M3 : DType::kFloat8E8M0;
+  const ScaleGranularity want_gran = nv ? ScaleGranularity::kNVFP4 : ScaleGranularity::kMX;
+  for (const ScaledOperand* op : {&args.a, &args.b}) {
+    if (op->scale == nullptr) {
+      return detail::set_error(Status::kInvalidArgument, "fp4_gemm: %s block scales are required (per %d K elements)",
+                               op == &args.a ? "activation" : "weight", block);
+    }
+    if (op->scale_dtype != want_scale) {
+      return detail::set_error(Status::kUnsupportedDtype, "fp4_gemm: %s scales must be %s for this recipe",
+                               op == &args.a ? "activation" : "weight",
+                               nv ? "E4M3 (kFloat8E4M3)" : "UE8M0 (kFloat8E8M0)");
+    }
+    if (op->granularity != want_gran && op->granularity != ScaleGranularity::kNone) {
+      return detail::set_error(Status::kInvalidArgument, "fp4_gemm: %s scale granularity must be %s",
+                               op == &args.a ? "activation" : "weight", nv ? "kNVFP4 (1x16)" : "kMX (1x32)");
+    }
+    if (op->group_k != 0 && op->group_k != block) {
+      return detail::set_error(Status::kInvalidArgument, "fp4_gemm: %s group_k must be %d for this recipe",
+                               op == &args.a ? "activation" : "weight", block);
+    }
+    // The swizzled tile stride is derived from K / block (the layout block_scale_swizzle_kernel writes),
+    // so ScaledOperand::scale_ld is only read for the row-major form.
+    if (op->scale_layout != ScaleLayout::kRowMajor && op->scale_layout != ScaleLayout::kSwizzled128x4) {
+      return detail::set_error(Status::kUnsupportedLayout,
+                               "fp4_gemm: SM120a block scales are row-major or the 128x4 swizzled layout; the TMA "
+                               "column-major / packed-UE8M0 / Marlin layouts are not decoded");
+    }
+  }
+  if (!nv && (args.a.global_scale != nullptr || args.b.global_scale != nullptr)) {
+    return detail::set_error(Status::kInvalidArgument, "fp4_gemm: MXFP4 has no per-tensor global scale (E8M0 blocks only)");
+  }
+  if (args.m < 1 || args.n < 1 || args.k < 1 || args.batch < 1) {
+    return detail::set_error(Status::kInvalidArgument, "fp4_gemm: empty problem");
+  }
+  if (args.m > 0x7FFFFFFF || args.n > 0x7FFFFFFF || args.k > 0x7FFFFFFF) {
+    return detail::set_error(Status::kUnsupportedShape, "fp4_gemm: extents beyond int32");
+  }
+  if (args.batch > 65535) return detail::set_error(Status::kUnsupportedShape, "fp4_gemm: batch > 65535");
+  if (args.a.major != MajorOrder::kKMajor || args.b.major != MajorOrder::kKMajor) {
+    return detail::set_error(Status::kNotImplemented, "fp4_gemm: MN-major operands (weight_transpose first)");
+  }
+  if (args.k % block != 0) {
+    return detail::set_error(Status::kUnsupportedShape, "fp4_gemm: K must be a multiple of the %d-element scale block", block);
+  }
+  if (args.a.data == nullptr || args.b.data == nullptr || args.d == nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "fp4_gemm: null operand");
+  }
+  const int64_t k_bytes = args.k / 2;   // packed: 2 elements per byte
+  if (args.a.ld < k_bytes || args.b.ld < k_bytes) {
+    return detail::set_error(Status::kInvalidArgument, "fp4_gemm: leading dimensions smaller than K / 2 bytes");
+  }
+  if (args.ldd < args.n) return detail::set_error(Status::kInvalidArgument, "fp4_gemm: ldd smaller than N");
+  if (args.batch > 1 && (args.a.batch_stride == 0 || args.b.batch_stride == 0 || args.batch_stride_d == 0)) {
+    return detail::set_error(Status::kInvalidArgument, "fp4_gemm: batched problems need batch strides");
+  }
+  // The packed rows are read in 4-byte groups (8 e2m1), so the byte pitch only has to be a multiple of
+  // 4; the base pointers keep the 16 B requirement of every GEMM entry.
+  const bool a16 = aligned(args.a.data, 16) && aligned(args.b.data, 16) && aligned(args.d, 16);
+  if (!a16 || args.a.ld % 4 != 0 || args.b.ld % 4 != 0 || args.a.batch_stride % 4 != 0 ||
+      args.b.batch_stride % 4 != 0) {
+    return detail::set_error(Status::kMisaligned,
+                             "fp4_gemm: SM120a operands need 16 B aligned pointers and a 4-byte row pitch (packed bytes)");
+  }
+  if (t.split_k_mode != SplitKMode::kNone || t.split_k_slices > 1) {
+    return detail::set_error(Status::kNotImplemented, "fp4_gemm: the SM120a cell has no split-K yet");
+  }
+  if (t.swap_ab) return detail::set_error(Status::kNotImplemented, "fp4_gemm: swap_ab has no SM120a body yet");
+  if (t.persistent) {
+    return detail::set_error(Status::kNotImplemented, "fp4_gemm: the SM120a persistent tile scheduler is not implemented");
+  }
+  int id = -1;
+  Status st = sm120_tile_of(kSm120Fp4Tiles, kSm120NumFp4Tiles, t, "fp4_gemm", &id);
+  if (st != Status::kSuccess) return st;
+  st = sm120_check_epilogue(args.epi, args.d_dtype, "fp4_gemm");
+  if (st != Status::kSuccess) return st;
+  if (sm120_tile_smem(kSm120Fp4Tiles[id]) > static_cast<size_t>(sm120_smem_limit(ctx.device))) {
+    return detail::set_error(Status::kUnsupportedShape, "fp4_gemm: the SM120a tile needs %zu B of shared memory",
+                             sm120_tile_smem(kSm120Fp4Tiles[id]));
+  }
+  if (ctx.arch_id != KOPS_TARGET_SM120A) {
+    return detail::set_error(Status::kUnsupportedArch,
+                             "fp4_gemm: the mainloop %d is the SM120a cell and needs KOPS_TARGET_SM120A, found arch %d",
+                             static_cast<int>(t.mainloop), ctx.arch_id);
+  }
+  const GemmTmaParams p = sm120_params(args, kSm120Fp4Tiles[id]);
+  return fp4_sm120_out(id, p, stream_of(ctx), args.recipe);
+}
+
+Status sm120_fp8_gemm(const ScaledGemmArgs& args, const GemmTactic& t, const LaunchContext& ctx) {
+  if (args.a.dtype != DType::kFloat8E4M3 || args.b.dtype != DType::kFloat8E4M3 ||
+      args.a.fp8 != Fp8Encoding::kOCP || args.b.fp8 != Fp8Encoding::kOCP) {
+    return detail::set_error(Status::kUnsupportedDtype, "fp8_gemm: the SM120a FP8 tile takes OCP e4m3 x e4m3");
+  }
+  if (args.d_dtype != DType::kBFloat16 && args.d_dtype != DType::kFloat16 && args.d_dtype != DType::kFloat32) {
+    return detail::set_error(Status::kUnsupportedDtype, "fp8_gemm: SM120a output is bf16, fp16 or fp32");
+  }
+  // Operand scales of the tensorwise / rowwise recipes: per tensor folds into alpha, per token (A) and
+  // per channel (B) stay vectors. Block / MX scales need the block-scaled path, refused here.
+  for (const ScaledOperand* op : {&args.a, &args.b}) {
+    if (op->scale == nullptr) continue;
+    if (op->scale_dtype != DType::kFloat32) {
+      return detail::set_error(Status::kUnsupportedDtype, "fp8_gemm: SM120a tensorwise / rowwise scales are fp32");
+    }
+    const bool per_tensor = op->granularity == ScaleGranularity::kPerTensor;
+    const bool vec = op == &args.a ? op->granularity == ScaleGranularity::kPerToken
+                                   : op->granularity == ScaleGranularity::kPerChannel;
+    if (!per_tensor && !vec) {
+      return detail::set_error(Status::kNotImplemented,
+                               "fp8_gemm: SM120a covers per-tensor, per-token (A) and per-channel (B) FP8 scales; the 1x128 "
+                               "/ 128x128 blockwise recipes keep the B7 mma.sync promotion path and the MX recipes have "
+                               "no SM120a body");
+    }
+    if (op->scale_layout != ScaleLayout::kRowMajor) {
+      return detail::set_error(Status::kUnsupportedLayout, "fp8_gemm: SM120a operand scales are the contiguous row vector");
+    }
+  }
+  int id = -1;
+  Status st = sm120_check_args(args, t, 1, kSm120Fp8Tiles, kSm120NumFp8Tiles, "fp8_gemm", &id);
+  if (st != Status::kSuccess) return st;
+  st = sm120_check_epilogue(args.epi, args.d_dtype, "fp8_gemm");
+  if (st != Status::kSuccess) return st;
+  if (sm120_tile_smem(kSm120Fp8Tiles[id]) > static_cast<size_t>(sm120_smem_limit(ctx.device))) {
+    return detail::set_error(Status::kUnsupportedShape, "fp8_gemm: the SM120a tile needs %zu B of shared memory",
+                             sm120_tile_smem(kSm120Fp8Tiles[id]));
+  }
+  if (ctx.arch_id != KOPS_TARGET_SM120A) {
+    return detail::set_error(Status::kUnsupportedArch,
+                             "fp8_gemm: the mainloop %d is the SM120a cell and needs KOPS_TARGET_SM120A, found arch %d",
+                             static_cast<int>(t.mainloop), ctx.arch_id);
+  }
+  const GemmTmaParams p = sm120_params(args, kSm120Fp8Tiles[id]);
+  return fp8_sm120_out<f8e4m3_t>(id, p, stream_of(ctx), args.recipe);
+}
+
+/// One entry for every recipe whose tactic names an SM120a mainloop (called by scaled_gemm).
+Status launch_gemm_sm120(const ScaledGemmArgs& args, const GemmTactic& t, const LaunchContext& ctx) {
+  if (ctx.backend != BackendKind::kCuda) {
+    return detail::set_error(Status::kUnsupportedBackend, "gemm: CUDA backend only");
+  }
+  switch (args.recipe) {
+    case GemmRecipe::kBF16:
+    case GemmRecipe::kFP16:
+      return sm120_dense_gemm(args, t, ctx);
+    case GemmRecipe::kFP8Tensorwise:
+    case GemmRecipe::kFP8Rowwise:
+      return sm120_fp8_gemm(args, t, ctx);
+    case GemmRecipe::kFP8Blockwise:
+    case GemmRecipe::kFP8BlockwiseUE8M0:
+      return detail::set_error(Status::kNotImplemented,
+                               "gemm: SM120a has no block-scaled FP8 body yet (1x128 x 128x128 promotion); kFP8Blockwise "
+                               "and kFP8BlockwiseUE8M0 keep the B7 mma.sync path");
+    case GemmRecipe::kMXFP8:
+      return detail::set_error(Status::kNotImplemented,
+                               "gemm: SM120 block-scaled MXFP8 (mma.sync kind::mxf8f6f4.block_scale) is not implemented");
+    case GemmRecipe::kNVFP4:
+    case GemmRecipe::kMXFP4:
+      return sm120_fp4_gemm(args, t, ctx);
+    case GemmRecipe::kMXFP4xMXFP8:
+    case GemmRecipe::kMXFP6xMXFP8:
+      return detail::set_error(Status::kNotImplemented,
+                               "gemm: mixed MX (e4m3 / e2m3 activations with e2m1 / e2m3 weights) needs a second operand "
+                               "loader in sm120a_impl.cuh; only kNVFP4 and kMXFP4 are instantiated");
+    case GemmRecipe::kINT8Tensorwise:
+    case GemmRecipe::kINT8Rowwise:
+      return detail::set_error(Status::kNotImplemented,
+                               "gemm: the SM120a INT8 tile is not implemented (B7 mma.sync s8 serves kINT8Rowwise)");
+    default:
+      return detail::set_error(Status::kNotImplemented, "gemm: recipe %d has no SM120a body", static_cast<int>(args.recipe));
+  }
+}
+
 }  // namespace
 
 Status gemm(const GemmProblem& problem, const GemmArgs& args, GemmBackend backend, const Workspace& ws,
@@ -831,6 +1331,9 @@ Status scaled_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBac
                    const Workspace& ws, const LaunchContext& ctx) {
   Status st = backend_ok(ctx, backend, "scaled_gemm");
   if (st != Status::kSuccess) return st;
+  // SM120a / SM121a cells (B13): only an explicit tactic whose mainloop names the SM120a pipeline selects
+  // them, and only on the exact target. Everything else keeps the B7 mma.sync path below.
+  if (tactic != nullptr && sm120_mainloop(tactic->mainloop)) return launch_gemm_sm120(args, *tactic, ctx);
   switch (args.recipe) {
     case GemmRecipe::kBF16:
     case GemmRecipe::kFP16:
@@ -876,6 +1379,9 @@ Status gemm_workspace_requirements(const GemmProblem& problem, const GemmTactic*
   if (st != Status::kSuccess) return st;
   if (out == nullptr) return detail::set_error(Status::kInvalidArgument, "gemm_workspace_requirements: null output");
   *out = WorkspaceRequirements{};
+  if (tactic != nullptr && sm120_mainloop(tactic->mainloop)) {
+    return Status::kSuccess;   // the SM120a cell runs one CTA per tile: no split-K / scheduler workspace
+  }
   const bool dense = problem.recipe == GemmRecipe::kBF16 || problem.recipe == GemmRecipe::kFP16 || problem.recipe == GemmRecipe::kFP32;
   const bool mma16 = problem.recipe == GemmRecipe::kBF16 || problem.recipe == GemmRecipe::kFP16;
   if (mma16 && (problem.m > 16 || problem.batch > 1 || (tactic != nullptr && tactic->mainloop == MainloopSchedule::kMultistageMmaSync))) {

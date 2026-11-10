@@ -240,6 +240,108 @@ def make_op(case: dict, device: torch.device):
     rows = int(case["rows"])
     cols = int(case["cols"])
 
+    if op == "mla_decode":
+        import re
+        m = re.search(r"kv(\d+)(k|m)?", case["id"])
+        if m:
+            kv = int(m.group(1))
+            if m.group(2) == "k":
+                kv *= 1024
+            elif m.group(2) == "m":
+                kv *= 1024 * 1024
+        else:
+            kv = 4096
+        qlen = 4 if case["id"].endswith(".q4") or ".q4." in case["id"] else 1
+        h = 128
+        base_dt = torch.bfloat16 if dt in (torch.float8_e4m3fn, torch.float8_e5m2) else dt
+        q = torch.randn(qlen, h, 576, device=device, dtype=base_dt).to(dt)
+        latent = torch.randn(kv, 576, device=device, dtype=base_dt).to(dt)
+        work_dt = torch.bfloat16 if dt in (torch.float8_e4m3fn, torch.float8_e5m2) else dt
+
+        def run_mla():
+            s = torch.matmul(q.to(work_dt), latent.to(work_dt).t()) * (576 ** -0.5)
+            p = torch.softmax(s.float(), dim=-1).to(work_dt)
+            return torch.matmul(p, latent[:, :512].to(work_dt))
+
+        return run_mla
+
+    if op == "lightning_indexer":
+        h, d = 64, 128
+        base_dt = torch.bfloat16 if dt in (torch.float8_e4m3fn, torch.float8_e5m2) else dt
+        q = torch.randn(rows, h, d, device=device, dtype=base_dt).to(dt)
+        k = torch.randn(cols, d, device=device, dtype=base_dt).to(dt)
+        w = torch.rand(rows, h, device=device, dtype=torch.float32)
+
+        def run_indexer():
+            dots = torch.einsum("thd,sd->ths", q.float(), k.float())
+            return (torch.relu(dots) * w[:, :, None]).sum(dim=1)
+
+        return run_indexer
+
+    if op == "sparse_mla":
+        h = 128
+        base_dt = torch.bfloat16 if dt in (torch.float8_e4m3fn, torch.float8_e5m2) else dt
+        q = torch.randn(h, 576, device=device, dtype=base_dt).to(dt)
+        kv = torch.randn(cols, 576, device=device, dtype=base_dt).to(dt)
+
+        def run_sparse_mla():
+            s = torch.matmul(q.float(), kv.float().t()) * (576 ** -0.5)
+            p = torch.softmax(s, dim=-1).to(dt)
+            return torch.matmul(p, kv[:, :512])
+
+        return run_sparse_mla
+
+    if op == "sparse_topk":
+        scores = torch.randn(rows, cols, device=device, dtype=torch.float32)
+        topk = 512 if "topk512" in case["id"] else 2048
+        return lambda: torch.topk(scores, topk, dim=-1)
+
+    if op in ("hc_chain", "mega_mhc"):
+        n = 4
+        x = torch.randn(rows, cols, device=device, dtype=torch.float32)
+        residual = torch.randn(rows, n, cols, device=device, dtype=torch.float32)
+        post = torch.sigmoid(torch.randn(rows, n, 1, device=device))
+        comb = torch.rand(rows, n, n, device=device).softmax(-1)
+        fn = torch.randn(n * (n + 2), n * cols, device=device) * 0.01
+        scales = torch.randn(3, device=device) * 0.1
+        bases = torch.randn(n * (n + 2), device=device) * 0.1
+        rms = (torch.randn(cols, device=device) * 0.1 + 1.0).to(torch.bfloat16)
+
+        def run_hc():
+            new_res = (x.unsqueeze(1) * post).float()
+            new_res = new_res + torch.einsum("tij,tih->tjh", comb, residual)
+            mixes = new_res.flatten(1) @ fn.t()
+            mixes = mixes * torch.rsqrt(new_res.square().mean((1, 2), keepdim=False).unsqueeze(1) + 2e-5)
+            sc = torch.cat((scales[0].expand(n), scales[1].expand(n), scales[2].expand(n * n)))
+            mixes = mixes * sc + bases
+            pre = torch.sigmoid(mixes[:, :n]) + 3e-4
+            y = (new_res * pre.unsqueeze(-1)).sum(1)
+            y = y * torch.rsqrt(y.square().mean(1, keepdim=True) + 7e-6) * rms.float()
+            return y.to(torch.bfloat16)
+
+        return run_hc
+
+    if op == "attn_res":
+        import re
+        m = re.search(r"\.s(\d+)", case["id"])
+        s = int(m.group(1)) if m else 8
+        q = torch.randn(cols, device=device, dtype=torch.float32)
+        rms = (torch.randn(cols, device=device) * 0.1 + 1.0).to(torch.bfloat16)
+        sources = torch.randn(s, rows, cols, device=device, dtype=torch.bfloat16)
+        partial = torch.randn(rows, cols, device=device, dtype=torch.bfloat16)
+        with_norm = case["id"].endswith(".norm")
+
+        def run_ar():
+            vals = torch.cat((sources, partial.unsqueeze(0)), dim=0).float()
+            logits = (vals * q).sum(-1) / vals.square().mean(-1).add(1e-6).sqrt()
+            alpha = logits.softmax(0)
+            h = (vals * alpha.unsqueeze(-1)).sum(0)
+            if with_norm:
+                h = h * torch.rsqrt(h.square().mean(-1, keepdim=True) + 1e-6) * rms.float()
+            return h.to(torch.bfloat16)
+
+        return run_ar
+
     if op == "norm_quant":
         x = torch.randn(rows, cols, device=device, dtype=dt)
         res = torch.randn(rows, cols, device=device, dtype=dt)
@@ -1378,6 +1480,45 @@ def make_b6_op(case: dict, device: torch.device):
             return hidden[flat // k]
 
         return run
+
+    if op in ("sample_mode", "sample_fused"):
+        # Eager multi-op path for the sampling matrix: greedy / temperature-1 /
+        # top-k / top-p / min-p. `sample_mode` times the kops unfused path,
+        # `sample_fused` the one-launch kernel; both are compared with the same
+        # eager chain a model implementation runs.
+        mode = case["id"].split(".")[2]
+        x = torch.randn(T, cols, device=device, dtype=DTYPES[case["dtype"]])
+
+        def run_sample_mode():
+            if mode == "greedy":
+                return torch.argmax(x, dim=-1)
+            probs = torch.softmax(x.float(), dim=-1)
+            if mode == "t1":
+                return torch.multinomial(probs, 1)
+            if mode.startswith("minp"):
+                floor = float(mode[4:])
+                keep = probs >= floor * probs.max(dim=-1, keepdim=True).values
+                m = probs * keep
+            else:
+                kk = 50 if mode.startswith("k") else 0
+                pp = 0.0
+                if mode.startswith("k") and "p" in mode:
+                    pp = float(mode.split("p", 1)[1])
+                elif mode.startswith("p"):
+                    pp = float(mode[1:])
+                m = probs
+                if kk:
+                    w, ids = torch.topk(m, kk, dim=-1)
+                    m = torch.zeros_like(m).scatter_(1, ids, w)
+                if pp and pp < 1.0:
+                    m = m / m.sum(-1, keepdim=True)
+                    sp, si = torch.sort(m, dim=-1, descending=True)
+                    cs = torch.cumsum(sp, dim=-1)
+                    keep = (cs <= pp) | (cs - sp < pp)
+                    m = torch.zeros_like(m).scatter_(1, si, sp * keep)
+            return torch.multinomial(m / m.sum(-1, keepdim=True), 1)
+
+        return run_sample_mode
 
     if op == "sample":
         kk = 20 if "k20" in case["id"] else 50

@@ -20,6 +20,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -1547,6 +1548,415 @@ void test_ds_mla(LaunchContext& ctx) {
   }
 }
 
+// -----------------------------------------------------------------------------
+// B14: DeepSeek-V4 MLA records — V4.0 584 B, V4.1 528 B, V4.1 FP4 288 B
+// -----------------------------------------------------------------------------
+
+/// UE8M0 byte of 2^ceil(log2(max(amax / 448, 1e-4))), the FlashMLA scale recipe.
+uint8_t ue8m0_byte(float amax) {
+  float x = amax / 448.0f;
+  if (x < 1e-4f) x = 1e-4f;  // false for NaN, so a NaN tile keeps its NaN scale
+  if (!std::isfinite(x)) return 0xffu;
+  int e = 0;
+  std::frexp(x, &e);
+  e -= 1;
+  if (std::ldexp(1.0f, e) < x) ++e;
+  e = e < -127 ? -127 : (e > 127 ? 127 : e);
+  return static_cast<uint8_t>(e + 127);
+}
+
+float ue8m0_value(uint8_t b) { return std::ldexp(1.0f, static_cast<int>(b) - 127); }
+
+/// e2m1 code as tests/quant.py _quantize_to_e2m1: nearest, ties to the even code, saturate at 6.
+uint8_t e2m1_code(float x) {
+  static const float kMags[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const uint8_t sign = std::signbit(x) ? 8u : 0u;
+  if (std::isnan(x)) return sign;
+  float a = std::fabs(x);
+  if (std::isinf(a)) a = 6.0f;
+  a = std::min(a, 6.0f);
+  int code = 0;
+  float best = 1e30f;
+  for (int c = 0; c < 8; ++c) {
+    const float d = std::fabs(a - kMags[c]);
+    if (d < best || (d == best && (c & 1) == 0)) {  // a tie keeps the even code
+      best = d;
+      code = c;
+    }
+  }
+  return static_cast<uint8_t>(sign | code);
+}
+
+float e2m1_value(uint8_t c) {
+  static const float kMags[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
+  const float v = kMags[c & 7u];
+  return (c & 8u) ? -v : v;
+}
+
+struct MlaV4Spec {
+  KVCodec codec;
+  int entry_bytes;   // bytes per token physically written
+  int data_bytes;    // quantized payload before the inline scales
+  int tiles;
+  int tile;
+  bool fp4;
+  bool inline_scales;
+  int out_cols;      // logical bf16 columns produced by the upconvert
+};
+
+int64_t v4_page_bytes(const MlaV4Spec& s, int ps) {
+  if (s.codec == KVCodec::kMLAFp8DSV40) {
+    return ((static_cast<int64_t>(ps) * 584 + 575) / 576) * 576;  // FlashMLA 576 B page pad
+  }
+  return static_cast<int64_t>(ps) * s.entry_bytes;
+}
+
+PagedKVDesc make_v4_desc(const MlaV4Spec& s, void* cache, void* scales, int ps) {
+  PagedKVDesc d{};
+  d.k_data = cache;
+  d.k_dtype = s.fp4 ? DType::kFloat4E2M1x2 : DType::kFloat8E4M3;
+  d.k_codec = s.codec;
+  d.v_codec = KVCodec::kNative;
+  d.layout = KVLayout::kLatent;
+  d.page_size = ps;
+  d.num_kv_heads = 1;
+  d.head_dim_k = 512;
+  d.head_dim_v = 512;
+  d.entry_bytes = s.entry_bytes;
+  d.stride_unit = kops::StrideUnit::kByte;
+  d.k_stride_page = v4_page_bytes(s, ps);
+  d.k_stride_token = s.entry_bytes;
+  d.k_stride_head = s.entry_bytes;
+  d.table_format = PageTableFormat::kSlotMapping;
+  if (!s.inline_scales) {
+    d.k_scale_pages = scales;
+    d.k_scale_stride_page = static_cast<int64_t>(ps) * 8;
+    d.k_scale_stride_token = 8;
+    d.scale_bytes_per_token = 8;
+  }
+  return d;
+}
+
+void test_ds_mla_v4(LaunchContext& ctx) {
+  constexpr int kRank = 448, kPe = 64, kT = 5;
+  const MlaV4Spec specs[3] = {
+      {KVCodec::kMLAFp8DSV40, 576, 576, 7, 64, false, false, 512},
+      {KVCodec::kMLAFp8DSV41, 528, 512, 16, 32, false, true, 512},
+      {KVCodec::kMLAFp8DSV41Fp4, 288, 256, 32, 16, true, true, 512},
+  };
+  for (int v = 0; v < 3; ++v) {
+    const MlaV4Spec& sp = specs[v];
+    for (int ps : {16, 64}) {
+      const int pages = 3;
+      const int64_t page_bytes = v4_page_bytes(sp, ps);
+      const int64_t scale_page_bytes = sp.inline_scales ? 0 : static_cast<int64_t>(ps) * 8;
+      DevBuf<uint8_t> cache(static_cast<size_t>(pages * page_bytes));
+      DevBuf<uint8_t> scales(static_cast<size_t>(sp.inline_scales ? 1 : pages * scale_page_bytes));
+      DevBuf<__nv_bfloat16> kv_c(static_cast<size_t>(kT) * kRank);
+      DevBuf<__nv_bfloat16> k_pe(static_cast<size_t>(kT) * kPe);
+      DevBuf<int64_t> slots(kT);
+      if (!cache.ok() || !scales.ok() || !kv_c.ok() || !k_pe.ok() || !slots.ok()) return;
+      std::vector<float> cf(static_cast<size_t>(kT) * kRank);
+      std::vector<float> pf(static_cast<size_t>(kT) * kPe);
+      fill_uniform(cf, 810 + v, -3.0f, 3.0f);
+      fill_uniform(pf, 820 + v, -1.5f, 1.5f);
+      // An all-zero 64-value block exercises the 1e-4 floor (FP8 -> 2^-13, FP4 -> 2^-9 clamp);
+      // it lands on a tile boundary for every V4 record width.
+      for (int j = 0; j < 64; ++j) cf[static_cast<size_t>(2 * kRank + 128 + j)] = 0.0f;
+      if (sp.fp4) {
+        // Token 0 tile 0: exact e2m1 midpoints (ties must round to the even code).
+        static const float kTies[16] = {0.25f, 0.75f, 1.25f, 1.75f, 2.5f,  3.5f,  5.0f,  6.0f,
+                                       -0.25f, -0.75f, -1.25f, -1.75f, -2.5f, -3.5f, -5.0f, -6.0f};
+        for (int j = 0; j < 16; ++j) cf[static_cast<size_t>(j)] = kTies[j];
+        // Token 1 tile 1: NaN / Inf poison the whole tile.
+        cf[static_cast<size_t>(kRank + 16)] = std::numeric_limits<float>::quiet_NaN();
+        cf[static_cast<size_t>(kRank + 17)] = std::numeric_limits<float>::infinity();
+        // Token 3 tile 3: above the e4m3 scale range -> clamp to 448.
+        for (int j = 0; j < 16; ++j) cf[static_cast<size_t>(3 * kRank + 48 + j)] = 3000.0f;
+      }
+      const std::vector<__nv_bfloat16> ch = cast_from_float<__nv_bfloat16>(cf);
+      const std::vector<__nv_bfloat16> ph = cast_from_float<__nv_bfloat16>(pf);
+      kops_test::copy_in(kv_c.p, ch);
+      kops_test::copy_in(k_pe.p, ph);
+      std::vector<int64_t> sh(kT);
+      for (int t = 0; t < kT; ++t) sh[static_cast<size_t>(t)] = ps + t;
+      kops_test::copy_in(slots.p, sh);
+      cudaMemset(cache.p, 0xCD, static_cast<size_t>(pages * page_bytes));
+      if (!sp.inline_scales) {
+        cudaMemset(scales.p, 0xCD, static_cast<size_t>(pages * scale_page_bytes));
+      }
+      const PagedKVDesc d = make_v4_desc(sp, cache.p, scales.p, ps);
+      const Tensor tc = tensor2d(kv_c.p, kBf16, kT, kRank);
+      const Tensor tp = tensor2d(k_pe.p, kBf16, kT, kPe);
+      const Tensor ts = tensor1d(slots.p, DType::kInt64, kT);
+      KOPS_EXPECT_OK(kops::kv::concat_and_cache_mla(tc, tp, d, ts, ctx), "v4 mla write");
+      const auto rec = kops_test::copy_out(cache.p, static_cast<size_t>(pages * page_bytes));
+      const auto srec =
+          kops_test::copy_out(scales.p, static_cast<size_t>(sp.inline_scales ? 1 : pages * scale_page_bytes));
+
+      auto val = [&](int t, int dim) {
+        return kops_test::to_float(ch[static_cast<size_t>(t * kRank + dim)]);
+      };
+      // Expected bytes / scales, then byte-exact comparison of every written record.
+      for (int t = 0; t < kT; ++t) {
+        const int64_t page = sh[static_cast<size_t>(t)] / ps;
+        const int64_t off = sh[static_cast<size_t>(t)] % ps;
+        const uint8_t* row = &rec[static_cast<size_t>(page * page_bytes + off * sp.entry_bytes)];
+        const uint8_t* srow = sp.inline_scales
+                                  ? row + sp.data_bytes
+                                  : &srec[static_cast<size_t>(page * scale_page_bytes + off * 8)];
+        for (int tile = 0; tile < sp.tiles; ++tile) {
+          float amax = 0.0f;
+          bool nan_seen = false, inf_seen = false;
+          for (int j = 0; j < sp.tile; ++j) {
+            const int dim = tile * sp.tile + j;
+            float x;
+            if (dim < kRank) {
+              x = val(t, dim);
+            } else {
+              x = kops_test::to_float(ph[static_cast<size_t>(t * kPe + dim - kRank)]);
+            }
+            const float a = std::fabs(x);
+            if (std::isnan(a)) nan_seen = true;
+            if (std::isinf(a)) inf_seen = true;
+            amax = std::max(amax, std::isnan(a) ? 0.0f : a);
+          }
+          if (sp.fp4) {
+            const bool bad = nan_seen || inf_seen;
+            const float sval = bad ? std::numeric_limits<float>::quiet_NaN()
+                                   : q8_value(q8_byte(std::min(std::max(amax / 6.0f, 0x1p-9f), 448.0f)));
+            if (bad) {
+              KOPS_TEST_CHECK(srow[tile] == 0x7f);
+            } else {
+              KOPS_TEST_CHECK(srow[tile] == q8_byte(std::min(std::max(amax / 6.0f, 0x1p-9f), 448.0f)));
+            }
+            for (int j = 0; j < sp.tile; ++j) {
+              const int dim = tile * sp.tile + j;
+              const float x = dim < kRank
+                                  ? val(t, dim)
+                                  : kops_test::to_float(ph[static_cast<size_t>(t * kPe + dim - kRank)]);
+              const uint8_t want = e2m1_code(x / sval);
+              const uint8_t got = row[dim / 2];
+              const uint8_t got_code = (dim & 1) ? static_cast<uint8_t>(got >> 4)
+                                                 : static_cast<uint8_t>(got & 0x0f);
+              if (bad) {
+                KOPS_TEST_CHECK((got_code & 7u) == 0u);
+              } else {
+                KOPS_TEST_CHECK(got_code == want);
+              }
+            }
+          } else {
+            const uint8_t want_scale = ue8m0_byte(amax);
+            const float sval = nan_seen ? std::numeric_limits<float>::quiet_NaN()
+                                        : (inf_seen ? std::numeric_limits<float>::infinity()
+                                                    : ue8m0_value(want_scale));
+            KOPS_TEST_CHECK(srow[tile] == want_scale);
+            for (int j = 0; j < sp.tile; ++j) {
+              const int dim = tile * sp.tile + j;
+              const float x = dim < kRank
+                                  ? val(t, dim)
+                                  : kops_test::to_float(ph[static_cast<size_t>(t * kPe + dim - kRank)]);
+              KOPS_TEST_CHECK(row[dim] == q8_byte(x / sval));
+            }
+          }
+        }
+        if (sp.codec == KVCodec::kMLAFp8DSV40) {
+          for (int j = 0; j < kPe; ++j) {
+            KOPS_TEST_CHECK(*reinterpret_cast<const uint16_t*>(row + 448 + 2 * j) ==
+                            *reinterpret_cast<const uint16_t*>(
+                                &ph[static_cast<size_t>(t * kPe + j)]));
+          }
+        }
+        if (!sp.inline_scales) {
+          KOPS_TEST_CHECK(srow[7] == 0u);  // the pad byte of the 8 B scale record
+        }
+      }
+      // Untouched regions: the slot after the written tokens and the 576-byte page tail.
+      {
+        const int64_t page = (ps + kT) / ps;
+        const int64_t off = (ps + kT) % ps;
+        if (page < pages) {
+          const uint8_t* row = &rec[static_cast<size_t>(page * page_bytes + off * sp.entry_bytes)];
+          KOPS_TEST_CHECK(row[0] == 0xCD);
+        }
+        const int64_t used = static_cast<int64_t>(ps) * (sp.entry_bytes + (sp.inline_scales ? 0 : 8));
+        for (int64_t i = used; i < page_bytes; ++i) {
+          KOPS_TEST_CHECK(rec[static_cast<size_t>(page_bytes + i)] == 0xCD);
+        }
+      }
+      // Physical bytes: the formula, 16-byte alignment, and the stride override.
+      KOPS_TEST_CHECK(kops::kv::kv_physical_bytes(d, 2) == 2 * page_bytes);
+      KOPS_TEST_CHECK((kops::kv::kv_physical_bytes(d, 3) % 16) == 0);
+      {
+        PagedKVDesc dense = d;
+        dense.k_stride_page = 0;
+        KOPS_TEST_CHECK(kops::kv::kv_physical_bytes(dense, 2) == 2 * page_bytes);
+      }
+      // Gather back to bf16 through the block table (tokens live in physical page 1).
+      {
+        DevBuf<__nv_bfloat16> dst(static_cast<size_t>(kT) * sp.out_cols);
+        DevBuf<int32_t> table(2), cu(2);
+        if (!dst.ok() || !table.ok() || !cu.ok()) return;
+        kops_test::copy_in(table.p, std::vector<int32_t>{1, 0});
+        kops_test::copy_in(cu.p, std::vector<int32_t>{0, kT});
+        kops::kv::GatherSpec spec{};
+        spec.block_table = table.p;
+        spec.block_table_stride = 2;
+        spec.cu_seq_lens = cu.p;
+        spec.num_reqs = 1;
+        spec.num_tokens = kT;
+        const Tensor td = tensor2d(dst.p, kBf16, kT, sp.out_cols);
+        KOPS_EXPECT_OK(kops::kv::cp_gather_and_upconvert_ds_mla(td, d, spec, Tensor{}, Tensor{},
+                                                               Tensor{}, ctx),
+                       "v4 mla gather");
+        const auto got = kops_test::copy_out(dst.p, static_cast<size_t>(kT) * sp.out_cols);
+        for (int t = 0; t < kT; ++t) {
+          const int64_t page = sh[static_cast<size_t>(t)] / ps;
+          const int64_t off = sh[static_cast<size_t>(t)] % ps;
+          const uint8_t* row = &rec[static_cast<size_t>(page * page_bytes + off * sp.entry_bytes)];
+          const uint8_t* srow = sp.inline_scales
+                                    ? row + sp.data_bytes
+                                    : &srec[static_cast<size_t>(page * scale_page_bytes + off * 8)];
+          const int dequant_dims = sp.codec == KVCodec::kMLAFp8DSV40 ? 448 : 512;
+          for (int dim = 0; dim < dequant_dims; ++dim) {
+            float want;
+            if (sp.fp4) {
+              const uint8_t by = row[dim / 2];
+              const uint8_t code = (dim & 1) ? static_cast<uint8_t>(by >> 4)
+                                             : static_cast<uint8_t>(by & 0x0f);
+              want = e2m1_value(code) * q8_value(srow[dim / sp.tile]);
+            } else {
+              const float sval = ue8m0_value(srow[dim / sp.tile]);
+              want = q8_value(row[dim]) * sval;
+            }
+            const __nv_bfloat16 expected = __float2bfloat16_rn(want);
+            const __nv_bfloat16 g = got[static_cast<size_t>(t * sp.out_cols + dim)];
+            if (!std::isfinite(want)) {
+              KOPS_TEST_CHECK(!std::isfinite(kops_test::to_float(g)));
+            } else {
+              KOPS_TEST_CHECK(*reinterpret_cast<const uint16_t*>(&g) ==
+                              *reinterpret_cast<const uint16_t*>(&expected));
+            }
+          }
+          if (sp.codec == KVCodec::kMLAFp8DSV40) {
+            for (int j = 0; j < kPe; ++j) {
+              const __nv_bfloat16 g = got[static_cast<size_t>(t * sp.out_cols + 448 + j)];
+              KOPS_TEST_CHECK(*reinterpret_cast<const uint16_t*>(&g) ==
+                              *reinterpret_cast<const uint16_t*>(
+                                  &ph[static_cast<size_t>(t * kPe + j)]));
+            }
+          }
+          if (sp.out_cols == 576) {
+            for (int dim = 512; dim < 576; ++dim) {
+              const __nv_bfloat16 g = got[static_cast<size_t>(t * 576 + dim)];
+              KOPS_TEST_CHECK(kops_test::to_float(g) == 0.0f);
+            }
+          }
+        }
+        // A 576-wide destination for V4.1 zeroes the columns the record does not carry.
+        if (sp.out_cols == 512) {
+          DevBuf<__nv_bfloat16> wide(static_cast<size_t>(kT) * 576);
+          if (!wide.ok()) return;
+          const Tensor tw = tensor2d(wide.p, kBf16, kT, 576);
+          KOPS_EXPECT_OK(kops::kv::cp_gather_and_upconvert_ds_mla(tw, d, spec, Tensor{}, Tensor{},
+                                                                 Tensor{}, ctx),
+                         "v4 mla wide gather");
+          const auto wgot = kops_test::copy_out(wide.p, static_cast<size_t>(kT) * 576);
+          for (int t = 0; t < kT; ++t) {
+            for (int dim = 512; dim < 576; ++dim) {
+              KOPS_TEST_CHECK(kops_test::to_float(wgot[static_cast<size_t>(t * 576 + dim)]) == 0.0f);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void test_ds_mla_v4_contracts(LaunchContext& ctx) {
+  constexpr int kPage = 16;
+  DevBuf<uint8_t> cache(static_cast<size_t>(kPage) * 576);
+  DevBuf<uint8_t> scales(static_cast<size_t>(kPage) * 8);
+  if (!cache.ok() || !scales.ok()) return;
+  const MlaV4Spec v40{KVCodec::kMLAFp8DSV40, 576, 576, 7, 64, false, false, 576};
+  const MlaV4Spec v41{KVCodec::kMLAFp8DSV41, 528, 512, 16, 32, false, true, 512};
+  const MlaV4Spec fp4{KVCodec::kMLAFp8DSV41Fp4, 288, 256, 32, 16, true, true, 512};
+  const PagedKVDesc good40 = make_v4_desc(v40, cache.p, scales.p, kPage);
+  const PagedKVDesc good41 = make_v4_desc(v41, cache.p, nullptr, kPage);
+  const PagedKVDesc goodfp4 = make_v4_desc(fp4, cache.p, nullptr, kPage);
+  KOPS_EXPECT_OK(kops::kv::kv_desc_validate(good40), "v40 desc");
+  KOPS_EXPECT_OK(kops::kv::kv_desc_validate(good41), "v41 desc");
+  KOPS_EXPECT_OK(kops::kv::kv_desc_validate(goodfp4), "fp4 desc");
+  {
+    PagedKVDesc view = goodfp4;  // FlashMLA exposes the 288 B record as an e4m3 tensor
+    view.k_dtype = DType::kFloat8E4M3;
+    KOPS_EXPECT_OK(kops::kv::kv_desc_validate(view), "fp4 e4m3 record view");
+  }
+
+  PagedKVDesc bad = good40;
+  bad.entry_bytes = 584;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedShape, "v40 record");
+  bad = good40;
+  bad.k_scale_pages = nullptr;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kInvalidArgument, "v40 scales");
+  bad = good40;
+  bad.scale_bytes_per_token = 0;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kInvalidArgument, "v40 scale width");
+  bad = good40;
+  bad.k_dtype = kBf16;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedDtype, "v40 dtype");
+  bad = good40;
+  bad.head_dim_k = 576;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedShape, "v40 head dim");
+  bad = good40;
+  bad.layout = KVLayout::kNHD;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedLayout, "v40 layout");
+  bad = good40;
+  bad.v_codec = KVCodec::kFP8PerTensor;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedDtype, "v40 v codec");
+  bad = good40;
+  bad.num_kv_heads = 2;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedShape, "v40 heads");
+
+  bad = good41;
+  bad.entry_bytes = 512;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedShape, "v41 record");
+  bad = good41;
+  bad.k_scale_pages = scales.p;
+  bad.scale_bytes_per_token = 8;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kInvalidArgument, "v41 inline");
+  bad = good41;
+  bad.k_stride_token = 512;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kInvalidArgument, "v41 stride");
+
+  bad = goodfp4;
+  bad.k_dtype = DType::kUInt8;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedDtype, "fp4 dtype");
+  bad = goodfp4;
+  bad.entry_bytes = 528;
+  KOPS_EXPECT_STATUS(kops::kv::kv_desc_validate(bad), Status::kUnsupportedShape, "fp4 record");
+
+  DevBuf<__nv_bfloat16> kv_c(static_cast<size_t>(kPage) * 448);
+  DevBuf<int64_t> slots(kPage);
+  if (!kv_c.ok() || !slots.ok()) return;
+  kops_test::copy_in(slots.p, std::vector<int64_t>(kPage, 0));
+  const Tensor tbad = tensor2d(kv_c.p, kBf16, kPage, 512);
+  const Tensor ts = tensor1d(slots.p, DType::kInt64, kPage);
+  KOPS_EXPECT_STATUS(kops::kv::concat_and_cache_mla(tbad, Tensor{}, good41, ts, ctx),
+                     Status::kUnsupportedShape, "v41 kv_c width");
+
+  // Page geometry is fixed by the format for every page size and is always 16-byte aligned.
+  for (int ps : {1, 2, 4, 8, 16, 64}) {
+    for (const MlaV4Spec& sp : {v40, v41, fp4}) {
+      const PagedKVDesc d = make_v4_desc(sp, cache.p, scales.p, ps);
+      const int64_t page = v4_page_bytes(sp, ps);
+      KOPS_TEST_CHECK(kops::kv::kv_physical_bytes(d, 1) == page);
+      KOPS_TEST_CHECK((kops::kv::kv_physical_bytes(d, 5) % 16) == 0);
+      KOPS_TEST_CHECK((kops::kv::kv_physical_bytes(d, 5) == 5 * page));
+    }
+  }
+}
+
 void test_indexer_cache(LaunchContext& ctx) {
   constexpr int kPages = 4, kPage = 2, kT = 3, kD = 128, kQb = 128;
   const int groups = kD / kQb;
@@ -1923,6 +2333,8 @@ int main() {
   test_graph_replay(ctx);
   test_per_token_head_codecs(ctx);
   test_ds_mla(ctx);
+  test_ds_mla_v4(ctx);
+  test_ds_mla_v4_contracts(ctx);
   test_indexer_cache(ctx);
   test_requantize_and_scale(ctx);
   test_fused_qkv_append(ctx);

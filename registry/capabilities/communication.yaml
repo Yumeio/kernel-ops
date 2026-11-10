@@ -1,0 +1,104 @@
+{
+ "family": "communication",
+ "rows": [
+  {
+   "op_id": "C01.peer_barrier",
+   "kernel_symbol": "peer_barrier_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "intra-node NVLink/peer/IPC or pinned host staging; world in {1,2,4,8}; epoch on device; graph replay",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C01.allreduce",
+   "kernel_symbol": "allreduce_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16/fp32; world in {1,2,4,8}; one-shot/two-shot/deterministic; fp32 ascending-rank sum; graph replay",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C01.allgather",
+   "kernel_symbol": "allgather_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16/fp32; world in {1,2,4,8}; per-rank numel multiple of 16 B; graph replay",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C01.reduce_scatter",
+   "kernel_symbol": "reduce_scatter_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16/fp32; world in {1,2,4,8}; in = world * out; fp32 ascending-rank sum; graph replay",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C01.allreduce_fusion",
+   "kernel_symbol": "allreduce_fusion_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16/fp32; residual + RMSNorm; optional dynamic per-token OCP e4m3; world in {1,2,4,8}",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C02.ep_dispatch_layout",
+   "kernel_symbol": "ep_dispatch_layout_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "topk_idx int32 [T,K]; num_experts divisible by num_ranks; -1 dropped; counts + rank bitmap",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C02.ep_dispatch",
+   "kernel_symbol": "ep_dispatch_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16/fp32; NVLink peer transport; normal compact layout and low-latency masked layout; epoch-tagged records",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C02.ep_combine",
+   "kernel_symbol": "ep_combine_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16/fp32; normal and low-latency masked layout; fixed source-rank reduction order; optional residual",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C01.allgather_gemm",
+   "kernel_symbol": "allgather_gemm_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16; mma.sync m16n8k16; A sharded on M; output [M_total, N]; chunked epoch flags",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C01.gemm_reduce_scatter",
+   "kernel_symbol": "gemm_reduce_scatter_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16; mma.sync m16n8k16; fp32 partials; owner-rank M slice; chunked epoch flags",
+   "evidence": "test_communication;bench_communication"
+  },
+  {
+   "op_id": "C01.gemm_allreduce",
+   "kernel_symbol": "gemm_allreduce_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "bf16/fp16; mma.sync m16n8k16; fp32 partials; optional residual + RMSNorm; chunked epoch flags",
+   "evidence": "test_communication;bench_communication"
+  }
+ ]
+}

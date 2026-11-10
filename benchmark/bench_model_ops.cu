@@ -47,6 +47,33 @@ std::vector<Case> make_cases() {
            kops::DType::kFloat32, 1024, 4096);
   add_cast("model_ops.cast.bf16_to_fp32.t4096.h8192", kops::DType::kBFloat16,
            kops::DType::kFloat32, 4096, 8192);
+
+  // AttnRes (Kimi K3 shape). Roofline bytes: every source byte is read from
+  // DRAM once (the stats pass and the mix pass touch one row's sources
+  // back-to-back, so the second read hits L2), plus the fused partial += delta
+  // update, the raw output, and (with the fused output norm) the normed row and
+  // the MXFP8 payload with its UE8M0 scales.
+  auto add_attn_res = [&](const char* id, int64_t tokens, int64_t d, int sources, bool norm) {
+    constexpr int es = 2;   // bf16
+    const int depth = sources + 1;  // the partial is always a source here
+    int64_t bytes = depth * tokens * d * es;       // sources
+    bytes += 2 * tokens * d * es;                  // delta read + partial write
+    bytes += tokens * d * es;                      // raw output
+    if (norm) bytes += tokens * d * es + tokens * d + tokens * d / 8;
+    const int64_t flops = 4 * depth * tokens * d;  // sq, dot, mix, one rounding
+    cases.push_back({id, "attn_res", kops::DType::kBFloat16, tokens, d, bytes, flops, 20, 200});
+  };
+  for (const int64_t tokens : {int64_t{1}, int64_t{16}, int64_t{256}}) {
+    for (const int sources : {1, 4, 8}) {
+      char id[128];
+      std::snprintf(id, sizeof(id), "model_ops.attn_res.bf16.t%lld.h7168.s%d",
+                    static_cast<long long>(tokens), sources);
+      add_attn_res(id, tokens, 7168, sources, false);
+      std::snprintf(id, sizeof(id), "model_ops.attn_res.bf16.t%lld.h7168.s%d.norm",
+                    static_cast<long long>(tokens), sources);
+      add_attn_res(id, tokens, 7168, sources, true);
+    }
+  }
   return cases;
 }
 
@@ -99,6 +126,104 @@ bool run_cast(const Case& c, kops::DType in_dt, kops::DType out_dt, const kops::
   return ok;
 }
 
+/// Digits following `.<key>` in a case id, or `fallback`.
+int id_int(const Case& c, const char* key, int fallback) {
+  const std::string marker = std::string(".") + key;
+  size_t i = c.id.find(marker);
+  if (i == std::string::npos) return fallback;
+  i += marker.size();
+  int value = 0;
+  bool any = false;
+  while (i < c.id.size() && c.id[i] >= '0' && c.id[i] <= '9') {
+    value = value * 10 + (c.id[i] - '0');
+    ++i;
+    any = true;
+  }
+  return any ? value : fallback;
+}
+
+/// AttnRes benchmark: `sources` completed block residuals plus the running
+/// partial (always a source, as in K3), fused delta update, cached fp32 inverse
+/// RMS, and the optional fused output norm / MXFP8 epilogue.
+template <typename T>
+bool run_attn_res(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const int sources = id_int(c, "s", 1);
+  const bool norm = c.id.find(".norm") != std::string::npos;
+  const int64_t tokens = c.rows, d = c.cols;
+  if (sources < 1 || tokens < 1 || d < 1) return false;
+  T *src = nullptr, *partial = nullptr, *delta = nullptr, *out = nullptr, *normed = nullptr;
+  T *query = nullptr, *knw = nullptr, *onw = nullptr;
+  float* rinv = nullptr;
+  const size_t row = static_cast<size_t>(d);
+  const size_t src_n = static_cast<size_t>(sources) * tokens * d;
+  auto alloc = [](void** p, size_t bytes) {
+    return cuda_ok(cudaMalloc(p, bytes), "cudaMalloc attn_res");
+  };
+  bool alloc_ok = alloc(reinterpret_cast<void**>(&src), src_n * sizeof(T)) &&
+                  alloc(reinterpret_cast<void**>(&partial), tokens * row * sizeof(T)) &&
+                  alloc(reinterpret_cast<void**>(&delta), tokens * row * sizeof(T)) &&
+                  alloc(reinterpret_cast<void**>(&out), tokens * row * sizeof(T)) &&
+                  alloc(reinterpret_cast<void**>(&query), row * sizeof(T)) &&
+                  alloc(reinterpret_cast<void**>(&knw), row * sizeof(T)) &&
+                  alloc(reinterpret_cast<void**>(&rinv), sources * tokens * sizeof(float));
+  if (alloc_ok && norm) {
+    alloc_ok = alloc(reinterpret_cast<void**>(&normed), tokens * row * sizeof(T)) &&
+               alloc(reinterpret_cast<void**>(&onw), row * sizeof(T));
+  }
+  if (!alloc_ok) {
+    std::fprintf(stderr, "[bench] %s: allocation failed\n", c.id.c_str());
+    return false;
+  }
+  cudaMemset(src, 0, src_n * sizeof(T));
+  cudaMemset(partial, 0, tokens * row * sizeof(T));
+  cudaMemset(delta, 0, tokens * row * sizeof(T));
+  cudaMemset(out, 0, tokens * row * sizeof(T));
+  cudaMemset(query, 0, row * sizeof(T));
+  cudaMemset(knw, 0, row * sizeof(T));
+  cudaMemset(rinv, 0, sources * tokens * sizeof(float));
+  if (norm) {
+    cudaMemset(normed, 0, tokens * row * sizeof(T));
+    cudaMemset(onw, 0, row * sizeof(T));
+  }
+  kops::model_ops::AttnResParams p{};
+  p.sources = src;
+  p.source_stride = tokens * d;
+  p.source_token_stride = d;
+  p.num_sources = sources;
+  p.source_rinv = rinv;
+  p.partial = partial;
+  p.partial_stride = d;
+  p.delta = delta;
+  p.delta_stride = d;
+  p.include_partial = true;
+  p.query = query;
+  p.key_norm_weight = knw;
+  p.key_eps = 1e-5f;
+  p.out = out;
+  p.out_stride = d;
+  if (norm) {
+    p.normed_out = normed;
+    p.out_norm_weight = onw;
+    p.out_norm_eps = 1e-5f;
+  }
+  p.num_tokens = static_cast<int32_t>(tokens);
+  p.d = static_cast<int32_t>(d);
+  bool ok = status_ok(kops::model_ops::attn_res(p, c.dtype, ctx), c.id.c_str());
+  if (ok) ok = measure(c, [&] { (void)kops::model_ops::attn_res(p, c.dtype, ctx); }, st);
+  cudaFree(src);
+  cudaFree(partial);
+  cudaFree(delta);
+  cudaFree(out);
+  if (norm) {
+    cudaFree(normed);
+    cudaFree(onw);
+  }
+  cudaFree(query);
+  cudaFree(knw);
+  cudaFree(rinv);
+  return ok;
+}
+
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   const bool three = c.id.find(".3.") != std::string::npos;
   if (c.op == "residual_add") {
@@ -113,6 +238,12 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
       return run_cast<float, __nv_bfloat16>(c, c.dtype, kops::DType::kBFloat16, ctx, st);
     if (c.id.find("fp16_to_fp32") != std::string::npos)
       return run_cast<__half, float>(c, c.dtype, kops::DType::kFloat32, ctx, st);
+  }
+  if (c.op == "attn_res") {
+    if (c.dtype == kops::DType::kBFloat16) return run_attn_res<__nv_bfloat16>(c, ctx, st);
+    if (c.dtype == kops::DType::kFloat32) return run_attn_res<float>(c, ctx, st);
+    if (c.dtype == kops::DType::kFloat16) return run_attn_res<__half>(c, ctx, st);
+    return false;
   }
   return false;
 }

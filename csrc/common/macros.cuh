@@ -47,7 +47,12 @@
 //     B7: gemm::MmaRowMap / MmaGemmParams, MarlinParams::a_tmp, and the gemm_mma_sync_kernel /
 //     gguf_moe_mmq_kernel parameter contracts; B8: runtime mask mode in the prefill parameter blocks.
 //     ABI 6 is not released yet, so these share the version instead of opening a v7 line.
-#define KOPS_ABI_VERSION 6
+// v7: B11/B14/B15 contract wave. KVCodec V4.0/V4.1/V4.1-FP4 records and the out-of-record
+//     per-token scale region in PagedKVDesc; SparseMLAScope (two KV ranges, per-query
+//     topk_length, fused V4.1 flags) in SparseMLAParams; MLADecodeParams output gate;
+//     IndexerParams and CompressedAttentionParams V4 fields; the DeepSeek-V4 mHC revision of
+//     HCParams plus HCStreamParams. No C mirror carries these structs.
+#define KOPS_ABI_VERSION 7
 
 // =============================================================================
 // Backend

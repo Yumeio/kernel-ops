@@ -6,7 +6,7 @@
  * ========================================================================== */
 #include "bindings/c_api/kops_c.h"
 
-_Static_assert(KOPS_C_ABI_VERSION == 6u, "C ABI version");
+_Static_assert(KOPS_C_ABI_VERSION == 7u, "C ABI version");
 _Static_assert(sizeof(kops_status_t) == 4, "kops_status_t is int32");
 _Static_assert(sizeof(kops_dtype_t) == 1, "kops_dtype_t is uint8");
 _Static_assert(sizeof(kops_tensor) == 168, "kops_tensor size (x86-64 / aarch64 LP64)");

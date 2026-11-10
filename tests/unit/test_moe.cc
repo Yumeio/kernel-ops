@@ -1854,6 +1854,368 @@ Result run(const kops::LaunchContext& ctx, const Case& cs, const Routing& R, con
   return res;
 }
 
+
+// ---- B17 experimental W2 experts -------------------------------------------------------------
+float w2_level_host(int code) {
+  const float l[4] = {-4.0f, -1.0f, 1.0f, 4.0f};
+  return l[code & 3];
+}
+int w2_code_host(float z) { return z < -2.5f ? 0 : (z < 0.0f ? 1 : (z < 2.5f ? 2 : 3)); }
+
+struct W2Pack {
+  std::vector<uint8_t> codes;
+  std::vector<float> scales;
+};
+
+W2Pack w2_pack_host(const std::vector<__nv_bfloat16>& w, int E, int N, int K, int group) {
+  W2Pack out;
+  out.codes.assign(static_cast<size_t>(E) * N * (K / 4), 0);
+  out.scales.assign(static_cast<size_t>(E) * N * (K / group), 0.0f);
+  const int ng = K / group;
+  for (int e = 0; e < E; ++e) {
+    for (int n = 0; n < N; ++n) {
+      for (int g = 0; g < ng; ++g) {
+        float amax = 0.0f;
+        float x[128];
+        for (int j = 0; j < group; ++j) {
+          x[j] = __bfloat162float(w[(static_cast<size_t>(e) * N + n) * K + g * group + j]);
+          amax = std::max(amax, std::fabs(x[j]));
+        }
+        const float scale = amax > 0.0f ? amax / 4.0f : 0.0f;
+        const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+        for (int j = 0; j < group; j += 4) {
+          uint8_t b = 0;
+          for (int t = 0; t < 4; ++t) {
+            const int c = scale > 0.0f ? w2_code_host(x[j + t] * inv) : 2;
+            b = static_cast<uint8_t>(b | (c << (2 * t)));
+          }
+          out.codes[(static_cast<size_t>(e) * N + n) * (K / 4) + g * (group / 4) + j / 4] = b;
+        }
+        out.scales[(static_cast<size_t>(e) * N + n) * ng + g] = scale;
+      }
+    }
+  }
+  return out;
+}
+
+void test_moe_w2_pack(const kops::LaunchContext& ctx) {
+  const int E = 2, N = 4, K = 64, G = 32;
+  Rng r(4242);
+  std::vector<__nv_bfloat16> w(static_cast<size_t>(E) * N * K);
+  for (auto& x : w) x = __float2bfloat16(r.uni(-1.5f, 1.5f));
+  const W2Pack ref = w2_pack_host(w, E, N, K, G);
+  Buf<__nv_bfloat16> dw(w);
+  Buf<uint8_t> dc(ref.codes.size());
+  Buf<float> ds(ref.scales.size());
+  cudaMemset(dc.p, 0x5A, dc.n);
+  cudaMemset(ds.p, 0, ds.n * 4);
+  Tensor tw = kops_test::tensor3d(dw.p, DType::kBFloat16, E, N, K);
+  Tensor tc = kops_test::tensor3d(dc.p, DType::kUInt8, E, N, K / 4);
+  Tensor ts = kops_test::tensor3d(ds.p, DType::kFloat32, E, N, K / G);
+  KOPS_EXPECT_OK(kops::experimental::moe_w2::pack(tc, ts, tw, kops::WeightPacking::kNone, G, ctx),
+                 "w2 pack bf16");
+  cudaDeviceSynchronize();
+  const auto got_c = dc.get();
+  const auto got_s = ds.get();
+  int bad = 0;
+  for (size_t i = 0; i < ref.codes.size(); ++i) bad += got_c[i] != ref.codes[i];
+  for (size_t i = 0; i < ref.scales.size(); ++i) bad += std::memcmp(&got_s[i], &ref.scales[i], 4) != 0;
+  if (bad != 0) kops_test::record_failure("w2 pack bytes", "codes or scales differ", __FILE__, __LINE__);
+
+  // Packed e2m1 source: decode nibbles exactly, then quantize to the four W2 levels.
+  static const float kE2M1[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                                  0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+  std::vector<uint8_t> q4(static_cast<size_t>(E) * N * (K / 2));
+  for (auto& b : q4) b = static_cast<uint8_t>(r.range(256));
+  std::vector<__nv_bfloat16> w4(static_cast<size_t>(E) * N * K);
+  for (size_t i = 0; i < w4.size(); ++i) {
+    const uint8_t b = q4[i / 2];
+    const float x = kE2M1[(b >> (4 * (i & 1))) & 0x0F];
+    w4[i] = __float2bfloat16(x);
+  }
+  const W2Pack ref4 = w2_pack_host(w4, E, N, K, G);
+  Buf<uint8_t> dq4(q4.size());
+  kops_test::copy_in(dq4.p, q4);
+  Buf<uint8_t> dc4(ref4.codes.size());
+  Buf<float> ds4(ref4.scales.size());
+  Tensor tq4 = kops_test::tensor3d(dq4.p, DType::kUInt8, E, N, K / 2);
+  Tensor tc4 = kops_test::tensor3d(dc4.p, DType::kUInt8, E, N, K / 4);
+  Tensor ts4 = kops_test::tensor3d(ds4.p, DType::kFloat32, E, N, K / G);
+  KOPS_EXPECT_OK(kops::experimental::moe_w2::pack(tc4, ts4, tq4, kops::WeightPacking::kFP4E2M1, G, ctx),
+                 "w2 pack fp4");
+  cudaDeviceSynchronize();
+  const auto got_c4 = dc4.get();
+  const auto got_s4 = ds4.get();
+  bad = 0;
+  for (size_t i = 0; i < ref4.codes.size(); ++i) bad += got_c4[i] != ref4.codes[i];
+  for (size_t i = 0; i < ref4.scales.size(); ++i) bad += std::memcmp(&got_s4[i], &ref4.scales[i], 4) != 0;
+  if (bad != 0) kops_test::record_failure("w2 pack fp4 bytes", "codes or scales differ", __FILE__, __LINE__);
+
+  // Contract errors.
+  Tensor badshape = tc;
+  badshape.shape[2] = K / 8;
+  KOPS_EXPECT_STATUS(kops::experimental::moe_w2::pack(badshape, ts, tw, kops::WeightPacking::kNone, G, ctx),
+                     Status::kUnsupportedShape, "w2 pack shape");
+  KOPS_EXPECT_STATUS(kops::experimental::moe_w2::pack(tc, ts, tw, kops::WeightPacking::kNone, 24, ctx),
+                     Status::kUnsupportedShape, "w2 pack group");
+  KOPS_EXPECT_STATUS(kops::experimental::moe_w2::pack(tc, ts, tw, kops::WeightPacking::kInt4LowNibbleFirst, G, ctx),
+                     Status::kUnsupportedDtype, "w2 pack source");
+  Tensor f32w = tw;
+  f32w.dtype = DType::kFloat32;
+  KOPS_EXPECT_STATUS(kops::experimental::moe_w2::pack(tc, ts, f32w, kops::WeightPacking::kNone, G, ctx),
+                     Status::kUnsupportedDtype, "w2 pack weight dtype");
+  kops::LaunchContext old{};
+  old.arch_id = KOPS_TARGET_SM70;
+  KOPS_EXPECT_STATUS(kops::experimental::moe_w2::pack(tc, ts, tw, kops::WeightPacking::kNone, G, old),
+                     Status::kUnsupportedArch, "w2 pack arch");
+}
+
+void test_moe_w2_gemm(const kops::LaunchContext& ctx) {
+  const int N = 192, K = 256, G = 32;
+  const int kBlock = 16;
+  Rng r(9182);
+  Routing R = route(ctx, kBlock, true, 11);
+  const int cap = static_cast<int>(R.sorted.size());
+  std::vector<__nv_bfloat16> w(static_cast<size_t>(kE) * N * K);
+  for (auto& x : w) x = __float2bfloat16(r.uni(-0.5f, 0.5f));
+  const W2Pack ref = w2_pack_host(w, kE, N, K, G);
+  Buf<__nv_bfloat16> dw(w);
+  Buf<uint8_t> dc(ref.codes);
+  Buf<float> ds(ref.scales);
+  Tensor tw = kops_test::tensor3d(dw.p, DType::kBFloat16, kE, N, K);
+  Tensor tc = kops_test::tensor3d(dc.p, DType::kUInt8, kE, N, K / 4);
+  Tensor ts = kops_test::tensor3d(ds.p, DType::kFloat32, kE, N, K / G);
+  KOPS_EXPECT_OK(kops::experimental::moe_w2::pack(tc, ts, tw, kops::WeightPacking::kNone, G, ctx),
+                 "w2 gemm pack");
+
+  // A rows are slots (W2 stage); routed weights are indexed by slot.
+  const int slots = kSlots;
+  std::vector<__nv_bfloat16> a(static_cast<size_t>(slots) * K);
+  for (auto& x : a) x = __float2bfloat16(r.uni(-1.0f, 1.0f));
+  std::vector<float> tw8(slots);
+  for (auto& x : tw8) x = r.uni(0.3f, 1.2f);
+  std::vector<__nv_bfloat16> bias(static_cast<size_t>(kE) * N);
+  for (auto& x : bias) x = __float2bfloat16(r.uni(-0.2f, 0.2f));
+  Buf<__nv_bfloat16> da(a);
+  Buf<float> dtw(tw8);
+  Buf<__nv_bfloat16> db(bias);
+  const int ldc = N + 4;
+  Buf<__nv_bfloat16> dcb(static_cast<size_t>(cap) * ldc);
+  cudaMemset(dcb.p, 0xCD, dcb.n * 2);
+  Buf<int32_t> dsorted(R.sorted), deids(R.expert_ids), dpost(1);
+  std::vector<int32_t> post = {R.post_pad};
+  kops_test::copy_in(dpost.p, post);
+
+  kops::moe::FusedMoEGemmParams p{};
+  p.a = da.p;
+  p.lda = K;
+  p.a_rows_are_slots = true;
+  p.w = dc.p;
+  p.w_expert_stride = static_cast<int64_t>(N) * (K / 4);
+  p.w_scale = ds.p;
+  p.w_scale_expert_stride = static_cast<int64_t>(N) * (K / G);
+  p.bias = db.p;
+  p.c = dcb.p;
+  p.ldc = ldc;
+  p.sorted_token_ids = dsorted.p;
+  p.expert_ids = deids.p;
+  p.num_tokens_post_pad = dpost.p;
+  p.topk_weights = dtw.p;
+  p.mul_routed_weight = true;
+  p.top_k = kTopK;
+  p.n = N;
+  p.k = K;
+  p.num_valid_slots = slots;
+  p.w_quant.packing = kops::WeightPacking::kW2;
+  p.w_quant.granularity = kops::ScaleGranularity::kPerGroup;
+  p.w_quant.group_k = G;
+  KOPS_EXPECT_OK(kops::experimental::moe_w2::gemm(p, kE, kBlock, DType::kBFloat16,
+                                                  DType::kBFloat16, ctx),
+                 "w2 gemm bf16");
+  cudaDeviceSynchronize();
+  const auto got = dcb.get();
+
+  std::vector<double> want(static_cast<size_t>(cap) * ldc, 0.0);
+  for (int b = 0; b < R.post_pad / kBlock; ++b) {
+    const int e = R.expert_ids[static_cast<size_t>(b)];
+    if (e < 0) continue;
+    for (int m = 0; m < kBlock; ++m) {
+      const int slot = b * kBlock + m;
+      if (slot >= R.post_pad) continue;
+      const int tok = R.sorted[static_cast<size_t>(slot)];
+      if (tok >= slots) continue;
+      for (int n = 0; n < N; ++n) {
+        double acc = 0.0;
+        for (int k = 0; k < K; ++k) {
+          const uint8_t code = ref.codes[(static_cast<size_t>(e) * N + n) * (K / 4) + k / 4] >> (2 * (k & 3)) & 3;
+          const float s = ref.scales[(static_cast<size_t>(e) * N + n) * (K / G) + k / G];
+          const double av = static_cast<double>(a[static_cast<size_t>(tok) * K + k]);
+          acc += av * static_cast<double>(w2_level_host(code) * s);
+        }
+        acc += static_cast<double>(__bfloat162float(bias[static_cast<size_t>(e) * N + n]));
+        acc *= static_cast<double>(tw8[static_cast<size_t>(tok)]);
+        want[static_cast<size_t>(slot) * ldc + n] = acc;
+      }
+    }
+  }
+  std::vector<double> flat, wantv;
+  for (int slot = 0; slot < cap; ++slot) {
+    const bool valid = slot < R.post_pad && R.sorted[static_cast<size_t>(slot)] < slots &&
+                       R.expert_ids[static_cast<size_t>(slot / kBlock)] >= 0;
+    if (!valid) continue;
+    for (int n = 0; n < N; ++n) {
+      flat.push_back(static_cast<double>(__bfloat162float(got[static_cast<size_t>(slot) * ldc + n])));
+      wantv.push_back(want[static_cast<size_t>(slot) * ldc + n]);
+    }
+  }
+  close(flat, wantv, 1e-2, "w2 gemm bf16 oracle");
+
+  // Padding slots, padding columns and rejected expert blocks keep their sentinel bytes.
+  int touched = 0;
+  for (int slot = 0; slot < cap; ++slot) {
+    const bool valid = slot < R.post_pad && R.sorted[static_cast<size_t>(slot)] < slots &&
+                       R.expert_ids[static_cast<size_t>(slot / kBlock)] >= 0;
+    for (int n = 0; n < ldc; ++n) {
+      if (n < N && valid) continue;
+      touched += __bfloat16_as_ushort(got[static_cast<size_t>(slot) * ldc + n]) != 0xCDCDu ? 1 : 0;
+    }
+  }
+  if (touched != 0) kops_test::record_failure("w2 gemm padding", "wrote a padding row", __FILE__, __LINE__);
+
+  // fp16 A / fp32 C and W13-style A rows (slot / top_k).
+  {
+    std::vector<__half> ah(static_cast<size_t>(kTokens) * K);
+    for (auto& x : ah) x = __float2half_rn(r.uni(-1.0f, 1.0f));
+    Buf<__half> dah(ah);
+    Buf<float> dcf(static_cast<size_t>(cap) * ldc);
+    cudaMemset(dcf.p, 0, dcf.n * 4);
+    kops::moe::FusedMoEGemmParams q = p;
+    q.a = dah.p;
+    q.a_rows_are_slots = false;
+    q.c = dcf.p;
+    q.bias = nullptr;
+    q.mul_routed_weight = false;
+    KOPS_EXPECT_OK(kops::experimental::moe_w2::gemm(q, kE, kBlock, DType::kFloat16, DType::kFloat32, ctx),
+                   "w2 gemm fp16/fp32");
+    cudaDeviceSynchronize();
+    const auto gotf = dcf.get();
+    std::vector<double> wantf(static_cast<size_t>(cap) * ldc, 0.0);
+    for (int b = 0; b < R.post_pad / kBlock; ++b) {
+      const int e = R.expert_ids[static_cast<size_t>(b)];
+      if (e < 0) continue;
+      for (int m = 0; m < kBlock; ++m) {
+        const int slot = b * kBlock + m;
+        if (slot >= R.post_pad) continue;
+        const int tok = R.sorted[static_cast<size_t>(slot)];
+        if (tok >= slots) continue;
+        const int row = tok / kTopK;
+        for (int n = 0; n < N; ++n) {
+          double acc = 0.0;
+          for (int k = 0; k < K; ++k) {
+            const uint8_t code = ref.codes[(static_cast<size_t>(e) * N + n) * (K / 4) + k / 4] >> (2 * (k & 3)) & 3;
+            const float s = ref.scales[(static_cast<size_t>(e) * N + n) * (K / G) + k / G];
+            acc += static_cast<double>(__half2float(ah[static_cast<size_t>(row) * K + k])) * static_cast<double>(w2_level_host(code) * s);
+          }
+          wantf[static_cast<size_t>(slot) * ldc + n] = acc;
+        }
+      }
+    }
+    std::vector<double> gotfd, wantfv;
+    for (int slot = 0; slot < cap; ++slot) {
+      const bool valid = slot < R.post_pad && R.sorted[static_cast<size_t>(slot)] < slots &&
+                         R.expert_ids[static_cast<size_t>(slot / kBlock)] >= 0;
+      if (!valid) continue;
+      for (int n = 0; n < N; ++n) {
+        gotfd.push_back(static_cast<double>(gotf[static_cast<size_t>(slot) * ldc + n]));
+        wantfv.push_back(wantf[static_cast<size_t>(slot) * ldc + n]);
+      }
+    }
+    close(gotfd, wantfv, 2e-3, "w2 gemm fp16/fp32 oracle");
+  }
+
+  // Group 16 / 64 take the scalar path; check the first valid slots against the same oracle.
+  for (int G2 : {16, 64}) {
+    const W2Pack r2 = w2_pack_host(w, kE, N, K, G2);
+    Buf<uint8_t> c2(r2.codes);
+    Buf<float> s2(r2.scales);
+    Tensor tc2 = kops_test::tensor3d(c2.p, DType::kUInt8, kE, N, K / 4);
+    Tensor ts2 = kops_test::tensor3d(s2.p, DType::kFloat32, kE, N, K / G2);
+    KOPS_EXPECT_OK(kops::experimental::moe_w2::pack(tc2, ts2, tw, kops::WeightPacking::kNone, G2, ctx),
+                   "w2 gemm pack group");
+    Buf<__nv_bfloat16> c2out(static_cast<size_t>(cap) * ldc);
+    cudaMemset(c2out.p, 0xCD, c2out.n * 2);
+    kops::moe::FusedMoEGemmParams q2 = p;
+    q2.w = c2.p;
+    q2.w_scale = s2.p;
+    q2.w_scale_expert_stride = static_cast<int64_t>(N) * (K / G2);
+    q2.w_quant.group_k = G2;
+    q2.bias = nullptr;
+    q2.mul_routed_weight = false;
+    q2.c = c2out.p;
+    KOPS_EXPECT_OK(kops::experimental::moe_w2::gemm(q2, kE, kBlock, DType::kBFloat16,
+                                                    DType::kBFloat16, ctx),
+                   "w2 gemm group");
+    cudaDeviceSynchronize();
+    const auto got2 = c2out.get();
+    int checked = 0;
+    for (int b = 0; b < R.post_pad / kBlock && checked < 8; ++b) {
+      const int e = R.expert_ids[static_cast<size_t>(b)];
+      if (e < 0) continue;
+      for (int m = 0; m < kBlock && checked < 8; ++m) {
+        const int slot = b * kBlock + m;
+        const int tok = R.sorted[static_cast<size_t>(slot)];
+        if (tok >= slots) continue;
+        ++checked;
+        for (int n = 0; n < N; ++n) {
+          double acc = 0.0;
+          for (int k = 0; k < K; ++k) {
+            const uint8_t code = r2.codes[(static_cast<size_t>(e) * N + n) * (K / 4) + k / 4] >> (2 * (k & 3)) & 3;
+            const float sc = r2.scales[(static_cast<size_t>(e) * N + n) * (K / G2) + k / G2];
+            acc += static_cast<double>(__bfloat162float(a[static_cast<size_t>(tok) * K + k])) *
+                   static_cast<double>(w2_level_host(code) * sc);
+          }
+          const double g = static_cast<double>(__bfloat162float(got2[static_cast<size_t>(slot) * ldc + n]));
+          if (std::fabs(g - acc) > 1e-2 * std::fabs(acc) + 2e-5) {
+            char det[96];
+            std::snprintf(det, sizeof(det), "G=%d slot %d n %d got %.5f want %.5f", G2, slot, n, g, acc);
+            kops_test::record_failure("w2 gemm group oracle", det, __FILE__, __LINE__);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // Contract errors.
+  p.lda = K;
+  auto expect = [&](const kops::moe::FusedMoEGemmParams& q, int block, DType ad, DType cd, Status want,
+                    const char* what) {
+    KOPS_EXPECT_STATUS(kops::experimental::moe_w2::gemm(q, kE, block, ad, cd, ctx), want, what);
+    cudaDeviceSynchronize();
+  };
+  expect(p, 8, DType::kBFloat16, DType::kBFloat16, Status::kUnsupportedShape, "w2 gemm block 8");
+  auto q = p;
+  q.w_quant.packing = kops::WeightPacking::kNone;
+  expect(q, kBlock, DType::kBFloat16, DType::kBFloat16, Status::kInvalidArgument, "w2 gemm packing");
+  q = p;
+  q.w_expert_stride = 10;
+  expect(q, kBlock, DType::kBFloat16, DType::kBFloat16, Status::kInvalidArgument, "w2 gemm w stride");
+  q = p;
+  q.a_scale = ds.p;
+  expect(q, kBlock, DType::kBFloat16, DType::kBFloat16, Status::kNotImplemented, "w2 gemm act scales");
+  q = p;
+  q.w_zeros = ds.p;
+  expect(q, kBlock, DType::kBFloat16, DType::kBFloat16, Status::kNotImplemented, "w2 gemm zeros");
+  q = p;
+  q.w_quant.group_k = 24;
+  expect(q, kBlock, DType::kBFloat16, DType::kBFloat16, Status::kUnsupportedShape, "w2 gemm group 24");
+  expect(p, kBlock, DType::kBFloat16, DType::kInt8, Status::kUnsupportedDtype, "w2 gemm c dtype");
+  q = p;
+  q.sorted_token_ids = nullptr;
+  expect(q, kBlock, DType::kBFloat16, DType::kBFloat16, Status::kInvalidArgument, "w2 gemm null ids");
+}
+
+
 }  // namespace b7moe
 
 void test_b7_moe_gemm() {
@@ -1968,6 +2330,11 @@ void test_b7_moe_gemm() {
 int main() {
   kops::LaunchContext probe{};
   if (!kops_test::make_context(&probe)) return 77;
+  if (std::getenv("KOPS_TEST_ONLY_W2") != nullptr) {
+    b7moe::test_moe_w2_pack(probe);
+    b7moe::test_moe_w2_gemm(probe);
+    return kops_test::finish("test_moe --w2");
+  }
   test_route();
   test_route_grouped();
   test_route_ties();
@@ -1985,5 +2352,7 @@ int main() {
   test_moe_sum_and_latent();
   test_contracts();
   test_b7_moe_gemm();
+  b7moe::test_moe_w2_pack(probe);
+  b7moe::test_moe_w2_gemm(probe);
   return kops_test::finish("test_moe");
 }

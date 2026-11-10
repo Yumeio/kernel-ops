@@ -13,8 +13,8 @@ Status hc_post(const HCParams& params, const Tensor& y, const LaunchContext& ctx
 Status mega_mhc(const HCParams& next_layer, const Tensor& prev_coeff_b, const Tensor& prev_coeff_c,
                 const Tensor& prev_y, const Tensor& layer_in, const ActQuantOut& quant,
                 const Tensor& sub_norm_weight, float sub_norm_eps, const LaunchContext& ctx);
-Status hc_expand(const Tensor& streams, const Tensor& embed, int32_t n_hc, const LaunchContext& ctx);
-Status hc_head(const Tensor& out, const Tensor& streams, const Tensor& head_weights,
+Status hc_expand(const HCStreamParams& params, const Tensor& embed, const LaunchContext& ctx);
+Status hc_head(const Tensor& out, const HCStreamParams& params, const Tensor& head_weights,
                const LaunchContext& ctx);
 
 Status attn_res(const AttnResParams& params, DType dtype, const LaunchContext& ctx);

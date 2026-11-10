@@ -4,6 +4,7 @@
 //   weight_transpose, glu_weight_interleave, router_weight_split_bf16x2,
 //   int8_weight_colsum, block_scale_swizzle, fp8_scale_to_tma_layout,
 //   fp8_block2d_quant_weight.
+// B11 operand prep: machete_prepack (Machete SM90 prepacked weight layout).
 //
 // Contract: csrc/gemm/ops.h + csrc/gemm/gemm_prep_kernels.cuh.
 // Load-time operations: run once after the checkpoint is loaded, outside graph
@@ -15,7 +16,10 @@
 //
 // Provenance (THIRD_PARTY_NOTICES.md, "Derived implementations"): the 128x4 swizzle is the CUTLASS
 // SfAtom / torchao `to_blocked` layout, packed UE8M0 and the FP8 128x128 block quantization follow
-// DeepGEMM deep_gemm/utils/math.py @ 5081f85 (MIT).  No upstream source text is copied.
+// DeepGEMM deep_gemm/utils/math.py @ 5081f85 (MIT).  The Machete prepacked layout follows
+// vLLM csrc/quantization/machete (machete_prepacked_layout.cuh / machete_prepack_kernel.cuh,
+// Apache-2.0); the block and within-block formulas are re-derived in this file and re-implemented
+// without CUTE.  No upstream source text is copied.
 //
 // Scale-layout conventions (shared with B3 quantize_per_group):
 //   128x4 swizzle   offset = tile*512 + (row&31)*16 + ((row>>5)&3)*4 + (col&3),
@@ -524,6 +528,67 @@ __global__ void fp8_scale_pack_ue8m0_kernel(int32_t* __restrict__ out, const flo
 }
 
 // =============================================================================
+// machete_prepack:  [N, K] low-bit weight -> Machete prepacked layout
+// =============================================================================
+// Provenance (3rd/vllm/csrc/quantization/machete/, Apache-2.0): the tensor is the permutation written by
+// `prepack_B_kernel` (machete_prepack_kernel.cuh) under `PrepackedLayoutBTemplate`
+// (machete_prepacked_layout.cuh).  It is a pure permutation of the N * K elements:
+//
+//   block          the weight is cut into PPBlockShape_NK = 128 (N) x 64 (K) blocks; block
+//                  (n_tile, k_tile) starts at element 8192 * (n_tile + k_tile * N_tiles)
+//                  (bNbKL_to_offset: column-major over blocks, n_tile fastest).  N % 128 == 0 and
+//                  K % 64 == 0 are required, so there is no partial block.
+//   within block   offset(n, k) = ppblock_ilvd_NK_to_offset()(n, k), which for 0 <= n < 128 and
+//                  0 <= k < 64 reduces to the bit-field maps below (each destination bit range is
+//                  disjoint, so both directions are exact bit permutations; verified against CUTE
+//                  `print(PrepackedLayoutBTemplate<...>::ppblock_ilvd_NK_to_offset())` for every
+//                  (n, k) and every atom of MacheteAtomLayout):
+//
+//   kInt4Mma16  n[0,3)->off[7,10)  n[3]->off[0]  n[4,3)->off[10,13)
+//               k[0]->off[2]       k[1,2)->off[5,7]  k[3]->off[1]  k[4,2)->off[3,5)
+//   kInt8Mma16  n[0,3)->off[7,10)  n[3]->off[1]  n[4,3)->off[10,13)
+//               k[0]->off[0]       k[1,2)->off[5,7]  k[3,3)->off[2,5)
+//   kInt4Mma8   n[0,3)->off[7,10)  n[3]->off[2]  n[4,3)->off[10,13)
+//   kInt8Mma8   (same as kInt4Mma8)
+//               k[0,2)->off[0,2)   k[2,2)->off[5,7)  k[4,2)->off[3,5)
+//
+// (n[a,b) is bits [a, b) of n.)  Every atom gives one MMA thread value 32 consecutive storage elements
+// (16 B for a 4-bit payload, 32 B for 8-bit), puts n[0,3) on the 128-element stride (64 B / 128 B) and
+// n[4,3) on 1024, which is why a 128x64 block is 4 KiB / 8 KiB.  kInt4Mma16
+// is the only interleaved one: its first eight elements are {n0k0, n8k0, n0k8, n8k8, n0k1, n8k1, n0k9,
+// n8k9}, the `get_interleaved_blk_layout<int4, 16, 32>` block Machete's prmt upconvert consumes.
+//
+// Packing: element 2i is the low nibble of byte i (the shared convention, `WeightPacking::
+// kInt4LowNibbleFirst`); 8-bit payloads are one element per byte.  The tensor is therefore exactly as
+// large as the unpacked weight and the whole map is a permutation in ELEMENT units — which is what the
+// Machete mainloop's own `TVbNbKL_to_offset` model of B assumes.  (A literal transcription of
+// `prepack_B_kernel` over a byte-addressed subbyte pointer would scale every block and within-block
+// offset by the element size; that is not a layout, so this file keeps the element semantics.)
+
+constexpr int kMacheteBlockN = 128;
+constexpr int kMacheteBlockK = 64;
+constexpr int kMacheteBlockElems = kMacheteBlockN * kMacheteBlockK;   // 8192 elements per block
+
+/// Storage element offset inside a prepacked block -> (n, k): the field-for-field inverse of the bit
+/// maps documented above (each (n, k) bit range lands in its own offset bit range, so this is exact).
+__device__ __forceinline__ void machete_unpack_offset(int atom, int o, int* n, int* k) {
+  switch (atom) {
+    case static_cast<int>(MacheteAtomLayout::kInt4Mma16):
+      *n = ((o >> 7) & 7) | ((o & 1) << 3) | (((o >> 10) & 7) << 4);
+      *k = ((o >> 2) & 1) | (((o >> 5) & 3) << 1) | (((o >> 1) & 1) << 3) | (((o >> 3) & 3) << 4);
+      break;
+    case static_cast<int>(MacheteAtomLayout::kInt8Mma16):
+      *n = ((o >> 7) & 7) | (((o >> 1) & 1) << 3) | (((o >> 10) & 7) << 4);
+      *k = (o & 1) | (((o >> 5) & 3) << 1) | (((o >> 2) & 7) << 3);
+      break;
+    default:
+      *n = ((o >> 7) & 7) | (((o >> 2) & 1) << 3) | (((o >> 10) & 7) << 4);
+      *k = (o & 3) | (((o >> 5) & 3) << 2) | (((o >> 3) & 3) << 4);
+      break;
+  }
+}
+
+// =============================================================================
 // fp8_block2d_quant_weight
 // =============================================================================
 
@@ -642,6 +707,59 @@ __global__ void fp8_block2d_quant_weight_vec_kernel(
 }
 
 }  // namespace
+
+/// One CTA per prepacked block (blockIdx.x = n tile, blockIdx.y = k tile), 128 threads.  The block's
+/// input rows are staged in shared memory (coalesced 16-byte loads: a 4-bit block is 128 rows x 32 B,
+/// an 8-bit block 128 x 64 B) and the output is written as 32-bit words in element order.
+__global__ void machete_prepack_kernel(void* __restrict__ out_weight, const void* __restrict__ weight,
+                                       const int size_n, const int size_k, const int weight_bits,
+                                       const int atom_layout_id) {
+  const bool nib4 = weight_bits == 4;
+  const int row_bytes = size_k * weight_bits / 8;             // one [K] row, nibble-packed for 4-bit
+  const int tile_row_bytes = kMacheteBlockK * weight_bits / 8;   // 32 (4-bit) or 64 (8-bit)
+  const int n_tiles = size_n / kMacheteBlockN;
+  const int64_t block_bytes = static_cast<int64_t>(kMacheteBlockElems) * weight_bits / 8;
+  const int64_t block = static_cast<int64_t>(blockIdx.x) + static_cast<int64_t>(blockIdx.y) * n_tiles;
+
+  __shared__ __align__(16) uint8_t tile[kMacheteBlockElems];   // elements of this block (4 KiB / 8 KiB)
+  const uint8_t* src = static_cast<const uint8_t*>(weight) +
+                       static_cast<int64_t>(blockIdx.x) * kMacheteBlockN * row_bytes +
+                       static_cast<int64_t>(blockIdx.y) * tile_row_bytes;
+  const int chunks = kMacheteBlockN * (tile_row_bytes / 16);
+  for (int c = threadIdx.x; c < chunks; c += blockDim.x) {
+    const int row = c / (tile_row_bytes / 16);
+    const int sub = c - row * (tile_row_bytes / 16);
+    *reinterpret_cast<uint4*>(tile + row * tile_row_bytes + sub * 16) =
+        *reinterpret_cast<const uint4*>(src + static_cast<int64_t>(row) * row_bytes + sub * 16);
+  }
+  __syncthreads();
+
+  uint8_t* dst = static_cast<uint8_t*>(out_weight) + block * block_bytes;
+  const int words = static_cast<int>(block_bytes / 4);
+  for (int w = threadIdx.x; w < words; w += blockDim.x) {
+    uint32_t word = 0;
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const int o = 4 * w + j;                     // storage element / byte of this block
+      int n = 0, k = 0;
+      if (nib4) {
+        // A byte of the output holds elements 2i (low) and 2i + 1; the two differ in exactly one k bit.
+        uint32_t packed = 0;
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+          machete_unpack_offset(atom_layout_id, 2 * o + half, &n, &k);
+          const uint8_t b = tile[n * tile_row_bytes + (k >> 1)];
+          packed |= static_cast<uint32_t>((b >> ((k & 1) * 4)) & 0xF) << (4 * half);
+        }
+        word |= packed << (8 * j);
+      } else {
+        machete_unpack_offset(atom_layout_id, o, &n, &k);
+        word |= static_cast<uint32_t>(tile[n * tile_row_bytes + k]) << (8 * j);
+      }
+    }
+    reinterpret_cast<uint32_t*>(dst)[w] = word;
+  }
+}
 
 // =============================================================================
 // Host launchers
@@ -805,6 +923,81 @@ Status glu_weight_interleave(const Tensor& out_weight, const Tensor& out_scales,
       dst_interleave);
   const cudaError_t err = cudaGetLastError();
   return err == cudaSuccess ? Status::kSuccess : launch_error("glu_weight_interleave", err);
+}
+
+Status machete_prepack(const Tensor& out, const Tensor& weight, int32_t weight_bits,
+                       int32_t atom_layout_id, const LaunchContext& ctx) {
+  Status s = backend_ok(ctx);
+  if (s != Status::kSuccess) return s;
+  if (atom_layout_id < static_cast<int32_t>(MacheteAtomLayout::kInt4Mma16) ||
+      atom_layout_id > static_cast<int32_t>(MacheteAtomLayout::kInt8Mma8)) {
+    return detail::set_error(Status::kInvalidArgument,
+                             "machete_prepack: atom_layout_id %d outside [0, 3] (MacheteAtomLayout)",
+                             atom_layout_id);
+  }
+  s = check_rows(weight, 2, "machete_prepack.weight");
+  if (s != Status::kSuccess) return s;
+  const int64_t n = weight.shape[0];
+  const int64_t k = weight.shape[1];
+  const int bits = dtype_bits(weight.dtype);
+  if (bits != 4 && bits != 8) {
+    return detail::set_error(Status::kUnsupportedDtype,
+                             "machete_prepack: weight dtype %s is neither packed 4-bit nor 8-bit",
+                             dtype_name(weight.dtype));
+  }
+  if (weight_bits != bits) {
+    return detail::set_error(Status::kInvalidArgument,
+                             "machete_prepack: weight_bits %d disagrees with dtype %s (%d bits)",
+                             weight_bits, dtype_name(weight.dtype), bits);
+  }
+  const bool atom4 = atom_layout_id == static_cast<int32_t>(MacheteAtomLayout::kInt4Mma16) ||
+                     atom_layout_id == static_cast<int32_t>(MacheteAtomLayout::kInt4Mma8);
+  if (atom4 != (bits == 4)) {
+    return detail::set_error(Status::kInvalidArgument,
+                             "machete_prepack: atom_layout_id %d is a %d-bit payload layout, weight is %d-bit",
+                             atom_layout_id, atom4 ? 4 : 8, bits);
+  }
+  if (weight.stride[0] != k) {
+    return detail::set_error(Status::kUnsupportedLayout,
+                             "machete_prepack: weight must be contiguous ([N, K] with row stride K)");
+  }
+  s = check_tensor(out, weight.dtype, -1, 4, "machete_prepack.out");
+  if (s != Status::kSuccess) return s;
+  const int64_t elems = n * k;
+  if (out.ndim == 2) {
+    if (out.shape[0] != n || out.shape[1] != k || out.stride[1] != 1 || out.stride[0] != k) {
+      return detail::set_error(Status::kInvalidArgument,
+                               "machete_prepack: out must be a contiguous [%lld, %lld] view",
+                               static_cast<long long>(n), static_cast<long long>(k));
+    }
+  } else if (out.ndim == 1) {
+    if (tensor_numel(out) < elems) {
+      return detail::set_error(Status::kCapacityExceeded,
+                               "machete_prepack: out holds %lld elements, the pack needs %lld",
+                               static_cast<long long>(tensor_numel(out)), static_cast<long long>(elems));
+    }
+  } else {
+    return detail::set_error(Status::kInvalidArgument, "machete_prepack: out must be [N, K] or a flat capacity view");
+  }
+  if ((n & (kMacheteBlockN - 1)) != 0 || (k & (kMacheteBlockK - 1)) != 0) {
+    return detail::set_error(Status::kUnsupportedShape,
+                             "machete_prepack: N %d must be a multiple of 128 and K %d a multiple of 64 "
+                             "(the prepacked block is 128 x 64)", static_cast<int>(n), static_cast<int>(k));
+  }
+  if (n == 0 || k == 0) return Status::kSuccess;
+  if (n > INT32_MAX || k > INT32_MAX) {
+    return detail::set_error(Status::kUnsupportedShape, "machete_prepack: N and K must fit in int32");
+  }
+  if (!aligned(data_of(weight), 16) || !aligned(data_of(out), 4)) {
+    return detail::set_error(Status::kMisaligned,
+                             "machete_prepack: weight needs 16-byte alignment (16-byte staging loads), out 4-byte");
+  }
+  const dim3 grid(static_cast<unsigned>(n / kMacheteBlockN), static_cast<unsigned>(k / kMacheteBlockK));
+  machete_prepack_kernel<<<grid, 128, 0, stream_of(ctx)>>>(mut_ptr<uint8_t>(out), data_of(weight),
+                                                           static_cast<int>(n), static_cast<int>(k),
+                                                           weight_bits, atom_layout_id);
+  const cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? Status::kSuccess : launch_error("machete_prepack", err);
 }
 
 Status router_weight_split_bf16x2(const Tensor& w_hi, const Tensor& w_lo, const Tensor& w_fp32,

@@ -188,23 +188,37 @@ __global__ void concat_and_cache_mla_grouped_kernel(
     const int kv_lora_rank, const int pe_dim, const int block_size);
 
 /**
- * concat_and_cache_ds_mla_kernel — KVCodec::kMLAFp8DS 656-byte records (DeepSeek-V3.2 / FlashMLA
- * sparse FP8 format). Per token: 4 NoPE tiles of 128 values, each tile quantized with its own
- * power-of-two fp32 scale 2^ceil(log2(max(amax/448, 1e-4))); RoPE kept in bf16. pe_dim == 0
- * (NoPE rows) zeroes the RoPE tail.
- * Launch : grid = num_tokens, block = 96 (2 warps: NoPE, half-warp per tile with lanes 0/16
- *          writing scales; 1 warp: RoPE, 2 values per thread).
+ * concat_and_cache_ds_mla_kernel — DeepSeek MLA FP8 / FP4 latent records. The record version is
+ * the template parameter (formats are not backward compatible; see mla_kv_format()):
+ *   kMLAFp8DS       656 B: 512 x e4m3 NoPE in 4 tiles of 128, 4 x fp32 tile scales
+ *                        2^ceil(log2(max(amax/448, 1e-4))), then 64 x bf16 RoPE (528..656).
+ *   kMLAFp8DSV40    576 B data: 448 x e4m3 NoPE in 7 tiles of 64, then 64 x bf16 RoPE at 448.
+ *                    The 8 B/token scale region (7 x UE8M0 + 1 zero pad) is written to the
+ *                    separate k_scale_pages array: scale_row = k_scale_pages + page *
+ *                    k_scale_stride_page + off * k_scale_stride_token.
+ *   kMLAFp8DSV41    528 B: 512 x e4m3 covering NoPE + RoPE in 16 tiles of 32, followed by
+ *                    16 x UE8M0 inline at 512.
+ *   kMLAFp8DSV41Fp4 288 B: 512 x e2m1 in 32 tiles of 16 (element 2i in the low nibble of byte
+ *                    i), followed by 32 x e4m3 inline scales at 256. scale = clamp(amax/6,
+ *                    2^-9, 448); a NaN/Inf element makes the whole tile scale NaN (0x7F) and
+ *                    its codes zero, matching FlashMLA tests/quant.py.
+ * pe_dim == 0 (NoPE rows) writes zeros into the RoPE columns. slot < 0 skips.
+ * Launch : grid = num_tokens. block = 96 for kMLAFp8DS (legacy mapping), else 256
+ *          (7 warps + RoPE warp for V40; tile warps for V41; 8-lane groups for FP4).
  */
-template <typename scalar_t>
+template <typename scalar_t, KVCodec kCodec>
 __global__ void concat_and_cache_ds_mla_kernel(
-    const scalar_t* __restrict__ kv_c,         // [num_tokens(+pad), 512]
-    const scalar_t* __restrict__ k_pe,         // [num_tokens(+pad), 64] (or ignored when pe_dim == 0)
-    uint8_t* __restrict__ kv_cache,            // [num_blocks, block_size, 656] bytes
+    const scalar_t* __restrict__ kv_c,         // [num_tokens(+pad), 448|512]
+    const scalar_t* __restrict__ k_pe,         // [num_tokens(+pad), 64] or null (pe_dim == 0)
+    uint8_t* __restrict__ kv_cache,            // [num_blocks, block_size, entry_bytes]
+    uint8_t* __restrict__ scale_pages,         // V40 only: [num_blocks, block_size, 8], else null
     const int64_t* __restrict__ slot_mapping,  // [num_tokens]
-    const int block_stride,                    // bytes
-    const int entry_stride,                    // bytes (656, or padded)
+    const int64_t block_stride,                // bytes per page
+    const int64_t entry_stride,                // bytes per token record (padded)
+    const int64_t scale_block_stride,          // V40: bytes per scale page (else 0)
+    const int64_t scale_token_stride,          // V40: bytes per token in the scale array (else 0)
     const int kv_c_stride, const int k_pe_stride,
-    const int kv_lora_rank,                    // 512
+    const int kv_lora_rank,                    // 448 (V40/V41/FP4) or 512 (656, includes NoPE only)
     const int pe_dim,                          // 64 or 0
     const int block_size);
 
@@ -338,24 +352,33 @@ __global__ void cp_gather_cache_kernel(
     const int64_t dst_entry_stride);           // bytes
 
 /**
- * cp_gather_and_upconvert_ds_mla_fp8_kernel — kMLAFp8DS 656-byte records -> bf16 [num_tokens, 576]
- * (512 NoPE dequantized with their tile scales + 64 RoPE copied). Supports partially offloaded
- * caches: when device_row_ids is given, source row r is read from the device cache if
- * device_row_ids[r] >= 0, otherwise from pinned host memory host_cache[host_row_ids[r]] through UVA
- * (no staging copy). One warp per token.
- * Launch : grid = ceil(num_tokens / block_size) + 2 * num_reqs, block = 512 (16 warps).
+ * cp_gather_and_upconvert_ds_mla_fp8_kernel — MLA latent records -> bf16, one warp per token.
+ * kCodec selects the record version (same formats as concat_and_cache_ds_mla_kernel):
+ *   656     -> dst [T, 576]: 512 NoPE dequantized with their fp32 tile scales + 64 RoPE copied.
+ *   V40     -> dst [T, 512|576]: 448 NoPE dequantized with the out-of-record UE8M0 scales +
+ *              64 RoPE values copied; a 576-wide dst gets a zero tail.
+ *   V41     -> dst [T, 512|576]: 512 dequantized values; a 576-wide dst gets a zero tail.
+ *   V41Fp4  -> dst [T, 512|576]: e2m1 x e4m3 dequantized; a 576-wide dst gets a zero tail.
+ * Supports partially offloaded caches: when device_row_ids is given, source row r is read from
+ * the device cache if device_row_ids[r] >= 0, otherwise from pinned host memory
+ * host_cache[host_row_ids[r]] through UVA (no staging copy).
+ * Launch : grid = ceil(num_tokens / 8), block = 256 (8 warps, one token per warp).
  */
+template <KVCodec kCodec>
 __global__ void cp_gather_and_upconvert_ds_mla_fp8_kernel(
-    const uint8_t* __restrict__ src_cache,     // [num_blocks, block_size, 656]
-    bf16_t* __restrict__ dst,                  // [num_tokens, 576]
+    const uint8_t* __restrict__ src_cache,     // [num_blocks, block_size, entry_bytes]
+    bf16_t* __restrict__ dst,                  // [num_tokens, 512|576]
     const GatherSpec spec,                     // cu_seq_lens = workspace_starts (per-request output offsets)
     const int32_t block_size,
     const int64_t cache_block_stride, const int64_t cache_entry_stride,
     const int64_t dst_entry_stride,
-    const uint8_t* __restrict__ host_cache,    // [num_host_rows, 656] pinned, or null
+    const uint8_t* __restrict__ host_cache,    // [num_host_rows, entry_bytes] pinned, or null
     const int32_t* __restrict__ host_row_ids,  // [num_blocks * block_size] row in host_cache, or null
     const int32_t* __restrict__ device_row_ids,// [num_blocks * block_size] row in src_cache or -1, or null
-    const int64_t host_entry_stride);
+    const int64_t host_entry_stride,
+    const uint8_t* __restrict__ scale_pages,   // V40: [num_blocks, block_size, 8], else null
+    const int64_t scale_block_stride, const int64_t scale_token_stride,
+    const int dst_cols);                       // logical columns of dst (512 or 576)
 
 /// cp_gather_and_upconvert_ds_mla_nvfp4_kernel — kMLANvfp4DS 352-byte records -> bf16 [num_tokens, 576].
 /// Sm100a only (provider format).

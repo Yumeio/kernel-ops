@@ -20,6 +20,15 @@
    "evidence": "test_model_ops;bench_model_ops"
   },
   {
+   "op_id": "X02.residual_add",
+   "kernel_symbol": "residual_add_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "dtype in {f32,f16,bf16}; 2 or 3 inputs; exact in-place alias",
+   "evidence": "test_model_ops;bench_model_ops"
+  },
+  {
    "op_id": "X02.cast",
    "kernel_symbol": "cast_kernel",
    "provider": "native",
@@ -36,6 +45,231 @@
    "status": "benchmarked",
    "predicates": "dtype in {f32,f16,bf16}; scale multiplier",
    "evidence": "test_model_ops;bench_model_ops"
+  },
+  {
+   "op_id": "X02.cast",
+   "kernel_symbol": "cast_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "dtype in {f32,f16,bf16}; scale multiplier",
+   "evidence": "test_model_ops;bench_model_ops"
+  },
+  {
+   "op_id": "X01.hc_expand",
+   "kernel_symbol": "hc_expand_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "embedding -> n_hc streams",
+   "evidence": "test_hyper_connection"
+  },
+  {
+   "op_id": "X01.hc_head",
+   "kernel_symbol": "hc_head_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "n_hc streams -> hidden; uniform/static/per-token weights",
+   "evidence": "test_hyper_connection"
+  },
+  {
+   "op_id": "X01.hc_coeff",
+   "kernel_symbol": "hc_coeff_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "official DeepSeek-V4 mHC: rsqrt-normed projection + sigmoid/Sinkhorn",
+   "evidence": "test_hyper_connection"
+  },
+  {
+   "op_id": "X01.hc_pre",
+   "kernel_symbol": "hc_pre_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "pre mix + optional RMSNorm/quant",
+   "evidence": "test_hyper_connection"
+  },
+  {
+   "op_id": "X01.hc_post",
+   "kernel_symbol": "hc_post_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "B*X + C*y residual update",
+   "evidence": "test_hyper_connection"
+  },
+  {
+   "op_id": "X01.mega_mhc",
+   "kernel_symbol": "mega_mhc_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "generic T1 fused post+coeff+pre; deterministic chain parity",
+   "evidence": "test_hyper_connection"
+  },
+  {
+   "op_id": "X01.attn_res",
+   "kernel_symbol": "attn_res_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "Kimi-K3 block AttnRes; sources/partial/delta; RMSNorm + MXFP8",
+   "evidence": "test_model_ops"
+  },
+  {
+   "op_id": "X01.attn_res_commit",
+   "kernel_symbol": "attn_res_commit_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "source commit + inverse RMS cache + partial reset",
+   "evidence": "test_model_ops"
+  },
+  {
+   "op_id": "X01.hc_expand",
+   "kernel_symbol": "hc_expand_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.hc_expand",
+   "kernel_symbol": "hc_expand_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "X01.hc_head",
+   "kernel_symbol": "hc_head_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.hc_head",
+   "kernel_symbol": "hc_head_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "X01.hc_coeff",
+   "kernel_symbol": "hc_coeff_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.hc_coeff",
+   "kernel_symbol": "hc_coeff_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "X01.hc_pre",
+   "kernel_symbol": "hc_pre_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.hc_pre",
+   "kernel_symbol": "hc_pre_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "X01.hc_post",
+   "kernel_symbol": "hc_post_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.hc_post",
+   "kernel_symbol": "hc_post_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "X01.mega_mhc",
+   "kernel_symbol": "mega_mhc_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.mega_mhc",
+   "kernel_symbol": "mega_mhc_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "X01.attn_res",
+   "kernel_symbol": "attn_res_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.attn_res",
+   "kernel_symbol": "attn_res_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
+  },
+  {
+   "op_id": "X01.attn_res_commit",
+   "kernel_symbol": "attn_res_commit_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm90a"
+  },
+  {
+   "op_id": "X01.attn_res_commit",
+   "kernel_symbol": "attn_res_commit_kernel",
+   "provider": "native",
+   "arch_id": 1000,
+   "status": "compiled",
+   "predicates": "T1/generic fallback body compiled for the exact SM; optimized wgmma/tcgen05 body pending",
+   "evidence": "out/handoff/sm100a"
   }
  ]
 }

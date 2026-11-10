@@ -69,6 +69,7 @@ set(KOPS_CUDA_ARCHS "native" CACHE STRING
     "CUDA targets: native, or a ;-list such as 80;89;90a;100a;120a")
 option(KOPS_BUILD_TESTS "Build the host/GPU smoke tests" ON)
 option(KOPS_BUILD_BENCHMARKS "Build the C++ benchmark targets" OFF)
+option(KOPS_TWIN "Build SM80-policy twin instantiations of arch-specific kernels (test only)" OFF)
 option(KOPS_WITH_CUTLASS "Link CUTLASS-based adapters (not implemented yet)" OFF)
 option(KOPS_WITH_TORCH "Build bindings/torch (needs libtorch; not in M1)" OFF)
 option(KOPS_LINEINFO "Emit -lineinfo in CUDA objects (Nsight source view; slower build)" OFF)
@@ -144,6 +145,8 @@ endif()
 add_library(kops_cuda STATIC
   csrc/common/tensor.cc
   csrc/execution/launch.cc
+  csrc/execution/persistent.cu
+  csrc/mega/mega.cu
   csrc/runtime/trace.cc
   csrc/model_ops/residual.cu
   csrc/norm/norm.cu
@@ -170,10 +173,14 @@ csrc/gemm/gemm_mma.cu
   csrc/moe/fused_moe.cu
   csrc/moe/routing.cu
   csrc/moe/permute.cu
+  csrc/communication/allreduce.cu
+  csrc/communication/ep.cu
+  csrc/communication/comm_gemm.cu
   csrc/attention/merge.cu
   csrc/attention/prefill.cu
   csrc/attention/decode.cu
   csrc/attention/mla.cu
+  csrc/attention/lowbit.cu
   csrc/kvcache/kvcache.cu
   csrc/state/state_cache.cu
   csrc/state/conv1d.cu
@@ -183,10 +190,22 @@ csrc/gemm/gemm_mma.cu
   csrc/state/delta_rule_chunk.cu)
 target_link_libraries(kops_cuda PUBLIC kops_host CUDA::cudart)
 target_include_directories(kops_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+foreach(kops_new_source
+    csrc/attention/sparse.cu
+    csrc/model_ops/hyper_connection.cu
+    csrc/model_ops/attn_res.cu)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${kops_new_source}")
+    target_sources(kops_cuda PRIVATE "${kops_new_source}")
+  endif()
+endforeach()
 set_target_properties(kops_cuda PROPERTIES
   POSITION_INDEPENDENT_CODE ON
   CUDA_RUNTIME_LIBRARY Shared)
 kops_set_cuda_options(kops_cuda)
+if(KOPS_TWIN)
+  target_compile_definitions(kops_cuda PUBLIC KOPS_TWIN=1)
+  message(STATUS "kernel-ops: KOPS_TWIN=ON (SM80-policy twins, test only)")
+endif()
 
 # ---- tests ------------------------------------------------------------------
 function(kops_add_test name)
@@ -213,6 +232,14 @@ if(KOPS_BUILD_TESTS)
   kops_add_test(kops_test_m1
     SOURCES tests/unit/test_m1.cc
     LIBS kops_cuda)
+  # P8 layer conformance: composes the implemented families into the ROADMAP §3.5
+  # layers and checks every result against the fp64 oracle (tests/golden/).
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_conformance.cc")
+    set_source_files_properties(tests/unit/test_conformance.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_conformance
+      SOURCES tests/unit/test_conformance.cc
+      LIBS kops_cuda)
+  endif()
   set_source_files_properties(tests/unit/test_model_ops.cc PROPERTIES LANGUAGE CUDA)
   kops_add_test(kops_test_model_ops
     SOURCES tests/unit/test_model_ops.cc
@@ -275,12 +302,32 @@ if(KOPS_BUILD_TESTS)
       SOURCES tests/unit/test_gemm.cc
       LIBS kops_cuda)
   endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_communication.cc")
+    set_source_files_properties(tests/unit/test_communication.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_communication
+      SOURCES tests/unit/test_communication.cc
+      LIBS kops_cuda)
+  endif()
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_moe.cc")
     set_source_files_properties(tests/unit/test_moe.cc PROPERTIES LANGUAGE CUDA)
     kops_add_test(kops_test_moe
       SOURCES tests/unit/test_moe.cc
       LIBS kops_cuda)
   endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/test_mega.cc")
+    set_source_files_properties(tests/unit/test_mega.cc PROPERTIES LANGUAGE CUDA)
+    kops_add_test(kops_test_mega
+      SOURCES tests/unit/test_mega.cc
+      LIBS kops_cuda)
+  endif()
+  foreach(kops_test_name test_mla test_sparse test_sparse_mla test_indexer test_compressed_attention test_kv_compressor test_hyper_connection test_attn_res test_mla_metadata test_mla_1m test_sm120)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/${kops_test_name}.cc")
+      set_source_files_properties("tests/unit/${kops_test_name}.cc" PROPERTIES LANGUAGE CUDA)
+      kops_add_test("kops_${kops_test_name}"
+        SOURCES "tests/unit/${kops_test_name}.cc"
+        LIBS kops_cuda)
+    endif()
+  endforeach()
 endif()
 
 # ---- install (static libs now; module/wheel targets later) ------------------

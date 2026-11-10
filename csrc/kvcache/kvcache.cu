@@ -935,60 +935,220 @@ __global__ void kv_scale_update_kernel(float* __restrict__ k_absmax,
 }
 
 // =============================================================================
-// K01/B3  ds_mla 656-byte records
+// K01/B3  ds_mla latent records (656 / V4.0 584 / V4.1 528 / V4.1 FP4 288)
 // =============================================================================
 
-template <typename scalar_t>
+/// Decode a UE8M0 byte (2^(e-127)); 0xFF is NaN by spec.
+__device__ __forceinline__ float ue8m0_to_scale(uint8_t e) {
+  if (e == 0xffu) return __int_as_float(0x7fc00000);
+  return ldexpf(1.0f, static_cast<int>(e) - 127);
+}
+
+/**
+ * Power-of-two tile scale for the FP8 records: 2^ceil(log2(max(amax / 448, 1e-4))) as UE8M0
+ * (FlashMLA _cast_scale_inv_to_ue8m0). A NaN in the tile keeps NaN (byte 0xFF) and an Inf
+ * tile scale stays +Inf (also 0xFF), matching the reference's clamp/log2/pow chain.
+ */
+__device__ __forceinline__ float fp8_tile_scale(float amax, unsigned nan_flag, uint8_t* byte) {
+  float x = __fdiv_rn(amax, kFp8E4M3Max);
+  if (x < 1e-4f) x = 1e-4f;  // false for NaN, so NaN survives
+  if (nan_flag != 0u) {
+    *byte = 0xffu;
+    return __int_as_float(0x7fc00000);
+  }
+  if (isinf(x)) {
+    *byte = 0xffu;
+    return x;
+  }
+  int e = 0;
+  frexpf(x, &e);
+  e -= 1;
+  if (ldexpf(1.0f, e) < x) ++e;
+  e = e < -127 ? -127 : (e > 127 ? 127 : e);
+  *byte = static_cast<uint8_t>(e + 127);
+  return ldexpf(1.0f, e);
+}
+
+/**
+ * E4M3 block scale of one FP4 tile: clamp(amax / 6, 2^-9, 448) rounded to e4m3. A NaN or Inf
+ * element poisons the tile (the reference nan_to_num + where(isinf(amax)) chain), so the scale
+ * byte is the e4m3 NaN 0x7F and every code in the tile is zero.
+ */
+__device__ __forceinline__ float fp4_tile_scale(float amax, unsigned bad_flag, uint8_t* byte) {
+  if (bad_flag != 0u) {
+    *byte = 0x7fu;
+    return __int_as_float(0x7fc00000);
+  }
+  float x = __fdiv_rn(amax, kFp4E2M1Max);
+  x = x < 0x1p-9f ? 0x1p-9f : x;
+  x = x > kFp8E4M3Max ? kFp8E4M3Max : x;
+  *byte = e4m3_from_float(x);
+  return e4m3_to_float(*byte);
+}
+
+/// fp32 -> e2m1 code with FlashMLA's semantics: nearest, ties to even code, saturate at +-6,
+/// NaN -> zero magnitude (sign kept). `__nv_cvt_float_to_fp4` implements the finite cases.
+__device__ __forceinline__ uint8_t fp4_from_float(float x, float scale) {
+  const float q = (scale != 0.0f) ? __fdiv_rn(x, scale) : 0.0f;
+  if (isnan(q)) return static_cast<uint8_t>((__float_as_uint(q) >> 28) & 0x8u);
+  return static_cast<uint8_t>(__nv_cvt_float_to_fp4(q, __NV_E2M1, cudaRoundNearest));
+}
+
+template <typename scalar_t, KVCodec kCodec>
 __global__ void concat_and_cache_ds_mla_kernel(
     const scalar_t* __restrict__ kv_c, const scalar_t* __restrict__ k_pe,
-    uint8_t* __restrict__ kv_cache, const int64_t* __restrict__ slot_mapping,
-    const int block_stride, const int entry_stride, const int kv_c_stride,
-    const int k_pe_stride, const int kv_lora_rank, const int pe_dim, const int block_size) {
+    uint8_t* __restrict__ kv_cache, uint8_t* __restrict__ scale_pages,
+    const int64_t* __restrict__ slot_mapping, const int64_t block_stride,
+    const int64_t entry_stride, const int64_t scale_block_stride,
+    const int64_t scale_token_stride, const int kv_c_stride, const int k_pe_stride,
+    const int kv_lora_rank, const int pe_dim, const int block_size) {
   const int64_t token = blockIdx.x;
   const int64_t slot = slot_mapping[token];
   if (slot < 0) return;
-  uint8_t* record = kv_cache + (slot / block_size) * block_stride +
-                    (slot % block_size) * entry_stride;
-  if (threadIdx.x >= 64) {
-    const int i = (threadIdx.x - 64) * 2;
-    if (i + 1 < pe_dim && k_pe != nullptr) {
-      const int64_t src = token * k_pe_stride + i;
-      const __nv_bfloat16 a = __float2bfloat16_rn(to_f<scalar_t>(k_pe[src]));
-      const __nv_bfloat16 b = __float2bfloat16_rn(to_f<scalar_t>(k_pe[src + 1]));
-      uint16_t* dst = reinterpret_cast<uint16_t*>(record + kv_lora_rank + 16 + 2 * i);
+  const int64_t page = slot / block_size;
+  const int64_t off = slot - page * block_size;
+  uint8_t* record = kv_cache + page * block_stride + off * entry_stride;
+  uint8_t* scale_row = scale_pages != nullptr
+                           ? scale_pages + page * scale_block_stride + off * scale_token_stride
+                           : nullptr;
+  if constexpr (kCodec == KVCodec::kMLAFp8DS) {
+    if (threadIdx.x >= 64) {
+      const int i = (threadIdx.x - 64) * 2;
+      if (i + 1 < pe_dim && k_pe != nullptr) {
+        const int64_t src = token * k_pe_stride + i;
+        const __nv_bfloat16 a = __float2bfloat16_rn(to_f<scalar_t>(k_pe[src]));
+        const __nv_bfloat16 b = __float2bfloat16_rn(to_f<scalar_t>(k_pe[src + 1]));
+        uint16_t* dst = reinterpret_cast<uint16_t*>(record + kv_lora_rank + 16 + 2 * i);
+        dst[0] = *reinterpret_cast<const uint16_t*>(&a);
+        dst[1] = *reinterpret_cast<const uint16_t*>(&b);
+      } else {
+        *reinterpret_cast<uint32_t*>(record + kv_lora_rank + 16 + 2 * i) = 0u;
+      }
+      return;
+    }
+    const int tid = static_cast<int>(threadIdx.x);
+    const int tile = tid >> 4;
+    const int lane16 = tid & 15;
+    const int tile_count = kv_lora_rank / 128;
+    if (tile >= tile_count) return;
+    const scalar_t* src = kv_c + token * kv_c_stride + tile * 128 + lane16 * 8;
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = to_f<scalar_t>(src[j]);
+    float amax = fmaxf(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))),
+                       fmaxf(fmaxf(fabsf(v[4]), fabsf(v[5])), fmaxf(fabsf(v[6]), fabsf(v[7]))));
+    for (int offs = 8; offs > 0; offs >>= 1) {
+      amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offs, 16));
+    }
+    const float unrounded = fmaxf(__fdiv_rn(amax, kFp8E4M3Max), 1e-4f);
+    const uint32_t bits = __float_as_uint(unrounded);
+    const float tile_scale = __uint_as_float((bits + 0x7fffffu) & 0x7f800000u);
+    if (lane16 == 0) {
+      reinterpret_cast<float*>(record + kv_lora_rank)[tile] = tile_scale;
+    }
+    uint8_t codes[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) codes[j] = e4m3_from_float(__fdiv_rn(v[j], tile_scale));
+    uint64_t packed;
+    memcpy(&packed, codes, 8);
+    *reinterpret_cast<uint64_t*>(record + tile * 128 + lane16 * 8) = packed;
+    return;
+  }
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+  if constexpr (kCodec == KVCodec::kMLAFp8DSV40) {
+    // 7 NoPE tiles of 64 (warps 0..6, two values per lane) + one bf16 RoPE warp.
+    if (warp < 7) {
+      const int base = warp * 64;
+      const float v0 = to_f<scalar_t>(kv_c[token * kv_c_stride + base + lane]);
+      const float v1 = to_f<scalar_t>(kv_c[token * kv_c_stride + base + lane + 32]);
+      const float a0 = fabsf(v0);
+      const float a1 = fabsf(v1);
+      unsigned nan_flag = (isnan(a0) || isnan(a1)) ? 1u : 0u;
+      float amax = fmaxf(isnan(a0) ? 0.0f : a0, isnan(a1) ? 0.0f : a1);
+      amax = fmaxf(amax, (isinf(a0) || isinf(a1)) ? __int_as_float(0x7f800000) : 0.0f);
+      amax = warp_reduce_max(amax);
+      unsigned any_nan = nan_flag;
+      for (int offs = 16; offs > 0; offs >>= 1) {
+        any_nan |= __shfl_xor_sync(0xffffffffu, any_nan, offs);
+      }
+      uint8_t sb = 0;
+      const float s = fp8_tile_scale(amax, any_nan, &sb);
+      if (lane == 0) scale_row[warp] = sb;
+      record[base + lane] = e4m3_from_float(__fdiv_rn(v0, s));
+      record[base + lane + 32] = e4m3_from_float(__fdiv_rn(v1, s));
+    } else if (warp == 7) {
+      const int j = lane * 2;
+      const float p0 = (k_pe != nullptr && j < pe_dim)
+                           ? to_f<scalar_t>(k_pe[token * k_pe_stride + j])
+                           : 0.0f;
+      const float p1 = (k_pe != nullptr && j + 1 < pe_dim)
+                           ? to_f<scalar_t>(k_pe[token * k_pe_stride + j + 1])
+                           : 0.0f;
+      const __nv_bfloat16 a = __float2bfloat16_rn(p0);
+      const __nv_bfloat16 b = __float2bfloat16_rn(p1);
+      uint16_t* dst = reinterpret_cast<uint16_t*>(record + 448 + 2 * j);
       dst[0] = *reinterpret_cast<const uint16_t*>(&a);
       dst[1] = *reinterpret_cast<const uint16_t*>(&b);
-    } else {
-      *reinterpret_cast<uint32_t*>(record + kv_lora_rank + 16 + 2 * i) = 0u;
+    }
+    if (threadIdx.x == 0) scale_row[7] = 0u;  // unused pad byte of the 8 B scale record
+    return;
+  }
+  if constexpr (kCodec == KVCodec::kMLAFp8DSV41) {
+    // 16 tiles of 32 over the 512 logical dims (448 NoPE from kv_c, 64 RoPE from k_pe).
+    for (int t = warp; t < 16; t += warps) {
+      const int dim = t * 32 + lane;
+      float v = 0.0f;
+      if (dim < 448) {
+        v = to_f<scalar_t>(kv_c[token * kv_c_stride + dim]);
+      } else if (k_pe != nullptr && dim - 448 < pe_dim) {
+        v = to_f<scalar_t>(k_pe[token * k_pe_stride + dim - 448]);
+      }
+      const float av = fabsf(v);
+      const unsigned nan_flag = isnan(av) ? 1u : 0u;
+      float amax = (nan_flag != 0u) ? 0.0f : av;
+      amax = fmaxf(amax, isinf(av) ? __int_as_float(0x7f800000) : 0.0f);
+      amax = warp_reduce_max(amax);
+      unsigned any_nan = nan_flag;
+      for (int offs = 16; offs > 0; offs >>= 1) {
+        any_nan |= __shfl_xor_sync(0xffffffffu, any_nan, offs);
+      }
+      uint8_t sb = 0;
+      const float s = fp8_tile_scale(amax, any_nan, &sb);
+      if (lane == 0) record[512 + t] = sb;
+      record[dim] = e4m3_from_float(__fdiv_rn(v, s));
     }
     return;
   }
-  const int tid = static_cast<int>(threadIdx.x);
-  const int tile = tid >> 4;
-  const int lane16 = tid & 15;
-  const int tile_count = kv_lora_rank / 128;
-  if (tile >= tile_count) return;
-  const scalar_t* src = kv_c + token * kv_c_stride + tile * 128 + lane16 * 8;
-  float v[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) v[j] = to_f<scalar_t>(src[j]);
-  float amax = fmaxf(fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3]))),
-                     fmaxf(fmaxf(fabsf(v[4]), fabsf(v[5])), fmaxf(fabsf(v[6]), fabsf(v[7]))));
-  for (int off = 8; off > 0; off >>= 1) {
-    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off, 16));
+  // kMLAFp8DSV41Fp4: 32 tiles of 16 packed two-per-byte; one 8-lane group per tile.
+  const int group = static_cast<int>(threadIdx.x) >> 3;
+  const int sub = static_cast<int>(threadIdx.x) & 7;
+  if (group >= 32) return;
+  const int dim0 = group * 16 + sub * 2;
+  float v0 = 0.0f, v1 = 0.0f;
+  if (dim0 < 448) {
+    v0 = to_f<scalar_t>(kv_c[token * kv_c_stride + dim0]);
+    v1 = (dim0 + 1 < 448) ? to_f<scalar_t>(kv_c[token * kv_c_stride + dim0 + 1]) : 0.0f;
+  } else if (k_pe != nullptr && dim0 - 448 < pe_dim) {
+    v0 = to_f<scalar_t>(k_pe[token * k_pe_stride + dim0 - 448]);
+    v1 = (dim0 + 1 - 448 < pe_dim) ? to_f<scalar_t>(k_pe[token * k_pe_stride + dim0 + 1 - 448])
+                                   : 0.0f;
   }
-  const float unrounded = fmaxf(__fdiv_rn(amax, kFp8E4M3Max), 1e-4f);
-  const uint32_t bits = __float_as_uint(unrounded);
-  const float tile_scale = __uint_as_float((bits + 0x7fffffu) & 0x7f800000u);
-  if (lane16 == 0) {
-    reinterpret_cast<float*>(record + kv_lora_rank)[tile] = tile_scale;
+  const float a0 = fabsf(v0);
+  const float a1 = fabsf(v1);
+  unsigned bad = (isnan(a0) || isnan(a1) || isinf(a0) || isinf(a1)) ? 1u : 0u;
+  float amax = fmaxf(isnan(a0) ? 0.0f : a0, isnan(a1) ? 0.0f : a1);
+  for (int offs = 4; offs > 0; offs >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, offs, 8));
+    bad |= __shfl_xor_sync(0xffffffffu, bad, offs, 8);
   }
-  uint8_t codes[8];
-#pragma unroll
-  for (int j = 0; j < 8; ++j) codes[j] = e4m3_from_float(__fdiv_rn(v[j], tile_scale));
-  uint64_t packed;
-  memcpy(&packed, codes, 8);
-  *reinterpret_cast<uint64_t*>(record + tile * 128 + lane16 * 8) = packed;
+  uint8_t sb = 0;
+  const float s = fp4_tile_scale(amax, bad, &sb);
+  if (sub == 0) record[256 + group] = sb;
+  const uint8_t c0 = fp4_from_float(v0, s);
+  const uint8_t c1 = fp4_from_float(v1, s);
+  record[group * 8 + sub] = static_cast<uint8_t>(c0 | (c1 << 4));
 }
 
 // =============================================================================
@@ -1409,16 +1569,20 @@ __global__ void cp_gather_cache_kernel(const uint8_t* __restrict__ src_cache,
   (void)kContiguousEntries;
 }
 
-// B3: ds_mla 656-byte records -> bf16 [num_tokens, 576]. One warp per token;
-// lane i dequantizes the 16 NoPE codes of tile i/8 and copies one RoPE word.
+// B3: MLA latent records -> bf16. One warp per token. The 656 B path (lane i dequantizes the
+// 16 NoPE codes of tile i/8 and copies one RoPE word) is unchanged; the V4 records follow.
+template <KVCodec kCodec>
 __global__ void cp_gather_and_upconvert_ds_mla_fp8_kernel(
     const uint8_t* __restrict__ src_cache, bf16_t* __restrict__ dst, const GatherSpec spec,
     const int32_t block_size, const int64_t cache_block_stride, const int64_t cache_entry_stride,
     const int64_t dst_entry_stride, const uint8_t* __restrict__ host_cache,
     const int32_t* __restrict__ host_row_ids, const int32_t* __restrict__ device_row_ids,
-    const int64_t host_entry_stride) {
+    const int64_t host_entry_stride, const uint8_t* __restrict__ scale_pages,
+    const int64_t scale_block_stride, const int64_t scale_token_stride, const int dst_cols) {
   const int lane = threadIdx.x & 31;
-  const int64_t token = static_cast<int64_t>(blockIdx.x) * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int warp = threadIdx.x >> 5;
+  const int warps = blockDim.x >> 5;
+  const int64_t token = static_cast<int64_t>(blockIdx.x) * warps + warp;
   if (token >= spec.num_tokens) return;
   int64_t page = 0, off = 0;
   if (!resolve_gather_row(spec, static_cast<int>(token), block_size, &page, &off)) return;
@@ -1437,28 +1601,67 @@ __global__ void cp_gather_and_upconvert_ds_mla_fp8_kernel(
     }
   }
   if (record == nullptr) return;
-  const uint2 lo = reinterpret_cast<const uint2*>(record)[2 * lane];
-  const uint2 hi = reinterpret_cast<const uint2*>(record)[2 * lane + 1];
-  const float scale = reinterpret_cast<const float*>(record + 512)[lane >> 3];
-  const uint32_t words[4] = {lo.x, lo.y, hi.x, hi.y};
-  uint32_t packed[8];
-  #pragma unroll
-  for (int w = 0; w < 4; ++w) {
+  bf16_t* out = dst + token * dst_entry_stride;
+  if constexpr (kCodec == KVCodec::kMLAFp8DS) {
+    const uint2 lo = reinterpret_cast<const uint2*>(record)[2 * lane];
+    const uint2 hi = reinterpret_cast<const uint2*>(record)[2 * lane + 1];
+    const float scale = reinterpret_cast<const float*>(record + 512)[lane >> 3];
+    const uint32_t words[4] = {lo.x, lo.y, hi.x, hi.y};
+    uint32_t packed[8];
     #pragma unroll
-    for (int k = 0; k < 2; ++k) {
-      const uint8_t code0 = (words[w] >> (8 * (2 * k))) & 0xff;
-      const uint8_t code1 = (words[w] >> (8 * (2 * k + 1))) & 0xff;
-      const float f0 = e4m3_to_float(code0) * scale;
-      const float f1 = e4m3_to_float(code1) * scale;
+    for (int w = 0; w < 4; ++w) {
+      #pragma unroll
+      for (int k = 0; k < 2; ++k) {
+        const uint8_t code0 = (words[w] >> (8 * (2 * k))) & 0xff;
+        const uint8_t code1 = (words[w] >> (8 * (2 * k + 1))) & 0xff;
+        const float f0 = e4m3_to_float(code0) * scale;
+        const float f1 = e4m3_to_float(code1) * scale;
+        const __nv_bfloat162 pair = __floats2bfloat162_rn(f0, f1);
+        packed[2 * w + k] = *reinterpret_cast<const uint32_t*>(&pair);
+      }
+    }
+    uint4* nope = reinterpret_cast<uint4*>(out) + 2 * lane;
+    nope[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+    nope[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
+    reinterpret_cast<uint32_t*>(out + 512)[lane] = reinterpret_cast<const uint32_t*>(record + 528)[lane];
+    return;
+  }
+  if constexpr (kCodec == KVCodec::kMLAFp8DSV40) {
+    // Scale rows are addressed by the block-table page and offset, exactly like the write path.
+    // They must stay device-resident when only the data rows are offloaded (host_cache carries
+    // entry_bytes-wide data records, not the 8 B scale region).
+    const uint8_t* scale_row = scale_pages + page * scale_block_stride + off * scale_token_stride;
+    for (int t = 0; t < 7; ++t) {
+      const float s = ue8m0_to_scale(scale_row[t]);
+      for (int j = lane; j < 64; j += 32) {
+        out[t * 64 + j] = __float2bfloat16_rn(e4m3_to_float(record[t * 64 + j]) * s);
+      }
+    }
+    for (int j = lane; j < 64; j += 32) {
+      out[448 + j] = *reinterpret_cast<const bf16_t*>(record + 448 + 2 * j);
+    }
+  } else if constexpr (kCodec == KVCodec::kMLAFp8DSV41) {
+    for (int t = 0; t < 16; ++t) {
+      const float s = ue8m0_to_scale(record[512 + t]);
+      const int idx = t * 32 + lane;
+      out[idx] = __float2bfloat16_rn(e4m3_to_float(record[idx]) * s);
+    }
+  } else {
+    // FP4: 32 tiles of 16; four tiles per warp, 8 lanes per tile, even element low nibble.
+    const int sub = lane & 7;
+    for (int t = lane >> 3; t < 32; t += 4) {
+      const uint8_t by = record[t * 8 + sub];
+      const float s = e4m3_to_float(record[256 + t]);
+      const float f0 = dev::e2m1_decode(by & 0x0fu) * s;
+      const float f1 = dev::e2m1_decode(by >> 4) * s;
       const __nv_bfloat162 pair = __floats2bfloat162_rn(f0, f1);
-      packed[2 * w + k] = *reinterpret_cast<const uint32_t*>(&pair);
+      *reinterpret_cast<uint32_t*>(out + t * 16 + 2 * sub) =
+          *reinterpret_cast<const uint32_t*>(&pair);
     }
   }
-  bf16_t* out = dst + token * dst_entry_stride;
-  uint4* nope = reinterpret_cast<uint4*>(out) + 2 * lane;
-  nope[0] = make_uint4(packed[0], packed[1], packed[2], packed[3]);
-  nope[1] = make_uint4(packed[4], packed[5], packed[6], packed[7]);
-  reinterpret_cast<uint32_t*>(out + 512)[lane] = reinterpret_cast<const uint32_t*>(record + 528)[lane];
+  if (dst_cols > 512) {
+    for (int j = 512 + lane; j < dst_cols; j += 32) out[j] = __float2bfloat16_rn(0.0f);
+  }
 }
 
 // B3: indexer split-page gather. Block (32, BLOCK_Y) with BLOCK_Y tokens per
@@ -2019,6 +2222,109 @@ Status kv_desc_validate(const PagedKVDesc& desc) {
                                  "PagedKVDesc: kMLAFp8DSFNUZ requires FNUZ FP8");
       }
       break;
+    case KVCodec::kMLAFp8DSV40: {
+      if (desc.layout != KVLayout::kLatent) {
+        return detail::set_error(Status::kUnsupportedLayout,
+                                 "PagedKVDesc: kMLAFp8DSV40 is a latent record codec");
+      }
+      if (desc.entry_bytes != 576) {
+        return detail::set_error(Status::kUnsupportedShape,
+                                 "PagedKVDesc: kMLAFp8DSV40 data record must be 576 B, got %d",
+                                 desc.entry_bytes);
+      }
+      if (desc.head_dim_k != 512 || desc.head_dim_v != 512) {
+        return detail::set_error(Status::kUnsupportedShape,
+                                 "PagedKVDesc: kMLAFp8DSV40 head dims must be 512/512, got %d/%d",
+                                 desc.head_dim_k, desc.head_dim_v);
+      }
+      if (desc.num_kv_heads > 1) {
+        return detail::set_error(Status::kUnsupportedShape,
+                                 "PagedKVDesc: kMLAFp8DSV40 has one latent head, got %d",
+                                 desc.num_kv_heads);
+      }
+      if (desc.k_dtype != DType::kFloat8E4M3 || desc.fp8 != Fp8Encoding::kOCP) {
+        return detail::set_error(Status::kUnsupportedDtype,
+                                 "PagedKVDesc: kMLAFp8DSV40 requires an OCP e4m3 payload, got %s",
+                                 dtype_name(desc.k_dtype));
+      }
+      if (desc.scale_bytes_per_token != 8) {
+        return detail::set_error(Status::kInvalidArgument,
+                                 "PagedKVDesc: kMLAFp8DSV40 needs scale_bytes_per_token 8, got %d",
+                                 desc.scale_bytes_per_token);
+      }
+      if (desc.k_scale_pages == nullptr || desc.k_scale_stride_page <= 0 ||
+          desc.k_scale_stride_token < 8) {
+        return detail::set_error(Status::kInvalidArgument,
+                                 "PagedKVDesc: kMLAFp8DSV40 needs k_scale_pages with positive "
+                                 "page/token strides");
+      }
+      if (desc.k_stride_token != 0 && desc.k_stride_token < 576) {
+        return detail::set_error(Status::kInvalidArgument,
+                                 "PagedKVDesc: kMLAFp8DSV40 token stride %lld < 576 B",
+                                 static_cast<long long>(desc.k_stride_token));
+      }
+      if (desc.v_codec != KVCodec::kNative) {
+        return detail::set_error(Status::kUnsupportedDtype,
+                                 "PagedKVDesc: kMLAFp8DSV40 has no V cache (v_codec must be "
+                                 "native)");
+      }
+      break;
+    }
+    case KVCodec::kMLAFp8DSV41:
+    case KVCodec::kMLAFp8DSV41Fp4: {
+      const bool fp4 = desc.k_codec == KVCodec::kMLAFp8DSV41Fp4;
+      const int want_bytes = fp4 ? 288 : 528;
+      if (desc.layout != KVLayout::kLatent) {
+        return detail::set_error(Status::kUnsupportedLayout,
+                                 "PagedKVDesc: codec %d is a latent record codec",
+                                 static_cast<int>(desc.k_codec));
+      }
+      if (desc.entry_bytes != want_bytes) {
+        return detail::set_error(Status::kUnsupportedShape,
+                                 "PagedKVDesc: codec %d record must be %d B, got %d",
+                                 static_cast<int>(desc.k_codec), want_bytes, desc.entry_bytes);
+      }
+      if (desc.head_dim_k != 512 || desc.head_dim_v != 512) {
+        return detail::set_error(Status::kUnsupportedShape,
+                                 "PagedKVDesc: codec %d head dims must be 512/512, got %d/%d",
+                                 static_cast<int>(desc.k_codec), desc.head_dim_k, desc.head_dim_v);
+      }
+      if (desc.num_kv_heads > 1) {
+        return detail::set_error(Status::kUnsupportedShape,
+                                 "PagedKVDesc: codec %d has one latent head, got %d",
+                                 static_cast<int>(desc.k_codec), desc.num_kv_heads);
+      }
+      if (desc.scale_bytes_per_token != 0 || desc.k_scale_pages != nullptr) {
+        return detail::set_error(Status::kInvalidArgument,
+                                 "PagedKVDesc: codec %d stores its scales inline",
+                                 static_cast<int>(desc.k_codec));
+      }
+      if (fp4) {
+        if ((desc.k_dtype != DType::kFloat4E2M1x2 && desc.k_dtype != DType::kFloat8E4M3) ||
+            desc.fp8 != Fp8Encoding::kOCP) {
+          return detail::set_error(Status::kUnsupportedDtype,
+                                   "PagedKVDesc: kMLAFp8DSV41Fp4 needs an e2m1 payload (or the "
+                                   "e4m3 record view) with OCP scales, got %s",
+                                   dtype_name(desc.k_dtype));
+        }
+      } else if (desc.k_dtype != DType::kFloat8E4M3 || desc.fp8 != Fp8Encoding::kOCP) {
+        return detail::set_error(Status::kUnsupportedDtype,
+                                 "PagedKVDesc: codec %d requires an OCP e4m3 payload, got %s",
+                                 static_cast<int>(desc.k_codec), dtype_name(desc.k_dtype));
+      }
+      if (desc.k_stride_token != 0 && desc.k_stride_token < want_bytes) {
+        return detail::set_error(Status::kInvalidArgument,
+                                 "PagedKVDesc: codec %d token stride %lld < %d B",
+                                 static_cast<int>(desc.k_codec),
+                                 static_cast<long long>(desc.k_stride_token), want_bytes);
+      }
+      if (desc.v_codec != KVCodec::kNative) {
+        return detail::set_error(Status::kUnsupportedDtype,
+                                 "PagedKVDesc: codec %d has no V cache (v_codec must be native)",
+                                 static_cast<int>(desc.k_codec));
+      }
+      break;
+    }
     case KVCodec::kFP8PerTokenHead:
     case KVCodec::kInt8PerTokenHead:
     case KVCodec::kInt4PerTokenHead:
@@ -2054,7 +2360,9 @@ Status kv_desc_validate(const PagedKVDesc& desc) {
   }
   if (desc.k_codec != KVCodec::kNative && desc.k_codec != KVCodec::kMLAFp8DS &&
       desc.k_codec != KVCodec::kMLAFp8DSFNUZ && desc.k_codec != KVCodec::kIndexerFP8 &&
-      desc.k_codec != KVCodec::kIndexerFP4 && desc.k_scale == nullptr &&
+      desc.k_codec != KVCodec::kIndexerFP4 && desc.k_codec != KVCodec::kMLAFp8DSV40 &&
+      desc.k_codec != KVCodec::kMLAFp8DSV41 && desc.k_codec != KVCodec::kMLAFp8DSV41Fp4 &&
+      desc.k_scale == nullptr &&
       desc.k_codec != KVCodec::kFP8PerTokenHead &&
       desc.k_codec != KVCodec::kInt8PerTokenHead &&
       desc.k_codec != KVCodec::kInt4PerTokenHead) {
@@ -2111,6 +2419,37 @@ Status kv_desc_validate(const PagedKVDesc& desc) {
 
 int64_t kv_physical_bytes(const PagedKVDesc& desc, int64_t num_pages) {
   if (desc.page_size <= 0 || num_pages <= 0) return 0;
+  auto align16 = [](int64_t n) { return (n + 15) & ~static_cast<int64_t>(15); };
+  const int64_t ps = desc.page_size;
+  // V4 MLA records own their page geometry: the format fixes the per-token width, so the ledger
+  // does not depend on a caller-supplied stride. V4.0 keeps the FlashMLA page padding rule
+  // (the whole page is rounded up to a multiple of the 576 B data row) and counts its 8 B/token
+  // out-of-record scale region once, inside that padded page.
+  switch (desc.k_codec) {
+    case KVCodec::kMLAFp8DSV40: {
+      int64_t page = ((ps * 584 + 575) / 576) * 576;
+      if (desc.stride_unit == StrideUnit::kByte && desc.k_stride_page > page) {
+        page = desc.k_stride_page;  // caller padded further; never double count the scales
+      }
+      return align16(page) * num_pages;
+    }
+    case KVCodec::kMLAFp8DSV41: {
+      int64_t page = ps * 528;
+      if (desc.stride_unit == StrideUnit::kByte && desc.k_stride_page > page) {
+        page = desc.k_stride_page;
+      }
+      return align16(page) * num_pages;
+    }
+    case KVCodec::kMLAFp8DSV41Fp4: {
+      int64_t page = ps * 288;
+      if (desc.stride_unit == StrideUnit::kByte && desc.k_stride_page > page) {
+        page = desc.k_stride_page;
+      }
+      return align16(page) * num_pages;
+    }
+    default:
+      break;
+  }
   auto page_bytes = [&](DType dtype, KVCodec codec, int32_t entry_bytes, int32_t heads,
                         int32_t head_dim, int64_t stride_page, int64_t stride_token,
                         int64_t stride_head, StrideUnit unit) -> int64_t {
@@ -2613,42 +2952,61 @@ Status concat_and_cache_mla(const Tensor& kv_c, const Tensor& k_pe, const PagedK
   if (kv_c.shape[0] < num_tokens || (tensor_present(k_pe) && k_pe.shape[0] < num_tokens)) {
     return detail::set_error(Status::kInvalidArgument, "concat_and_cache_mla: source too short");
   }
-  if (cache.k_codec == KVCodec::kMLAFp8DS) {
+  const bool record_codec = cache.k_codec == KVCodec::kMLAFp8DS ||
+                            cache.k_codec == KVCodec::kMLAFp8DSV40 ||
+                            cache.k_codec == KVCodec::kMLAFp8DSV41 ||
+                            cache.k_codec == KVCodec::kMLAFp8DSV41Fp4;
+  if (record_codec) {
     const int rank = static_cast<int>(kv_c.shape[1]);
     const int pe = tensor_present(k_pe) ? static_cast<int>(k_pe.shape[1]) : 0;
-    if (!((rank + pe == 576) || (rank == 512 && pe == 0)) || rank % 128 != 0) {
+    const int want_rank = cache.k_codec == KVCodec::kMLAFp8DS ? 512 : 448;
+    if (!((rank == want_rank && pe == 64) || (rank == want_rank && pe == 0))) {
       return detail::set_error(Status::kUnsupportedShape,
-                               "concat_and_cache_mla: ds_mla needs kv_c 512 + pe 64 (or NoPE)");
-    }
-    if (cache.entry_bytes != 656) {
-      return detail::set_error(Status::kUnsupportedShape,
-                               "concat_and_cache_mla: ds_mla record must be 656 B");
+                               "concat_and_cache_mla: codec %d needs kv_c %d + pe 64 (or NoPE), "
+                               "got %d + %d",
+                               static_cast<int>(cache.k_codec), want_rank, rank, pe);
     }
     if (num_tokens == 0) return Status::kSuccess;
     const cudaStream_t stream = stream_of(ctx);
+    const bool v40 = cache.k_codec == KVCodec::kMLAFp8DSV40;
     const int64_t block_stride =
         cache.k_stride_page > 0 ? cache.k_stride_page
                                 : static_cast<int64_t>(cache.page_size) * cache.entry_bytes;
-    const int64_t entry_stride = cache.entry_bytes;
-    if (block_stride > INT32_MAX || entry_stride > INT32_MAX || kv_c.stride[0] > INT32_MAX ||
-        (tensor_present(k_pe) && k_pe.stride[0] > INT32_MAX)) {
+    const int64_t entry_stride =
+        cache.k_codec == KVCodec::kMLAFp8DS
+            ? cache.entry_bytes
+            : (cache.k_stride_token > 0 ? cache.k_stride_token : cache.entry_bytes);
+    const int64_t scale_block_stride = v40 ? cache.k_scale_stride_page : 0;
+    const int64_t scale_token_stride = v40 ? cache.k_scale_stride_token : 0;
+    const int block = cache.k_codec == KVCodec::kMLAFp8DS ? 96 : 256;
+    if (kv_c.stride[0] > INT32_MAX || (tensor_present(k_pe) && k_pe.stride[0] > INT32_MAX)) {
       return detail::set_error(Status::kCapacityExceeded, "concat_and_cache_mla: strides");
     }
-#define KOPS_KV_DS_MLA(S)                                                                          \
+#define KOPS_KV_DS_MLA(S, CODEC)                                                                   \
   do {                                                                                             \
-    concat_and_cache_ds_mla_kernel<S><<<static_cast<unsigned>(num_tokens), 96, 0, stream>>>(       \
+    concat_and_cache_ds_mla_kernel<S, CODEC><<<static_cast<unsigned>(num_tokens), block, 0,        \
+                                               stream>>>(                                          \
         const_ptr<S>(kv_c), tensor_present(k_pe) ? const_ptr<S>(k_pe) : nullptr,                    \
-        reinterpret_cast<uint8_t*>(cache.k_data), const_ptr<int64_t>(slot_mapping),                 \
-        static_cast<int>(block_stride), static_cast<int>(entry_stride),                            \
-        static_cast<int>(kv_c.stride[0]),                                                          \
-        tensor_present(k_pe) ? static_cast<int>(k_pe.stride[0]) : 0, rank, pe, cache.page_size);    \
+        reinterpret_cast<uint8_t*>(cache.k_data),                                                   \
+        v40 ? reinterpret_cast<uint8_t*>(cache.k_scale_pages) : nullptr,                            \
+        const_ptr<int64_t>(slot_mapping), block_stride, entry_stride, scale_block_stride,           \
+        scale_token_stride, static_cast<int>(kv_c.stride[0]),                                      \
+        tensor_present(k_pe) ? static_cast<int>(k_pe.stride[0]) : 0, rank, pe, cache.page_size);     \
     const cudaError_t err = cudaGetLastError();                                                    \
     if (err != cudaSuccess) return launch_error("concat_and_cache_ds_mla", err);                   \
     return Status::kSuccess;                                                                       \
   } while (0)
-    if (kv_c.dtype == DType::kBFloat16) KOPS_KV_DS_MLA(__nv_bfloat16);
-    if (kv_c.dtype == DType::kFloat16) KOPS_KV_DS_MLA(__half);
-    if (kv_c.dtype == DType::kFloat32) KOPS_KV_DS_MLA(float);
+#define KOPS_KV_DS_MLA_DTYPE(S)                                                                    \
+  do {                                                                                             \
+    if (cache.k_codec == KVCodec::kMLAFp8DS) KOPS_KV_DS_MLA(S, KVCodec::kMLAFp8DS);                \
+    if (cache.k_codec == KVCodec::kMLAFp8DSV40) KOPS_KV_DS_MLA(S, KVCodec::kMLAFp8DSV40);          \
+    if (cache.k_codec == KVCodec::kMLAFp8DSV41) KOPS_KV_DS_MLA(S, KVCodec::kMLAFp8DSV41);          \
+    KOPS_KV_DS_MLA(S, KVCodec::kMLAFp8DSV41Fp4);                                                   \
+  } while (0)
+    if (kv_c.dtype == DType::kBFloat16) KOPS_KV_DS_MLA_DTYPE(__nv_bfloat16);
+    if (kv_c.dtype == DType::kFloat16) KOPS_KV_DS_MLA_DTYPE(__half);
+    if (kv_c.dtype == DType::kFloat32) KOPS_KV_DS_MLA_DTYPE(float);
+#undef KOPS_KV_DS_MLA_DTYPE
 #undef KOPS_KV_DS_MLA
     return detail::set_error(Status::kUnsupportedDtype, "concat_and_cache_ds_mla dtype");
   }
@@ -3123,13 +3481,24 @@ Status cp_gather_and_upconvert_ds_mla(const Tensor& dst, const PagedKVDesc& cach
   }
   s = check_tensor(dst, DType::kBFloat16, 2, 1, "cp_gather_and_upconvert_ds_mla.dst");
   if (s != Status::kSuccess) return s;
-  if (dst.stride[1] != 1 || dst.shape[1] != 576) {
+  const kops::kv::MLAKVFormat fmt = mla_kv_format(cache.k_codec);
+  const bool record = fmt.data_bytes != 0;
+  if (!record) {
     return detail::set_error(Status::kUnsupportedShape,
-                             "cp_gather_and_upconvert_ds_mla: dst must be [T, 576]");
+                             "cp_gather_and_upconvert_ds_mla: codec %d is not an MLA record",
+                             static_cast<int>(cache.k_codec));
   }
-  if (cache.k_codec != KVCodec::kMLAFp8DS || cache.entry_bytes != 656) {
+  const int logical_cols = cache.k_codec == KVCodec::kMLAFp8DS ? 576 : 512;
+  if (dst.stride[1] != 1 ||
+      (dst.shape[1] != 576 && dst.shape[1] != 512) || dst.shape[1] < logical_cols) {
     return detail::set_error(Status::kUnsupportedShape,
-                             "cp_gather_and_upconvert_ds_mla: kMLAFp8DS 656 B cache");
+                             "cp_gather_and_upconvert_ds_mla: dst must be [T, %d (or 576)]",
+                             logical_cols);
+  }
+  if (cache.entry_bytes != fmt.data_bytes + (fmt.inline_scales ? fmt.scale_bytes : 0)) {
+    return detail::set_error(Status::kUnsupportedShape,
+                             "cp_gather_and_upconvert_ds_mla: codec %d record width",
+                             static_cast<int>(cache.k_codec));
   }
   if (spec.block_table == nullptr || spec.cu_seq_lens == nullptr || spec.num_reqs <= 0 ||
       spec.block_table_stride <= 0 || spec.num_tokens < 0) {
@@ -3160,7 +3529,7 @@ Status cp_gather_and_upconvert_ds_mla(const Tensor& dst, const PagedKVDesc& cach
       return detail::set_error(Status::kInvalidArgument,
                                "cp_gather_and_upconvert_ds_mla: host_cache must be host memory");
     }
-    if (host_cache.shape[1] != 656 ||
+    if (host_cache.shape[1] != cache.entry_bytes ||
         host_row_ids.shape[0] < static_cast<int64_t>(cache.page_size)) {
       return detail::set_error(Status::kUnsupportedShape,
                                "cp_gather_and_upconvert_ds_mla: host table extents");
@@ -3180,14 +3549,35 @@ Status cp_gather_and_upconvert_ds_mla(const Tensor& dst, const PagedKVDesc& cach
   const int64_t entry_stride = cache.k_stride_token > 0 ? cache.k_stride_token
                                                         : cache.entry_bytes;
   const int grid = static_cast<int>(ceil_div(spec.num_tokens, 8));
-  cp_gather_and_upconvert_ds_mla_fp8_kernel<<<grid, 256, 0, stream>>>(
-      static_cast<const uint8_t*>(cache.k_data), mut_ptr<bf16_t>(dst), spec, cache.page_size,
-      block_stride, entry_stride, dst.stride[0], host_ptr,
-      all_host ? const_ptr<int32_t>(host_row_ids) : nullptr,
-      all_host ? const_ptr<int32_t>(device_row_ids) : nullptr, host_stride);
-  const cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) return launch_error("cp_gather_and_upconvert_ds_mla", err);
-  return Status::kSuccess;
+  const uint8_t* scale_pages = cache.k_scale_pages != nullptr
+                                   ? static_cast<const uint8_t*>(cache.k_scale_pages)
+                                   : nullptr;
+  const int64_t scale_block_stride = cache.k_scale_stride_page;
+  const int64_t scale_token_stride = cache.k_scale_stride_token;
+  const int dst_cols = static_cast<int>(dst.shape[1]);
+#define KOPS_KV_DS_GATHER(CODEC)                                                                   \
+  do {                                                                                             \
+    cp_gather_and_upconvert_ds_mla_fp8_kernel<CODEC><<<grid, 256, 0, stream>>>(                    \
+        static_cast<const uint8_t*>(cache.k_data), mut_ptr<bf16_t>(dst), spec, cache.page_size,    \
+        block_stride, entry_stride, dst.stride[0], host_ptr,                                       \
+        all_host ? const_ptr<int32_t>(host_row_ids) : nullptr,                                     \
+        all_host ? const_ptr<int32_t>(device_row_ids) : nullptr, host_stride, scale_pages,         \
+        scale_block_stride, scale_token_stride, dst_cols);                                         \
+    const cudaError_t err = cudaGetLastError();                                                    \
+    if (err != cudaSuccess) return launch_error("cp_gather_and_upconvert_ds_mla", err);            \
+    return Status::kSuccess;                                                                       \
+  } while (0)
+  switch (cache.k_codec) {
+    case KVCodec::kMLAFp8DS: KOPS_KV_DS_GATHER(KVCodec::kMLAFp8DS);
+    case KVCodec::kMLAFp8DSV40: KOPS_KV_DS_GATHER(KVCodec::kMLAFp8DSV40);
+    case KVCodec::kMLAFp8DSV41: KOPS_KV_DS_GATHER(KVCodec::kMLAFp8DSV41);
+    case KVCodec::kMLAFp8DSV41Fp4: KOPS_KV_DS_GATHER(KVCodec::kMLAFp8DSV41Fp4);
+    default:
+      return detail::set_error(Status::kUnsupportedShape,
+                               "cp_gather_and_upconvert_ds_mla: codec %d",
+                               static_cast<int>(cache.k_codec));
+  }
+#undef KOPS_KV_DS_GATHER
 }
 
 Status cp_gather_indexer_k_quant_cache(const Tensor& dst_k, const Tensor& dst_scale,

@@ -79,6 +79,12 @@ Status mla_decode_plan(const AttentionSpec& spec, int32_t max_batch, int32_t q_l
                        const LaunchContext& ctx, const Workspace& ws, AttentionPlan* plan);
 Status mla_decode_run(const AttentionPlan& plan, const MLADecodeParams& params,
                       const Workspace& ws, const LaunchContext& ctx);
+/// Device-side split planner (FlashMLA get_decoding_sched_meta semantics). seq_lens is [B];
+/// tile_scheduler_metadata is [num_sm_parts, 8], num_splits is [B + 1]. Graph-capturable.
+Status mla_get_metadata(const Tensor& tile_scheduler_metadata, const Tensor& num_splits,
+                        const Tensor& seq_lens, int32_t q_len_times_heads_per_group,
+                        int32_t num_sm_parts, int32_t block_size_n,
+                        int32_t fixed_overhead_num_blocks, const LaunchContext& ctx);
 Status mla_context_gather(const Tensor& c_kv_out, const Tensor& k_pe_out,
                           const kv::PagedKVDesc& cache, const Tensor& ctx_token_indptr,
                           const Tensor& ctx_start, const LaunchContext& ctx);
@@ -92,6 +98,20 @@ Status sparse_topk(const Tensor& indices, const Tensor& values, const Tensor& sc
                    const Tensor& row_starts, const Tensor& row_ends, int32_t topk,
                    const Tensor& block_table, const Tensor& token_to_request, int32_t page_size,
                    bool absolute_indices, bool to_page_slots, const LaunchContext& ctx);
+/// Same selection with a caller-owned device scratch lease. rows == 1 with max_kv >= 256 Ki
+/// switches to a cooperative multi-CTA path (three chunked passes over the row instead of one CTA
+/// scanning it); every other shape - and a lease that is absent, smaller than
+/// sparse_topk_workspace_bytes() or not 256-byte aligned - runs the workspace-free path unchanged,
+/// so the result never depends on the workspace. No allocation, no device query, no host
+/// synchronization: safe under CUDA-graph capture and replay.
+Status sparse_topk_ws(const Tensor& indices, const Tensor& values, const Tensor& scores,
+                      const Tensor& row_starts, const Tensor& row_ends, int32_t topk,
+                      const Tensor& block_table, const Tensor& token_to_request,
+                      int32_t page_size, bool absolute_indices, bool to_page_slots,
+                      const Workspace& ws, const LaunchContext& ctx);
+/// Device scratch bytes sparse_topk_ws uses for the fast path; reserving it unconditionally
+/// covers every shape (the other shapes ignore it).
+size_t sparse_topk_workspace_bytes() noexcept;
 Status block_select(const Tensor& block_row_indptr, const Tensor& block_col_indices,
                     const Tensor& q, const Tensor& summaries, const Tensor& qo_indptr,
                     const Tensor& kv_lens, int32_t q_block, int32_t kv_block, int32_t topk_blocks,
@@ -100,3 +120,51 @@ Status kv_compress(const KVCompressorParams& params, DType in_dtype, const Launc
 Status compressed_attention(const CompressedAttentionParams& params, const LaunchContext& ctx);
 
 }  // namespace kops::attn
+
+// ---- A09 low-bit rotated KV (EXPERIMENTAL, B17) -------------------------------------------------
+// Opt-in entry points; nothing in kops::attn selects them. A low-bit cache is a PagedKVDesc with
+// k_codec = v_codec = KVCodec::kLowBitWHT, k_dtype = v_dtype = kUInt8, stride_unit = kByte (every
+// stride a multiple of 4 bytes, pages 16-byte aligned), entry_bytes = the K record size and the
+// scales inline in the records (k_token_scales / v_token_scales unused). The record layout and the
+// codec semantics are in attention/lowbit_kernels.cuh and CONTRACTS §1h.
+namespace kops::experimental::lowbit {
+
+struct LowBitCodec;                 // attention/lowbit_kernels.cuh
+struct LowBitTables;
+enum class LowBitFormat : uint8_t;
+
+/// Fill the descriptor of (k_format, v_format) at head_dim: transforms, packing version, seed.
+/// kUnsupportedShape unless head_dim is 64, 128 or 256; kUnsupportedDtype for a format that is
+/// not compiled (kFP8, kNVFP4) or a kTurboProd V.
+Status lowbit_codec(LowBitFormat k_format, LowBitFormat v_format, int32_t head_dim, uint32_t seed,
+                    LowBitCodec* codec);
+/// Bytes of one (token, head) record of K (is_k) or V; 0 for an unsupported codec.
+int32_t lowbit_entry_bytes(const LowBitCodec& codec, bool is_k);
+/// Level tables, thresholds and record sizes the kernels read (also what a host reader needs).
+Status lowbit_resolve(const LowBitCodec& codec, LowBitTables* tables);
+
+/// Quantize key / value [num_tokens, Hkv, head_dim] (bf16 or fp16) into the slots of slot_mapping
+/// (int64 [num_tokens], < 0 skipped). Mutates only the records of the named slots.
+Status lowbit_kv_store(const Tensor& key, const Tensor& value, const kv::PagedKVDesc& cache,
+                       const Tensor& slot_mapping, const LowBitCodec& codec,
+                       const LaunchContext& ctx);
+
+/// Decode over a low-bit cache. Same plan / run split, workspace and split-KV rules as
+/// decode_plan / decode_run (static grid only: no device planner, no tensor-core path).
+Status lowbit_decode_plan(const attn::AttentionSpec& spec, const LowBitCodec& codec,
+                          int32_t max_batch, int32_t max_kv_len, int32_t q_len,
+                          const LaunchContext& ctx, const Workspace& ws, attn::AttentionPlan* plan);
+Status lowbit_decode_run(const attn::AttentionPlan& plan, const attn::DecodeParams& params,
+                         const LowBitCodec& codec, const Workspace& ws, const LaunchContext& ctx);
+
+/// Paged prefill over a low-bit cache (the chunk's K/V are stored with lowbit_kv_store first).
+/// The plan is built on the host from qo_indptr_host / kv_lens_host (int32 host tensors) and is
+/// valid for those lengths: replan when they change (no device planner).
+Status lowbit_prefill_plan(const attn::AttentionSpec& spec, const LowBitCodec& codec,
+                           const Tensor& qo_indptr_host, const Tensor& kv_lens_host,
+                           const LaunchContext& ctx, const Workspace& ws,
+                           attn::AttentionPlan* plan);
+Status lowbit_prefill_run(const attn::AttentionPlan& plan, const attn::PagedPrefillParams& params,
+                          const LowBitCodec& codec, const Workspace& ws, const LaunchContext& ctx);
+
+}  // namespace kops::experimental::lowbit

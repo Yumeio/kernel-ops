@@ -1,0 +1,291 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://kernel-ops.invalid/schemas/golden-manifest-v1.json",
+  "title": "kernel-ops golden manifest",
+  "description": "Index of golden vectors used by kernel-ops C++ tests. A ready case names a KOPSGOLD file whose sha256 must match; a planned case reserves an id and carries no fake hash.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "generated_by",
+    "source_commit",
+    "cases"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Optional path or URL of this schema."
+    },
+    "version": {
+      "const": 1,
+      "description": "Manifest format version. Bump only for an incompatible change."
+    },
+    "generated_by": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Producer name, normally \"kernel-ops\"."
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^(pending|[0-9a-f]{7,40})$",
+      "description": "Commit that produced the ready goldens, or \"pending\" while no ready case exists."
+    },
+    "generated_at": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional ISO-8601 UTC timestamp."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Optional free-form provenance or regeneration notes."
+    },
+    "cases": {
+      "type": "array",
+      "description": "Golden cases. May be empty while the format is being introduced.",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/definitions/case"
+      }
+    }
+  },
+  "definitions": {
+    "dtype": {
+      "type": "string",
+      "description": "Logical element type of the golden output. Binary code: fp32=0, bf16=1, fp16=2, u8=3.",
+      "enum": [
+        "fp32",
+        "bf16",
+        "fp16",
+        "u8"
+      ]
+    },
+    "codec": {
+      "type": "string",
+      "description": "Storage codec of the inputs. Names mirror kops::kv::KVCodec; the binary header stores the numeric value.",
+      "enum": [
+        "native",
+        "fp8_per_tensor",
+        "fp8_per_head",
+        "fp8_per_token_head",
+        "int8_per_token_head",
+        "int4_per_token_head",
+        "nvfp4",
+        "mla_fp8_ds",
+        "mla_nvfp4_ds",
+        "lowbit_wht",
+        "indexer_fp8",
+        "indexer_fp4",
+        "mla_fp8_ds_fnuz",
+        "mla_fp8_ds_v40",
+        "mla_fp8_ds_v41",
+        "mla_fp8_ds_v41_fp4"
+      ]
+    },
+    "tier": {
+      "type": "string",
+      "description": "Test tier: smoke is minimal but covers every branch; standard is the default; full is the target-GPU sweep.",
+      "enum": [
+        "smoke",
+        "standard",
+        "full"
+      ]
+    },
+    "shape": {
+      "type": "array",
+      "description": "Row-major logical extents. Every extent is positive.",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "shapes": {
+      "type": "object",
+      "description": "Named tensor shapes. \"output\" is required; other keys describe inputs generated on demand.",
+      "minProperties": 1,
+      "required": [
+        "output"
+      ],
+      "properties": {
+        "output": {
+          "$ref": "#/definitions/shape"
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/definitions/shape"
+      }
+    },
+    "tolerance": {
+      "type": "object",
+      "description": "Comparison budget: abs(got - want) <= atol + rtol * abs(want).",
+      "additionalProperties": false,
+      "required": [
+        "atol",
+        "rtol"
+      ],
+      "properties": {
+        "atol": {
+          "type": "number",
+          "minimum": 0
+        },
+        "rtol": {
+          "type": "number",
+          "minimum": 0
+        },
+        "lse_atol": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Absolute budget for fp32 log-sum-exp when the case stores LSE."
+        },
+        "max_ulp": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Optional bit-exactness budget for integer or quantized outputs."
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "op",
+        "dtype",
+        "shapes",
+        "codec",
+        "topk",
+        "sink",
+        "seed",
+        "golden",
+        "sha256",
+        "tolerance",
+        "tier",
+        "on_demand_input",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]{1,95}$",
+          "description": "Stable case id; file names derive from it."
+        },
+        "op": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_.]*$",
+          "description": "kernel-ops operation name, for example attention.decode."
+        },
+        "dtype": {
+          "$ref": "#/definitions/dtype"
+        },
+        "shapes": {
+          "$ref": "#/definitions/shapes"
+        },
+        "codec": {
+          "$ref": "#/definitions/codec"
+        },
+        "topk": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1048576,
+          "description": "Sparse-attention top-k; 0 means dense."
+        },
+        "sink": {
+          "type": "number",
+          "description": "Attention sink logit added to the denominator; 0 means no sink."
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "description": "Seed for the deterministic on-demand input generator."
+        },
+        "golden": {
+          "type": "string",
+          "pattern": "^cases/[A-Za-z0-9_][A-Za-z0-9._-]*\\.kopsgold$",
+          "description": "Path relative to KOPS_GOLDEN_DIR. One flat cases/ directory; no absolute paths or dot-dot segments."
+        },
+        "sha256": {
+          "description": "Lowercase SHA-256 of the whole .kopsgold file; null only for a planned case.",
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "tolerance": {
+          "$ref": "#/definitions/tolerance"
+        },
+        "tier": {
+          "$ref": "#/definitions/tier"
+        },
+        "on_demand_input": {
+          "type": "boolean",
+          "description": "true: the test regenerates inputs from seed and may cache them locally. false: stored_output mode, output/LSE only."
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "planned",
+            "ready"
+          ],
+          "description": "planned reserves an id and must not carry a hash; ready requires a real file and hash."
+        },
+        "has_lse": {
+          "type": "boolean",
+          "description": "True when the golden file stores an fp32 log-sum-exp section."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Case-specific generation or provenance notes."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "planned"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sha256": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ready"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

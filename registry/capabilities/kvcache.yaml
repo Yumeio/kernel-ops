@@ -20,6 +20,15 @@
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
   },
   {
+   "op_id": "K01.reshape_and_cache.flash",
+   "kernel_symbol": "reshape_and_cache_flash_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "dtype in {bf16,f16,f32}; NHD/HND; native or e4m3 per-tensor/per-head; slot<0 skips",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
    "op_id": "K01.reshape_and_cache.legacy",
    "kernel_symbol": "reshape_and_cache_legacy_kernel",
    "provider": "native",
@@ -33,6 +42,15 @@
    "kernel_symbol": "reshape_and_cache_legacy_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "dtype in {bf16,f16,f32}; KVLayout::kVllmLegacy; x = 16/sizeof(cache_t)",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K01.reshape_and_cache.legacy",
+   "kernel_symbol": "reshape_and_cache_legacy_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "dtype in {bf16,f16,f32}; KVLayout::kVllmLegacy; x = 16/sizeof(cache_t)",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -51,6 +69,15 @@
    "kernel_symbol": "append_paged_kv_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "CSR page table; native or e4m3; NHD/HND",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K01.append_paged_kv",
+   "kernel_symbol": "append_paged_kv_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "CSR page table; native or e4m3; NHD/HND",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -69,6 +96,15 @@
    "kernel_symbol": "ring_kv_append_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "native; window > 0; newest position wins on a ring-cell collision",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K01.ring_kv_append",
+   "kernel_symbol": "ring_kv_append_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "native; window > 0; newest position wins on a ring-cell collision",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -87,6 +123,15 @@
    "kernel_symbol": "concat_and_cache_mla_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "latent record [kv_lora_rank | pe]; native or e4m3 per-tensor; pe=0 zeroes the rope tail",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K01.concat_and_cache_mla",
+   "kernel_symbol": "concat_and_cache_mla_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "latent record [kv_lora_rank | pe]; native or e4m3 per-tensor; pe=0 zeroes the rope tail",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -105,6 +150,15 @@
    "kernel_symbol": "concat_and_cache_mla_grouped_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "layers x tokens grid; per-layer cache pointer and scale",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K01.concat_and_cache_mla_grouped",
+   "kernel_symbol": "concat_and_cache_mla_grouped_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "layers x tokens grid; per-layer cache pointer and scale",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -123,6 +177,15 @@
    "kernel_symbol": "gather_pages_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "by token or by page; native or e4m3; NHD/HND/latent",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K02.gather_pages",
+   "kernel_symbol": "gather_pages_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "by token or by page; native or e4m3; NHD/HND/latent",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -141,6 +204,15 @@
    "kernel_symbol": "scatter_pages_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "inverse of gather_pages; by token or by page",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K02.scatter_pages",
+   "kernel_symbol": "scatter_pages_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "inverse of gather_pages; by token or by page",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -159,6 +231,15 @@
    "kernel_symbol": "copy_pages_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "byte-preserving page copy across layers and caches_per_layer",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K02.copy_pages",
+   "kernel_symbol": "copy_pages_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "byte-preserving page copy across layers and caches_per_layer",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -177,6 +258,15 @@
    "kernel_symbol": "zero_pages_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "byte-preserving page memset across layers and caches_per_layer",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K02.zero_pages",
+   "kernel_symbol": "zero_pages_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "byte-preserving page memset across layers and caches_per_layer",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -195,6 +285,15 @@
    "kernel_symbol": "cp_gather_cache_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "block table + cu_seq_lens + optional seq_starts; num_tokens may be an upper bound",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K02.cp_gather_cache",
+   "kernel_symbol": "cp_gather_cache_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "block table + cu_seq_lens + optional seq_starts; num_tokens may be an upper bound",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -213,6 +312,15 @@
    "kernel_symbol": "gather_and_maybe_dequant_cache_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "ENTRY_SIZE in {64,96,128,192,256,320,512,576}; native or e4m3 per-tensor",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K02.gather_and_maybe_dequant_cache",
+   "kernel_symbol": "gather_and_maybe_dequant_cache_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "ENTRY_SIZE in {64,96,128,192,256,320,512,576}; native or e4m3 per-tensor",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -231,6 +339,15 @@
    "kernel_symbol": "convert_cache_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "bf16/f16/f32 <-> e4m3 with a per-tensor scale",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K03.convert_cache",
+   "kernel_symbol": "convert_cache_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "bf16/f16/f32 <-> e4m3 with a per-tensor scale",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -249,6 +366,15 @@
    "kernel_symbol": "kv_relayout_pages_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "NHD <-> HND and page-size change; native only",
+   "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
+  },
+  {
+   "op_id": "K03.kv_relayout_pages",
+   "kernel_symbol": "kv_relayout_pages_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "NHD <-> HND and page-size change; native only",
    "evidence": "test_kvcache;bench_kvcache;docs/KV_CACHE_PARITY.md"
@@ -267,6 +393,15 @@
    "kernel_symbol": "reshape_and_cache_per_token_quant_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "e4m3/int8/int4 per-token-head; NHD/HND",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K01.reshape_and_cache.per_token_head",
+   "kernel_symbol": "reshape_and_cache_per_token_quant_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "e4m3/int8/int4 per-token-head; NHD/HND",
    "evidence": "test_kvcache;bench_kvcache"
@@ -285,6 +420,15 @@
    "kernel_symbol": "kv_requantize_pages_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "native/e4m3/per-token-head -> per-token-head; NHD/HND",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K03.requantize_pages",
+   "kernel_symbol": "kv_requantize_pages_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "native/e4m3/per-token-head -> per-token-head; NHD/HND",
    "evidence": "test_kvcache;bench_kvcache"
@@ -303,6 +447,15 @@
    "kernel_symbol": "kv_scale_update_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "running per-head absmax; dense [T,H,D]",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K03.kv_scale_update",
+   "kernel_symbol": "kv_scale_update_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "running per-head absmax; dense [T,H,D]",
    "evidence": "test_kvcache;bench_kvcache"
@@ -321,6 +474,15 @@
    "kernel_symbol": "concat_and_cache_ds_mla_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "kMLAFp8DS 656 B; 512 e4m3 + 4 fp32 scales + 64 bf16 RoPE",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K01.concat_and_cache_ds_mla",
+   "kernel_symbol": "concat_and_cache_ds_mla_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "kMLAFp8DS 656 B; 512 e4m3 + 4 fp32 scales + 64 bf16 RoPE",
    "evidence": "test_kvcache;bench_kvcache"
@@ -339,6 +501,15 @@
    "kernel_symbol": "cp_gather_and_upconvert_ds_mla_fp8_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "656 B -> bf16 [T,576]; optional pinned host rows",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K02.cp_gather_and_upconvert_ds_mla",
+   "kernel_symbol": "cp_gather_and_upconvert_ds_mla_fp8_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "656 B -> bf16 [T,576]; optional pinned host rows",
    "evidence": "test_kvcache;bench_kvcache"
@@ -357,6 +528,15 @@
    "kernel_symbol": "indexer_k_quant_and_cache_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "split-page e4m3 + fp32 block scales; UE8M0 option",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K01.indexer_k_quant_and_cache",
+   "kernel_symbol": "indexer_k_quant_and_cache_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "split-page e4m3 + fp32 block scales; UE8M0 option",
    "evidence": "test_kvcache;bench_kvcache"
@@ -375,6 +555,15 @@
    "kernel_symbol": "cp_gather_indexer_k_quant_cache_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "split-page gather; block table + cu_seq_lens",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K02.cp_gather_indexer_k_quant_cache",
+   "kernel_symbol": "cp_gather_indexer_k_quant_cache_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "split-page gather; block table + cu_seq_lens",
    "evidence": "test_kvcache;bench_kvcache"
@@ -393,6 +582,15 @@
    "kernel_symbol": "fused_qkv_norm_rope_append_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "QK RMSNorm + RoPE + cache append; native/e4m3",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K01.fused_qkv_norm_rope_append",
+   "kernel_symbol": "fused_qkv_norm_rope_append_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "QK RMSNorm + RoPE + cache append; native/e4m3",
    "evidence": "test_kvcache;bench_kvcache"
@@ -411,6 +609,15 @@
    "kernel_symbol": "concat_and_cache_mla_rope_fused_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "RoPE q_pe/k_pe + [kv_c | k_pe] cache append",
+   "evidence": "test_kvcache;bench_kvcache"
+  },
+  {
+   "op_id": "K01.concat_and_cache_mla_rope_fused",
+   "kernel_symbol": "concat_and_cache_mla_rope_fused_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "RoPE q_pe/k_pe + [kv_c | k_pe] cache append",
    "evidence": "test_kvcache;bench_kvcache"

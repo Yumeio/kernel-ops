@@ -45,6 +45,11 @@ Status persistent_grid(const void* kernel_fn, int32_t block_threads, size_t dyna
     return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(err),
                                      "persistent_grid occupancy: %s", cudaGetErrorString(err));
   }
+  if (ctx.max_ctas_per_cu > 0 && active > ctx.max_ctas_per_cu) {
+    // The caller probed a smaller residency (MPS / green context test rigs); never
+    // silently exceed it: the persistent grid must fit the partition it was sized for.
+    active = ctx.max_ctas_per_cu;
+  }
   int sms = ctx.compute_units;
   if (sms <= 0) {
     int device = ctx.device >= 0 ? ctx.device : 0;

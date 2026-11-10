@@ -97,6 +97,14 @@ std::vector<Case> make_cases() {
            1024, 3584, 1024 * 3584 * 2 * (8 + 1));
   add_case(&cases, "chain_moe_route_permute.bf16.t4096.h7168.e256.k8", "chain_moe_route_permute",
            kops::DType::kBFloat16, 4096, 7168, 4096 * 256 * 4 + 4096 * 7168 * 2 * (1 + 8) + 4096 * 8 * 4 * 2);
+
+  // B17 experimental W2 experts: E=8, N=2048, K=4096, 1024 tokens x top-2 slots.
+  add_case(&cases, "moe.w2.pack.bf16.e8.n2048.k4096.g32", "moe_w2_pack", kops::DType::kBFloat16,
+           2048, 4096, 8ll * 2048 * 4096 * 2 + 8ll * 2048 * 4096 / 4 + 8ll * 2048 * 4096 / 32 * 4);
+  add_case(&cases, "moe.w2.gemm.bf16.e8.n2048.k4096.slots2048", "moe_w2_gemm",
+           kops::DType::kBFloat16, 2048, 2048, 8ll * 2048 * 4096 / 4 +
+           8ll * 2048 * 4096 / 32 * 4 + 2048ll * 4096 * 2 + 2048ll * 2048 * 2);
+  cases.back().flops = 2ll * 2048 * 2048 * 4096;
   return cases;
 }
 
@@ -459,6 +467,88 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
     };
     const bool ok = status_ok(kops::Status::kSuccess, c.id.c_str()) && measure(c, call, st);
     free_bufs(&b);
+    return ok;
+  }
+  if (c.op == "moe_w2_pack" || c.op == "moe_w2_gemm") {
+    const int E = 8, N = 2048, K = 4096, G = 32, block = 64;
+    const int tokens = 1024, topk = 2, slots = tokens * topk;
+    __nv_bfloat16* w = nullptr;
+    __nv_bfloat16* a = nullptr;
+    __nv_bfloat16* cdev = nullptr;
+    uint8_t* codes = nullptr;
+    float* scales = nullptr;
+    int32_t *sorted = nullptr, *eids = nullptr, *post = nullptr;
+    bool ok = cuda_ok(cudaMalloc(reinterpret_cast<void**>(&w), static_cast<size_t>(E) * N * K * 2), "w") &&
+              cuda_ok(cudaMalloc(reinterpret_cast<void**>(&a), static_cast<size_t>(slots) * K * 2), "a") &&
+              cuda_ok(cudaMalloc(reinterpret_cast<void**>(&cdev), static_cast<size_t>(slots) * N * 2), "c") &&
+              cuda_ok(cudaMalloc(reinterpret_cast<void**>(&codes), static_cast<size_t>(E) * N * K / 4), "codes") &&
+              cuda_ok(cudaMalloc(reinterpret_cast<void**>(&scales), static_cast<size_t>(E) * N * K / G * 4), "scales");
+    if (!ok) return false;
+    fill_bf16(w, static_cast<size_t>(E) * N * K, 0.3f);
+    fill_bf16(a, static_cast<size_t>(slots) * K, 1.0f);
+    // Group slots by expert with block-8 padding; sentinel = slots.
+    std::vector<std::vector<int32_t>> per(E);
+    for (int s = 0; s < slots; ++s) per[s % E].push_back(s);
+    std::vector<int32_t> hs, he;
+    for (int e = 0; e < E; ++e) {
+      const int n = static_cast<int>(per[e].size());
+      const int nb = (n + block - 1) / block;
+      for (int b = 0; b < nb; ++b) he.push_back(e);
+      for (int i = 0; i < nb * block; ++i) hs.push_back(i < n ? per[e][i] : slots);
+    }
+    const int post_pad = static_cast<int>(hs.size());
+    ok = cuda_ok(cudaMalloc(reinterpret_cast<void**>(&sorted), hs.size() * 4), "sorted") &&
+         cuda_ok(cudaMalloc(reinterpret_cast<void**>(&eids), he.size() * 4), "eids") &&
+         cuda_ok(cudaMalloc(reinterpret_cast<void**>(&post), 4), "post");
+    if (!ok) return false;
+    cudaMemcpy(sorted, hs.data(), hs.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(eids, he.data(), he.size() * 4, cudaMemcpyHostToDevice);
+    cudaMemcpy(post, &post_pad, 4, cudaMemcpyHostToDevice);
+    const kops::Tensor tw = tensor3d(w, kops::DType::kBFloat16, E, N, K);
+    const kops::Tensor tc = tensor3d(codes, kops::DType::kUInt8, E, N, K / 4);
+    const kops::Tensor ts = tensor3d(scales, kops::DType::kFloat32, E, N, K / G);
+    ok = status_ok(kops::experimental::moe_w2::pack(tc, ts, tw, kops::WeightPacking::kNone, G, ctx),
+                   c.id.c_str());
+    if (ok && c.op == "moe_w2_pack") {
+      ok = measure(c, [&] {
+        (void)kops::experimental::moe_w2::pack(tc, ts, tw, kops::WeightPacking::kNone, G, ctx);
+      }, st);
+    } else if (ok) {
+      kops::moe::FusedMoEGemmParams p{};
+      p.a = a;
+      p.lda = K;
+      p.a_rows_are_slots = true;
+      p.w = codes;
+      p.w_expert_stride = static_cast<int64_t>(N) * (K / 4);
+      p.w_scale = scales;
+      p.w_scale_expert_stride = static_cast<int64_t>(N) * (K / G);
+      p.c = cdev;
+      p.ldc = N;
+      p.sorted_token_ids = sorted;
+      p.expert_ids = eids;
+      p.num_tokens_post_pad = post;
+      p.top_k = topk;
+      p.n = N;
+      p.k = K;
+      p.num_valid_slots = slots;
+      p.w_quant.packing = kops::WeightPacking::kW2;
+      p.w_quant.granularity = kops::ScaleGranularity::kPerGroup;
+      p.w_quant.group_k = G;
+      ok = status_ok(kops::experimental::moe_w2::gemm(p, E, block, kops::DType::kBFloat16,
+                                                      kops::DType::kBFloat16, ctx),
+                     c.id.c_str());
+      if (ok) {
+        ok = measure(c, [&] {
+          (void)kops::experimental::moe_w2::gemm(p, E, block, kops::DType::kBFloat16,
+                                                 kops::DType::kBFloat16, ctx);
+        }, st);
+      }
+    }
+    for (void* p : {static_cast<void*>(w), static_cast<void*>(a), static_cast<void*>(cdev),
+                    static_cast<void*>(codes), static_cast<void*>(scales),
+                    static_cast<void*>(sorted), static_cast<void*>(eids), static_cast<void*>(post)}) {
+      cudaFree(p);
+    }
     return ok;
   }
   if (c.op == "chain_moe_route_permute") {

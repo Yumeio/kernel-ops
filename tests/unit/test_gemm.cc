@@ -708,6 +708,227 @@ void test_e4m3_encode_exhaustive() {
 }
 
 // -----------------------------------------------------------------------------
+// machete_prepack (Machete / CUTLASS mixed-input SM90 prepacked weight layout)
+// -----------------------------------------------------------------------------
+// The layout is the one vLLM's `prepack_B_kernel` writes under
+// PrepackedLayoutBTemplate (csrc/quantization/machete/machete_prepacked_layout.cuh): the [N, K] weight
+// is cut into 128 x 64 blocks, block (n_tile, k_tile) is stored at element 8192 * (n_tile + k_tile *
+// N_tiles), and every block is permuted by the atom's bit-field map. The oracle below is the forward
+// form of that map (the kernel walks its inverse); the golden hashes/prefixes were generated from
+// CUTE's `ppblock_ilvd_NK_to_offset()` for the same input pattern, so the test pins the layout even if
+// the oracle's algebra were wrong in the same way as the kernel.
+
+constexpr int kMacheteAtoms = 4;
+
+int machete_bits(int atom) { return (atom == 0 || atom == 2) ? 4 : 8; }
+
+/// Storage element offset of (n, k) inside one prepacked block (0 <= n < 128, 0 <= k < 64).
+int machete_pp_offset(int atom, int n, int k) {
+  const int n_lo = n & 7, n_b3 = (n >> 3) & 1, n_hi = n >> 4;
+  switch (atom) {
+    case 0:   // 16-bit MMA atom, packed int4, interleaved value blocks (W4A16)
+      return (n_lo << 7) | n_b3 | (n_hi << 10) | ((k & 1) << 2) | (((k >> 1) & 3) << 5) |
+             (((k >> 3) & 1) << 1) | (((k >> 4) & 3) << 3);
+    case 1:   // 16-bit MMA atom, int8 weights (W8A16)
+      return (n_lo << 7) | (n_b3 << 1) | (n_hi << 10) | (k & 1) | (((k >> 1) & 3) << 5) |
+             (((k >> 3) & 7) << 2);
+    default:  // 8-bit MMA atom (k32): int4 (W4A8) and int8 (W8A8) share the value order
+      return (n_lo << 7) | (n_b3 << 2) | (n_hi << 10) | (k & 3) | (((k >> 2) & 3) << 5) |
+             (((k >> 4) & 3) << 3);
+  }
+}
+
+/// Deterministic, position-dependent element value (each bit group of (n, k) moves it).
+int machete_elem(int n, int k, int bits) {
+  return (n * 13 + k * 7 + (k >> 3) * 5 + (n >> 3) * 3 + 3) & (bits == 4 ? 0xF : 0xFF);
+}
+
+std::vector<uint8_t> machete_input(int n, int k, int bits) {
+  const size_t elems = static_cast<size_t>(n) * k;
+  std::vector<uint8_t> bytes(bits == 4 ? elems / 2 : elems, 0);
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < k; ++c) {
+      const int v = machete_elem(r, c, bits);
+      if (bits == 4) {
+        const size_t i = static_cast<size_t>(r) * k + c;
+        bytes[i >> 1] = static_cast<uint8_t>(bytes[i >> 1] | (v << (4 * (i & 1))));
+      } else {
+        bytes[static_cast<size_t>(r) * k + c] = static_cast<uint8_t>(v);
+      }
+    }
+  }
+  return bytes;
+}
+
+std::vector<uint8_t> machete_reference(int atom, int n, int k) {
+  const int bits = machete_bits(atom);
+  const int n_tiles = n / 128;
+  std::vector<uint8_t> bytes(bits == 4 ? static_cast<size_t>(n) * k / 2
+                                       : static_cast<size_t>(n) * k, 0);
+  for (int r = 0; r < n; ++r) {
+    for (int c = 0; c < k; ++c) {
+      const size_t base = static_cast<size_t>(8192) * (r / 128 + static_cast<size_t>(c / 64) * n_tiles);
+      const size_t o = base + machete_pp_offset(atom, r % 128, c % 64);
+      const int v = machete_elem(r, c, bits);
+      if (bits == 4) {
+        bytes[o >> 1] = static_cast<uint8_t>(bytes[o >> 1] | (v << (4 * (o & 1))));
+      } else {
+        bytes[o] = static_cast<uint8_t>(v);
+      }
+    }
+  }
+  return bytes;
+}
+
+uint64_t fnv1a64(const std::vector<uint8_t>& v) {
+  uint64_t h = 1469598103934665603ULL;
+  for (uint8_t b : v) {
+    h ^= b;
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/// Runs one prepack and compares every output byte with the oracle. Returns the device bytes.
+std::vector<uint8_t> run_machete_case(const LaunchContext& ctx, int atom, int64_t n, int64_t k,
+                                      const char* what_in) {
+  char what[160];
+  const int bits = machete_bits(atom);
+  std::snprintf(what, sizeof(what), "%s atom %d %lldx%lld", what_in, atom,
+                static_cast<long long>(n), static_cast<long long>(k));
+  const auto in = machete_input(static_cast<int>(n), static_cast<int>(k), bits);
+  const auto want = machete_reference(atom, static_cast<int>(n), static_cast<int>(k));
+  auto din = upload(in);
+  DevBuf<uint8_t> dout(want.size());
+  cudaMemset(dout.p, 0xCD, want.size());
+  const DType dt = bits == 4 ? DType::kInt4x2 : DType::kInt8;
+  KOPS_EXPECT_OK(kops::gemm::machete_prepack(kops_test::tensor2d(dout.p, dt, n, k),
+                                             kops_test::tensor2d(din.p, dt, n, k), bits, atom, ctx),
+                 what);
+  cudaDeviceSynchronize();
+  const auto got = kops_test::copy_out(dout.p, want.size());
+  size_t bad = 0, first = 0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    if (got[i] != want[i]) {
+      if (bad == 0) first = i;
+      ++bad;
+    }
+  }
+  if (bad != 0) {
+    char detail[160];
+    std::snprintf(detail, sizeof(detail), "%zu/%zu bytes differ, first at %zu (got %02x want %02x)", bad,
+                  want.size(), first, got[first], want[first]);
+    kops_test::record_failure(what, detail, __FILE__, __LINE__);
+  }
+  return got;
+}
+
+void test_machete_prepack(const LaunchContext& ctx) {
+  // Full-buffer comparison against the oracle for one and for several prepacked blocks.
+  for (int atom = 0; atom < kMacheteAtoms; ++atom) {
+    run_machete_case(ctx, atom, 128, 64, "machete prepack single block");
+    run_machete_case(ctx, atom, 256, 128, "machete prepack 2x2 blocks");
+  }
+  // Byte-exact goldens from CUTE (N = 256, K = 128, element (n, k) = (13 n + 7 k + 5 (k >> 3) +
+  // 3 (n >> 3) + 3) mod 2^bits, 4-bit packed low nibble first) for all four atoms.
+  struct Golden { int atom; uint64_t hash; const char* prefix; };
+  const Golden goldens[] = {
+      {0, 0x009494cde0c20b83ULL,
+       "e3b05a278d5af4c127f49e6bc19e3805c19e38056b38d2af05d27c49af7c16e3"},
+      {1, 0x206bdd1d62c59ec3ULL,
+       "030a6e754047abb27d84e8efbac1252cf7fe6269343b9fa67178dce3aeb51920"},
+      {2, 0x72e376279625af83ULL,
+       "a3815e3c4d2bf8d6e7c59270816f3c1a6f4d1af809e7b492a3815e3c4d2bf8d6"},
+      {3, 0xf323b483ed814243ULL,
+       "030a11186e757c837d848b92e8eff6fdf7fe050c6269707771787f86dce3eaf1"},
+  };
+  for (const Golden& g : goldens) {
+    char what[128];
+    std::snprintf(what, sizeof(what), "machete prepack golden atom %d", g.atom);
+    const auto got = run_machete_case(ctx, g.atom, 256, 128, "machete prepack golden");
+    const uint64_t h = fnv1a64(got);
+    if (h != g.hash) {
+      char detail[128];
+      std::snprintf(detail, sizeof(detail), "FNV-1a %016llx, want %016llx", static_cast<unsigned long long>(h),
+                    static_cast<unsigned long long>(g.hash));
+      kops_test::record_failure(what, detail, __FILE__, __LINE__);
+    }
+    size_t bad = 0;
+    for (int i = 0; i < 32; ++i) {
+      char byte[3] = {g.prefix[2 * i], g.prefix[2 * i + 1], 0};
+      bad += got[static_cast<size_t>(i)] != static_cast<uint8_t>(std::strtoul(byte, nullptr, 16));
+    }
+    if (bad != 0) kops_test::record_failure(what, "first 32 bytes differ from the CUTE golden", __FILE__, __LINE__);
+  }
+  // The W4A16 atom is the only interleaved one: the first eight elements of a block are
+  // {n0k0, n8k0, n0k8, n8k8, n0k1, n8k1, n0k9, n8k9}.
+  {
+    const int n = 128, k = 64;
+    const auto got = run_machete_case(ctx, 0, n, k, "machete prepack interleave order");
+    const int want_elems[8] = {0, 8 * k, 8, 8 * k + 8, 1, 8 * k + 1, 9, 8 * k + 9};
+    size_t bad = 0;
+    for (int i = 0; i < 8; ++i) {
+      const uint8_t b = got[static_cast<size_t>(i >> 1)];
+      const int nib = (i & 1) ? (b >> 4) : (b & 0xF);
+      bad += nib != machete_elem(want_elems[i] / k, want_elems[i] % k, 4);
+    }
+    if (bad != 0) kops_test::record_failure("machete prepack interleave order", "the first 8 nibbles are not the ACEGBDFH interleave", __FILE__, __LINE__);
+  }
+  // A flat capacity view is accepted, and the kernel is a permutation (elements are conserved).
+  {
+    const int64_t n = 128, k = 64;
+    const auto in = machete_input(static_cast<int>(n), static_cast<int>(k), 8);
+    auto din = upload(in);
+    DevBuf<uint8_t> dout(in.size());
+    cudaMemset(dout.p, 0, in.size());
+    KOPS_EXPECT_OK(kops::gemm::machete_prepack(tensor1d(dout.p, DType::kInt8, static_cast<int64_t>(in.size())),
+                                               kops_test::tensor2d(din.p, DType::kInt8, n, k), 8, 1, ctx),
+                   "machete prepack flat capacity");
+    cudaDeviceSynchronize();
+    auto got = kops_test::copy_out(dout.p, in.size());
+    auto want = in;
+    std::sort(got.begin(), got.end());
+    std::sort(want.begin(), want.end());
+    if (got != want) kops_test::record_failure("machete prepack flat capacity", "the pack is not a permutation", __FILE__, __LINE__);
+  }
+  // Contracts.
+  {
+    const int64_t n = 128, k = 64;
+    const auto in4 = machete_input(static_cast<int>(n), static_cast<int>(k), 4);
+    const auto in8 = machete_input(static_cast<int>(n), static_cast<int>(k), 8);
+    auto d4 = upload(in4);
+    auto d8 = upload(in8);
+    DevBuf<uint8_t> out4(in4.size()), out8(in8.size());
+    const Tensor w4 = kops_test::tensor2d(d4.p, DType::kInt4x2, n, k);
+    const Tensor w8 = kops_test::tensor2d(d8.p, DType::kInt8, n, k);
+    const Tensor o4 = kops_test::tensor2d(out4.p, DType::kInt4x2, n, k);
+    const Tensor o8 = kops_test::tensor2d(out8.p, DType::kInt8, n, k);
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(o4, w4, 4, 4, ctx), Status::kInvalidArgument, "machete prepack: atom id 4");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(o4, w4, 4, -1, ctx), Status::kInvalidArgument, "machete prepack: negative atom id");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(o4, w4, 8, 0, ctx), Status::kInvalidArgument, "machete prepack: weight_bits vs dtype");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(o4, w4, 4, 1, ctx), Status::kInvalidArgument, "machete prepack: 8-bit atom on int4");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(o8, w8, 8, 0, ctx), Status::kInvalidArgument, "machete prepack: int4 atom on int8");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(kops_test::tensor2d(out8.p, DType::kInt8, n, k / 2), w8, 8, 1, ctx),
+                       Status::kInvalidArgument, "machete prepack: short out shape");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(kops_test::tensor2d(out4.p, DType::kInt4x2, n, 96),
+                                                   kops_test::tensor2d(d4.p, DType::kInt4x2, n, 96), 4, 0, ctx),
+                       Status::kUnsupportedShape, "machete prepack: K % 64");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(kops_test::tensor2d(out4.p, DType::kInt4x2, 64, k),
+                                                   kops_test::tensor2d(d4.p, DType::kInt4x2, 64, k), 4, 0, ctx),
+                       Status::kUnsupportedShape, "machete prepack: N % 128");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(o4, tensor2d_ld(d4.p, DType::kInt4x2, n, k, k + 64), 4, 0, ctx),
+                       Status::kUnsupportedLayout, "machete prepack: padded weight rows");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(o4, kops_test::tensor2d(d8.p, DType::kBFloat16, n, k), 4, 0, ctx),
+                       Status::kUnsupportedDtype, "machete prepack: bf16 weight");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(tensor1d(out4.p, DType::kInt4x2, n * k / 2 - 1), w4, 4, 0, ctx),
+                       Status::kCapacityExceeded, "machete prepack: short flat capacity");
+    KOPS_EXPECT_STATUS(kops::gemm::machete_prepack(kops_test::tensor2d(static_cast<uint8_t*>(out4.p) + 1, DType::kInt4x2, n, k),
+                                                   kops_test::tensor2d(static_cast<uint8_t*>(d4.p) + 1, DType::kInt4x2, n, k), 4, 0, ctx),
+                       Status::kMisaligned, "machete prepack: 1-byte offset");
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Contracts
 // -----------------------------------------------------------------------------
 
@@ -5688,7 +5909,9 @@ void b7_grouped_contracts(const LaunchContext& ctx) {
     ws.device_scratch = scratch.p;
     GemmTactic tw = t64;
     tw.mainloop = kg::MainloopSchedule::kTmaWarpSpecialized;
-    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, tw, ws, ctx), Status::kNotImplemented, "b7 grouped prepare: TMA tactic");
+    // A TMA-class tactic also prepares GroupedProblem[G], so the mma-sized scratch is too small now.
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, tw, ws, ctx), Status::kWorkspaceTooSmall, "b7 grouped prepare: TMA tactic needs the problems region");
+    KOPS_TEST_CHECK(p.tile_task_map == nullptr);
     p.layout = GroupedLayout::kContiguousRowIndex;
     KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t64, ws, ctx), Status::kNotImplemented, "b7 grouped prepare: row index layout");
     p = base;
@@ -5713,6 +5936,353 @@ void test_b7_grouped(const LaunchContext& ctx) {
   b7_task_map(ctx);
   b7_grouped_graph(ctx);
   b7_grouped_contracts(ctx);
+}
+
+// ---- B11 grouped GEMM preparation (GroupedProblem[] + task map, TMA-class mainloops) --------------
+
+/// Host reference for one prepared group: the group's rows, the byte offsets of its operands from the
+/// params' bases, its dequant alpha and its first tile id.
+struct RefGroup {
+  int32_t m = 0;
+  int64_t a_off = 0, b_off = 0, d_off = 0;
+  float alpha = 0.0f;
+  int64_t tile_offset = 0;
+};
+
+/// Checks GroupedProblem[G] and the task map that grouped_gemm_prepare wrote, plus the
+/// (num_tasks, overflow) header, against the reference. The header is addressed through the params
+/// (tile_task_map points just past it) so the test does not depend on the scratch layout.
+void b11_check_prepared(const char* what, const kg::GroupedGemmParams& p, const std::vector<RefGroup>& ref,
+                        int tile_m, int tile_n) {
+  const int g_count = static_cast<int>(ref.size());
+  const auto got = kops_test::copy_out(static_cast<const kg::GroupedProblem*>(p.problems), static_cast<size_t>(g_count));
+  const int32_t* hdr = p.tile_task_map - 4;
+  const auto h0 = kops_test::copy_out(hdr, 1);
+  const auto h = kops_test::copy_out(hdr, 4 + static_cast<size_t>(3) * static_cast<size_t>(h0[0] > 0 ? h0[0] : 0));
+  int64_t want_tiles = 0;
+  size_t bad_fields = 0, bad_map = 0;
+  const int n_tiles = static_cast<int>((p.n + tile_n - 1) / tile_n);
+  for (int g = 0; g < g_count; ++g) {
+    const RefGroup& r = ref[g];
+    const kg::GroupedProblem& q = got[g];
+    if (q.m != r.m || q.n != p.n || q.k != p.k || q.tile_offset != static_cast<int32_t>(r.tile_offset)) ++bad_fields;
+    if (q.lda != p.lda || q.ldb != p.ldb || q.ldd != p.ldd) ++bad_fields;
+    if (q.alpha != r.alpha) ++bad_fields;
+    const auto* abase = static_cast<const uint8_t*>(p.a);
+    const auto* bbase = static_cast<const uint8_t*>(p.b);
+    const auto* dbase = static_cast<const uint8_t*>(p.d);
+    const bool a_ok = p.layout == GroupedLayout::kIndexed ? q.a == p.a : q.a == abase + r.a_off;
+    if (!a_ok || q.b != bbase + r.b_off || q.d != dbase + r.d_off) ++bad_fields;
+    want_tiles += static_cast<int64_t>((r.m + tile_m - 1) / tile_m) * n_tiles;
+  }
+  // task map: group g occupies [tile_offset, tile_offset + tiles), m tile fastest
+  int64_t idx = 0;
+  for (int g = 0; g < g_count && idx < h[0]; ++g) {
+    const int mt = (ref[g].m + tile_m - 1) / tile_m;
+    for (int t = 0; t < mt * n_tiles && idx < h[0]; ++t) {
+      const int32_t* e = &h[4 + 3 * idx];
+      bad_map += e[0] != g || e[1] != t % mt || e[2] != t / mt;
+      ++idx;
+    }
+  }
+  if (h[0] != static_cast<int32_t>(want_tiles) || h[1] != 0) {
+    char det[128];
+    std::snprintf(det, sizeof(det), "num_tasks %d overflow %d, want %lld / 0", h[0], h[1],
+                  static_cast<long long>(want_tiles));
+    kops_test::record_failure(what, det, __FILE__, __LINE__);
+  }
+  if (bad_fields != 0) kops_test::record_failure(what, "GroupedProblem fields differ from the reference", __FILE__, __LINE__);
+  if (bad_map != 0) kops_test::record_failure(what, "task map entries differ from the reference", __FILE__, __LINE__);
+}
+
+void b11_grouped_prepare(const LaunchContext& ctx) {
+  using namespace b7grp;
+  auto tma_tile = [](int tm, int tn) {
+    GemmTactic t = make_tile(tm, tn, false);
+    t.mainloop = kg::MainloopSchedule::kTmaWarpSpecializedCooperative;
+    return t;
+  };
+  // 1. contiguous: rows come from expert_offsets, empty experts produce no tiles
+  {
+    Spec s;
+    s.rows = {5, 0, 70, 3, 33};
+    s.n = 192;
+    s.k = 256;
+    s.recipe = R_BF16;
+    const Problem P = make_problem(s);
+    DevProblem D(P, s);
+    auto p = make_params(s, P, D);
+    const GemmTactic t = tma_tile(64, 128);
+    kops::WorkspaceRequirements req{};
+    KOPS_EXPECT_OK(kg::grouped_gemm_workspace_requirements(p, &t, ctx, &req), "b11 prepare: contiguous requirements");
+    KOPS_TEST_CHECK(req.device_scratch_bytes >= static_cast<size_t>(P.G) * sizeof(kg::GroupedProblem));
+    DevBuf<uint8_t> scratch(req.device_scratch_bytes + 64);
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p;
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    // captured-size check: the problems region is 16 B aligned and precedes the task map
+    kops::WorkspaceRequirements r0{};
+    KOPS_EXPECT_OK(kg::grouped_gemm_workspace_requirements(p, nullptr, ctx, &r0), "b11 prepare: no tactic");
+    KOPS_TEST_CHECK(r0.device_scratch_bytes == 0);
+    KOPS_EXPECT_OK(kg::grouped_gemm_prepare(&p, t, ws, ctx), "b11 prepare: contiguous");
+    cudaDeviceSynchronize();
+    KOPS_TEST_CHECK(p.problems != nullptr && p.tile_task_map != nullptr && p.group_tma == nullptr);
+    std::vector<RefGroup> ref;
+    int64_t tile = 0;
+    for (int g = 0; g < P.G; ++g) {
+      RefGroup r;
+      r.m = s.rows[g];
+      r.a_off = static_cast<int64_t>(P.offs[g]) * P.K * 2;
+      r.b_off = static_cast<int64_t>(g) * P.N * P.K * 2;
+      r.d_off = static_cast<int64_t>(P.offs[g]) * P.ldd * 2;
+      r.alpha = p.epi.alpha;
+      r.tile_offset = tile;
+      tile += (r.m + 63) / 64 * ((P.N + 127) / 128);
+      ref.push_back(r);
+    }
+    b11_check_prepared("b11 prepare contiguous", p, ref, 64, 128);
+  }
+  // 2. masked: rows come from masked_m clamped to max_m, A and D are [G, max_m, *]
+  {
+    Spec s;
+    s.layout = L_MASKED;
+    s.rows = {0, 5, 12};
+    s.n = 128;
+    s.k = 128;
+    const Problem P = make_problem(s);
+    DevProblem D(P, s);
+    auto p = make_params(s, P, D);
+    const GemmTactic t = tma_tile(32, 64);
+    kops::WorkspaceRequirements req{};
+    KOPS_EXPECT_OK(kg::grouped_gemm_workspace_requirements(p, &t, ctx, &req), "b11 prepare: masked requirements");
+    DevBuf<uint8_t> scratch(req.device_scratch_bytes + 64);
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p;
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    KOPS_EXPECT_OK(kg::grouped_gemm_prepare(&p, t, ws, ctx), "b11 prepare: masked");
+    cudaDeviceSynchronize();
+    std::vector<RefGroup> ref;
+    int64_t tile = 0;
+    for (int g = 0; g < P.G; ++g) {
+      RefGroup r;
+      r.m = std::min(s.rows[g], P.max_m);
+      r.a_off = static_cast<int64_t>(g) * P.max_m * P.K * 2;
+      r.b_off = static_cast<int64_t>(g) * P.N * P.K * 2;
+      r.d_off = static_cast<int64_t>(g) * P.max_m * P.ldd * 2;
+      r.alpha = p.epi.alpha;
+      r.tile_offset = tile;
+      tile += (r.m + 31) / 32 * ((P.N + 63) / 64);
+      ref.push_back(r);
+    }
+    b11_check_prepared("b11 prepare masked", p, ref, 32, 64);
+  }
+  // 3. ptr array: per-problem pointers and rows
+  {
+    const int G = 3;
+    const int N = 64, K = 64;
+    DevBuf<uint8_t> a(static_cast<size_t>(G) * 16 * K * 2), b(static_cast<size_t>(G) * N * K * 2);
+    DevBuf<uint8_t> d(static_cast<size_t>(G) * 16 * N * 2);
+    std::vector<const void*> pa(G), pb(G);
+    std::vector<void*> pd(G);
+    for (int g = 0; g < G; ++g) {
+      pa[g] = a.p + static_cast<size_t>(g) * 16 * K * 2;
+      pb[g] = b.p + static_cast<size_t>(g) * N * K * 2;
+      pd[g] = d.p + static_cast<size_t>(g) * 16 * N * 2;
+    }
+    auto dpa = upload(pa);
+    auto dpb = upload(pb);
+    auto dpd = upload(pd);
+    auto dm = upload(std::vector<int32_t>{4, 0, 9});
+    kg::GroupedGemmParams p{};
+    p.layout = GroupedLayout::kPtrArray;
+    p.recipe = GemmRecipe::kBF16;
+    p.num_groups = G;
+    p.a_ptrs = dpa.p;
+    p.b_ptrs = dpb.p;
+    p.d_ptrs = dpd.p;
+    p.problem_m = dm.p;
+    p.lda = K; p.ldb = K; p.ldd = N;
+    p.n = N; p.k = K;
+    p.max_m = 16;
+    p.epi.alpha = 0.5f;
+    const GemmTactic t = tma_tile(16, 32);
+    kops::WorkspaceRequirements req{};
+    KOPS_EXPECT_OK(kg::grouped_gemm_workspace_requirements(p, &t, ctx, &req), "b11 prepare: ptr array requirements");
+    DevBuf<uint8_t> scratch(req.device_scratch_bytes + 64);
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p;
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    KOPS_EXPECT_OK(kg::grouped_gemm_prepare(&p, t, ws, ctx), "b11 prepare: ptr array");
+    cudaDeviceSynchronize();
+    const auto probs = kops_test::copy_out(reinterpret_cast<const kg::GroupedProblem*>(scratch.p), static_cast<size_t>(G));
+    size_t bad = 0;
+    int64_t tile = 0;
+    const int32_t ms[G] = {4, 0, 9};
+    for (int g = 0; g < G; ++g) {
+      bad += probs[g].m != ms[g];
+      bad += probs[g].a != pa[g] || probs[g].b != pb[g] || probs[g].d != pd[g];
+      bad += probs[g].alpha != 0.5f;
+      bad += probs[g].tile_offset != static_cast<int32_t>(tile);
+      tile += (ms[g] + 15) / 16 * ((N + 31) / 32);
+    }
+    if (bad != 0) kops_test::record_failure("b11 prepare: ptr array", "GroupedProblem fields differ", __FILE__, __LINE__);
+    const int32_t* hdr = p.tile_task_map - 4;
+    const auto h = kops_test::copy_out(hdr, static_cast<size_t>(4 + 3 * std::min<int64_t>(tile, 64)));
+    if (h[0] != static_cast<int32_t>(tile) || h[1] != 0) {
+      kops_test::record_failure("b11 prepare: ptr array", "num_tasks / overflow differ", __FILE__, __LINE__);
+    }
+  }
+  // 4. fp8 tensorwise: alpha picks up the per-expert weight scale, sfb moves by the expert stride
+  {
+    Spec s;
+    s.rows = {9, 4};
+    s.recipe = R_FP8T;
+    const Problem P = make_problem(s);
+    DevProblem D(P, s);
+    auto p = make_params(s, P, D);
+    p.b_scale_group_stride = 1;
+    p.epi.alpha = 0.75f;
+    const GemmTactic t = tma_tile(64, 128);
+    kops::WorkspaceRequirements req{};
+    KOPS_EXPECT_OK(kg::grouped_gemm_workspace_requirements(p, &t, ctx, &req), "b11 prepare: fp8 requirements");
+    DevBuf<uint8_t> scratch(req.device_scratch_bytes + 64);
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p;
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    KOPS_EXPECT_OK(kg::grouped_gemm_prepare(&p, t, ws, ctx), "b11 prepare: fp8 tensorwise");
+    cudaDeviceSynchronize();
+    const auto probs = kops_test::copy_out(reinterpret_cast<const kg::GroupedProblem*>(scratch.p), 2u);
+    size_t bad = 0;
+    for (int g = 0; g < 2; ++g) {
+      bad += probs[g].alpha != 0.75f * P.sb[static_cast<size_t>(g)];
+      bad += probs[g].sfb != static_cast<const uint8_t*>(p.b_scale) + 4 * g;
+      bad += probs[g].sfa != p.a_scale;   // per-tensor A scale: not a row-major per-token layout
+      bad += probs[g].a != static_cast<const uint8_t*>(p.a) + static_cast<int64_t>(P.offs[g]) * P.K;
+    }
+    if (bad != 0) kops_test::record_failure("b11 prepare: fp8 tensorwise", "alpha / sfa / sfb / a differ", __FILE__, __LINE__);
+  }
+  // 5. graph replay: the preparation follows the expert counts that change on the device
+  {
+    cudaStream_t stream = nullptr;
+    if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+      kops_test::record_failure("b11 prepare graph", "cudaStreamCreate failed", __FILE__, __LINE__);
+      return;
+    }
+    LaunchContext gctx = ctx;
+    gctx.stream = stream;
+    Spec s;
+    s.rows = {5, 0, 70, 3};
+    s.n = 128;
+    s.k = 128;
+    const Problem P = make_problem(s);
+    DevProblem D(P, s);
+    auto p = make_params(s, P, D);
+    const GemmTactic t = tma_tile(64, 128);
+    kops::WorkspaceRequirements req{};
+    KOPS_EXPECT_OK(kg::grouped_gemm_workspace_requirements(p, &t, gctx, &req), "b11 prepare graph: requirements");
+    DevBuf<uint8_t> scratch(req.device_scratch_bytes + 64);
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p;
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    bool ok = cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal) == cudaSuccess;
+    Status st = Status::kSuccess;
+    kg::GroupedGemmParams q = p;   // the captured launch holds a snapshot of these params
+    if (ok) {
+      st = kg::grouped_gemm_prepare(&q, t, ws, gctx);
+      ok = cudaStreamEndCapture(stream, &graph) == cudaSuccess && st == Status::kSuccess;
+      ok = ok && cudaGraphInstantiate(&exec, graph, 0) == cudaSuccess;
+    }
+    KOPS_EXPECT_OK(st, "b11 prepare graph: capture");
+    if (!ok) {
+      kops_test::record_failure("b11 prepare graph", "capture / instantiate failed", __FILE__, __LINE__);
+      cudaGetLastError();
+      cudaStreamDestroy(stream);
+      return;
+    }
+    const std::vector<std::vector<int>> counts = {{5, 0, 70, 3}, {0, 0, 0, 0}, {33, 41, 2, 0}};
+    for (const auto& c : counts) {
+      std::vector<int64_t> offs(c.size() + 1, 0);
+      for (size_t g = 0; g < c.size(); ++g) offs[g + 1] = offs[g] + c[g];
+      kops_test::copy_in(D.offs.p, offs);
+      cudaDeviceSynchronize();
+      KOPS_TEST_CHECK(cudaGraphLaunch(exec, stream) == cudaSuccess);
+      KOPS_TEST_CHECK(cudaStreamSynchronize(stream) == cudaSuccess);
+      const auto probs = kops_test::copy_out(reinterpret_cast<const kg::GroupedProblem*>(scratch.p), c.size());
+      const auto h = kops_test::copy_out(q.tile_task_map - 4, 2);
+      int64_t want_tiles = 0, tile = 0;
+      size_t bad = 0;
+      for (size_t g = 0; g < c.size(); ++g) {
+        const int mt = (c[g] + 63) / 64;
+        bad += probs[g].m != c[g];
+        bad += probs[g].tile_offset != static_cast<int32_t>(tile);
+        bad += probs[g].a != static_cast<const uint8_t*>(p.a) + offs[g] * P.K * 2;
+        tile += static_cast<int64_t>(mt) * ((P.N + 127) / 128);
+        want_tiles += static_cast<int64_t>(mt) * ((P.N + 127) / 128);
+      }
+      char det[160];
+      std::snprintf(det, sizeof(det), "num_tasks %d (want %lld), %zu problem fields differ", h[0],
+                    static_cast<long long>(want_tiles), bad);
+      if (h[0] != static_cast<int32_t>(want_tiles) || h[1] != 0 || bad != 0) {
+        kops_test::record_failure("b11 prepare graph: replay after the expert counts changed", det, __FILE__, __LINE__);
+      }
+    }
+    cudaGraphExecDestroy(exec);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+  }
+  // 6. contracts
+  {
+    Spec s;
+    s.rows = {3, 0, 20};
+    const Problem P = make_problem(s);
+    DevProblem D(P, s);
+    const auto base = make_params(s, P, D);
+    const GemmTactic t = tma_tile(64, 128);
+    kops::WorkspaceRequirements req{};
+    KOPS_EXPECT_OK(kg::grouped_gemm_workspace_requirements(base, &t, ctx, &req), "b11 prepare: contract requirements");
+    DevBuf<uint8_t> scratch(req.device_scratch_bytes + 64);
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p;
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    auto p = base;
+    ws.device_scratch_bytes = req.device_scratch_bytes - 8;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kWorkspaceTooSmall, "b11 prepare: short workspace");
+    KOPS_TEST_CHECK(p.problems == nullptr && p.tile_task_map == nullptr);
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    ws.device_scratch = scratch.p + 8;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kMisaligned, "b11 prepare: misaligned scratch");
+    ws.device_scratch = scratch.p;
+    p = base;
+    p.layout = GroupedLayout::kContiguousRowIndex;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kNotImplemented, "b11 prepare: row index layout");
+    p = base;
+    p.layout = GroupedLayout::kMasked;
+    p.masked_m = nullptr;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kInvalidArgument, "b11 prepare: masked without masked_m");
+    p = base;
+    p.recipe = GemmRecipe::kW4A16Int;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kNotImplemented, "b11 prepare: mixed-input recipe");
+    p = base;
+    p.recipe = GemmRecipe::kFP8Tensorwise;
+    p.b_scale = nullptr;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kInvalidArgument, "b11 prepare: tensorwise without b_scale");
+    p = base;
+    p.d = nullptr;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kInvalidArgument, "b11 prepare: null D");
+    p = base;
+    p.max_m = 0;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kInvalidArgument, "b11 prepare: max_m missing");
+    GemmTactic tb = t;
+    tb.mainloop = kg::MainloopSchedule::kSimtFma;
+    p = base;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, tb, ws, ctx), Status::kNotImplemented, "b11 prepare: SIMT mainloop");
+    p = base;
+    p.layout = GroupedLayout::kPtrArray;   // no pointer arrays
+    p.expert_offsets = nullptr;
+    KOPS_EXPECT_STATUS(kg::grouped_gemm_prepare(&p, t, ws, ctx), Status::kInvalidArgument, "b11 prepare: ptr array without pointers");
+  }
 }
 
 // ---- multi-LoRA (Punica SGMV) ---------------------------------------------------------------------
@@ -5919,6 +6489,7 @@ int main() {
   test_colsum(ctx);
   test_scale_swizzle(ctx);
   test_scale_tma(ctx);
+  test_machete_prepack(ctx);
   test_e4m3_encode_exhaustive();
   test_block_quant(ctx);
   test_contracts(ctx);
@@ -5946,6 +6517,7 @@ int main() {
   test_b7_w4a8(ctx);
   test_b7_gguf_mmq(ctx);
   test_b7_grouped(ctx);
+  b11_grouped_prepare(ctx);
   test_b7_lora(ctx);
   return kops_test::finish("test_gemm");
 }

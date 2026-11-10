@@ -119,6 +119,15 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S03.rejection_sample",
+   "kernel_symbol": "rejection_sample_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "chain greedy / target-only / p-q; counter RNG draw map; one CTA per request; no workspace",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S03.tree_verify",
    "kernel_symbol": "tree_verify_kernel",
    "provider": "native",
@@ -128,10 +137,28 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S03.tree_verify",
+   "kernel_symbol": "tree_verify_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "numerically_validated",
+   "predicates": "EAGLE tree, greedy / target-only / p-q; first-child/next-sibling; accept path and recovered node",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S03.tree_attention_mask",
    "kernel_symbol": "build_tree_attention_mask_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "numerically_validated",
+   "predicates": "bit-packed custom mask, little-endian, no padding between rows; depth offsets; atomicOr word writes",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S03.tree_attention_mask",
+   "kernel_symbol": "build_tree_attention_mask_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "numerically_validated",
    "predicates": "bit-packed custom mask, little-endian, no padding between rows; depth offsets; atomicOr word writes",
    "evidence": "test_sampling;bench_sampling"
@@ -173,10 +200,28 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S01.softmax",
+   "kernel_symbol": "softmax_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S01.argmax",
    "kernel_symbol": "argmax_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.argmax",
+   "kernel_symbol": "argmax_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "planned",
    "evidence": "test_sampling;bench_sampling"
@@ -191,10 +236,28 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S01.compute_logprobs",
+   "kernel_symbol": "compute_logprobs_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S02.token_bincount",
    "kernel_symbol": "token_bincount_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S02.token_bincount",
+   "kernel_symbol": "token_bincount_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "planned",
    "evidence": "test_sampling;bench_sampling"
@@ -209,10 +272,28 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S02.apply_penalties",
+   "kernel_symbol": "apply_penalties_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S02.apply_token_bitmask",
    "kernel_symbol": "apply_token_bitmask_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S02.apply_token_bitmask",
+   "kernel_symbol": "apply_token_bitmask_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "planned",
    "evidence": "test_sampling;bench_sampling"
@@ -227,10 +308,28 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S02.apply_logit_bias",
+   "kernel_symbol": "apply_logit_bias_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S01.top_k_renorm_probs",
    "kernel_symbol": "top_k_renorm_probs_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "exact top-k set (radix threshold, ties -> lower id); fp32 probs; k<=0 or k>=V copies the row",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.top_k_renorm_probs",
+   "kernel_symbol": "top_k_renorm_probs_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "exact top-k set (radix threshold, ties -> lower id); fp32 probs; k<=0 or k>=V copies the row",
    "evidence": "test_sampling;bench_sampling"
@@ -245,10 +344,28 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S01.top_p_renorm_probs",
+   "kernel_symbol": "top_p_renorm_probs_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "exact nucleus (fixed-point 2^40 deterministic accumulation, crossing token included, ties by id); p>=1 copies; p<=0 keeps the single largest",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S01.top_k_mask_logits",
    "kernel_symbol": "top_k_mask_logits_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "keeps fp32/fp16/bf16 logits inside top-k, writes -inf outside; exact threshold+id tie handling",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.top_k_mask_logits",
+   "kernel_symbol": "top_k_mask_logits_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "keeps fp32/fp16/bf16 logits inside top-k, writes -inf outside; exact threshold+id tie handling",
    "evidence": "test_sampling;bench_sampling"
@@ -263,10 +380,28 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S01.sample",
+   "kernel_symbol": "top_k_top_p_sampling_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "counter RNG (seed, request, offset, draw, stream); ordered exact prefix scan over the truncated fp32 distribution; top-k then top-p (or joint), min-p; invalid rows write -1; device outputs only",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S01.gumbel_max_sample",
    "kernel_symbol": "gumbel_max_sampling_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "argmax(logit/T + Gumbel) with counter RNG; top-k + min-p truncation; top-p rejected with kNotImplemented (use sample()); greedy T<=0",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.gumbel_max_sample",
+   "kernel_symbol": "gumbel_max_sampling_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "argmax(logit/T + Gumbel) with counter RNG; top-k + min-p truncation; top-p rejected with kNotImplemented (use sample()); greedy T<=0",
    "evidence": "test_sampling;bench_sampling"
@@ -290,6 +425,15 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S01.fused_greedy",
+   "kernel_symbol": "fused_greedy_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "greedy fused sampler; one CTA per row; no [B,V] probs; lowest-id tie break; penalty mask/counts",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S01.fused_categorical",
    "kernel_symbol": "fused_categorical_kernel",
    "provider": "native",
@@ -308,6 +452,15 @@
    "evidence": "test_sampling;bench_sampling"
   },
   {
+   "op_id": "S01.fused_categorical",
+   "kernel_symbol": "fused_categorical_kernel",
+   "provider": "native",
+   "arch_id": 1200,
+   "status": "benchmarked",
+   "predicates": "full-vocab categorical draw; fixed-point inverse CDF; counter RNG; temperature<=0 greedy branch",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
    "op_id": "S01.fused_filtered",
    "kernel_symbol": "fused_filtered_kernel",
    "provider": "native",
@@ -321,6 +474,15 @@
    "kernel_symbol": "fused_filtered_kernel",
    "provider": "native",
    "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "top-k (full tie group), min-p, top-p joint/sequential; 4096-bin histogram + smem refine + radix fallback; split-row",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S01.fused_filtered",
+   "kernel_symbol": "fused_filtered_kernel",
+   "provider": "native",
+   "arch_id": 1200,
    "status": "benchmarked",
    "predicates": "top-k (full tie group), min-p, top-p joint/sequential; 4096-bin histogram + smem refine + radix fallback; split-row",
    "evidence": "test_sampling;bench_sampling"

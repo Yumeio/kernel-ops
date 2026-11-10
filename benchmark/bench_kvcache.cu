@@ -614,6 +614,94 @@ bool run_b3(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
       if (ok) ok = measure(c, fn, st);
       cudaFree(kc); cudaFree(pe); cudaFree(cache);
     }
+  } else if (c.op == "ds_mla_v40" || c.op == "ds_mla_v41" || c.op == "ds_mla_v41_fp4" ||
+             c.op == "ds_mla_v40_gather" || c.op == "ds_mla_v41_gather" ||
+             c.op == "ds_mla_v41_fp4_gather") {
+    // DeepSeek-V4 MLA records: V4.0 584 B (576 B data + 8 B out-of-record scales), V4.1 528 B
+    // (512 e4m3 + 16 UE8M0), V4.1 FP4 288 B (256 e2m1 + 32 e4m3). Gather measures the bf16
+    // upconvert reader of the same cache.
+    const int ps = 64;
+    const bool v40 = c.op.find("v40") != std::string::npos;
+    const bool fp4 = c.op.find("fp4") != std::string::npos;
+    const bool gather = c.op.find("gather") != std::string::npos;
+    const int entry = v40 ? 576 : (fp4 ? 288 : 528);
+    const int64_t page_bytes =
+        v40 ? ((static_cast<int64_t>(ps) * 584 + 575) / 576) * 576
+            : static_cast<int64_t>(ps) * entry;
+    const int64_t pages = (tokens + ps - 1) / ps;
+    void* kc = nullptr; void* pe = nullptr; uint8_t* cache = nullptr; uint8_t* scales = nullptr;
+    void* dst = nullptr; int32_t* table = nullptr; int32_t* cu = nullptr;
+    std::vector<int32_t> pages_id(static_cast<size_t>(pages));
+    for (int64_t i = 0; i < pages; ++i) pages_id[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    const bool alloc_ok =
+        cuda_ok(cudaMalloc(&cache, static_cast<size_t>(pages * page_bytes)), "cache") &&
+        (!v40 || cuda_ok(cudaMalloc(reinterpret_cast<void**>(&scales),
+                                    static_cast<size_t>(pages * ps * 8)), "scales")) &&
+        (!gather || (cuda_ok(cudaMalloc(&dst, static_cast<size_t>(tokens) * (v40 ? 576 : 512) * 2),
+                             "dst") &&
+                     cuda_ok(cudaMalloc(reinterpret_cast<void**>(&table),
+                                        static_cast<size_t>(pages) * 4), "table") &&
+                     cuda_ok(cudaMalloc(reinterpret_cast<void**>(&cu), 2 * 4), "cu")));
+    if (alloc_ok) {
+      cudaMemset(cache, 0, static_cast<size_t>(pages * page_bytes));
+      if (v40) cudaMemset(scales, 0, static_cast<size_t>(pages * ps * 8));
+    }
+    PagedKVDesc d{};
+    d.k_data = cache;
+    d.k_dtype = fp4 ? DType::kFloat4E2M1x2 : DType::kFloat8E4M3;
+    d.k_codec = v40 ? KVCodec::kMLAFp8DSV40
+                    : (fp4 ? KVCodec::kMLAFp8DSV41Fp4 : KVCodec::kMLAFp8DSV41);
+    d.layout = KVLayout::kLatent;
+    d.page_size = ps;
+    d.num_kv_heads = 1;
+    d.head_dim_k = 512;
+    d.head_dim_v = 512;
+    d.entry_bytes = entry;
+    d.stride_unit = kops::StrideUnit::kByte;
+    d.k_stride_page = page_bytes;
+    d.k_stride_token = entry;
+    d.k_stride_head = entry;
+    d.table_format = PageTableFormat::kSlotMapping;
+    if (v40) {
+      d.k_scale_pages = scales;
+      d.k_scale_stride_page = static_cast<int64_t>(ps) * 8;
+      d.k_scale_stride_token = 8;
+      d.scale_bytes_per_token = 8;
+    }
+    if (alloc_ok && !gather) {
+      if (cuda_ok(cudaMalloc(&kc, static_cast<size_t>(tokens) * 448 * 2), "kc") &&
+          cuda_ok(cudaMalloc(&pe, static_cast<size_t>(tokens) * 64 * 2), "pe")) {
+        const Tensor tc = t2b(kc, tokens, 448);
+        const Tensor tp = t2b(pe, tokens, 64);
+        auto fn = [&]() { return kops::kv::concat_and_cache_mla(tc, tp, d, ts, ctx); };
+        ok = status_ok(fn(), c.id.c_str());
+        if (ok) ok = measure(c, fn, st);
+      }
+      cudaFree(kc);
+      cudaFree(pe);
+    } else if (alloc_ok && gather) {
+      const int32_t cu_host[2] = {0, static_cast<int32_t>(tokens)};
+      cudaMemcpy(table, pages_id.data(), pages_id.size() * 4, cudaMemcpyHostToDevice);
+      cudaMemcpy(cu, cu_host, sizeof(cu_host), cudaMemcpyHostToDevice);
+      kops::kv::GatherSpec spec{};
+      spec.block_table = table;
+      spec.block_table_stride = static_cast<int32_t>(pages);
+      spec.cu_seq_lens = cu;
+      spec.num_reqs = 1;
+      spec.num_tokens = static_cast<int32_t>(tokens);
+      const Tensor td = tensor2d(dst, DType::kBFloat16, tokens, v40 ? 576 : 512);
+      auto fn = [&]() {
+        return kops::kv::cp_gather_and_upconvert_ds_mla(td, d, spec, Tensor{}, Tensor{}, Tensor{},
+                                                        ctx);
+      };
+      ok = status_ok(fn(), c.id.c_str());
+      if (ok) ok = measure(c, fn, st);
+    }
+    cudaFree(cache);
+    cudaFree(scales);
+    cudaFree(dst);
+    cudaFree(table);
+    cudaFree(cu);
   } else if (c.op == "indexer_fp8") {
     const int64_t record = D + 4;
     const int64_t pages = (tokens + kPage - 1) / kPage;
@@ -739,7 +827,10 @@ bool run_b3(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   if (c.op == "reshape_per_token_head" || c.op == "ds_mla" || c.op == "indexer_fp8" ||
       c.op == "fused_qkv_append" || c.op == "fused_kv_append" ||
-      c.op == "requantize_pages" || c.op == "kv_scale_update" || c.op == "mla_rope_fused") {
+      c.op == "requantize_pages" || c.op == "kv_scale_update" || c.op == "mla_rope_fused" ||
+      c.op == "ds_mla_v40" || c.op == "ds_mla_v41" || c.op == "ds_mla_v41_fp4" ||
+      c.op == "ds_mla_v40_gather" || c.op == "ds_mla_v41_gather" ||
+      c.op == "ds_mla_v41_fp4_gather") {
     return run_b3(c, ctx, st);
   }
   if (c.op == "reshape_and_cache") return run_reshape(c, ctx, st);
@@ -796,6 +887,18 @@ std::vector<Case> make_cases() {
       static_cast<int64_t>(2048) * 8 * 128 * 4);
   add("ds_mla.fp8.t2048.r512.p64", "ds_mla", 2048, 576,
       static_cast<int64_t>(2048) * (656 + 1024));
+  add("ds_mla_v40.fp8.t256.r448.p64", "ds_mla_v40", 256, 448,
+      static_cast<int64_t>(256) * (448 + 64) * 2 + static_cast<int64_t>(256) * 584);
+  add("ds_mla_v41.fp8.t1024.r448.p64", "ds_mla_v41", 1024, 448,
+      static_cast<int64_t>(1024) * (448 + 64) * 2 + static_cast<int64_t>(1024) * 528);
+  add("ds_mla_v41.fp4.t1024.r448.p64", "ds_mla_v41_fp4", 1024, 448,
+      static_cast<int64_t>(1024) * (448 + 64) * 2 + static_cast<int64_t>(1024) * 288);
+  add("ds_mla_v40_gather.bf16.t256", "ds_mla_v40_gather", 256, 576,
+      static_cast<int64_t>(256) * (584 + 576 * 2));
+  add("ds_mla_v41_gather.bf16.t1024", "ds_mla_v41_gather", 1024, 512,
+      static_cast<int64_t>(1024) * (528 + 512 * 2));
+  add("ds_mla_v41_fp4_gather.bf16.t1024", "ds_mla_v41_fp4_gather", 1024, 512,
+      static_cast<int64_t>(1024) * (288 + 512 * 2));
   add("indexer_fp8.t2048.d128", "indexer_fp8", 2048, 128,
       static_cast<int64_t>(2048) * (128 + 4) * 3);
   add("fused_qkv_append.bf16.t2048.hq32.hkv8.d128", "fused_qkv_append", 2048, 128,

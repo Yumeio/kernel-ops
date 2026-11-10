@@ -53,8 +53,46 @@ remain the ABI and shape authority.
   with a one-quantization-step tolerance, not bitwise.
 - `kMLAFp8DS` records are 656 B: four 128-value e4m3 tiles, four fp32 tile
   scales `2^ceil(log2(max(amax/448, 1e-4)))`, then 64 bf16 RoPE values.
+- `kMLAFp8DSV40` is 584 B/token: 448 e4m3 NoPE in seven 64-value tiles, then 64
+  bf16 RoPE values (576 B of data), plus an 8 B/token scale region outside the
+  record (seven UE8M0 bytes + one pad). The page data region and scale region
+  are each padded by the FlashMLA 576-byte rule; `k_scale_pages` describes the
+  second region.
+- `kMLAFp8DSV41` is 528 B/token: 512 e4m3 values covering NoPE and RoPE in 16
+  tiles of 32, followed by 16 inline UE8M0 scale bytes.
+- `kMLAFp8DSV41Fp4` is 288 B/token: 256 B e2m1 (512 values, even element in the
+  low nibble) followed by 32 inline e4m3 scale bytes with block 16. It is valid
+  only as the extra cache next to a V4.1 FP8 cache.
 - The indexer split page is `[page_size × head_dim e4m3 | page_size ×
   (head_dim/quant_block) fp32 scales]`; scales follow all keys of the page.
+
+## 1b2. Sparse MLA / DSA conventions (B14)
+
+- Sparse MLA uses two KV ranges, `primary` and `extra`, each with its own
+  `indices` and optional per-query `topk_length`. `-1` entries are invalid;
+  entries at or beyond `topk_length[t]` are invalid. Both ranges contribute to
+  one online softmax; a sink adds one denominator term and is included in LSE.
+- Top-k indices are exact, unordered, and ties resolve to the lower logical
+  index. `to_page_slots` converts through the block table; invalid or
+  out-of-range entries become `-1`.
+- V4.1 fused variants use the same attention body: Q-norm + Q-RoPE before the
+  score, O-RoPE conjugate + FP8 1×32 UE8M0 cast after. The unfused chain must
+  agree within the FP8 output tolerance.
+- A query row with no valid key writes `o = 0`; LSE is `-inf` without a sink and
+  the sink logit with a sink.
+
+## 1b3. DeepSeek-V4 mHC and Kimi-K3 AttnRes (B15)
+
+- mHC follows `deepgemm:tests/test_mega_mhc.py::mhc_reference`: `new_residual =
+  bf16(x*post_mix + comb^T*residual)`, projection `flatten(new_residual) @ fn^T`,
+  `rsqrt(mean(x^2)+hc_norm_eps)`, `mix_scales`/`mix_bases`, `pre = sigmoid+eps`,
+  `post = sigmoid*scale`, `comb = Sinkhorn(softmax+eps)`, then `sum(pre*X)` and
+  RMSNorm. The projection is TF32 on the reference kernel and fp32 in the fp64
+  oracle; tests use the TF32 tolerance documented by the row, never bitwise.
+- AttnRes follows the Kimi-K3 block residual contract: sources are completed
+  block representations plus the running partial, logits use a learned query and
+  cached inverse RMS, softmax over depth, weighted sum, optional output RMSNorm
+  and MXFP8 quant. Batch composition must not change a row's bits.
 
 ## 1c. Routing, permutation and sampling rules (B6)
 
@@ -360,6 +398,195 @@ remain the ABI and shape authority.
   already holds the state after the complete draft forward. Negative slots skip.
   This is the rollback half of the hybrid B9 contract; the test composes it with
   `causal_conv1d_update`.
+
+## 1h. Low-bit rotated KV (B17, experimental)
+
+Opt-in only: the entry points live in `kops::experimental::lowbit` and no
+`kops::attn` plan selects them. A low-bit cache is a `kv::PagedKVDesc` with
+`k_codec = v_codec = kLowBitWHT`, `k_dtype = v_dtype = kUInt8`,
+`stride_unit = kByte`, 4-byte strides and `entry_bytes` equal to the **K**
+record size (V strides may address a different record size). There is no
+ragged (non-paged) path.
+
+- **Codecs.** `kUniform3/4` = signed uniform mid-rise levels
+  `2i - (2^b - 1)`, `scale = absmax / (2^b - 1)`, K rotated, V *not* rotated
+  (attention.rs turbo4/turbo3). `kTurboMse2/3/4` = TurboQuant_mse
+  (arXiv:2504.19874 Alg. 1): signed Hadamard, b-bit Lloyd-Max code,
+  `scale = ||x|| / sqrt(D)`; K and V rotated. `kTurboProd2/3/4` = TurboQuant_prod
+  (Alg. 2): `kTurboMse<b-1>` codes plus one QJL sign per coordinate of the
+  residual and one fp32 gain; K only. `kFP8` and `kNVFP4` are reserved and
+  return `kUnsupportedDtype` (not compiled).
+- **Transform.** `x_rot = Hn (s .* x)`, `Hn` the Sylvester Hadamard divided by
+  `sqrt(D)`, `s` the sign stream of `lowbit_sign_word(seed, stream, word)`
+  (`bit 1` negates). Streams: 0 = K and Q, 1 = QJL sketch, 2 = V. The seed is
+  `LowBitCodec::transform_seed`; Q and K must use the same one. D is 64, 128 or
+  256 (`kUnsupportedShape` otherwise).
+- **Record** (`packing_version = 1`, little-endian, 4-byte aligned):
+  `[codes: D*b/8][signs: D/8, kTurboProd][scale: fp32][gain: fp32, kTurboProd]`.
+  Element `i` is bits `[i*b, (i+1)*b)` of the code stream; the code is the index
+  into the ascending level table (`code = #{thresholds < x_rot / scale}`), and
+  `thresholds` are the midpoints. The scale is rounded to fp32 first and the
+  codes are taken against the stored scale. A non-finite input poisons the
+  record scale (NaN) instead of producing an out-of-range code.
+  `lowbit_entry_bytes` is the declared size; physical cache bytes still come
+  from `kv::kv_physical_bytes` on a byte-stride descriptor.
+- **Attention.** The query is rotated once per CTA, the score is
+  `scale * <q_rot, levels[code]> + gain * <q_sk, sgn>` with
+  `q_sk = Hn (s' .* q_rot)`, and V is accumulated in its rotated basis and
+  rotated back once per output row. Mask / window / chunk / softcap / ALiBi /
+  sink / LSE follow §1e exactly. Sink is applied once, in the unsplit row or in
+  `merge_split_kv` for split rows. Rows with no visible key give `o = 0`,
+  `lse = -inf`. Decode is fp32; paged prefill dequantizes K/V to fp16 in shared
+  memory and runs QK/PV on `mma.sync` fp16, so dequantized magnitudes must stay
+  below 65504 (the same bound as an fp16 cache).
+- **Compiled cells.** D 64/128/256; q/o bf16 or fp16 (same type); NHD or HND
+  pages via byte strides; CSR or block table; any page size; decode `q_len`
+  1..8; prefill causal, window, chunk, softcap, ALiBi, sinks and custom masks.
+  Decode refuses custom masks (`kUnsupportedShape`); use paged prefill for
+  them. TurboProd V, FP8/NVFP4 records and ragged KV are not compiled.
+- **Plans and workspace.** `lowbit_decode_plan` and `lowbit_prefill_plan` follow
+  the two-call workspace protocol of §1e: an empty workspace returns
+  `kWorkspaceTooSmall` with `plan->workspace` filled, then the same call with a
+  256-byte aligned workspace uploads the tables. Prefill lengths are host
+  inputs: the plan is valid for those `qo_indptr` / `kv_lens` and must be
+  rebuilt when they change (`lowbit_prefill_run` returns `kCapacityExceeded`
+  for a different batch). Decode carries the planned capacities and fixed
+  split count in `kernel_id`; a different codec returns `kPlanInvalidated`.
+  Runs never allocate or synchronize, so both paths are graph-capturable.
+- **Oracle and tolerances.** `ref::lowbit_encode_f64` / `lowbit_decode_f64`
+  (`reference/ops.h`) are the fp64 reader/writer. `test_merge` checks (1) store:
+  every named slot decodes to the fp64-encoded record within one code cell and
+  unwritten slots keep their bytes; (2) decode/prefill attention against
+  `ref::attention_f64` over the fp64-decoded records, with `rtol = atol = 2e-2`
+  for the fp16 prefill path and `lse` within 2e-3; (3) bit-identical repeat
+  launches. Quality (perplexity, long-context eval) is a model-level gate and
+  is not claimed by these numerics.
+
+## 1i. Communication: TP collectives and EP (B12)
+
+**Transport.** A communicator is a `PeerBuffers` set: one single-writer staging
+buffer per rank (`data[r]`, `buffer_bytes`, two parity slots of
+`(buffer_bytes / 2) & ~127` bytes) and one signal array per rank
+(`flags[r]`, `kSignalWords` words). The kernels only take pointers, so the same
+body runs over NVLink/IPC peer mappings, over pinned mapped host memory when the
+GPUs have no P2P, and over virtual ranks (N regions of one allocation on one
+device, one stream per rank). `scratch` is rank-private device memory:
+`kScrCalls` is the on-device call counter, `kScrError` records a `CommError`,
+`kScrTimeoutUs` overrides the 20 s wait. `comm_configure` zeros the signal area
+and scratch and must run on every rank before the first call and after a
+`CommError`.
+
+**Epoch.** The call epoch is `generation + calls + 1`, read on the device; the
+last CTA advances `calls`. A captured graph therefore replays with a fresh epoch
+without a host update. One flag per phase is posted by the last staging CTA
+(device-scope arrival counter) with a system-scope release; consumers acquire
+the peers' flags. Waits are bounded and write `CommError::kPeerTimeout` instead
+of trapping. A message above 128 KiB is chunked. The chunked launcher uses one
+data CTA plus one poster CTA per rank: a rank's data CTAs and poster must be
+co-resident, and two CTAs per rank remain progress-safe on every supported
+device. (Four data CTAs plus a poster produced a mixed poster/chunk view at
+world 4/8 on the dev GPU.)
+
+**Numerics.** `allreduce`, `allgather` and `reduce_scatter` convert to fp32,
+accumulate in ascending rank order and round once. This makes every algorithm
+and arrival order bit-identical (`kOneShot == kTwoShot == kDeterministic`).
+`allreduce_fusion` applies the chain `AR -> residual add -> RMSNorm`; the residual
+is rounded to the output dtype before the sum of squares, matching the separate
+`norm::fused_add_rms_norm_out` chain. The optional per-token FP8 output
+(`ActQuantOut::mode = kDynamicPerToken`) is produced in the same kernel: the
+normalized value `y = r' * rstd * (w + offset)` is kept in fp32 for the scale and
+the payload, while `norm_out` is the rounded output dtype. The scale is
+`max(amax(y)/448, 1/(448*512))` (clamped by `scale_upper_bound` when set),
+`q = e4m3(y / scale)` uses saturating OCP conversion, and `scales[row] = scale`. `kMXFP8`, `kNVFP4` and the
+other quant modes return `kNotImplemented`; the `q` pointer may be byte-aligned,
+`scales` must be 4-byte aligned.
+`kMultimem`, `kLamportOneShot` and `kQuickReduce` are reserved and return
+`kUnsupportedBackend` / `kNotImplemented`; no multicast object is used.
+
+**EP.** `ep_dispatch_layout` writes per-rank/per-expert counts and the
+`[tokens, ranks]` membership bitmap; the caller zeroes the outputs (the kernel
+also zeroes them). `ep_dispatch`/`ep_combine` use `EPBuffers`: a peer-mapped
+NVLink buffer per rank and a symmetric signal array of **two words per rank**
+(`signals[2r]` arrival counter, `signals[2r+1]` ready epoch). A source region is
+`(nvl_bytes / num_ranks) & ~127` bytes. Records are fixed-size and epoch-tagged;
+stale records are ignored. Normal dispatch compacts in `(source rank, source
+token)` order and writes `recv_src_info = (source_rank << 32) | token`,
+`recv_topk_idx` (local expert ids, -1 for unused) and `recv_topk_weights`.
+Low-latency dispatch scatters a `(token, local expert)` assignment into the
+masked `[E_local, max_tokens_per_rank, hidden]` layout with atomics; the slot
+order inside an expert is intentionally unordered. `max_tokens_per_rank` is the
+masked row capacity **per local expert**. The expert id → rank map is
+`expert / (num_experts / num_ranks)`. Combine sums contributions in ascending
+source-rank order; when `weights_already_applied == false`, a normal row uses the
+sum of its local routing weights and a low-latency slot uses its own weight.
+Unused `src_info` entries must be `-1`; the dispatch leaves them untouched, so
+the caller clears the array before the first call. Payload quantization is not
+implemented (`payload_quant != kNone` → `kNotImplemented`).
+
+**GEMM + communication.** `CommGemmParams::gemm` carries the local GEMM
+(`ScaledGemmArgs`). The implemented body is `mma.sync` m16n8k16 BF16/FP16 with
+fp32 accumulation and a 64x32 CTA tile; A/B are K-major, D is the operand dtype.
+`allgather_gemm` treats `args.m` as the local M shard and writes
+`[m_local * world, N]`; `gemm_reduce_scatter` and `gemm_allreduce` treat
+`args.m` as the total M. `num_chunks` must divide M and be a multiple of the
+world size. A chunk is owned by a small CTA group (up to 8 CTAs at world 2); the
+last local CTA posts `chunk_ready[rank * num_chunks + chunk]`
+is set to the epoch tag when the rank's data for that chunk is staged. The
+staging slot is `[m_local * K * sizeof(T)]` for allgather and
+`[M * N * sizeof(float)]` for the output-side collectives (fp32 partials).
+The chunk call counter is the same on-device `kScrCalls` used by the
+collectives, so graph replay is safe. The GEMM epilogue accepts `kEpiNone` and
+`kEpiBias`; `fuse_residual_rmsnorm` is GEMM+AR only and adds residual + RMSNorm
+after the reduction (the norm runs as a second kernel launch on the same
+stream). Quantized or packed operands and MN-major operands return
+`kNotImplemented` / `kUnsupportedLayout`.
+
+**Test model and tolerances.** `test_communication` runs virtual ranks (2/4/8
+regions on one GPU) and a host-staged 2-GPU world. Collectives are compared
+bit-for-bit with an ascending-rank fp32 oracle; EP is compared with a host
+reader of the normal compact order and with the masked slots; comm-GEMM is
+compared with an fp64 matrix product (`atol = rtol = 3e-2` for BF16). Real P2P,
+NVLink multicast and RDMA are not exercised by the dev machine; those cells stay
+`authored` until the `multi` handoff kit runs them.
+
+## 1i. Experimental W2 experts (B17, opt-in only)
+
+`kops::experimental::moe_w2` is not selected by `moe::route`, `moe::moe_forward`
+or the registry. It exists to evaluate the attention.rs Moet idea (2-bit expert
+weights) on this repo's block-sorted MoE path.
+
+- **Format.** One 2-bit code per element, four codes per byte (little-endian:
+  element `4i+j` in bits `2j..2j+1`), into the fixed levels `{-4, -1, +1, +4}`.
+  One fp32 dequant multiplier per `GROUP_SIZE` consecutive K elements;
+  `GROUP_SIZE` is 16, 32, 64 or 128 and `K % GROUP_SIZE == 0`.
+- **Pack.** `pack(packed, scales, weight, source, group_size)` writes
+  `[E, N, K/4]` u8 codes and `[E, N, K/group_size]` fp32 scales.
+  `source = WeightPacking::kNone` reads bf16 `[E, N, K]`;
+  `source = kFP4E2M1` reads packed e2m1 `[E, N, K/2]` (element `2i` in the low
+  nibble). The scale is `amax(group) / 4` (0 for an all-zero group), and each
+  element takes the nearest level using the midpoints `-2.5, 0, +2.5`.
+  No input scale array is consumed; this is a self-contained 2-bit re-encode.
+- **GEMM.** `moe_w2::gemm` consumes `FusedMoEGemmParams` with
+  `w_quant.packing = kW2`, `granularity = kPerGroup`, `group_k = GROUP_SIZE`,
+  `w` = packed codes (byte stride `w_expert_stride = N*K/4`), `w_scale` = fp32
+  scales (`w_scale_expert_stride = N*K/GROUP_SIZE`). Block-sorted semantics are
+  the B7 ones: `sorted_token_ids`/`expert_ids`/`num_tokens_post_pad` from
+  `moe::align_block_size`, `block_size = 16` (small-M WMMA) or `64` (one expert
+  tile), A row = slot when `a_rows_are_slots` else `slot / top_k`, C row = the
+  padded slot, and padding slots or `expert_id < 0` are untouched. `bias` is
+  `[E, N]` in `c_dtype`; `mul_routed_weight` uses `topk_weights[slot_id]` (the
+  original slot id, not the padded row), matching `fused_moe`/`moe_gemv`.
+  `a_scale` and `w_zeros` are not implemented (`kNotImplemented`). A/C are
+  bf16, fp16 or fp32; the 16-bit path uses WMMA `m16n16k16` tiles
+  (16×64 for block 16, 64×64 for block 64; group 32 only) after dequantizing the 2-bit tile
+  to 16-bit shared memory, and falls back to a scalar fp32 kernel for fp32
+  activations or K not divisible by 64.
+- **Quality.** `benchmark/compare/lowbit_quality.py` measures weight NMSE and
+  expert-output error against the attention.rs Moet MXFP4-LUT format. On the
+  synthetic N(0, 0.1) study the kops nearest-level pack is better on both
+  (weight NMSE 0.180 vs 0.197, output relative Frobenius 0.414 vs 0.441).
+  A model-level quality gate (PPL / long-context) still needs an engine and a
+  checkpoint and is not claimed here.
 
 ## 2. Benchmark protocol
 

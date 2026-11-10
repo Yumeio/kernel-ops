@@ -308,6 +308,167 @@ Status ssm_recurrence_f64(const SsmRefArgs& a) {
   return Status::kSuccess;
 }
 
+// ---- low-bit KV records (B17) ------------------------------------------------------------------
+namespace {
+
+/// Independent copy of kops::experimental::lowbit::lowbit_sign_word (the spec is CONTRACTS §1h).
+uint32_t lowbit_mix(uint32_t x) {
+  x ^= x >> 16;
+  x *= 0x85EBCA6Bu;
+  x ^= x >> 13;
+  x *= 0xC2B2AE35u;
+  x ^= x >> 16;
+  return x;
+}
+bool lowbit_negated(uint32_t seed, uint32_t stream, int32_t i) {
+  const uint32_t word = static_cast<uint32_t>(i) / 32u;
+  const uint32_t w = lowbit_mix(lowbit_mix(seed + 0x9E3779B9u * (stream + 1u)) ^ (0x85EBCA6Bu * (word + 1u)));
+  return ((w >> (static_cast<uint32_t>(i) % 32u)) & 1u) != 0;
+}
+
+/// In-place unnormalized Sylvester Hadamard transform (dim a power of two).
+void hadamard(std::vector<double>& v) {
+  const size_t n = v.size();
+  for (size_t h = 1; h < n; h *= 2) {
+    for (size_t i = 0; i < n; i += 2 * h) {
+      for (size_t j = i; j < i + h; ++j) {
+        const double a = v[j], b = v[j + h];
+        v[j] = a + b;
+        v[j + h] = a - b;
+      }
+    }
+  }
+}
+
+bool lowbit_side_ok(const LowBitRefSide& s) {
+  return (s.dim == 64 || s.dim == 128 || s.dim == 256) && s.code_bits >= 1 && s.code_bits <= 4 &&
+         s.levels != nullptr && s.thresholds != nullptr;
+}
+
+void put_f32(uint8_t* dst, double v) {
+  const float f = static_cast<float>(v);
+  const unsigned char* b = reinterpret_cast<const unsigned char*>(&f);
+  for (int i = 0; i < 4; ++i) dst[i] = b[i];
+}
+double get_f32(const uint8_t* src) {
+  float f;
+  unsigned char* b = reinterpret_cast<unsigned char*>(&f);
+  for (int i = 0; i < 4; ++i) b[i] = src[i];
+  return static_cast<double>(f);
+}
+
+}  // namespace
+
+int32_t lowbit_record_bytes(const LowBitRefSide& s) {
+  if (!lowbit_side_ok(s)) return 0;
+  return s.dim * s.code_bits / 8 + (s.qjl ? s.dim / 8 + 8 : 4);
+}
+
+Status lowbit_rotate_f64(const double* x, int32_t dim, uint32_t seed, uint32_t stream, bool inverse,
+                         double* out) {
+  if (x == nullptr || out == nullptr || dim < 2 || (dim & (dim - 1)) != 0) {
+    return detail::set_error(Status::kInvalidArgument, "lowbit_rotate_f64: bad argument");
+  }
+  std::vector<double> v(static_cast<size_t>(dim));
+  for (int32_t i = 0; i < dim; ++i) v[i] = (!inverse && lowbit_negated(seed, stream, i)) ? -x[i] : x[i];
+  hadamard(v);
+  const double norm = 1.0 / std::sqrt(static_cast<double>(dim));
+  for (int32_t i = 0; i < dim; ++i) {
+    const double y = v[i] * norm;
+    out[i] = (inverse && lowbit_negated(seed, stream, i)) ? -y : y;
+  }
+  return Status::kSuccess;
+}
+
+Status lowbit_encode_f64(const double* x, const LowBitRefSide& s, uint8_t* record) {
+  if (x == nullptr || record == nullptr || !lowbit_side_ok(s)) {
+    return detail::set_error(Status::kInvalidArgument, "lowbit_encode_f64: bad argument");
+  }
+  const int32_t d = s.dim, bits = s.code_bits, levels = 1 << bits;
+  const int32_t code_bytes = d * bits / 8, bytes = lowbit_record_bytes(s);
+  for (int32_t i = 0; i < bytes; ++i) record[i] = 0;
+  std::vector<double> xr(static_cast<size_t>(d));
+  if (s.rotated) {
+    const Status st = lowbit_rotate_f64(x, d, s.seed, s.sign_stream, false, xr.data());
+    if (st != Status::kSuccess) return st;
+  } else {
+    for (int32_t i = 0; i < d; ++i) xr[i] = x[i];
+  }
+  double scale;
+  if (s.absmax) {
+    double amax = 0.0;
+    for (int32_t i = 0; i < d; ++i) amax = std::max(amax, std::fabs(xr[i]));
+    scale = amax / s.levels[levels - 1];
+    for (int32_t i = 0; i < d; ++i) {
+      if (std::isnan(xr[i])) scale = xr[i];
+    }
+  } else {
+    double ss = 0.0;
+    for (int32_t i = 0; i < d; ++i) ss += xr[i] * xr[i];
+    scale = std::sqrt(ss) / std::sqrt(static_cast<double>(d));
+  }
+  const double a = static_cast<double>(static_cast<float>(scale));  // the stored scale
+  std::vector<double> e(static_cast<size_t>(d));
+  double ee = 0.0;
+  for (int32_t i = 0; i < d; ++i) {
+    const double z = a > 0.0 ? xr[i] / a : (a == 0.0 ? 0.0 : xr[i] / a);
+    int32_t code = 0;
+    for (int32_t t = 0; t < levels - 1; ++t) code += s.thresholds[t] < z ? 1 : 0;
+    const int32_t bit = i * bits;
+    record[bit >> 3] = static_cast<uint8_t>(record[bit >> 3] | (code << (bit & 7)));
+    if ((bit & 7) + bits > 8) {
+      record[(bit >> 3) + 1] = static_cast<uint8_t>(record[(bit >> 3) + 1] | (code >> (8 - (bit & 7))));
+    }
+    e[i] = z - s.levels[code];
+    ee += e[i] * e[i];
+  }
+  if (!s.qjl) {
+    put_f32(record + code_bytes, scale);
+    return Status::kSuccess;
+  }
+  for (int32_t i = 0; i < d; ++i) {
+    if (lowbit_negated(s.seed, 1u, i)) e[i] = -e[i];
+  }
+  hadamard(e);
+  for (int32_t i = 0; i < d; ++i) {
+    if (!(e[i] < 0.0)) record[code_bytes + (i >> 3)] = static_cast<uint8_t>(record[code_bytes + (i >> 3)] | (1u << (i & 7)));
+  }
+  put_f32(record + code_bytes + d / 8, scale);
+  put_f32(record + code_bytes + d / 8 + 4, a * std::sqrt(ee) * std::sqrt(kPi / 2.0) / std::sqrt(static_cast<double>(d)));
+  return Status::kSuccess;
+}
+
+Status lowbit_decode_f64(const uint8_t* record, const LowBitRefSide& s, double* x) {
+  if (x == nullptr || record == nullptr || !lowbit_side_ok(s)) {
+    return detail::set_error(Status::kInvalidArgument, "lowbit_decode_f64: bad argument");
+  }
+  const int32_t d = s.dim, bits = s.code_bits, code_bytes = d * bits / 8;
+  const uint8_t* tail = record + code_bytes + (s.qjl ? d / 8 : 0);
+  const double a = get_f32(tail);
+  std::vector<double> xr(static_cast<size_t>(d));
+  for (int32_t i = 0; i < d; ++i) {
+    const int32_t bit = i * bits;
+    uint32_t w = record[bit >> 3];
+    if ((bit & 7) + bits > 8) w |= static_cast<uint32_t>(record[(bit >> 3) + 1]) << 8;
+    const uint32_t code = (w >> (bit & 7)) & ((1u << bits) - 1u);
+    xr[i] = a * s.levels[code];
+  }
+  if (s.qjl) {
+    const double g = get_f32(tail + 4);
+    std::vector<double> sg(static_cast<size_t>(d));
+    for (int32_t i = 0; i < d; ++i) sg[i] = ((record[code_bytes + (i >> 3)] >> (i & 7)) & 1) != 0 ? 1.0 : -1.0;
+    hadamard(sg);
+    const double norm = 1.0 / std::sqrt(static_cast<double>(d));
+    for (int32_t i = 0; i < d; ++i) {
+      const double t = sg[i] * norm;
+      xr[i] += g * (lowbit_negated(s.seed, 1u, i) ? -t : t);
+    }
+  }
+  if (s.rotated) return lowbit_rotate_f64(xr.data(), d, s.seed, s.sign_stream, true, x);
+  for (int32_t i = 0; i < d; ++i) x[i] = xr[i];
+  return Status::kSuccess;
+}
+
 Status linear_attention_f64(const double* q, const double* k, const double* v,
                             const double* slope, double scale, int64_t len, int64_t heads,
                             int64_t dk, int64_t dv, double* state, double* o) {

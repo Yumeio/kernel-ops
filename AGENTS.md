@@ -207,8 +207,8 @@ re-requiring a header. `build-clangd/` and `compile_commands.json` are ignored;
 `--cuda-path`/`--gpu-arch` default to the local toolkit and `sm_86`.
 
 Build and run the implemented kernels (needs CUDA toolkit). Presets live in
-`CMakePresets.json`: `dev` targets the local GPU, `dev-sm90a`/`dev-sm100a`
-target H100/B200, `ci-sm*` are compile-only, `release*` builds without tests.
+`CMakePresets.json`: `dev` targets the local GPU, `dev-sm90a`/`dev-sm100a`/`dev-sm120a`
+target H100/B200/RTX 50, `ci-sm*` are compile-only, `release*` builds without tests.
 
 ```bash
 # Windows: vcvars64 + Ninja + ccache + ctest, one command.
@@ -227,8 +227,8 @@ ctest --preset dev
 
 `native` lets CMake detect the host GPU, but CMake reports `90`/`100`/`120`
 **without the `a` suffix** even on H100/B200/RTX 50, so a native build cannot use
-WGMMA/tcgen05/block-scaled instructions. Use `dev-sm90a`, `dev-sm100a` or an
-explicit `KOPS_CUDA_ARCHS` list for those parts.
+WGMMA/tcgen05/block-scaled instructions. Use `dev-sm90a`, `dev-sm100a`,
+`dev-sm120a` or an explicit `KOPS_CUDA_ARCHS` list for those parts.
 
 The test exits with the number of failed checks. It compares every implemented
 kernel against `csrc/reference/` on device memory and asserts the `Status`

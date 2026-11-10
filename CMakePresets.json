@@ -58,6 +58,14 @@
       }
     },
     {
+      "name": "dev-sm120a",
+      "displayName": "Dev: RTX 50 / RTX PRO 6000 Blackwell (block-scaled mma.sync)",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "120a"
+      }
+    },
+    {
       "name": "bench",
       "displayName": "Dev + C++ benchmark targets",
       "inherits": "dev",
@@ -71,6 +79,51 @@
       "inherits": "bench",
       "cacheVariables": {
         "KOPS_CUDA_ARCHS": "90a"
+      }
+    },
+    {
+      "name": "bench-sm120a",
+      "displayName": "RTX 50 / RTX PRO 6000 Blackwell benchmarks",
+      "inherits": "bench",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "120a"
+      }
+    },
+    {
+      "name": "bench-sm100a",
+      "displayName": "B200/GB200 benchmarks",
+      "inherits": "bench",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "100a"
+      }
+    },
+    {
+      "name": "handoff-sm90a",
+      "displayName": "Handoff kit: H100/H200, tests + benchmarks",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "90a",
+        "KOPS_BUILD_TESTS": "ON",
+        "KOPS_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "handoff-sm100a",
+      "displayName": "Handoff kit: B200/GB200, tests + benchmarks",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "100a",
+        "KOPS_BUILD_TESTS": "ON",
+        "KOPS_BUILD_BENCHMARKS": "ON"
+      }
+    },
+    {
+      "name": "twin-sm120a",
+      "displayName": "Twin T2 build for SM120 (test only)",
+      "inherits": "base",
+      "cacheVariables": {
+        "KOPS_CUDA_ARCHS": "120a",
+        "KOPS_TWIN": "ON"
       }
     },
     {
@@ -142,8 +195,14 @@
     { "name": "dev-debug", "configurePreset": "dev-debug" },
     { "name": "dev-sm90a", "configurePreset": "dev-sm90a" },
     { "name": "dev-sm100a", "configurePreset": "dev-sm100a" },
+    { "name": "dev-sm120a", "configurePreset": "dev-sm120a" },
     { "name": "bench", "configurePreset": "bench" },
     { "name": "bench-sm90a", "configurePreset": "bench-sm90a" },
+    { "name": "bench-sm100a", "configurePreset": "bench-sm100a" },
+    { "name": "bench-sm120a", "configurePreset": "bench-sm120a" },
+    { "name": "handoff-sm90a", "configurePreset": "handoff-sm90a" },
+    { "name": "handoff-sm100a", "configurePreset": "handoff-sm100a" },
+    { "name": "twin-sm120a", "configurePreset": "twin-sm120a" },
     { "name": "release", "configurePreset": "release" },
     { "name": "release-sm90a", "configurePreset": "release-sm90a" },
     { "name": "release-sm100a", "configurePreset": "release-sm100a" },
@@ -171,6 +230,26 @@
     {
       "name": "dev-sm100a",
       "configurePreset": "dev-sm100a",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "dev-sm120a",
+      "configurePreset": "dev-sm120a",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "handoff-sm90a",
+      "configurePreset": "handoff-sm90a",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "handoff-sm100a",
+      "configurePreset": "handoff-sm100a",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "twin-sm120a",
+      "configurePreset": "twin-sm120a",
       "output": { "outputOnFailure": true }
     }
   ]

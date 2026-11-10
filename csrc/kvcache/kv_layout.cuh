@@ -51,7 +51,52 @@ enum class KVCodec : uint8_t {
   kMLAFp8DSFNUZ = 12,     // Same 656 B record as kMLAFp8DS but e4m3fnuz (max 240, bias 8) and
                           //   scale exponent base 240, required by AMD gfx94x readers. A record
                           //   written as kMLAFp8DS must never be read as kMLAFp8DSFNUZ.
+  kMLAFp8DSV40 = 13,      // DeepSeek-V4.0 584 B/token: 448 x e4m3 NoPE in 7 tiles of 64, then
+                          //   128 B of bf16 RoPE (64 values). The 8 B/token scale region (7 UE8M0
+                          //   + 1 pad) lives at the end of the page, not inside the token record:
+                          //   k_scale_pages + page * k_scale_stride_page + token * 8.
+  kMLAFp8DSV41 = 14,      // DeepSeek-V4.1 528 B/token: 512 x e4m3 covering NoPE and RoPE in 16
+                          //   tiles of 32, followed by 16 UE8M0 scale bytes inline (block 32).
+  kMLAFp8DSV41Fp4 = 15,   // DeepSeek-V4.1 FP4 288 B/token: 256 B e2m1 (512 dims, even element in
+                          //   the low nibble) followed by 32 e4m3 scale bytes inline (block 16).
+                          //   Valid as the `extra_kv` cache next to a V4.1 FP8 cache.
 };
+
+/// Logical K/V shape and storage split of an MLA-family record. `data_bytes` excludes inline
+/// scales; `scale_bytes` is the scale payload per token (inline or out-of-record). `scale_block`
+/// is the number of quantized dimensions that share one scale (0 for a non-MLA codec).
+struct MLAKVFormat {
+  int32_t nope_dim = 0;
+  int32_t rope_dim = 0;
+  int32_t data_bytes = 0;
+  int32_t scale_bytes = 0;
+  int32_t scale_block = 0;
+  bool inline_scales = true;
+  bool fp4 = false;
+};
+
+/// Host/device format table for the MLA latent codecs. Non-MLA codecs return all zeros.
+KOPS_HOST_DEVICE_INLINE MLAKVFormat mla_kv_format(KVCodec codec) {
+  MLAKVFormat f{};
+  switch (codec) {
+    case KVCodec::kMLAFp8DS:
+      f = {512, 64, 640, 16, 128, true, false};
+      break;
+    case KVCodec::kMLAFp8DSV40:
+      f = {448, 64, 576, 8, 64, false, false};
+      break;
+    case KVCodec::kMLAFp8DSV41:
+      f = {448, 64, 512, 16, 32, true, false};
+      break;
+    case KVCodec::kMLAFp8DSV41Fp4:
+      f = {448, 64, 256, 32, 16, true, true};
+      break;
+    default:
+      break;
+  }
+  return f;
+}
+
 
 // Unit of the PagedKVDesc stride fields is kops::StrideUnit (common/macros.cuh):
 // entry_bytes != 0 => k_stride_* are bytes and stride_unit must be kByte;
@@ -98,6 +143,12 @@ struct PagedKVDesc {
   void* k_token_scales = nullptr;  // [P, PS, Hkv] (+ zeros) for per-token-head codecs
   void* v_token_scales = nullptr;
   int64_t token_scale_stride_page = 0;
+  // B11/B14: scales stored outside the per-token record (kMLAFp8DSV40). The descriptor treats
+  // them as a second page-sized array so kv_physical_bytes() and the page padding are explicit.
+  void* k_scale_pages = nullptr;       // [P, PS, scale_bytes_per_token]
+  int64_t k_scale_stride_page = 0;     // bytes between pages of k_scale_pages
+  int64_t k_scale_stride_token = 0;    // bytes between tokens inside one page
+  int32_t scale_bytes_per_token = 0;   // 0 when the codec stores scales inline (or has none)
 };
 
 /// Non-paged (ragged, contiguous) KV for prefill without cache / cross-attention.

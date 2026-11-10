@@ -248,6 +248,33 @@ void add_b7_gguf_cases(std::vector<Case>* cases) {
   }
 }
 
+// ---- B11: Machete prepack and grouped preparation -------------------------------------------------
+// Load-time weight repack and per-step MoE group preparation. rows = N, cols = K (prepack) or the
+// grouped problem's N x K with `rows` experts; bytes is the compulsory traffic of the operation.
+void add_b11_cases(std::vector<Case>* cases) {
+  char id[128];
+  for (const char* kind : {"int4", "int8"}) {
+    const int64_t n = 4096, k = 4096;
+    const int64_t w = std::strcmp(kind, "int4") == 0 ? n * k / 2 : n * k;
+    std::snprintf(id, sizeof(id), "gemm.machete_prepack.%s.4096x4096", kind);
+    // The dumped case spec names the packed storage type (kUInt8) like weight_transpose_int4; the
+    // launch below uses kInt4x2 / kInt8 so the kernel sees the logical element type.
+    cases->push_back({id, std::string("machete_prepack_") + kind,
+                      std::strcmp(kind, "int4") == 0 ? kops::DType::kUInt8 : kops::DType::kInt8, n, k, 2 * w, 0,
+                      20, 200});
+  }
+  {
+    // 32 experts, 128 rows each, one task per 128x128 tile: the preparation only touches the row
+    // metadata, the problems and the task map, so the case keeps the problem small on purpose.
+    const int64_t g = 32, n = 1024, k = 1024, rows_per_group = 128;
+    const int64_t tasks = g * ((rows_per_group + 127) / 128) * ((n + 127) / 128);
+    const int64_t bytes = (g + 1) * 8 + g * static_cast<int64_t>(sizeof(kops::gemm::GroupedProblem)) +
+                          (4 + 3 * tasks) * 4;
+    cases->push_back({"gemm.grouped_prepare.e32.1024x1024", "grouped_prepare", kops::DType::kBFloat16, n, k,
+                      bytes, 0, 20, 200});
+  }
+}
+
 std::vector<Case> make_cases() {
   std::vector<Case> cases;
   auto add = [&](const char* id, const char* op, kops::DType dt, int64_t rows, int64_t cols,
@@ -280,6 +307,7 @@ std::vector<Case> make_cases() {
   add_b7_row2_cases(&cases);
   add_b7_gguf_cases(&cases);
   add_b7_int8_cases(&cases);
+  add_b11_cases(&cases);
   return cases;
 }
 
@@ -699,6 +727,59 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
     const kops::Tensor tq = tensor2d(q.p, kops::DType::kFloat8E4M3, r, k);
     const kops::Tensor ts = tensor2d(s.p, kops::DType::kFloat32, r / 128, k / 128);
     return go([&] { return kops::gemm::fp8_block2d_quant_weight(tq, ts, tw, 128, 128, ue, ctx); });
+  }
+  if (c.op == "machete_prepack_int4" || c.op == "machete_prepack_int8") {
+    const bool nib = c.op == "machete_prepack_int4";
+    const kops::DType dt = nib ? kops::DType::kInt4x2 : kops::DType::kInt8;
+    Buf w(n * (nib ? 1 : 2) / 2), out(n * (nib ? 1 : 2) / 2);
+    if (w.p == nullptr || out.p == nullptr) return false;
+    const kops::Tensor tw = tensor2d(w.p, dt, r, k);
+    const kops::Tensor to = tensor2d(out.p, dt, r, k);
+    const int bits = nib ? 4 : 8;
+    const int atom = nib ? 0 : 1;
+    return go([&] { return kops::gemm::machete_prepack(to, tw, bits, atom, ctx); });
+  }
+  if (c.op == "grouped_prepare") {
+    const int experts = 32, rows_per_group = 128;
+    const int64_t total_rows = static_cast<int64_t>(experts) * rows_per_group;
+    std::vector<int64_t> offs(experts + 1);
+    for (int e = 0; e <= experts; ++e) offs[e] = static_cast<int64_t>(e) * rows_per_group;
+    Buf a(static_cast<size_t>(total_rows) * k * 2), w(static_cast<size_t>(experts) * r * k * 2),
+        d(static_cast<size_t>(total_rows) * r * 2);
+    if (a.p == nullptr || w.p == nullptr || d.p == nullptr) return false;
+    int64_t* d_offs = nullptr;
+    if (!cuda_ok(cudaMalloc(&d_offs, offs.size() * 8), "cudaMalloc expert_offsets")) return false;
+    cudaMemcpy(d_offs, offs.data(), offs.size() * 8, cudaMemcpyHostToDevice);
+    kops::gemm::GroupedGemmParams p{};
+    p.layout = kops::gemm::GroupedLayout::kContiguous;
+    p.recipe = kops::gemm::GemmRecipe::kBF16;
+    p.num_groups = experts;
+    p.a = a.p; p.lda = k;
+    p.expert_offsets = d_offs;
+    p.b = w.p; p.ldb = k; p.b_group_stride = r * k;
+    p.d = d.p; p.ldd = r;
+    p.n = static_cast<int32_t>(r); p.k = static_cast<int32_t>(k);
+    p.max_m = static_cast<int32_t>(total_rows);
+    p.expected_m = rows_per_group;
+    kops::gemm::GemmTactic t{};
+    t.tile_m = 128; t.tile_n = 128;
+    t.mainloop = kops::gemm::MainloopSchedule::kTmaWarpSpecializedCooperative;
+    kops::WorkspaceRequirements req{};
+    const bool req_ok = status_ok(kops::gemm::grouped_gemm_workspace_requirements(p, &t, ctx, &req), id);
+    Buf scratch(req.device_scratch_bytes + 64);
+    if (!req_ok || scratch.p == nullptr) {
+      cudaFree(d_offs);
+      return false;
+    }
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p;
+    ws.device_scratch_bytes = req.device_scratch_bytes;
+    const bool ok = go([&] {
+      kops::gemm::GroupedGemmParams q = p;   // prepare writes the prepared pointers into the params
+      return kops::gemm::grouped_gemm_prepare(&q, t, ws, ctx);
+    });
+    cudaFree(d_offs);
+    return ok;
   }
   std::fprintf(stderr, "[bench] unknown op %s\n", c.op.c_str());
   return false;

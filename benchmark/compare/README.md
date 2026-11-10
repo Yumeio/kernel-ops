@@ -42,6 +42,24 @@ python benchmark/compare/torch_baseline.py --cases out/cases-quant.json \
 python benchmark/compare/compare_results.py out/kops-quant.json out/torch-quant.json
 ```
 
+### Communication (B12)
+
+```bash
+build/bench/benchmark/bench_communication --dump-cases > out/b12/cases.json
+build/bench/benchmark/bench_communication --json out/b12/kops-comm.json
+python benchmark/compare/communication_torch.py --cases out/b12/cases.json \
+    --json out/b12/torch-comm.json --calls 8 --groups 8
+python benchmark/compare/compare_results.py out/b12/kops-comm.json out/b12/torch-comm.json
+```
+
+`communication_torch.py` runs two NCCL ranks with `torch.distributed` and the
+same ids/shapes (allreduce, allgather, reduce-scatter, the fused residual+ RMSNorm
+chain including dynamic per-token FP8, and the W=2 comm-GEMMs with `torch.mm` +
+NCCL). It skips `peer_barrier`/EP and W=4/W=8 virtual-rank cases; DeepEP is not a
+PyTorch package here and the node has two GPUs. The kops JSON may be measured in
+graph mode while the PyTorch baseline is eager; run the C++ benchmark with
+`--mode eager` for a launch-model-matched comparison, and report both.
+
 The PyTorch environment pinned by `pyproject.toml` / `requirements.txt` is
 `torch==2.14.1+cu126`. `torch_baseline.py` maps every B3 op (including
 `quantize_per_token_int8`, `norm_quant`, `act_and_mul_quant`) and the two fused

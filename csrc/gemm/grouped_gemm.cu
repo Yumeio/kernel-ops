@@ -15,7 +15,13 @@
 //   lora_shrink_kernel / lora_expand_kernel = gemm_mma_sync_kernel over seg_indptr segments with the adapter
 //                                  pointer array (Punica SGMV semantics; expand reads the fp32 shrink buffer)
 // Host entries: grouped_gemm (tensor-core path when the tactic names mma.sync, a task map is prepared, the
-// activations are 8-bit, or expected_m > 16), grouped_gemm_prepare (task map), lora_sgmv.
+// activations are 8-bit, or expected_m > 16), grouped_gemm_prepare (GroupedProblem[] + task map for the
+// TMA-class mainloops, task map only for mma.sync), lora_sgmv.
+//
+// B11 operand prep: grouped_gemm_prepare_kernel builds GroupedProblem[G] (rows, per-group pointers, alpha,
+// first tile id) for the TMA / tcgen05 / SM120 warp-specialized mainloops; the tile list is the shared
+// grouped_gemm_task_map_kernel.  The generic form is architecture-independent: no TMA descriptor patching
+// (group_tma stays null) and no host sync or allocation.
 //
 // Contract: csrc/gemm/grouped_gemm_kernels.cuh + csrc/gemm/ops.h.
 //
@@ -299,10 +305,182 @@ __global__ void grouped_gemm_task_map_kernel(int32_t* __restrict__ task_map, int
 
 namespace {
 
+// =============================================================================
+// B11: generic device-side group preparation (GroupedProblem per group)
+// =============================================================================
+// GroupedGemmParams carries no dtype fields, so the recipe is the contract for the element sizes (the
+// same mapping grouped_to_mma applies when it fills MmaGemmParams); the host admits only the recipes whose
+// activation and weight element sizes are implied by the recipe (bf16 / fp16 / FP8 / INT8).  Layouts: kContiguous / kIndexed
+// take the group extent from expert_offsets, kMasked from masked_m clamped to max_m, kPtrArray from
+// problem_m with the per-group pointer arrays.  Groups with m == 0 get no tiles.
+
+KOPS_HOST_DEVICE_INLINE bool recipe_is_8bit(GemmRecipe r) {
+  return r == GemmRecipe::kFP8Tensorwise || r == GemmRecipe::kFP8Rowwise ||
+         r == GemmRecipe::kFP8Blockwise || r == GemmRecipe::kFP8BlockwiseUE8M0 ||
+         r == GemmRecipe::kMXFP8 || r == GemmRecipe::kINT8Tensorwise || r == GemmRecipe::kINT8Rowwise;
+}
+
+/// Bits of one activation, weight and output element.
+KOPS_HOST_DEVICE_INLINE void recipe_element_bits(GemmRecipe r, uint32_t epi_ops, int* a_bits, int* b_bits, int* d_bits) {
+  const int w = recipe_is_8bit(r) ? 8 : 16;
+  *a_bits = w;
+  *b_bits = w;
+  *d_bits = (epi_ops & kEpiOutFp32) != 0u ? 32 : (w == 8 ? 16 : w);
+}
+
+/// Bytes of one B-scale element: UE8M0 for the block-scaled FP8 / MX recipes, fp32 otherwise.
+KOPS_HOST_DEVICE_INLINE int scale_element_bytes(GemmRecipe r) {
+  return (r == GemmRecipe::kFP8BlockwiseUE8M0 || r == GemmRecipe::kMXFP8) ? 1 : 4;
+}
+
+/// Expert stride of the B-scale tensor: a zero stride is read as one scale per expert (the
+/// grouped_to_mma convention for the tensorwise recipes), so alpha and sfb always agree.
+__device__ __forceinline__ int64_t b_scale_stride(const GroupedGemmParams& p) {
+  return p.b_scale_group_stride > 0 ? p.b_scale_group_stride : 1;
+}
+
+__device__ __forceinline__ float group_alpha(const GroupedGemmParams& p, int g) {
+  float alpha = p.epi.alpha_ptr != nullptr ? p.epi.alpha_ptr[g] : p.epi.alpha;
+  if (p.recipe == GemmRecipe::kFP8Tensorwise || p.recipe == GemmRecipe::kINT8Tensorwise) {
+    if (p.b_scale != nullptr) alpha *= static_cast<const float*>(p.b_scale)[g * b_scale_stride(p)];
+  }
+  return alpha;
+}
+
+}  // namespace
+
+/// One CTA, blockDim up to 1024, groups scanned blockDim at a time (same shape as the task map scan):
+/// problems[g] gets the group's shapes, pointers, leading dimensions, alpha and first tile id, and the
+/// block-wide exclusive scan of ceil(m / tile_m) * n_tiles gives both tile_offset and the total that
+/// *num_tasks / *overflow_flag report.  The tile list itself is written by
+/// grouped_gemm_task_map_kernel (the host launches it right after this kernel, same stream, so the two
+/// counts agree); tensor-map patching (tensormap.replace) is the Sm90a/Sm100a TMA path and is left to
+/// the caller: group_tma / tma_templates stay untouched, and *nothing* here requires TMA.
+__global__ void grouped_gemm_prepare_kernel(GroupedProblem* __restrict__ problems,
+                                            KOPS_TMA_DESC* __restrict__ group_tma,
+                                            const KOPS_TMA_DESC* __restrict__ tma_templates,
+                                            int32_t* __restrict__ tile_task_map,
+                                            int32_t* __restrict__ num_tasks,
+                                            int32_t* __restrict__ overflow_flag,
+                                            const GroupedGemmParams params, const int tile_m,
+                                            const int tile_n, const int task_capacity) {
+  (void)group_tma;
+  (void)tma_templates;
+  (void)tile_task_map;
+  const int tid = threadIdx.x;
+  const int nt = blockDim.x;
+  const int n_tiles = (params.n + tile_n - 1) / tile_n;
+  int a_bits = 16, b_bits = 16, d_bits = 16;
+  recipe_element_bits(params.recipe, params.epi.ops, &a_bits, &b_bits, &d_bits);
+  const int sb_bytes = scale_element_bytes(params.recipe);
+  const int64_t a_elem = a_bits / 8, b_elem = b_bits / 8, d_elem = d_bits / 8;   // 4-bit: row * ld / 2
+
+  __shared__ int64_t s_excl[1024];
+  __shared__ int64_t s_total;
+  int64_t base = 0;
+  for (int g0 = 0; g0 < params.num_groups; g0 += nt) {
+    const int g = g0 + tid;
+    int32_t m = 0;
+    int64_t row0 = 0;
+    if (g < params.num_groups) {
+      switch (params.layout) {
+        case GroupedLayout::kMasked: {
+          row0 = static_cast<int64_t>(g) * params.max_m;
+          const int32_t v = params.masked_m[g];
+          m = v < 0 ? 0 : (v > params.max_m ? params.max_m : v);
+          break;
+        }
+        case GroupedLayout::kPtrArray:
+          m = params.problem_m[g] < 0 ? 0 : params.problem_m[g];
+          break;
+        default: {
+          const int64_t b0 = params.expert_offsets[g];
+          const int64_t b1 = params.expert_offsets[g + 1];
+          row0 = b0;
+          m = b1 > b0 ? static_cast<int32_t>(b1 - b0) : 0;
+        }
+      }
+    }
+    const int64_t cnt = g < params.num_groups ? static_cast<int64_t>((m + tile_m - 1) / tile_m) * n_tiles : 0;
+    s_excl[tid] = cnt;
+    __syncthreads();
+    for (int o = 1; o < nt; o <<= 1) {
+      const int64_t v = tid >= o ? s_excl[tid - o] : 0;
+      __syncthreads();
+      s_excl[tid] += v;
+      __syncthreads();
+    }
+    if (tid == nt - 1) s_total = s_excl[tid];
+    __syncthreads();
+    s_excl[tid] -= cnt;
+    const int64_t first_tile = base + s_excl[tid];
+    __syncthreads();
+
+    if (g < params.num_groups && problems != nullptr) {
+      GroupedProblem pr;
+      pr.m = m;
+      pr.n = params.n;
+      pr.k = params.k;
+      pr.tile_offset = static_cast<int32_t>(first_tile);
+      pr.lda = params.lda;
+      pr.ldb = params.ldb;
+      pr.ldd = params.ldd;
+      pr.alpha = group_alpha(params, g);
+      const auto* abase = static_cast<const uint8_t*>(params.a);
+      const auto* bbase = static_cast<const uint8_t*>(params.b);
+      auto* dbase = static_cast<uint8_t*>(params.d);
+      switch (params.layout) {
+        case GroupedLayout::kPtrArray:
+          pr.a = params.a_ptrs[g];
+          pr.b = params.b_ptrs[g];
+          pr.d = params.d_ptrs[g];
+          break;
+        case GroupedLayout::kIndexed:
+          pr.a = params.a;   // rows are gathered by gather_idx, the table is shared by every group
+          pr.b = bbase + static_cast<int64_t>(g) * params.b_group_stride * b_elem;
+          pr.d = dbase + static_cast<int64_t>(row0) * params.ldd * d_elem;
+          break;
+        default:   // kContiguous / kMasked: A and D rows are [row0, row0 + m) of the packed row space
+          pr.a = abase + static_cast<int64_t>(row0) * params.lda * a_elem;
+          pr.b = bbase + static_cast<int64_t>(g) * params.b_group_stride * b_elem;
+          pr.d = dbase + static_cast<int64_t>(row0) * params.ldd * d_elem;
+          break;
+      }
+      // Block-scale layouts (col-major TMA / 128x4 swizzled / packed UE8M0) already carry the group's
+      // rows, so their base passes through; row-major per-token scales move with the group's rows.
+      const bool row_major_token_scales = params.a_scale_layout == ScaleLayout::kRowMajor &&
+                                          (params.recipe == GemmRecipe::kFP8Rowwise ||
+                                           params.recipe == GemmRecipe::kINT8Rowwise);
+      pr.sfa = params.a_scale != nullptr
+                   ? (row_major_token_scales
+                          ? static_cast<const void*>(static_cast<const uint8_t*>(params.a_scale) +
+                                                     static_cast<int64_t>(row0) * scale_element_bytes(params.recipe))
+                          : params.a_scale)
+                   : nullptr;
+      pr.sfb = params.b_scale != nullptr
+                   ? static_cast<const void*>(static_cast<const uint8_t*>(params.b_scale) +
+                                              static_cast<int64_t>(g) * b_scale_stride(params) * sb_bytes)
+                   : nullptr;
+      problems[g] = pr;
+    }
+    base += s_total;
+    __syncthreads();
+  }
+  if (tid == 0) {
+    if (num_tasks != nullptr) {
+      *num_tasks = static_cast<int32_t>(base < task_capacity ? base : task_capacity);
+    }
+    if (overflow_flag != nullptr) *overflow_flag = base > task_capacity ? 1 : 0;
+  }
+}
+
+namespace {
+
 // ---- tensor-core grouped GEMM: GroupedGemmParams -> MmaGemmParams -------------------------------------
 
-/// Header of the task map grouped_gemm_prepare writes: tile_task_map points at the entries, the four int32
-/// before them hold (num_tasks, overflow, tile_m, n_tiles).
+/// Header of the task map grouped_gemm_prepare writes: tile_task_map points at the entries and the four
+/// int32 before them are (num_tasks, overflow, reserved, reserved) — only the first two are written, the
+/// (m tile, n tile) coordinates are in units of the tactic the map was prepared for.
 constexpr int kMapHeader = 4;
 
 int64_t ceil_div64(int64_t a, int64_t b) { return (a + b - 1) / b; }
@@ -426,12 +604,38 @@ Status grouped_to_mma(const GroupedGemmParams& p, MmaGemmParams* out) {
   return Status::kSuccess;
 }
 
-/// Tasks a task map may need: masked G * ceil(max_m / tm) * n_tiles; contiguous (max_m = rows of A)
-/// (ceil(max_m / tm) + G) * n_tiles.
+/// Tasks a task map may need: masked / ptr-array G * ceil(max_m / tm) * n_tiles; contiguous (max_m = rows
+/// of A) (ceil(max_m / tm) + G) * n_tiles.
 int64_t task_capacity(const GroupedGemmParams& p, int tile_m, int tile_n) {
   const int64_t n_tiles = ceil_div64(p.n, tile_n);
-  if (p.layout == GroupedLayout::kMasked) return static_cast<int64_t>(p.num_groups) * ceil_div64(p.max_m, tile_m) * n_tiles;
+  if (p.layout == GroupedLayout::kMasked || p.layout == GroupedLayout::kPtrArray) {
+    return static_cast<int64_t>(p.num_groups) * ceil_div64(p.max_m, tile_m) * n_tiles;
+  }
   return (ceil_div64(p.max_m, tile_m) + p.num_groups) * n_tiles;
+}
+
+/// Mainloops whose grouped body consumes GroupedProblem[] (TMA / tcgen05 / SM120 warp-specialized) and
+/// therefore needs the generic device-side preparation. kMultistageMmaSync derives the rows in the kernel
+/// from the row map and only needs the task list.
+bool prepare_builds_problems(MainloopSchedule m) {
+  switch (m) {
+    case MainloopSchedule::kTmaWarpSpecialized:
+    case MainloopSchedule::kTmaWarpSpecializedCooperative:
+    case MainloopSchedule::kTmaWarpSpecializedPingpong:
+    case MainloopSchedule::kTcgen05OneSm:
+    case MainloopSchedule::kTcgen05TwoSm:
+    case MainloopSchedule::kSm120BlockScaledWS:
+    case MainloopSchedule::kSm120WarpSpecialized:
+      return true;
+    default:
+      return false;
+  }
+}
+
+/// GroupedProblem[] region of the scratch (16 B aligned), then the task-map header + entries.
+int64_t problems_bytes(const GroupedGemmParams& p) {
+  const int64_t raw = ceil_div64(static_cast<int64_t>(p.num_groups) * static_cast<int64_t>(sizeof(GroupedProblem)), 16) * 16;
+  return raw;
 }
 
 /// Path selection. kFP8Tensorwise / kFP8Rowwise mean different activations on the two bodies: e4m3
@@ -456,46 +660,93 @@ Status grouped_gemm_workspace_requirements(const GroupedGemmParams& params, cons
   if (ctx.backend != BackendKind::kCuda) return detail::set_error(Status::kUnsupportedBackend, "grouped_gemm: CUDA backend only");
   if (out == nullptr) return detail::set_error(Status::kInvalidArgument, "grouped_gemm_workspace_requirements: null output");
   *out = WorkspaceRequirements{};   // the CUDA-core path and the in-kernel task scan keep no scratch
-  if (tactic != nullptr && tactic->mainloop == MainloopSchedule::kMultistageMmaSync && params.max_m > 0 &&
-      (params.layout == GroupedLayout::kContiguous || params.layout == GroupedLayout::kIndexed || params.layout == GroupedLayout::kMasked)) {
-    // optional task map for grouped_gemm_prepare: header + 3 int32 per task
-    const int64_t cap = task_capacity(params, tactic->tile_m, tactic->tile_n);
-    out->device_scratch_bytes = static_cast<size_t>(kMapHeader + 3 * cap) * sizeof(int32_t);
-  }
+  if (tactic == nullptr || params.max_m < 1 || params.layout == GroupedLayout::kContiguousRowIndex) return Status::kSuccess;
+  const bool task_map_ok = params.layout == GroupedLayout::kContiguous || params.layout == GroupedLayout::kIndexed ||
+                           params.layout == GroupedLayout::kMasked || params.layout == GroupedLayout::kPtrArray;
+  if (!task_map_ok) return Status::kSuccess;
+  const int64_t cap = task_capacity(params, tactic->tile_m, tactic->tile_n);
+  size_t need = static_cast<size_t>(kMapHeader + 3 * cap) * sizeof(int32_t);
+  if (prepare_builds_problems(tactic->mainloop)) need += static_cast<size_t>(problems_bytes(params));
+  out->device_scratch_bytes = need;
   return Status::kSuccess;
 }
 
-/// SM80-class preparation: only the task map (tensor maps and GroupedProblem belong to the TMA paths of
-/// B11 / B13). Graph-safe: one launch, no host sync; params->tile_task_map points into ws.device_scratch.
+/// Device-side preparation, graph-safe (no host sync, no allocation, one or two launches):
+///   kMultistageMmaSync  the task map only (the mma.sync body derives the rows from its row map)
+///   TMA / tcgen05 / SM120 warp-specialized  GroupedProblem[g] for every group plus the task map
+/// Scratch layout: [GroupedProblem[G], 16 B aligned][(num_tasks, overflow, reserved, reserved)][tasks].
+/// params->problems and params->tile_task_map point into it; params->group_tma stays null (per-group
+/// tensor-map patching is the Sm90a/Sm100a TMA path and is not built here).
 Status grouped_gemm_prepare(GroupedGemmParams* params, const GemmTactic& tactic, const Workspace& ws, const LaunchContext& ctx) {
   if (ctx.backend != BackendKind::kCuda) return detail::set_error(Status::kUnsupportedBackend, "grouped_gemm_prepare: CUDA backend only");
   if (params == nullptr) return detail::set_error(Status::kInvalidArgument, "grouped_gemm_prepare: null params");
-  if (tactic.mainloop != MainloopSchedule::kMultistageMmaSync) {
-    return detail::set_error(Status::kNotImplemented, "grouped_gemm_prepare: the TMA preparation (grouped_gemm_prepare_kernel) belongs to B11 / B13");
+  const bool problems_path = prepare_builds_problems(tactic.mainloop);
+  if (!problems_path && tactic.mainloop != MainloopSchedule::kMultistageMmaSync) {
+    return detail::set_error(Status::kNotImplemented,
+                             "grouped_gemm_prepare: mainloop %d has no grouped body", static_cast<int>(tactic.mainloop));
   }
   const GroupedGemmParams& p = *params;
-  if (p.layout != GroupedLayout::kContiguous && p.layout != GroupedLayout::kIndexed && p.layout != GroupedLayout::kMasked) {
-    return detail::set_error(Status::kNotImplemented, "grouped_gemm_prepare: task maps serve kContiguous / kIndexed / kMasked");
+  const bool ptr_array = p.layout == GroupedLayout::kPtrArray;
+  if (p.layout != GroupedLayout::kContiguous && p.layout != GroupedLayout::kIndexed && p.layout != GroupedLayout::kMasked &&
+      !(problems_path && ptr_array)) {
+    return detail::set_error(Status::kNotImplemented,
+                             "grouped_gemm_prepare: task maps serve kContiguous / kIndexed / kMasked, and kPtrArray only "
+                             "needs the TMA-class preparation (mainloop %d)", static_cast<int>(tactic.mainloop));
   }
   if (p.num_groups < 1 || p.n < 1 || p.max_m < 1 || tactic.tile_m < 1 || tactic.tile_n < 1) {
     return detail::set_error(Status::kInvalidArgument, "grouped_gemm_prepare: num_groups, n, max_m (rows of A or per group) and the tactic tile are required");
   }
-  if (p.layout == GroupedLayout::kMasked ? p.masked_m == nullptr : p.expert_offsets == nullptr) {
+  if (problems_path && p.max_m < 1) {
+    return detail::set_error(Status::kInvalidArgument, "grouped_gemm_prepare: max_m is the row bound of one group");
+  }
+  if (p.layout == GroupedLayout::kMasked ? p.masked_m == nullptr
+                                         : (ptr_array ? (p.problem_m == nullptr || p.a_ptrs == nullptr || p.b_ptrs == nullptr ||
+                                                         p.d_ptrs == nullptr)
+                                                      : p.expert_offsets == nullptr)) {
     return detail::set_error(Status::kInvalidArgument, "grouped_gemm_prepare: row metadata missing for the selected layout");
   }
+  if (problems_path) {
+    int a_bits = 0, b_bits = 0, d_bits = 0;
+    recipe_element_bits(p.recipe, p.epi.ops, &a_bits, &b_bits, &d_bits);
+    if (!recipe_is_8bit(p.recipe) && p.recipe != GemmRecipe::kBF16 && p.recipe != GemmRecipe::kFP16) {
+      return detail::set_error(Status::kNotImplemented,
+                               "grouped_gemm_prepare: recipe %d has no grouped problem description "
+                               "(packed weights / block-scaled operand dtypes are not in GroupedGemmParams)",
+                               static_cast<int>(p.recipe));
+    }
+    if (p.layout != GroupedLayout::kPtrArray && (p.a == nullptr || p.b == nullptr || p.d == nullptr)) {
+      return detail::set_error(Status::kInvalidArgument, "grouped_gemm_prepare: null operand");
+    }
+    if (p.recipe == GemmRecipe::kFP8Tensorwise && p.b_scale == nullptr) {
+      return detail::set_error(Status::kInvalidArgument, "grouped_gemm_prepare: kFP8Tensorwise needs the per-expert b_scale");
+    }
+  }
   const int64_t cap = task_capacity(p, tactic.tile_m, tactic.tile_n);
-  const size_t need = static_cast<size_t>(kMapHeader + 3 * cap) * sizeof(int32_t);
   if (cap > 0x7FFFFFFF / 3) return detail::set_error(Status::kUnsupportedShape, "grouped_gemm_prepare: task map too large");
+  const int64_t probs = problems_path ? problems_bytes(p) : 0;
+  const size_t need = static_cast<size_t>(probs) + static_cast<size_t>(kMapHeader + 3 * cap) * sizeof(int32_t);
   if (ws.device_scratch == nullptr || ws.device_scratch_bytes < need) {
     return detail::set_error(Status::kWorkspaceTooSmall, "grouped_gemm_prepare: needs %zu B of device scratch", need);
   }
   if (!aligned(ws.device_scratch, 16)) return detail::set_error(Status::kMisaligned, "grouped_gemm_prepare: device scratch must be 16 B aligned");
-  int32_t* hdr = static_cast<int32_t*>(ws.device_scratch);
+  int32_t* hdr = reinterpret_cast<int32_t*>(static_cast<uint8_t*>(ws.device_scratch) + probs);
   const cudaStream_t s = reinterpret_cast<cudaStream_t>(ctx.stream);
   const int threads = p.num_groups >= 1024 ? 1024 : ((p.num_groups + 31) / 32) * 32;
-  grouped_gemm_task_map_kernel<<<1, threads, 0, s>>>(hdr + kMapHeader, hdr, hdr + 1, p.layout == GroupedLayout::kMasked ? nullptr : p.expert_offsets,
-                                                     p.layout == GroupedLayout::kMasked ? p.masked_m : nullptr, p.num_groups, tactic.tile_m,
-                                                     static_cast<int>(ceil_div64(p.n, tactic.tile_n)), static_cast<int>(cap));
+  const int n_tiles = static_cast<int>(ceil_div64(p.n, tactic.tile_n));
+  const int32_t* row_counts = p.layout == GroupedLayout::kMasked ? p.masked_m
+                              : (ptr_array ? p.problem_m : nullptr);
+  if (problems_path) {
+    grouped_gemm_prepare_kernel<<<1, threads, 0, s>>>(
+        static_cast<GroupedProblem*>(ws.device_scratch), nullptr, nullptr, hdr + kMapHeader, hdr, hdr + 1, p,
+        tactic.tile_m, tactic.tile_n, static_cast<int>(cap));
+    Status st = launch_error("grouped_gemm_prepare_kernel");
+    if (st != Status::kSuccess) return st;
+    params->problems = static_cast<const GroupedProblem*>(ws.device_scratch);
+    params->group_tma = nullptr;
+  }
+  grouped_gemm_task_map_kernel<<<1, threads, 0, s>>>(hdr + kMapHeader, hdr, hdr + 1,
+                                                     p.expert_offsets, row_counts, p.num_groups, tactic.tile_m, n_tiles,
+                                                     static_cast<int>(cap));
   Status st = launch_error("grouped_gemm_task_map_kernel");
   if (st != Status::kSuccess) return st;
   params->tile_task_map = hdr + kMapHeader;

@@ -1,8 +1,10 @@
 // =============================================================================
 // kernel-ops | benchmark/bench_merge.cu
-// merge_state (split-KV combine) cases and B8 native attention (prefill FA2,
-// CUDA-core / tensor-core / dynamic decode). The case table is the shared spec
-// read by benchmark/compare/torch_baseline.py through --dump-cases.
+// merge_state (split-KV combine), B8 native attention (prefill FA2, CUDA-core /
+// tensor-core / dynamic decode) and B17 experimental low-bit rotated KV store /
+// decode / prefill. The case table is the shared spec read by
+// benchmark/compare/torch_baseline.py through --dump-cases (the lowbit ops have
+// no PyTorch equivalent and are skipped there).
 // =============================================================================
 #include "benchmark/harness.h"
 
@@ -18,9 +20,11 @@
 #include "csrc/attention/decode_kernels.cuh"
 #include "csrc/attention/mla_kernels.cuh"
 #include "csrc/attention/sparse_kernels.cuh"
+#include "csrc/attention/lowbit_kernels.cuh"
 #include "csrc/attention/ops.h"
 
 void add_attn_cases(std::vector<kops_bench::Case>& cases);  // B8 attention cases (below)
+void add_lowbit_cases(std::vector<kops_bench::Case>& cases);
 
 namespace {
 
@@ -60,6 +64,7 @@ std::vector<Case> make_cases() {
                      kops::DType::kBFloat16, tokens, 576, tokens * 576 * 2 * 2, 0, 10, 100});
   }
   add_attn_cases(cases);
+  add_lowbit_cases(cases);
   return cases;
 }
 
@@ -523,6 +528,279 @@ bool run_attention(const Case& c, const kops::LaunchContext& ctx_in, Stats* st) 
   return ok;
 }
 
+// ---- B17 low-bit rotated KV (experimental) ------------------------------------------------------
+namespace lbt = kops::experimental::lowbit;
+
+struct LbBench {
+  const char* id;
+  bool prefill;             // false: decode
+  bool store;               // only lowbit_kv_store, no attention
+  int batch, q, kv, Hq, Hkv, D, page;
+  lbt::LowBitFormat kf, vf;
+};
+
+const std::vector<LbBench>& lb_benches() {
+  using F = lbt::LowBitFormat;
+  static const std::vector<LbBench> b = {
+      {"lowbit.store.bf16.t2048.h8.d128.turbo4", false, true, 1, 1, 2048, 8, 8, 128, 16,
+       F::kUniform4, F::kUniform4},
+      {"lowbit.store.bf16.t2048.h8.d128.turbo3", false, true, 1, 1, 2048, 8, 8, 128, 16,
+       F::kUniform3, F::kUniform4},
+      {"lowbit.store.bf16.t4096.h8.d128.turbo4", false, true, 1, 1, 4096, 8, 8, 128, 16,
+       F::kUniform4, F::kUniform4},
+      {"lowbit.store.bf16.t4096.h8.d128.turbo3", false, true, 1, 1, 4096, 8, 8, 128, 16,
+       F::kUniform3, F::kUniform4},
+      {"lowbit.decode.bf16.d128.b8.kv4096.h32x8.turbo4", false, false, 8, 1, 4096, 32, 8, 128, 16,
+       F::kUniform4, F::kUniform4},
+      {"lowbit.decode.bf16.d128.b8.kv4096.h32x8.turbo3", false, false, 8, 1, 4096, 32, 8, 128, 16,
+       F::kUniform3, F::kUniform4},
+      {"lowbit.decode.bf16.d128.b8.kv4096.h32x8.prod3", false, false, 8, 1, 4096, 32, 8, 128, 16,
+       F::kTurboProd3, F::kUniform4},
+      {"lowbit.prefill.bf16.d128.t512.kv4096.h32x8.turbo4", true, false, 1, 512, 4096, 32, 8, 128, 16,
+       F::kUniform4, F::kUniform4},
+      {"lowbit.prefill.bf16.d128.t512.kv4096.h32x8.prod3", true, false, 1, 512, 4096, 32, 8, 128, 16,
+       F::kTurboProd3, F::kUniform4},
+  };
+  return b;
+}
+
+const LbBench* find_lb(const std::string& id) {
+  for (const LbBench& b : lb_benches())
+    if (id == b.id) return &b;
+  return nullptr;
+}
+
+void add_lowbit_cases(std::vector<Case>& cases) {
+  for (const LbBench& b : lb_benches()) {
+    lbt::LowBitCodec codec;
+    lbt::LowBitTables tb;
+    if (lbt::lowbit_codec(b.kf, b.vf, b.D, 7, &codec) != kops::Status::kSuccess ||
+        lbt::lowbit_resolve(codec, &tb) != kops::Status::kSuccess) {
+      continue;
+    }
+    const int64_t tokens = static_cast<int64_t>(b.batch) * b.kv;
+    const int64_t rec = tokens * b.Hkv * (tb.k.entry_bytes + tb.v.entry_bytes);
+    const int64_t qo = static_cast<int64_t>(b.batch) * b.q * b.Hq * b.D * 2 * 2;
+    int64_t bytes = rec + qo, flops = 0;
+    if (b.store) {
+      bytes = tokens * b.Hkv * b.D * 2 * 2 + rec;
+      cases.push_back({b.id, "lowbit_store", kops::DType::kBFloat16, tokens, b.D, bytes, 0, 3, 20});
+      continue;
+    }
+    if (b.prefill) {
+      int64_t pairs = static_cast<int64_t>(b.batch) * b.q * (2 * b.kv - b.q + 1) / 2;
+      flops = 4 * pairs * b.D * b.Hq;
+      bytes = 0;
+    }
+    cases.push_back({b.id, b.prefill ? "lowbit_prefill" : "lowbit_decode", kops::DType::kBFloat16,
+                     b.batch, b.D, bytes, flops, 3, b.prefill ? 40 : 100});
+  }
+}
+
+bool run_lowbit(const Case& c, const kops::LaunchContext& ctx_in, Stats* st) {
+  const LbBench* b = find_lb(c.id);
+  if (b == nullptr) return false;
+  const int B = b->batch, D = b->D, ps = b->page;
+  lbt::LowBitCodec codec;
+  lbt::LowBitTables tb;
+  if (lbt::lowbit_codec(b->kf, b->vf, D, 7, &codec) != kops::Status::kSuccess ||
+      lbt::lowbit_resolve(codec, &tb) != kops::Status::kSuccess) {
+    return false;
+  }
+  const int64_t tokens = static_cast<int64_t>(B) * b->kv;
+  int total_pages = 0;
+  std::vector<int32_t> block_table(static_cast<size_t>(B), 0), seq_lens(B), page_of(B, 0);
+  int max_pages = 1;
+  for (int r = 0; r < B; ++r) {
+    page_of[r] = total_pages;
+    const int np = (b->kv + ps - 1) / ps;
+    total_pages += np;
+    max_pages = std::max(max_pages, np);
+    seq_lens[r] = b->kv;
+  }
+  std::vector<int64_t> slots(tokens);
+  for (int r = 0; r < B; ++r) {
+    for (int t = 0; t < b->kv; ++t) {
+      slots[static_cast<size_t>(r) * b->kv + t] = static_cast<int64_t>(page_of[r] + t / ps) * ps + t % ps;
+    }
+  }
+  std::vector<int32_t> bt(static_cast<size_t>(B) * max_pages, 0);
+  for (int r = 0; r < B; ++r) {
+    const int np = (b->kv + ps - 1) / ps;
+    for (int i = 0; i < np; ++i) bt[static_cast<size_t>(r) * max_pages + i] = page_of[r] + i;
+  }
+
+  const int64_t kbytes = static_cast<int64_t>(total_pages) * ps * b->Hkv * tb.k.entry_bytes;
+  const int64_t vbytes = static_cast<int64_t>(total_pages) * ps * b->Hkv * tb.v.entry_bytes;
+  __nv_bfloat16* q = nullptr;
+  __nv_bfloat16* o = nullptr;
+  __nv_bfloat16* key = nullptr;
+  __nv_bfloat16* val = nullptr;
+  uint8_t* kc = nullptr;
+  uint8_t* vc = nullptr;
+  int64_t* smap = nullptr;
+  int32_t* dbt = nullptr;
+  int32_t* dseq = nullptr;
+  int32_t* dqo = nullptr;
+  float* lse = nullptr;
+  void* pers = nullptr;
+  void* scr = nullptr;
+  void* alibi = nullptr;
+  bool ok = true;
+  auto alloc = [&](auto** p, size_t n) {
+    ok = ok && cuda_ok(cudaMalloc(reinterpret_cast<void**>(p), std::max<size_t>(n, 1)), c.id.c_str());
+  };
+  alloc(&q, static_cast<size_t>(B) * b->q * b->Hq * D * 2);
+  alloc(&o, static_cast<size_t>(B) * b->q * b->Hq * D * 2);
+  alloc(&key, static_cast<size_t>(tokens) * b->Hkv * D * 2);
+  alloc(&val, static_cast<size_t>(tokens) * b->Hkv * D * 2);
+  alloc(&kc, static_cast<size_t>(kbytes));
+  alloc(&vc, static_cast<size_t>(vbytes));
+  alloc(&smap, static_cast<size_t>(tokens) * 8);
+  alloc(&dbt, bt.size() * 4);
+  alloc(&dseq, seq_lens.size() * 4);
+  alloc(&dqo, static_cast<size_t>(B + 1) * 4);
+  alloc(&lse, static_cast<size_t>(B) * b->q * b->Hq * 4);
+  if (!ok) return false;
+  std::vector<int32_t> qo(B + 1, 0), kvl(B, b->kv);
+  for (int r = 0; r < B; ++r) qo[r + 1] = qo[r] + b->q;
+  cudaMemcpy(smap, slots.data(), slots.size() * 8, cudaMemcpyHostToDevice);
+  cudaMemcpy(dbt, bt.data(), bt.size() * 4, cudaMemcpyHostToDevice);
+  cudaMemcpy(dseq, seq_lens.data(), seq_lens.size() * 4, cudaMemcpyHostToDevice);
+  cudaMemcpy(dqo, qo.data(), qo.size() * 4, cudaMemcpyHostToDevice);
+  bench_fill_bf16<<<32, 256>>>(q, static_cast<int64_t>(B) * b->q * b->Hq * D, 7);
+  bench_fill_bf16<<<64, 256>>>(key, static_cast<int64_t>(tokens) * b->Hkv * D, 11);
+  bench_fill_bf16<<<64, 256>>>(val, static_cast<int64_t>(tokens) * b->Hkv * D, 13);
+
+  kops::kv::PagedKVDesc kd{};
+  kd.k_data = kc;
+  kd.v_data = vc;
+  kd.k_dtype = kd.v_dtype = kops::DType::kUInt8;
+  kd.k_codec = kd.v_codec = kops::kv::KVCodec::kLowBitWHT;
+  kd.layout = kops::kv::KVLayout::kNHD;
+  kd.page_size = ps;
+  kd.num_kv_heads = b->Hkv;
+  kd.head_dim_k = kd.head_dim_v = D;
+  kd.entry_bytes = tb.k.entry_bytes;
+  kd.stride_unit = kops::StrideUnit::kByte;
+  kd.k_stride_page = static_cast<int64_t>(ps) * b->Hkv * tb.k.entry_bytes;
+  kd.k_stride_token = static_cast<int64_t>(b->Hkv) * tb.k.entry_bytes;
+  kd.k_stride_head = tb.k.entry_bytes;
+  kd.v_stride_page = static_cast<int64_t>(ps) * b->Hkv * tb.v.entry_bytes;
+  kd.v_stride_token = static_cast<int64_t>(b->Hkv) * tb.v.entry_bytes;
+  kd.v_stride_head = tb.v.entry_bytes;
+  kd.table_format = kops::kv::PageTableFormat::kBlockTable;
+  kd.block_table = dbt;
+  kd.block_table_stride = max_pages;
+  kd.seq_lens = dseq;
+
+  const kops::Tensor tq = tensor3d(q, kops::DType::kBFloat16, static_cast<int64_t>(B) * b->q, b->Hq, D);
+  const kops::Tensor to = tensor3d(o, kops::DType::kBFloat16, static_cast<int64_t>(B) * b->q, b->Hq, D);
+  const kops::Tensor tk = tensor3d(key, kops::DType::kBFloat16, tokens, b->Hkv, D);
+  const kops::Tensor tv = tensor3d(val, kops::DType::kBFloat16, tokens, b->Hkv, D);
+  kops::LaunchContext ctx = ctx_in;
+  if (b->store) {
+    const kops::Tensor ts = tensor1d(smap, kops::DType::kInt64, tokens);
+    ok = status_ok(lbt::lowbit_kv_store(tk, tv, kd, ts, codec, ctx), c.id.c_str());
+    if (ok) ok = measure(c, [&] { (void)lbt::lowbit_kv_store(tk, tv, kd, ts, codec, ctx); }, st);
+    for (void* p : {static_cast<void*>(q), static_cast<void*>(o), static_cast<void*>(key),
+                    static_cast<void*>(val), static_cast<void*>(kc), static_cast<void*>(vc),
+                    static_cast<void*>(smap), static_cast<void*>(dbt), static_cast<void*>(dseq),
+                    static_cast<void*>(dqo), static_cast<void*>(lse)}) {
+      cudaFree(p);
+    }
+    return ok;
+  }
+  // Fill the cache through the public store entry once (setup, not timed).
+  {
+    const kops::Tensor ts = tensor1d(smap, kops::DType::kInt64, tokens);
+    ok = status_ok(lbt::lowbit_kv_store(tk, tv, kd, ts, codec, ctx), c.id.c_str());
+    if (!ok) return false;
+  }
+  kops::attn::AttentionSpec spec;
+  spec.num_q_heads = b->Hq;
+  spec.num_kv_heads = b->Hkv;
+  spec.head_dim_qk = spec.head_dim_vo = D;
+  spec.q_dtype = spec.o_dtype = kops::DType::kBFloat16;
+  spec.kv_dtype = kops::DType::kUInt8;
+  spec.k_codec = spec.v_codec = kops::kv::KVCodec::kLowBitWHT;
+  spec.kv_layout = kd.layout;
+  spec.page_size = ps;
+  spec.mask = kops::attn::MaskMode::kCausal;
+  spec.return_lse = true;
+  kops::attn::AttentionPlan plan;
+  kops::Workspace ws{};
+  auto do_plan = [&]() {
+    if (b->prefill) {
+      std::vector<int32_t> qoh = qo, kvh = kvl;
+      kops::Tensor qot = tensor1d(qoh.data(), kops::DType::kInt32, B + 1);
+      qot.device = -1;
+      kops::Tensor kvt = tensor1d(kvh.data(), kops::DType::kInt32, B);
+      kvt.device = -1;
+      return lbt::lowbit_prefill_plan(spec, codec, qot, kvt, ctx, ws, &plan);
+    }
+    return lbt::lowbit_decode_plan(spec, codec, B, b->kv, b->q, ctx, ws, &plan);
+  };
+  if (do_plan() != kops::Status::kWorkspaceTooSmall) {
+    std::fprintf(stderr, "[bench] %s: workspace probe failed\n", c.id.c_str());
+    return false;
+  }
+  alloc(&pers, plan.workspace.device_persistent_bytes);
+  alloc(&scr, std::max<size_t>(plan.workspace.device_scratch_bytes, 1));
+  ws.device_persistent = pers;
+  ws.device_persistent_bytes = plan.workspace.device_persistent_bytes;
+  ws.device_scratch = scr;
+  ws.device_scratch_bytes = plan.workspace.device_scratch_bytes;
+  ok = ok && status_ok(do_plan(), c.id.c_str());
+  if (!ok) return false;
+  kops::attn::AttentionModifiers mod;
+  mod.sm_scale = 0.0f;
+  kops::attn::PagedPrefillParams pp{};
+  kops::attn::DecodeParams dp{};
+  auto run = [&]() {
+    if (b->prefill) {
+      pp.q = q;
+      pp.q_stride_n = static_cast<int64_t>(b->Hq) * D;
+      pp.q_stride_h = D;
+      pp.qo_indptr = dqo;
+      pp.kv = kd;
+      pp.mod = mod;
+      pp.o = o;
+      pp.o_stride_n = static_cast<int64_t>(b->Hq) * D;
+      pp.o_stride_h = D;
+      pp.lse = lse;
+      pp.batch_size = B;
+      pp.num_qo_heads = b->Hq;
+      pp.num_kv_heads = b->Hkv;
+      pp.total_q = qo[B];
+      return lbt::lowbit_prefill_run(plan, pp, codec, ws, ctx);
+    }
+    dp.q = q;
+    dp.q_stride_n = static_cast<int64_t>(b->Hq) * D;
+    dp.q_stride_h = D;
+    dp.q_len = b->q;
+    dp.kv = kd;
+    dp.mod = mod;
+    dp.o = o;
+    dp.o_stride_n = static_cast<int64_t>(b->Hq) * D;
+    dp.o_stride_h = D;
+    dp.lse = lse;
+    dp.batch_size = B;
+    dp.num_qo_heads = b->Hq;
+    dp.num_kv_heads = b->Hkv;
+    return lbt::lowbit_decode_run(plan, dp, codec, ws, ctx);
+  };
+  ok = status_ok(run(), c.id.c_str());
+  if (ok) ok = measure(c, [&] { (void)run(); }, st);
+  for (void* p : {static_cast<void*>(q), static_cast<void*>(o), static_cast<void*>(key),
+                  static_cast<void*>(val), static_cast<void*>(kc), static_cast<void*>(vc),
+                  static_cast<void*>(smap), static_cast<void*>(dbt), static_cast<void*>(dseq),
+                  static_cast<void*>(dqo), static_cast<void*>(lse), pers, scr}) {
+    cudaFree(p);
+  }
+  return ok;
+}
+
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   if (c.op == "attention") return run_attention(c, ctx, st);
   if (c.op == "merge_state") return run_merge(c, ctx, st);
@@ -530,6 +808,8 @@ bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   if (c.op == "merge_split_kv") return run_split(c, ctx, st);
   if (c.op == "concat_mla_q") return run_concat_mla_q(c, ctx, st);
   if (c.op == "mla_context_gather") return run_mla_context_gather(c, ctx, st);
+  if (c.op == "lowbit_store" || c.op == "lowbit_decode" || c.op == "lowbit_prefill")
+    return run_lowbit(c, ctx, st);
   return false;
 }
 

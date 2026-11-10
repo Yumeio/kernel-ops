@@ -28,6 +28,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <limits>
 #include <type_traits>
 
@@ -37,6 +38,9 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_fp4.h>
+#include <mma.h>
+
+using namespace nvcuda;
 
 #include "csrc/common/macros.cuh"
 #include "csrc/common/status.h"
@@ -502,3 +506,495 @@ Status latent_combine_norm(const Tensor& out, const Tensor& expert_out,
 }
 
 }  // namespace kops::moe
+
+// =============================================================================
+// M04 experimental: 2-bit experts (B17) — pack + expert GEMM.
+// Format/levels follow attention.rs "Moet" (MIT, 3rd/attention.rs moe_w2_pack.cu /
+// moe_w2_unpack.cu); the packing scale and the GEMM are this repo's own.
+// Weight: 4 codes/byte, levels {-4,-1,+1,+4}, fp32 scale per GROUP_SIZE K.
+// =============================================================================
+namespace kops::moe {
+namespace {
+
+__device__ __forceinline__ float w2_level(int code) {
+  const float l[4] = {-4.0f, -1.0f, 1.0f, 4.0f};
+  return l[code & 3];
+}
+
+__device__ __forceinline__ int w2_code(float z) {
+  // Midpoints between {-4,-1,+1,+4}: -2.5, 0, 2.5.
+  return z < -2.5f ? 0 : (z < 0.0f ? 1 : (z < 2.5f ? 2 : 3));
+}
+
+}  // namespace
+
+__global__ void moe_w2_pack_kernel(uint8_t* __restrict__ out, void* __restrict__ out_scales,
+                                   const void* __restrict__ weight, const int source_format,
+                                   const int E, const int N, const int K, const int group_size) {
+  const int groups_per_row = K / group_size;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int e = blockIdx.y;
+  if (e >= E || idx >= N * groups_per_row) return;
+  const int n = idx / groups_per_row, g = idx - n * groups_per_row;
+  const int k0 = g * group_size;
+  float scratch[128];
+  float amax = 0.0f;
+  const bool fp4 = source_format == static_cast<int>(WeightPacking::kFP4E2M1);
+  if (fp4) {
+    const uint8_t* src = static_cast<const uint8_t*>(weight) +
+                         (static_cast<int64_t>(e) * N + n) * (K / 2) + k0 / 2;
+    for (int j = 0; j < group_size; ++j) {
+      const uint8_t b = src[j / 2];
+      const float x = dev::e2m1_decode((b >> (4 * (j & 1))) & 0x0F);
+      scratch[j] = x;
+      amax = fmaxf(amax, fabsf(x));
+    }
+  } else {
+    const __nv_bfloat16* src = static_cast<const __nv_bfloat16*>(weight) +
+                               (static_cast<int64_t>(e) * N + n) * K + k0;
+    for (int j = 0; j < group_size; ++j) {
+      const float x = __bfloat162float(src[j]);
+      scratch[j] = x;
+      amax = fmaxf(amax, fabsf(x));
+    }
+  }
+  const float scale = amax > 0.0f ? amax / 4.0f : 0.0f;
+  const float inv = scale > 0.0f ? 1.0f / scale : 0.0f;
+  uint8_t* dst = out + (static_cast<int64_t>(e) * N + n) * (K / 4) + k0 / 4;
+  for (int j = 0; j < group_size; j += 4) {
+    const uint8_t c0 = static_cast<uint8_t>(scale > 0.0f ? w2_code(scratch[j] * inv) : 2);
+    const uint8_t c1 = static_cast<uint8_t>(scale > 0.0f ? w2_code(scratch[j + 1] * inv) : 2);
+    const uint8_t c2 = static_cast<uint8_t>(scale > 0.0f ? w2_code(scratch[j + 2] * inv) : 2);
+    const uint8_t c3 = static_cast<uint8_t>(scale > 0.0f ? w2_code(scratch[j + 3] * inv) : 2);
+    dst[j / 4] = static_cast<uint8_t>(c0 | (c1 << 2) | (c2 << 4) | (c3 << 6));
+  }
+  static_cast<float*>(out_scales)[(static_cast<int64_t>(e) * N + n) * groups_per_row + g] = scale;
+}
+
+template <typename T>
+__device__ __forceinline__ T w2_cvt(float x);
+template <>
+__device__ __forceinline__ __nv_bfloat16 w2_cvt<__nv_bfloat16>(float x) {
+  return __float2bfloat16_rn(x);
+}
+template <>
+__device__ __forceinline__ __half w2_cvt<__half>(float x) {
+  return __float2half_rn(x);
+}
+template <>
+__device__ __forceinline__ float w2_cvt<float>(float x) {
+  return x;
+}
+
+/// Scalar fallback: one output per thread, fp32 accumulation. Used for fp32 activations and for K
+/// that is not a multiple of the tensor-core tile.
+template <typename a_t, typename c_t, int BLOCK_M, int BLOCK_N, int GROUP_SIZE>
+__device__ __forceinline__ void w2_simt_body(const FusedMoEGemmParams& p) {
+  __shared__ float sA[BLOCK_M][GROUP_SIZE];
+  __shared__ float sW[BLOCK_N][GROUP_SIZE];
+  const int npost = p.num_tokens_post_pad[0];
+  const int slot0 = blockIdx.x * BLOCK_M;
+  if (slot0 >= npost) return;
+  const int e = p.expert_ids[blockIdx.x];
+  if (e < 0) return;
+  const int n0 = blockIdx.y * BLOCK_N;
+  if (n0 >= p.n) return;
+  const int tid = threadIdx.x, m = tid / BLOCK_N, n = tid - m * BLOCK_N;
+  const int slot = slot0 + m;
+  int row = -1, token_id = -1;
+  if (slot < npost) {
+    const int tok = p.sorted_token_ids[slot];
+    if (tok < p.num_valid_slots) {
+      token_id = tok;
+      row = p.a_rows_are_slots ? tok : tok / p.top_k;
+    }
+  }
+  const int kg = p.k / GROUP_SIZE;
+  float acc = 0.0f;
+  for (int g = 0; g < kg; ++g) {
+    for (int i = tid; i < BLOCK_M * GROUP_SIZE; i += blockDim.x) {
+      const int mm = i / GROUP_SIZE, kk = i - mm * GROUP_SIZE;
+      const int s = slot0 + mm;
+      float v = 0.0f;
+      if (s < npost) {
+        const int tok = p.sorted_token_ids[s];
+        if (tok < p.num_valid_slots) {
+          const int r = p.a_rows_are_slots ? tok : tok / p.top_k;
+          v = dev::to_f(static_cast<const a_t*>(p.a)[static_cast<int64_t>(r) * p.lda + g * GROUP_SIZE + kk]);
+        }
+      }
+      sA[mm][kk] = v;
+    }
+    for (int i = tid; i < BLOCK_N * GROUP_SIZE; i += blockDim.x) {
+      const int nn = i / GROUP_SIZE, kk = i - nn * GROUP_SIZE;
+      const int col = n0 + nn;
+      float v = 0.0f;
+      if (col < p.n) {
+        const int k = g * GROUP_SIZE + kk;
+        const uint8_t b = static_cast<const uint8_t*>(p.w)[e * p.w_expert_stride +
+                                                          static_cast<int64_t>(col) * (p.k / 4) + k / 4];
+        const float s = static_cast<const float*>(p.w_scale)[e * p.w_scale_expert_stride +
+                                                             static_cast<int64_t>(col) * kg + g];
+        v = w2_level((b >> (2 * (k & 3))) & 3) * s;
+      }
+      sW[nn][kk] = v;
+    }
+    __syncthreads();
+    if (row >= 0 && n0 + n < p.n) {
+#pragma unroll
+      for (int kk = 0; kk < GROUP_SIZE; ++kk) acc = __fmaf_rn(sA[m][kk], sW[n][kk], acc);
+    }
+    __syncthreads();
+  }
+  if (row < 0 || n0 + n >= p.n) return;
+  const int col = n0 + n;
+  float v = acc;
+  if (p.bias != nullptr) v += dev::to_f(static_cast<const c_t*>(p.bias)[static_cast<int64_t>(e) * p.n + col]);
+  if (p.mul_routed_weight) v *= p.topk_weights[token_id];
+  dev::from_f(static_cast<c_t*>(p.c)[static_cast<int64_t>(slot) * p.ldc + col], v);
+}
+
+/// 16-bit path: dequantize the 2-bit tile to bf16/fp16 in shared memory and run four warps of
+/// wmma m16n16k16 (16 x 64 x 64 tile).  K must be a multiple of 64; the host checks it.
+template <typename a_t, typename c_t, int GROUP_SIZE, int BM>
+__device__ __forceinline__ void w2_wmma_body(const FusedMoEGemmParams& p) {
+  constexpr int BN = 64, BK = 64;
+  constexpr int LDA = BK + 8;   // 16-byte pad: avoid 128-byte row-stride bank conflicts
+  constexpr int LDC = BN + 4;
+  constexpr int WARPS = BM == 16 ? 4 : 8;
+  constexpr int THREADS = WARPS * 32;
+  static_assert(BM == 16 || BM == 64, "W2 M tile");
+  __shared__ __align__(16) a_t sA[BM * LDA];
+  __shared__ __align__(16) a_t sW[BN * LDA];
+  __shared__ __align__(16) float sC[BM * LDC];
+  __shared__ int sRow[BM], sTok[BM];
+  __shared__ uint8_t sValid[BM];
+  const int npost = p.num_tokens_post_pad[0];
+  const int slot0 = blockIdx.x * BM;
+  if (slot0 >= npost) return;
+  const int e = p.expert_ids[blockIdx.x];
+  if (e < 0) return;
+  const int n0 = blockIdx.y * BN;
+  if (n0 >= p.n) return;
+  const int tid = threadIdx.x, warp = tid >> 5;
+  const int kg = p.k / GROUP_SIZE;
+  if (tid < BM) {
+    const int s = slot0 + tid;
+    sRow[tid] = -1;
+    sTok[tid] = -1;
+    sValid[tid] = 0;
+    if (s < npost) {
+      const int tok = p.sorted_token_ids[s];
+      if (tok < p.num_valid_slots) {
+        sTok[tid] = tok;
+        sRow[tid] = p.a_rows_are_slots ? tok : tok / p.top_k;
+        sValid[tid] = 1;
+      }
+    }
+  }
+  __syncthreads();
+
+  if constexpr (BM == 16) {
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf;
+    wmma::fill_fragment(cf, 0.0f);
+    for (int k0 = 0; k0 < p.k; k0 += BK) {
+      for (int i = tid; i < BM * (BK / 8); i += THREADS) {
+        const int m = i / (BK / 8), kv = i - m * (BK / 8);
+        if (sValid[m]) {
+          const uint4 w = *reinterpret_cast<const uint4*>(static_cast<const a_t*>(p.a) +
+                                                          static_cast<int64_t>(sRow[m]) * p.lda + k0 + kv * 8);
+          *reinterpret_cast<uint4*>(sA + m * LDA + kv * 8) = w;
+        } else {
+          *reinterpret_cast<uint4*>(sA + m * LDA + kv * 8) = make_uint4(0, 0, 0, 0);
+        }
+      }
+      for (int i = tid; i < BN * (BK / GROUP_SIZE); i += THREADS) {
+        const int nn = i / (BK / GROUP_SIZE), g = i - nn * (BK / GROUP_SIZE);
+        const int col = n0 + nn, kbase = k0 + g * GROUP_SIZE;
+        if (col < p.n) {
+          const float sc = static_cast<const float*>(p.w_scale)[e * p.w_scale_expert_stride +
+                                                                static_cast<int64_t>(col) * kg + kbase / GROUP_SIZE];
+          const uint64_t word = *reinterpret_cast<const uint64_t*>(
+              static_cast<const uint8_t*>(p.w) + e * p.w_expert_stride +
+              static_cast<int64_t>(col) * (p.k / 4) + kbase / 4);
+#pragma unroll
+          for (int j = 0; j < GROUP_SIZE; ++j)
+            sW[nn * LDA + g * GROUP_SIZE + j] = w2_cvt<a_t>(w2_level((word >> (2 * j)) & 3) * sc);
+        } else {
+#pragma unroll
+          for (int j = 0; j < GROUP_SIZE; ++j) sW[nn * LDA + g * GROUP_SIZE + j] = w2_cvt<a_t>(0.0f);
+        }
+      }
+      __syncthreads();
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, a_t, wmma::row_major> af;
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, a_t, wmma::col_major> bf;
+#pragma unroll
+      for (int kk = 0; kk < BK; kk += 16) {
+        wmma::load_matrix_sync(af, sA + kk, LDA);
+        wmma::load_matrix_sync(bf, sW + (warp * 16) * LDA + kk, LDA);
+        wmma::mma_sync(cf, af, bf, cf);
+      }
+      __syncthreads();
+    }
+    wmma::store_matrix_sync(sC + warp * 16, cf, LDC, wmma::mem_row_major);
+    __syncthreads();
+    for (int i = tid; i < BM * BN; i += THREADS) {
+      const int m = i / BN, nn = i - m * BN;
+      const int slot = slot0 + m, col = n0 + nn;
+      if (!sValid[m] || col >= p.n) continue;
+      float v = sC[m * LDC + nn];
+      if (p.bias != nullptr) v += dev::to_f(static_cast<const c_t*>(p.bias)[static_cast<int64_t>(e) * p.n + col]);
+      if (p.mul_routed_weight) v *= p.topk_weights[sTok[m]];
+      dev::from_f(static_cast<c_t*>(p.c)[static_cast<int64_t>(slot) * p.ldc + col], v);
+    }
+  } else {
+    const int row_tile = warp >> 1, col_base = (warp & 1) * 32;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> cf[2];
+#pragma unroll
+    for (int c = 0; c < 2; ++c) wmma::fill_fragment(cf[c], 0.0f);
+    for (int k0 = 0; k0 < p.k; k0 += BK) {
+      for (int i = tid; i < BM * (BK / 8); i += THREADS) {
+        const int m = i / (BK / 8), kv = i - m * (BK / 8);
+        if (sValid[m]) {
+          const uint4 w = *reinterpret_cast<const uint4*>(static_cast<const a_t*>(p.a) +
+                                                          static_cast<int64_t>(sRow[m]) * p.lda + k0 + kv * 8);
+          *reinterpret_cast<uint4*>(sA + m * LDA + kv * 8) = w;
+        } else {
+          *reinterpret_cast<uint4*>(sA + m * LDA + kv * 8) = make_uint4(0, 0, 0, 0);
+        }
+      }
+      for (int i = tid; i < BN * (BK / GROUP_SIZE); i += THREADS) {
+        const int nn = i / (BK / GROUP_SIZE), g = i - nn * (BK / GROUP_SIZE);
+        const int col = n0 + nn, kbase = k0 + g * GROUP_SIZE;
+        if (col < p.n) {
+          const float sc = static_cast<const float*>(p.w_scale)[e * p.w_scale_expert_stride +
+                                                                static_cast<int64_t>(col) * kg + kbase / GROUP_SIZE];
+          const uint64_t word = *reinterpret_cast<const uint64_t*>(
+              static_cast<const uint8_t*>(p.w) + e * p.w_expert_stride +
+              static_cast<int64_t>(col) * (p.k / 4) + kbase / 4);
+#pragma unroll
+          for (int j = 0; j < GROUP_SIZE; ++j)
+            sW[nn * LDA + g * GROUP_SIZE + j] = w2_cvt<a_t>(w2_level((word >> (2 * j)) & 3) * sc);
+        } else {
+#pragma unroll
+          for (int j = 0; j < GROUP_SIZE; ++j) sW[nn * LDA + g * GROUP_SIZE + j] = w2_cvt<a_t>(0.0f);
+        }
+      }
+      __syncthreads();
+      wmma::fragment<wmma::matrix_a, 16, 16, 16, a_t, wmma::row_major> af;
+#pragma unroll
+      for (int kk = 0; kk < BK; kk += 16) {
+        wmma::load_matrix_sync(af, sA + row_tile * 16 * LDA + kk, LDA);
+#pragma unroll
+        for (int c = 0; c < 2; ++c) {
+          wmma::fragment<wmma::matrix_b, 16, 16, 16, a_t, wmma::col_major> bf;
+          wmma::load_matrix_sync(bf, sW + (col_base + c * 16) * LDA + kk, LDA);
+          wmma::mma_sync(cf[c], af, bf, cf[c]);
+        }
+      }
+      __syncthreads();
+    }
+#pragma unroll
+    for (int c = 0; c < 2; ++c)
+      wmma::store_matrix_sync(sC + row_tile * 16 * LDC + col_base + c * 16, cf[c], LDC,
+                              wmma::mem_row_major);
+    __syncthreads();
+    for (int i = tid; i < BM * BN; i += THREADS) {
+      const int m = i / BN, nn = i - m * BN;
+      const int slot = slot0 + m, col = n0 + nn;
+      if (!sValid[m] || col >= p.n) continue;
+      float v = sC[m * LDC + nn];
+      if (p.bias != nullptr) v += dev::to_f(static_cast<const c_t*>(p.bias)[static_cast<int64_t>(e) * p.n + col]);
+      if (p.mul_routed_weight) v *= p.topk_weights[sTok[m]];
+      dev::from_f(static_cast<c_t*>(p.c)[static_cast<int64_t>(slot) * p.ldc + col], v);
+    }
+  }
+}
+
+template <typename a_t, typename c_t, int BLOCK_M, int BLOCK_N, int GROUP_SIZE>
+__global__ void __launch_bounds__(256)
+    moe_w2_gemm_kernel(const __grid_constant__ FusedMoEGemmParams p) {
+  if constexpr ((std::is_same<a_t, __nv_bfloat16>::value || std::is_same<a_t, __half>::value) &&
+                (BLOCK_M == 16 || BLOCK_M == 64) && BLOCK_N == 64) {
+    w2_wmma_body<a_t, c_t, GROUP_SIZE, BLOCK_M>(p);
+  } else {
+    w2_simt_body<a_t, c_t, BLOCK_M, BLOCK_N, GROUP_SIZE>(p);
+  }
+}
+
+}  // namespace kops::moe
+
+namespace kops::experimental::moe_w2 {
+namespace {
+
+
+Status w2_launch_error(const char* what, cudaError_t err) {
+  return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(err), "%s: %s", what,
+                                   cudaGetErrorString(err));
+}
+
+bool w2_dense3(const Tensor& t, DType dt, int64_t d0, int64_t d1, int64_t d2) {
+  return t.data != nullptr && t.dtype == dt && t.ndim == 3 && t.shape[0] == d0 && t.shape[1] == d1 &&
+         t.shape[2] == d2 && t.stride[2] == 1 && t.stride[1] >= d2 && t.stride[0] >= d1 * t.stride[1];
+}
+
+}  // namespace
+
+Status pack(const Tensor& packed, const Tensor& scales, const Tensor& weight, WeightPacking source,
+            int32_t group_size, const LaunchContext& ctx) {
+  if (ctx_is_amd(ctx)) return detail::set_error(Status::kUnsupportedBackend, "moe_w2::pack: CUDA only");
+  if (ctx.arch_id != 0 && ctx.arch_id < KOPS_TARGET_SM80) {
+    return detail::set_error(Status::kUnsupportedArch, "moe_w2::pack: needs sm_80+");
+  }
+  if (group_size != 16 && group_size != 32 && group_size != 64 && group_size != 128) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::pack: group_size 16/32/64/128");
+  }
+  const bool fp4 = source == WeightPacking::kFP4E2M1;
+  if (source != WeightPacking::kNone && !fp4) {
+    return detail::set_error(Status::kUnsupportedDtype, "moe_w2::pack: source is bf16 (kNone) or kFP4E2M1");
+  }
+  if (packed.data == nullptr || scales.data == nullptr || weight.data == nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "moe_w2::pack: null operand");
+  }
+  if (packed.ndim != 3 || scales.ndim != 3 || weight.ndim != 3) {
+    return detail::set_error(Status::kInvalidArgument, "moe_w2::pack: 3-D tensors");
+  }
+  const int64_t E = packed.shape[0], N = packed.shape[1];
+  if (E <= 0 || N <= 0 || E > INT32_MAX || N > INT32_MAX) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::pack: E and N must be positive");
+  }
+  if (weight.shape[0] != E || weight.shape[1] != N || scales.shape[0] != E || scales.shape[1] != N) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::pack: expert/row mismatch");
+  }
+  const int64_t K = weight.shape[2] * (fp4 ? 2 : 1);
+  if (K <= 0 || K > INT32_MAX || K % 4 != 0 || K % group_size != 0 ||
+      packed.shape[2] != K / 4 || scales.shape[2] != K / group_size) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::pack: K %% group and K/4 / K/group shapes");
+  }
+  if (packed.dtype != DType::kUInt8 || scales.dtype != DType::kFloat32) {
+    return detail::set_error(Status::kUnsupportedDtype, "moe_w2::pack: codes u8, scales fp32");
+  }
+  if ((!fp4 && weight.dtype != DType::kBFloat16) || (fp4 && weight.dtype != DType::kUInt8)) {
+    return detail::set_error(Status::kUnsupportedDtype, "moe_w2::pack: source dtype");
+  }
+  if (!w2_dense3(packed, DType::kUInt8, E, N, K / 4) ||
+      !w2_dense3(scales, DType::kFloat32, E, N, K / group_size) ||
+      weight.stride[2] != 1 || packed.stride[2] != 1 || scales.stride[2] != 1) {
+    return detail::set_error(Status::kUnsupportedLayout, "moe_w2::pack: dense rows, innermost stride 1");
+  }
+  const int64_t groups = N * (K / group_size);
+  const unsigned gx = static_cast<unsigned>((groups + 255) / 256);
+  if (E > 65535 || gx == 0) return detail::set_error(Status::kCapacityExceeded, "moe_w2::pack: grid");
+  const cudaStream_t s = reinterpret_cast<cudaStream_t>(ctx.stream);
+  moe::moe_w2_pack_kernel<<<dim3(gx, static_cast<unsigned>(E)), 256, 0, s>>>(
+      static_cast<uint8_t*>(packed.data), scales.data, weight.data, static_cast<int>(source),
+      static_cast<int>(E), static_cast<int>(N), static_cast<int>(K), group_size);
+  const cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? Status::kSuccess : w2_launch_error("moe_w2_pack", err);
+}
+
+template <typename AT, typename CT>
+void launch_w2(const moe::FusedMoEGemmParams& p, int group, int block_size, bool tensor,
+               dim3 grid, cudaStream_t s) {
+  if constexpr (std::is_same<AT, float>::value) {
+    if (group == 16) moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 16><<<grid, 256, 0, s>>>(p);
+    else if (group == 32) moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 32><<<grid, 256, 0, s>>>(p);
+    else if (group == 64) moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 64><<<grid, 256, 0, s>>>(p);
+    else moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 128><<<grid, 256, 0, s>>>(p);
+  } else {
+    if (tensor && block_size == 64) {
+      if (group == 16) moe::moe_w2_gemm_kernel<AT, CT, 64, 64, 16><<<grid, 256, 0, s>>>(p);
+      else if (group == 32) moe::moe_w2_gemm_kernel<AT, CT, 64, 64, 32><<<grid, 256, 0, s>>>(p);
+      else if (group == 64) moe::moe_w2_gemm_kernel<AT, CT, 64, 64, 64><<<grid, 256, 0, s>>>(p);
+      else moe::moe_w2_gemm_kernel<AT, CT, 64, 64, 128><<<grid, 256, 0, s>>>(p);
+    } else if (tensor) {
+      if (group == 16) moe::moe_w2_gemm_kernel<AT, CT, 16, 64, 16><<<grid, 128, 0, s>>>(p);
+      else if (group == 32) moe::moe_w2_gemm_kernel<AT, CT, 16, 64, 32><<<grid, 128, 0, s>>>(p);
+      else if (group == 64) moe::moe_w2_gemm_kernel<AT, CT, 16, 64, 64><<<grid, 128, 0, s>>>(p);
+      else moe::moe_w2_gemm_kernel<AT, CT, 16, 64, 128><<<grid, 128, 0, s>>>(p);
+    } else {
+      if (group == 16) moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 16><<<grid, 256, 0, s>>>(p);
+      else if (group == 32) moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 32><<<grid, 256, 0, s>>>(p);
+      else if (group == 64) moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 64><<<grid, 256, 0, s>>>(p);
+      else moe::moe_w2_gemm_kernel<AT, CT, 16, 16, 128><<<grid, 256, 0, s>>>(p);
+    }
+  }
+}
+
+Status gemm(const moe::FusedMoEGemmParams& p, int32_t num_local_experts, int32_t block_size,
+            DType a_dtype, DType c_dtype, const LaunchContext& ctx) {
+  if (ctx_is_amd(ctx)) return detail::set_error(Status::kUnsupportedBackend, "moe_w2::gemm: CUDA only");
+  if (ctx.arch_id != 0 && ctx.arch_id < KOPS_TARGET_SM80) {
+    return detail::set_error(Status::kUnsupportedArch, "moe_w2::gemm: needs sm_80+");
+  }
+  if (block_size != 16 && block_size != 64) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::gemm: block_size must be 16 or 64");
+  }
+  if (num_local_experts < 1 || p.n < 1 || p.k < 1 || p.top_k < 1 || p.num_valid_slots < 0) {
+    return detail::set_error(Status::kInvalidArgument, "moe_w2::gemm: empty or inconsistent problem");
+  }
+  if (p.a == nullptr || p.w == nullptr || p.w_scale == nullptr || p.c == nullptr ||
+      p.sorted_token_ids == nullptr || p.expert_ids == nullptr || p.num_tokens_post_pad == nullptr ||
+      (p.mul_routed_weight && p.topk_weights == nullptr)) {
+    return detail::set_error(Status::kInvalidArgument, "moe_w2::gemm: null operand");
+  }
+  if (p.w_zeros != nullptr || p.a_scale != nullptr) {
+    return detail::set_error(Status::kNotImplemented, "moe_w2::gemm: zeros / activation scales not supported");
+  }
+  if (p.w_quant.packing != WeightPacking::kW2 ||
+      p.w_quant.granularity != ScaleGranularity::kPerGroup) {
+    return detail::set_error(Status::kInvalidArgument, "moe_w2::gemm: w_quant must be kW2 per-group");
+  }
+  const int group = p.w_quant.group_k;
+  if (group != 16 && group != 32 && group != 64 && group != 128) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::gemm: group_k 16/32/64/128");
+  }
+  if (p.k % group != 0 || p.k % 4 != 0) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::gemm: K must divide by 4 and group_k");
+  }
+  if (p.w_expert_stride < static_cast<int64_t>(p.n) * (p.k / 4) ||
+      p.w_scale_expert_stride < static_cast<int64_t>(p.n) * (p.k / group)) {
+    return detail::set_error(Status::kInvalidArgument, "moe_w2::gemm: expert strides too small");
+  }
+  const bool a_ok = a_dtype == DType::kBFloat16 || a_dtype == DType::kFloat16 || a_dtype == DType::kFloat32;
+  const bool c_ok = c_dtype == DType::kBFloat16 || c_dtype == DType::kFloat16 || c_dtype == DType::kFloat32;
+  if (!a_ok || !c_ok) {
+    return detail::set_error(Status::kUnsupportedDtype, "moe_w2::gemm: a/c dtype bf16, fp16 or fp32");
+  }
+  const bool tensor = (a_dtype == DType::kBFloat16 || a_dtype == DType::kFloat16) &&
+                      group == 32 && p.k % 64 == 0 && p.lda % 8 == 0;
+  if (!tensor && block_size != 16) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_w2::gemm: fp32 / tail-K path needs block_size 16");
+  }
+  const int bm = tensor ? block_size : 16, bn = tensor ? 64 : 16;
+  const int64_t gx = (p.num_valid_slots + bm - 1) / bm + num_local_experts;
+  const int64_t gy = (p.n + bn - 1) / bn;
+  if (gx > INT32_MAX || gy > 65535) {
+    return detail::set_error(Status::kCapacityExceeded, "moe_w2::gemm: grid");
+  }
+  const cudaStream_t s = reinterpret_cast<cudaStream_t>(ctx.stream);
+  const dim3 grid(static_cast<unsigned>(gx), static_cast<unsigned>(gy));
+  if (a_dtype == DType::kBFloat16 && c_dtype == DType::kBFloat16) {
+    launch_w2<__nv_bfloat16, __nv_bfloat16>(p, group, block_size, tensor, grid, s);
+  } else if (a_dtype == DType::kBFloat16 && c_dtype == DType::kFloat16) {
+    launch_w2<__nv_bfloat16, __half>(p, group, block_size, tensor, grid, s);
+  } else if (a_dtype == DType::kBFloat16) {
+    launch_w2<__nv_bfloat16, float>(p, group, block_size, tensor, grid, s);
+  } else if (a_dtype == DType::kFloat16 && c_dtype == DType::kBFloat16) {
+    launch_w2<__half, __nv_bfloat16>(p, group, block_size, tensor, grid, s);
+  } else if (a_dtype == DType::kFloat16 && c_dtype == DType::kFloat16) {
+    launch_w2<__half, __half>(p, group, block_size, tensor, grid, s);
+  } else if (a_dtype == DType::kFloat16) {
+    launch_w2<__half, float>(p, group, block_size, tensor, grid, s);
+  } else if (c_dtype == DType::kBFloat16) {
+    launch_w2<float, __nv_bfloat16>(p, group, block_size, tensor, grid, s);
+  } else if (c_dtype == DType::kFloat16) {
+    launch_w2<float, __half>(p, group, block_size, tensor, grid, s);
+  } else {
+    launch_w2<float, float>(p, group, block_size, tensor, grid, s);
+  }
+  const cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? Status::kSuccess : w2_launch_error("moe_w2_gemm", err);
+}
+
+}  // namespace kops::experimental::moe_w2

@@ -4,7 +4,10 @@
 // merge_split_kv (A04); B8 native attention: ragged / paged prefill (A01, A02,
 // A06, A08) against kops::ref::attention_f64 over head dims, GQA, every
 // AttentionModifiers rule, page layouts / tables, FP8 K/V, split-KV,
-// determinism and batch invariance.
+// determinism and batch invariance. B17 (A09, experimental): low-bit rotated
+// KV codecs (kUniform3/4, kTurboMse2-4, kTurboProd2-4) — Lloyd-Max fixed point,
+// store against ref::lowbit_encode_f64, decode/prefill against attention_f64
+// over the decoded records, split-KV, determinism and the Status contract.
 //
 // Oracle: csrc/reference/reference.cc (merge_states_f64) for two- and N-state
 // merges, plus a local fp64 log-sum-exp reference for split-KV with a sink
@@ -37,6 +40,7 @@
 #include "csrc/attention/merge_kernels.cuh"
 #include "csrc/attention/mla_kernels.cuh"
 #include "csrc/attention/sparse_kernels.cuh"
+#include "csrc/attention/lowbit_kernels.cuh"
 #include "csrc/attention/ops.h"
 #include "csrc/reference/ops.h"
 
@@ -2470,11 +2474,1030 @@ void test_prefill_contracts() {
                      Status::kNotImplemented, "block sparse is A10");
 }
 
+// -----------------------------------------------------------------------------
+// B17 experimental: low-bit rotated KV (A09)
+// -----------------------------------------------------------------------------
+namespace lb = kops::experimental::lowbit;
+
+struct LbRefSide {
+  std::vector<double> levels, thresholds;
+  kops::ref::LowBitRefSide side{};
+};
+
+void lb_make_ref(const lb::LowBitSide& s, int d, uint32_t seed, LbRefSide* out) {
+  const int n = 1 << s.code_bits;
+  out->levels.assign(s.levels, s.levels + n);
+  out->thresholds.assign(s.thresholds, s.thresholds + (n - 1));
+  out->side.dim = d;
+  out->side.code_bits = s.code_bits;
+  out->side.qjl = s.qjl != 0;
+  out->side.rotated = s.rotated != 0;
+  out->side.absmax = s.absmax != 0;
+  out->side.seed = seed;
+  out->side.sign_stream = s.sign_stream;
+  out->side.levels = out->levels.data();
+  out->side.thresholds = out->thresholds.data();
+}
+
+std::vector<uint8_t> lb_encode(const std::vector<float>& x, LbRefSide& r) {
+  std::vector<double> xd(x.begin(), x.end());
+  std::vector<uint8_t> rec(static_cast<size_t>(kops::ref::lowbit_record_bytes(r.side)));
+  KOPS_EXPECT_OK(kops::ref::lowbit_encode_f64(xd.data(), r.side, rec.data()), "lowbit_encode_f64");
+  return rec;
+}
+
+std::vector<float> lb_decode(const uint8_t* rec, LbRefSide& r) {
+  std::vector<double> xd(static_cast<size_t>(r.side.dim));
+  KOPS_EXPECT_OK(kops::ref::lowbit_decode_f64(rec, r.side, xd.data()), "lowbit_decode_f64");
+  std::vector<float> x(xd.begin(), xd.end());
+  return x;
+}
+
+int64_t lb_off(int page, int off, int h, int page_size, int hkv, int entry, bool hnd) {
+  return hnd ? ((static_cast<int64_t>(page) * hkv + h) * page_size + off) * entry
+             : ((static_cast<int64_t>(page) * page_size + off) * hkv + h) * entry;
+}
+
+float lb_round(DType dt, float x) { return round_to(dt, x); }
+
+/// One low-bit problem: reference-encoded cache, then decode or paged prefill.
+struct LbCase {
+  const char* name = "";
+  std::vector<int> kv_lens;
+  int q_len = 1;
+  int Hq = 4, Hkv = 1, D = 128;
+  DType dt = DType::kBFloat16;
+  int page = 16;
+  bool hnd = false, block_table = false;
+  lb::LowBitFormat kf = lb::LowBitFormat::kTurboMse4;
+  lb::LowBitFormat vf = lb::LowBitFormat::kTurboMse4;
+  MaskMode mask = MaskMode::kCausal;
+  float softcap = 0.0f;
+  int wl = -1, wr = -1, chunk = 0, nsink = 0;
+  bool alibi = false, prefill = false, batch_invariant = false;
+  int compute_units = 1;
+  int seed = 7;
+  double atol = 2e-2, rtol = 2e-2, lse_atol = 2e-3;
+};
+
+struct LbData {
+  std::vector<int32_t> qo_indptr, kv_indptr;
+  std::vector<float> q, k, v;              // values the reference attention reads
+  std::vector<float> alibi, sinks;
+  std::vector<double> o_ref, lse_ref;
+  int total_q = 0, total_kv = 0;
+};
+
+LbData lb_build(const LbCase& c, uint32_t seed, std::vector<uint8_t>* k_img,
+                std::vector<uint8_t>* v_img, std::vector<std::vector<int32_t>>* pages,
+                std::vector<int32_t>* page_indices) {
+  LbData d;
+  const int B = static_cast<int>(c.kv_lens.size());
+  lb::LowBitCodec codec;
+  KOPS_EXPECT_OK(lb::lowbit_codec(c.kf, c.vf, c.D, seed, &codec), "lowbit_codec");
+  lb::LowBitTables tb;
+  KOPS_EXPECT_OK(lb::lowbit_resolve(codec, &tb), "lowbit_resolve");
+  const int ek = tb.k.entry_bytes, ev = tb.v.entry_bytes;
+  KOPS_TEST_CHECK(ek == lb::lowbit_entry_bytes(codec, true));
+  KOPS_TEST_CHECK(ev == lb::lowbit_entry_bytes(codec, false));
+
+  LbRefSide rk, rv;
+  lb_make_ref(tb.k, c.D, seed, &rk);
+  lb_make_ref(tb.v, c.D, seed, &rv);
+
+  d.qo_indptr.assign(B + 1, 0);
+  d.kv_indptr.assign(B + 1, 0);
+  for (int b = 0; b < B; ++b) {
+    d.qo_indptr[b + 1] = d.qo_indptr[b] + (c.prefill ? c.q_len : c.q_len);
+    d.kv_indptr[b + 1] = d.kv_indptr[b] + c.kv_lens[b];
+  }
+  d.total_q = d.qo_indptr[B];
+  d.total_kv = d.kv_indptr[B];
+
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> u(-1.0f, 1.0f);
+  d.q.resize(static_cast<size_t>(d.total_q) * c.Hq * c.D);
+  for (float& x : d.q) x = lb_round(c.dt, u(rng));
+  d.alibi.resize(c.alibi ? c.Hq : 0);
+  for (float& x : d.alibi) x = std::pow(2.0f, -8.0f * (static_cast<int>(&x - d.alibi.data()) + 1) / c.Hq);
+  d.sinks.resize(c.nsink > 0 ? c.Hq : 0);
+  if (!d.sinks.empty()) {
+    std::uniform_real_distribution<float> us(0.0f, 2.0f);
+    for (float& x : d.sinks) x = us(rng);
+  }
+
+  // Pages, shuffled (ids are not contiguous in request order).
+  pages->assign(B, {});
+  int num_pages = 0;
+  for (int b = 0; b < B; ++b) {
+    const int np = (c.kv_lens[b] + c.page - 1) / c.page;
+    num_pages += np;
+  }
+  num_pages += 2;
+  page_indices->resize(num_pages);
+  for (int i = 0; i < num_pages; ++i) (*page_indices)[i] = i;
+  std::shuffle(page_indices->begin(), page_indices->end(), rng);
+  int at = 0;
+  for (int b = 0; b < B; ++b) {
+    const int np = (c.kv_lens[b] + c.page - 1) / c.page;
+    for (int i = 0; i < np; ++i) (*pages)[b].push_back((*page_indices)[at++]);
+  }
+
+  k_img->assign(static_cast<size_t>(num_pages) * c.page * c.Hkv * ek, 0);
+  v_img->assign(static_cast<size_t>(num_pages) * c.page * c.Hkv * ev, 0);
+  d.k.resize(static_cast<size_t>(d.total_kv) * c.Hkv * c.D);
+  d.v.resize(d.k.size());
+  std::vector<float> xk(c.D), xv(c.D);
+  for (int b = 0; b < B; ++b) {
+    for (int t = 0; t < c.kv_lens[b]; ++t) {
+      const int pg = (*pages)[b][t / c.page], off = t % c.page;
+      const int64_t row = d.kv_indptr[b] + t;
+      for (int h = 0; h < c.Hkv; ++h) {
+        for (int i = 0; i < c.D; ++i) {
+          xk[i] = lb_round(c.dt, u(rng) * 0.5f);
+          xv[i] = lb_round(c.dt, u(rng) * 0.5f);
+        }
+        const std::vector<uint8_t> rk_rec = lb_encode(xk, rk);
+        const std::vector<uint8_t> rv_rec = lb_encode(xv, rv);
+        const int64_t ko = lb_off(pg, off, h, c.page, c.Hkv, ek, c.hnd);
+        const int64_t vo = lb_off(pg, off, h, c.page, c.Hkv, ev, c.hnd);
+        std::memcpy(k_img->data() + ko, rk_rec.data(), rk_rec.size());
+        std::memcpy(v_img->data() + vo, rv_rec.data(), rv_rec.size());
+        const std::vector<float> kd = lb_decode(rk_rec.data(), rk);
+        const std::vector<float> vd = lb_decode(rv_rec.data(), rv);
+        for (int i = 0; i < c.D; ++i) {
+          d.k[(row * c.Hkv + h) * c.D + i] = c.prefill ? __half2float(__float2half_rn(kd[i])) : kd[i];
+          d.v[(row * c.Hkv + h) * c.D + i] = c.prefill ? __half2float(__float2half_rn(vd[i])) : vd[i];
+        }
+      }
+    }
+  }
+
+  std::vector<double> q64(d.q.begin(), d.q.end()), k64(d.k.begin(), d.k.end()),
+      v64(d.v.begin(), d.v.end()), al64(d.alibi.begin(), d.alibi.end()),
+      sk64(d.sinks.begin(), d.sinks.end());
+  d.o_ref.assign(static_cast<size_t>(d.total_q) * c.Hq * c.D, 0.0);
+  d.lse_ref.assign(static_cast<size_t>(d.total_q) * c.Hq, 0.0);
+  kops::ref::AttentionRefArgs ra;
+  ra.q = q64.data();
+  ra.k = k64.data();
+  ra.v = v64.data();
+  ra.qo_indptr = d.qo_indptr.data();
+  ra.kv_indptr = d.kv_indptr.data();
+  ra.batch = B;
+  ra.q_heads = c.Hq;
+  ra.kv_heads = c.Hkv;
+  ra.head_dim_qk = ra.head_dim_vo = c.D;
+  ra.sm_scale = 1.0 / std::sqrt(static_cast<double>(c.D));
+  ra.logits_softcap = c.softcap;
+  ra.window_left = c.wl;
+  ra.window_right = c.wr;
+  ra.chunk_size = c.chunk;
+  ra.num_sink_tokens = c.nsink;
+  ra.sink_logits = d.sinks.empty() ? nullptr : sk64.data();
+  ra.alibi_slopes = d.alibi.empty() ? nullptr : al64.data();
+  ra.causal = c.mask == MaskMode::kCausal;
+  ra.o = d.o_ref.data();
+  ra.lse = d.lse_ref.data();
+  KOPS_EXPECT_OK(kops::ref::attention_f64(ra), "attention_f64 lowbit");
+  return d;
+}
+
+struct LbRun {
+  std::vector<float> o, lse;
+  bool ok = false;
+  bool split = false;
+};
+
+LbRun lb_run(const LbCase& c, const LbData& d, const std::vector<uint8_t>& k_img,
+             const std::vector<uint8_t>& v_img, const std::vector<std::vector<int32_t>>& pages,
+             bool graph_replay = false) {
+  LbRun res;
+  const int B = static_cast<int>(c.kv_lens.size());
+  lb::LowBitCodec codec;
+  KOPS_EXPECT_OK(lb::lowbit_codec(c.kf, c.vf, c.D, c.seed, &codec), "lowbit_codec");
+  lb::LowBitTables tb;
+  KOPS_EXPECT_OK(lb::lowbit_resolve(codec, &tb), "lowbit_resolve");
+
+  DevArray<uint16_t> q(d.q.size()), o(static_cast<size_t>(d.total_q) * c.Hq * c.D);
+  DevArray<float> lse(static_cast<size_t>(d.total_q) * c.Hq);
+  DevArray<uint8_t> k(k_img.size()), v(v_img.size());
+  std::vector<uint16_t> q_host(d.q.size());
+  for (size_t i = 0; i < d.q.size(); ++i) {
+    q_host[i] = c.dt == DType::kFloat16 ? __half_as_ushort(__float2half_rn(d.q[i]))
+                                        : __bfloat16_as_ushort(__float2bfloat16_rn(d.q[i]));
+  }
+  upload(q.p, q_host.data(), q_host.size() * 2);
+  upload(k.p, k_img.data(), k_img.size());
+  upload(v.p, v_img.data(), v_img.size());
+  cudaMemset(o.p, 0xFF, o.n * 2);
+  cudaMemset(lse.p, 0xFF, lse.n * 4);
+
+  std::vector<int32_t> page_indptr(B + 1, 0), last_len(B), seq(c.kv_lens.begin(), c.kv_lens.end());
+  std::vector<int32_t> flat;
+  int max_pages = 1;
+  for (int b = 0; b < B; ++b) {
+    page_indptr[b + 1] = page_indptr[b] + static_cast<int32_t>(pages[b].size());
+    for (int32_t p : pages[b]) flat.push_back(p);
+    last_len[b] = c.kv_lens[b] == 0 ? 0 : (c.kv_lens[b] - 1) % c.page + 1;
+    max_pages = std::max<int>(max_pages, static_cast<int>(pages[b].size()));
+  }
+  std::vector<int32_t> bt(static_cast<size_t>(B) * max_pages, 0);
+  for (int b = 0; b < B; ++b)
+    for (size_t i = 0; i < pages[b].size(); ++i) bt[static_cast<size_t>(b) * max_pages + i] = pages[b][i];
+  DevArray<int32_t> d_pi(std::max<size_t>(flat.size(), 1)), d_pp(B + 1), d_last(std::max(B, 1)),
+      d_bt(std::max<size_t>(bt.size(), 1)), d_seq(std::max(B, 1)), d_qo(B + 1), d_kv(B + 1);
+  upload(d_pi.p, flat.data(), flat.size() * 4);
+  upload(d_pp.p, page_indptr.data(), page_indptr.size() * 4);
+  upload(d_last.p, last_len.data(), last_len.size() * 4);
+  upload(d_bt.p, bt.data(), bt.size() * 4);
+  upload(d_seq.p, seq.data(), seq.size() * 4);
+  upload(d_qo.p, d.qo_indptr.data(), d.qo_indptr.size() * 4);
+  upload(d_kv.p, d.kv_indptr.data(), d.kv_indptr.size() * 4);
+
+  kops::kv::PagedKVDesc kd{};
+  kd.k_data = k.p;
+  kd.v_data = v.p;
+  kd.k_dtype = kd.v_dtype = DType::kUInt8;
+  kd.k_codec = kd.v_codec = kops::kv::KVCodec::kLowBitWHT;
+  kd.layout = c.hnd ? kops::kv::KVLayout::kHND : kops::kv::KVLayout::kNHD;
+  kd.page_size = c.page;
+  kd.num_kv_heads = c.Hkv;
+  kd.head_dim_k = kd.head_dim_v = c.D;
+  kd.entry_bytes = tb.k.entry_bytes;
+  kd.stride_unit = kops::StrideUnit::kByte;
+  const int64_t ps = c.page;
+  kd.k_stride_page = ps * c.Hkv * tb.k.entry_bytes;
+  kd.k_stride_token = c.hnd ? tb.k.entry_bytes : static_cast<int64_t>(c.Hkv) * tb.k.entry_bytes;
+  kd.k_stride_head = c.hnd ? ps * tb.k.entry_bytes : tb.k.entry_bytes;
+  kd.v_stride_page = ps * c.Hkv * tb.v.entry_bytes;
+  kd.v_stride_token = c.hnd ? tb.v.entry_bytes : static_cast<int64_t>(c.Hkv) * tb.v.entry_bytes;
+  kd.v_stride_head = c.hnd ? ps * tb.v.entry_bytes : tb.v.entry_bytes;
+  if (c.block_table) {
+    kd.table_format = kops::kv::PageTableFormat::kBlockTable;
+    kd.block_table = d_bt.p;
+    kd.block_table_stride = max_pages;
+    kd.seq_lens = d_seq.p;
+  } else {
+    kd.table_format = kops::kv::PageTableFormat::kCSR;
+    kd.kv_indptr = d_pp.p;
+    kd.kv_page_indices = d_pi.p;
+    kd.kv_last_page_len = d_last.p;
+  }
+
+  kops::attn::AttentionSpec spec;
+  spec.num_q_heads = c.Hq;
+  spec.num_kv_heads = c.Hkv;
+  spec.head_dim_qk = spec.head_dim_vo = c.D;
+  spec.q_dtype = spec.o_dtype = c.dt;
+  spec.kv_dtype = DType::kUInt8;
+  spec.k_codec = spec.v_codec = kops::kv::KVCodec::kLowBitWHT;
+  spec.kv_layout = kd.layout;
+  spec.page_size = c.page;
+  spec.mask = c.mask;
+  spec.sliding_window = c.wl >= 0 || c.wr >= 0;
+  spec.softcap = c.softcap > 0.0f;
+  spec.alibi = c.alibi;
+  spec.sinks = c.nsink > 0;
+  spec.chunked = c.chunk > 0;
+  spec.return_lse = true;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return res;
+  ctx.compute_units = c.compute_units;
+  ctx.batch_invariant = c.batch_invariant;
+
+  DevArray<float> alibi(std::max<size_t>(d.alibi.size(), 1)),
+      sinks(std::max<size_t>(d.sinks.size(), 1));
+  if (!d.alibi.empty()) upload(alibi.p, d.alibi.data(), d.alibi.size() * 4);
+  if (!d.sinks.empty()) upload(sinks.p, d.sinks.data(), d.sinks.size() * 4);
+  kops::attn::AttentionModifiers mod;
+  mod.sm_scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(c.D)));
+  mod.logits_softcap = c.softcap;
+  mod.window_left = c.wl;
+  mod.window_right = c.wr;
+  mod.chunk_size = c.chunk;
+  mod.num_sink_tokens = c.nsink;
+  mod.alibi_slopes = d.alibi.empty() ? nullptr : alibi.p;
+  mod.sink_logits = d.sinks.empty() ? nullptr : sinks.p;
+
+  kops::attn::AttentionPlan plan;
+  kops::Workspace ws{};
+  int max_kv = 0;
+  for (int x : c.kv_lens) max_kv = std::max(max_kv, x);
+  auto do_plan = [&]() {
+    if (c.prefill) {
+      std::vector<int32_t> qoi(d.qo_indptr.size());
+      for (size_t i = 0; i < qoi.size(); ++i) qoi[i] = d.qo_indptr[i];
+      std::vector<int32_t> kvl(c.kv_lens.begin(), c.kv_lens.end());
+      Tensor qo_t = tensor1d(qoi.data(), DType::kInt32, static_cast<int64_t>(qoi.size()));
+      qo_t.device = -1;
+      Tensor kv_t = tensor1d(kvl.data(), DType::kInt32, static_cast<int64_t>(kvl.size()));
+      kv_t.device = -1;
+      return lb::lowbit_prefill_plan(spec, codec, qo_t, kv_t, ctx, ws, &plan);
+    }
+    return lb::lowbit_decode_plan(spec, codec, B, max_kv, c.q_len, ctx, ws, &plan);
+  };
+  Status s = do_plan();
+  if (s != Status::kWorkspaceTooSmall) {
+    KOPS_EXPECT_STATUS(s, Status::kWorkspaceTooSmall, c.name);
+    return res;
+  }
+  DevArray<unsigned char> persistent(std::max<size_t>(plan.workspace.device_persistent_bytes, 1));
+  DevArray<unsigned char> scratch(std::max<size_t>(plan.workspace.device_scratch_bytes, 1));
+  ws.device_persistent = persistent.p;
+  ws.device_persistent_bytes = plan.workspace.device_persistent_bytes;
+  ws.device_scratch = scratch.p;
+  ws.device_scratch_bytes = plan.workspace.device_scratch_bytes;
+  s = do_plan();
+  KOPS_EXPECT_OK(s, c.name);
+  if (s != Status::kSuccess) return res;
+  res.split = plan.split_kv;
+
+  auto run_once = [&]() {
+    if (c.prefill) {
+      kops::attn::PagedPrefillParams p{};
+      p.q = q.p;
+      p.q_stride_n = static_cast<int64_t>(c.Hq) * c.D;
+      p.q_stride_h = c.D;
+      p.qo_indptr = d_qo.p;
+      p.kv = kd;
+      p.mod = mod;
+      p.o = o.p;
+      p.o_stride_n = static_cast<int64_t>(c.Hq) * c.D;
+      p.o_stride_h = c.D;
+      p.lse = lse.p;
+      p.batch_size = B;
+      p.num_qo_heads = c.Hq;
+      p.num_kv_heads = c.Hkv;
+      p.total_q = d.total_q;
+      return lb::lowbit_prefill_run(plan, p, codec, ws, ctx);
+    }
+    kops::attn::DecodeParams p{};
+    p.q = q.p;
+    p.q_stride_n = static_cast<int64_t>(c.Hq) * c.D;
+    p.q_stride_h = c.D;
+    p.q_len = c.q_len;
+    p.kv = kd;
+    p.mod = mod;
+    p.o = o.p;
+    p.o_stride_n = static_cast<int64_t>(c.Hq) * c.D;
+    p.o_stride_h = c.D;
+    p.lse = lse.p;
+    p.batch_size = B;
+    p.num_qo_heads = c.Hq;
+    p.num_kv_heads = c.Hkv;
+    return lb::lowbit_decode_run(plan, p, codec, ws, ctx);
+  };
+  s = run_once();
+  KOPS_EXPECT_OK(s, c.name);
+  if (s != Status::kSuccess) return res;
+  if (graph_replay) {
+    s = run_once();
+    KOPS_EXPECT_OK(s, c.name);
+  }
+  const cudaError_t err = cudaDeviceSynchronize();
+  if (err != cudaSuccess) {
+    kops_test::record_failure(c.name, cudaGetErrorString(err), __FILE__, __LINE__);
+    return res;
+  }
+  const std::vector<uint16_t> o16 = kops_test::copy_out(o.p, o.n);
+  std::vector<float> got_o(o16.size());
+  for (size_t i = 0; i < o16.size(); ++i) got_o[i] = unpack16(c.dt, o16[i]);
+  res.lse = kops_test::copy_out(lse.p, lse.n);
+  // Determinism: a second launch must be bit-identical.
+  cudaMemset(o.p, 0xFF, o.n * 2);
+  cudaMemset(lse.p, 0xFF, lse.n * 4);
+  KOPS_EXPECT_OK(run_once(), c.name);
+  cudaDeviceSynchronize();
+  const std::vector<uint16_t> o16b = kops_test::copy_out(o.p, o.n);
+  bool same = true;
+  for (size_t i = 0; i < o16.size() && same; ++i) same = o16[i] == o16b[i];
+  const std::vector<float> lse_b = kops_test::copy_out(lse.p, lse.n);
+  for (size_t i = 0; i < res.lse.size() && same; ++i)
+    same = std::memcmp(&res.lse[i], &lse_b[i], 4) == 0;
+  if (!same) kops_test::record_failure(c.name, "non-deterministic output", __FILE__, __LINE__);
+  res.o = std::move(got_o);
+  res.ok = true;
+  return res;
+}
+
+void lb_check(const LbCase& c, const LbData& d, const LbRun& r) {
+  if (!r.ok) return;
+  char what[192];
+  std::snprintf(what, sizeof(what), "%s o", c.name);
+  kops_test::compare(r.o, d.o_ref, c.atol, c.rtol, what);
+  std::snprintf(what, sizeof(what), "%s lse", c.name);
+  kops_test::compare(r.lse, d.lse_ref, c.lse_atol, 1e-5, what);
+  size_t lost = 0;
+  for (size_t i = 0; i < r.o.size(); ++i) lost += std::isfinite(d.o_ref[i]) && !std::isfinite(r.o[i]);
+  for (size_t i = 0; i < r.lse.size(); ++i) lost += !std::isnan(d.lse_ref[i]) && std::isnan(r.lse[i]);
+  if (lost != 0) kops_test::record_failure(c.name, "outputs not written", __FILE__, __LINE__);
+}
+
+void lb_case(const LbCase& c, bool graph_replay = false) {
+  std::vector<uint8_t> k_img, v_img;
+  std::vector<std::vector<int32_t>> pages;
+  std::vector<int32_t> page_ids;
+  const LbData d = lb_build(c, static_cast<uint32_t>(c.seed), &k_img, &v_img, &pages, &page_ids);
+  const LbRun r = lb_run(c, d, k_img, v_img, pages, graph_replay);
+  lb_check(c, d, r);
+}
+
+void test_lowbit_decode() {
+  {
+    LbCase c;
+    c.name = "lowbit decode turbo mse4 d128";
+    c.kv_lens = {64};
+    c.Hq = 4;
+    c.Hkv = 1;
+    c.D = 128;
+    lb_case(c);
+  }
+  {
+    LbCase c;
+    c.name = "lowbit decode uniform3 d64 fp16 window sink";
+    c.dt = DType::kFloat16;
+    c.kf = c.vf = lb::LowBitFormat::kUniform3;
+    c.kv_lens = {301};
+    c.Hq = 8;
+    c.Hkv = 2;
+    c.D = 64;
+    c.page = 32;
+    c.block_table = true;
+    c.wl = 64;
+    c.nsink = 2;
+    lb_case(c);
+  }
+  {
+    LbCase c;
+    c.name = "lowbit decode turbo prod3 d128 block table hnd";
+    c.kf = lb::LowBitFormat::kTurboProd3;
+    c.vf = lb::LowBitFormat::kUniform4;
+    c.page = 32;
+    c.block_table = true;
+    c.hnd = true;
+    c.kv_lens = {130};
+    c.Hq = 8;
+    c.Hkv = 2;
+    lb_case(c);
+  }
+  {
+    LbCase c;
+    c.name = "lowbit decode uniform4 d256 split";
+    c.kf = c.vf = lb::LowBitFormat::kUniform4;
+    c.D = 256;
+    c.kv_lens = {2050};
+    c.Hq = 4;
+    c.Hkv = 1;
+    c.compute_units = 16;
+    lb_case(c, true);
+  }
+}
+
+void test_lowbit_prefill() {
+  {
+    LbCase c;
+    c.name = "lowbit prefill uniform3 d64";
+    c.prefill = true;
+    c.kv_lens = {70};
+    c.q_len = 70;
+    c.Hq = 4;
+    c.Hkv = 1;
+    c.D = 64;
+    c.kf = c.vf = lb::LowBitFormat::kUniform3;
+    lb_case(c, true);
+  }
+  {
+    LbCase c;
+    c.name = "lowbit prefill turbo mse3 d128 window sink softcap alibi";
+    c.prefill = true;
+    c.kv_lens = {130};
+    c.q_len = 64;
+    c.D = 128;
+    c.kf = lb::LowBitFormat::kTurboMse3;
+    c.vf = lb::LowBitFormat::kUniform4;
+    c.wl = 48;
+    c.nsink = 4;
+    c.softcap = 20.0f;
+    c.alibi = true;
+    c.Hq = 8;
+    c.Hkv = 2;
+    c.compute_units = 8;
+    lb_case(c);
+  }
+  {
+    LbCase c;
+    c.name = "lowbit prefill quantized K/V d256 causal";
+    c.prefill = true;
+    c.kv_lens = {257, 33};
+    c.q_len = 64;
+    c.D = 256;
+    c.kf = lb::LowBitFormat::kTurboMse4;
+    c.vf = lb::LowBitFormat::kTurboMse4;
+    c.Hq = 4;
+    c.Hkv = 1;
+    c.compute_units = 8;
+    lb_case(c);
+  }
+  {
+    LbCase c;
+    c.name = "lowbit prefill uniform3 d128 split kv4096";
+    c.prefill = true;
+    c.kv_lens = {4096};
+    c.q_len = 8;
+    c.D = 128;
+    c.kf = c.vf = lb::LowBitFormat::kUniform3;
+    c.Hq = 4;
+    c.Hkv = 1;
+    c.compute_units = 8;
+    lb_case(c);
+  }
+  {
+    LbCase c;
+    c.name = "lowbit prefill turbo prod4 d256 qjl";
+    c.prefill = true;
+    c.kv_lens = {200};
+    c.q_len = 64;
+    c.D = 256;
+    c.kf = lb::LowBitFormat::kTurboProd4;
+    c.vf = lb::LowBitFormat::kUniform4;
+    c.Hq = 4;
+    c.Hkv = 1;
+    lb_case(c);
+  }
+}
+
+/// Store the same values through lowbit_kv_store and decode the records with the fp64 reader.
+void test_lowbit_store() {
+  const int D = 128, Hkv = 2, T = 5, page = 16, pages = 2;
+  const lb::LowBitFormat formats[][2] = {
+      {lb::LowBitFormat::kUniform4, lb::LowBitFormat::kUniform4},
+      {lb::LowBitFormat::kUniform3, lb::LowBitFormat::kUniform4},
+      {lb::LowBitFormat::kTurboMse4, lb::LowBitFormat::kTurboMse4},
+      {lb::LowBitFormat::kTurboMse2, lb::LowBitFormat::kUniform4},
+      {lb::LowBitFormat::kTurboProd3, lb::LowBitFormat::kTurboMse4},
+      {lb::LowBitFormat::kTurboProd2, lb::LowBitFormat::kUniform4},
+  };
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  for (const auto& f : formats) {
+    lb::LowBitCodec codec;
+    KOPS_EXPECT_OK(lb::lowbit_codec(f[0], f[1], D, 99, &codec), "lowbit_codec store");
+    lb::LowBitTables tb;
+    KOPS_EXPECT_OK(lb::lowbit_resolve(codec, &tb), "lowbit_resolve store");
+    LbRefSide rk, rv;
+    lb_make_ref(tb.k, D, 99, &rk);
+    lb_make_ref(tb.v, D, 99, &rv);
+    const int ek = tb.k.entry_bytes, ev = tb.v.entry_bytes;
+
+    DevArray<uint16_t> key(static_cast<size_t>(T) * Hkv * D), val(key.n);
+    DevArray<uint8_t> kb(static_cast<size_t>(pages) * page * Hkv * ek),
+        vb(static_cast<size_t>(pages) * page * Hkv * ev);
+    cudaMemset(kb.p, 0xA5, kb.n);
+    cudaMemset(vb.p, 0x5A, vb.n);
+    std::vector<int64_t> slots(T);
+    for (int t = 0; t < T; ++t) slots[t] = t == 3 ? -1 : t * 2;  // slot 6 unused, slot 8 last
+    DevArray<int64_t> dslots(T);
+    upload(dslots.p, slots.data(), slots.size() * 8);
+
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<float> u(-0.7f, 0.7f);
+    std::vector<float> kf(static_cast<size_t>(T) * Hkv * D), vf(kf.size());
+    std::vector<uint16_t> kh(kf.size()), vh(kf.size());
+    for (size_t i = 0; i < kf.size(); ++i) {
+      kf[i] = __bfloat162float(__float2bfloat16_rn(u(rng)));
+      vf[i] = __bfloat162float(__float2bfloat16_rn(u(rng)));
+      kh[i] = __bfloat16_as_ushort(__float2bfloat16_rn(kf[i]));
+      vh[i] = __bfloat16_as_ushort(__float2bfloat16_rn(vf[i]));
+    }
+    upload(key.p, kh.data(), kh.size() * 2);
+    upload(val.p, vh.data(), vh.size() * 2);
+    Tensor kt = tensor3d(key.p, DType::kBFloat16, T, Hkv, D);
+    Tensor vt = tensor3d(val.p, DType::kBFloat16, T, Hkv, D);
+    Tensor st = tensor1d(dslots.p, DType::kInt64, T);
+    kops::kv::PagedKVDesc d{};
+    d.k_data = kb.p;
+    d.v_data = vb.p;
+    d.k_dtype = d.v_dtype = DType::kUInt8;
+    d.k_codec = d.v_codec = kops::kv::KVCodec::kLowBitWHT;
+    d.layout = kops::kv::KVLayout::kNHD;
+    d.page_size = page;
+    d.num_kv_heads = Hkv;
+    d.head_dim_k = d.head_dim_v = D;
+    d.entry_bytes = ek;
+    d.stride_unit = kops::StrideUnit::kByte;
+    d.k_stride_page = static_cast<int64_t>(page) * Hkv * ek;
+    d.k_stride_token = static_cast<int64_t>(Hkv) * ek;
+    d.k_stride_head = ek;
+    d.v_stride_page = static_cast<int64_t>(page) * Hkv * ev;
+    d.v_stride_token = static_cast<int64_t>(Hkv) * ev;
+    d.v_stride_head = ev;
+    d.table_format = kops::kv::PageTableFormat::kSlotMapping;
+    KOPS_EXPECT_OK(lb::lowbit_kv_store(kt, vt, d, st, codec, ctx), "lowbit_kv_store");
+    cudaDeviceSynchronize();
+    const std::vector<uint8_t> hkb = kops_test::copy_out(kb.p, kb.n);
+    const std::vector<uint8_t> hvb = kops_test::copy_out(vb.p, vb.n);
+    // Untouched slots keep their sentinel bytes.
+    {
+      const int64_t o = lb_off(0, 6 / page == 0 ? 6 % page : 0, 0, page, Hkv, ek, false);
+      for (int i = 0; i < ek; ++i) KOPS_TEST_CHECK(hkb[o + i] == 0xA5);
+    }
+    for (int t = 0; t < T; ++t) {
+      if (slots[t] < 0) continue;
+      const int pg = static_cast<int>(slots[t] / page), off = static_cast<int>(slots[t] % page);
+      for (int h = 0; h < Hkv; ++h) {
+        std::vector<float> xk(D), xv(D);
+        for (int i = 0; i < D; ++i) {
+          xk[i] = kf[(static_cast<size_t>(t) * Hkv + h) * D + i];
+          xv[i] = vf[(static_cast<size_t>(t) * Hkv + h) * D + i];
+        }
+        const int64_t ko = lb_off(pg, off, h, page, Hkv, ek, false);
+        const int64_t vo = lb_off(pg, off, h, page, Hkv, ev, false);
+        const std::vector<float> gk = lb_decode(hkb.data() + ko, rk);
+        const std::vector<float> gv = lb_decode(hvb.data() + vo, rv);
+        std::vector<float> refk = lb_decode(lb_encode(xk, rk).data(), rk);
+        std::vector<float> refv = lb_decode(lb_encode(xv, rv).data(), rv);
+        // The device encoder runs the Hadamard and the scale reduction in fp32 while the
+        // reference uses fp64, so a borderline coordinate may pick an adjacent code. One code
+        // cell (the largest level gap) is the bound; a rotation/sign/stream bug is far larger.
+        auto gap = [](const lb::LowBitSide& s) {
+          const int n = 1 << s.code_bits;
+          float g = 0.0f;
+          for (int i = 0; i + 1 < n; ++i) g = std::max(g, s.levels[i + 1] - s.levels[i]);
+          return g;
+        };
+        const float kscale = tb.k.absmax ? 0.7f / tb.k.levels[(1 << tb.k.code_bits) - 1]
+                                         : 0.7f / std::sqrt(static_cast<float>(D));
+        const float vscale = tb.v.absmax ? 0.7f / tb.v.levels[(1 << tb.v.code_bits) - 1]
+                                         : 0.7f / std::sqrt(static_cast<float>(D));
+        const float ktol = 1.01f * gap(tb.k) * kscale + 1e-4f;
+        const float vtol = 1.01f * gap(tb.v) * vscale + 1e-4f;
+        for (int i = 0; i < D; ++i) {
+          KOPS_TEST_CHECK(std::fabs(gk[i] - refk[i]) <= ktol);
+          KOPS_TEST_CHECK(std::fabs(gv[i] - refv[i]) <= vtol);
+        }
+      }
+    }
+  }
+}
+
+/// Host-only check of the packing-version-1 Lloyd-Max tables: symmetric, ascending, and each
+/// positive centroid is the conditional mean of its cell under the d-dimensional sphere density
+/// f(z) ~ (1 - z^2 / d)^((d-3)/2) on [-sqrt(d), sqrt(d)] (the fixed point printed by
+/// benchmark/compare/lowbit_codebook.py).
+void test_lowbit_codebook() {
+  auto pdf = [](double z, int d) {
+    const double t = 1.0 - z * z / static_cast<double>(d);
+    return t > 0.0 ? std::pow(t, 0.5 * (d - 3)) : 0.0;
+  };
+  auto simpson = [&](double lo, double hi, int d) {  // integral of f and z*f
+    const int n = 8192;
+    const double h = (hi - lo) / n;
+    double s0 = 0.0, s1 = 0.0;
+    for (int i = 0; i <= n; ++i) {
+      const double z = lo + i * h;
+      const double w = (i == 0 || i == n) ? 1.0 : ((i & 1) ? 4.0 : 2.0);
+      const double f = pdf(z, d);
+      s0 += w * f;
+      s1 += w * z * f;
+    }
+    return std::pair<double, double>{s0 * h / 3.0, s1 * h / 3.0};
+  };
+  const int dims[] = {64, 128, 256};
+  const int bits[] = {1, 2, 3, 4};
+  for (int d : dims) {
+    for (int b : bits) {
+      const float* c = nullptr;
+      switch (d * 8 + b) {
+        case 64 * 8 + 1: c = lb::kLloydMax64B1; break;
+        case 64 * 8 + 2: c = lb::kLloydMax64B2; break;
+        case 64 * 8 + 3: c = lb::kLloydMax64B3; break;
+        case 64 * 8 + 4: c = lb::kLloydMax64B4; break;
+        case 128 * 8 + 1: c = lb::kLloydMax128B1; break;
+        case 128 * 8 + 2: c = lb::kLloydMax128B2; break;
+        case 128 * 8 + 3: c = lb::kLloydMax128B3; break;
+        case 128 * 8 + 4: c = lb::kLloydMax128B4; break;
+        case 256 * 8 + 1: c = lb::kLloydMax256B1; break;
+        case 256 * 8 + 2: c = lb::kLloydMax256B2; break;
+        case 256 * 8 + 3: c = lb::kLloydMax256B3; break;
+        case 256 * 8 + 4: c = lb::kLloydMax256B4; break;
+        default: break;
+      }
+      if (c == nullptr) {
+        kops_test::record_failure("lowbit codebook table missing", nullptr, __FILE__, __LINE__);
+        continue;
+      }
+      const int half = 1 << (b - 1);
+      for (int i = 0; i < half; ++i) {
+        KOPS_TEST_CHECK(c[i] > 0.0f);
+        if (i + 1 < half) KOPS_TEST_CHECK(c[i] < c[i + 1]);
+      }
+      const double hi = std::sqrt(static_cast<double>(d));
+      for (int i = 0; i < half; ++i) {
+        // Negative-half cell around -c[i]: lower boundary towards -c[i+1] (or the support end),
+        // upper boundary towards -c[i-1] (or 0 for the innermost cell).
+        const double blo = i + 1 == half ? -hi : 0.5 * (-static_cast<double>(c[i]) - static_cast<double>(c[i + 1]));
+        const double bhi = i == 0 ? 0.0 : 0.5 * (-static_cast<double>(c[i]) - static_cast<double>(c[i - 1]));
+        const auto pm = simpson(blo, bhi, d);
+        KOPS_TEST_CHECK(std::fabs(pm.second / pm.first + static_cast<double>(c[i])) < 2e-4);
+      }
+    }
+  }
+}
+
+void test_lowbit_store_dims() {
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  for (int D : {64, 256}) {
+    lb::LowBitCodec codec;
+    lb::LowBitTables tb;
+    KOPS_EXPECT_OK(lb::lowbit_codec(lb::LowBitFormat::kTurboMse4, lb::LowBitFormat::kUniform4, D, 3,
+                                    &codec),
+                   "store dims codec");
+    KOPS_EXPECT_OK(lb::lowbit_resolve(codec, &tb), "store dims resolve");
+    LbRefSide rk, rv;
+    lb_make_ref(tb.k, D, 3, &rk);
+    lb_make_ref(tb.v, D, 3, &rv);
+    const int ek = tb.k.entry_bytes, ev = tb.v.entry_bytes, page = 16, Hkv = 1, T = 2;
+    DevArray<uint16_t> key(static_cast<size_t>(T) * Hkv * D), val(key.n);
+    DevArray<uint8_t> kb(static_cast<size_t>(page) * Hkv * ek), vb(static_cast<size_t>(page) * Hkv * ev);
+    cudaMemset(kb.p, 0x11, kb.n);
+    cudaMemset(vb.p, 0x22, vb.n);
+    std::mt19937 rng(31);
+    std::uniform_real_distribution<float> u(-0.5f, 0.5f);
+    std::vector<float> kf(key.n), vf(key.n);
+    std::vector<uint16_t> kh(key.n), vh(key.n);
+    for (size_t i = 0; i < key.n; ++i) {
+      kf[i] = __bfloat162float(__float2bfloat16_rn(u(rng)));
+      vf[i] = __bfloat162float(__float2bfloat16_rn(u(rng)));
+      kh[i] = __bfloat16_as_ushort(__float2bfloat16_rn(kf[i]));
+      vh[i] = __bfloat16_as_ushort(__float2bfloat16_rn(vf[i]));
+    }
+    upload(key.p, kh.data(), kh.size() * 2);
+    upload(val.p, vh.data(), vh.size() * 2);
+    std::vector<int64_t> slots = {0, 15};
+    DevArray<int64_t> ds(slots.size());
+    upload(ds.p, slots.data(), slots.size() * 8);
+    Tensor kt = tensor3d(key.p, DType::kBFloat16, T, Hkv, D);
+    Tensor vt = tensor3d(val.p, DType::kBFloat16, T, Hkv, D);
+    Tensor st = tensor1d(ds.p, DType::kInt64, T);
+    kops::kv::PagedKVDesc d{};
+    d.k_data = kb.p;
+    d.v_data = vb.p;
+    d.k_dtype = d.v_dtype = DType::kUInt8;
+    d.k_codec = d.v_codec = kops::kv::KVCodec::kLowBitWHT;
+    d.layout = kops::kv::KVLayout::kHND;
+    d.page_size = page;
+    d.num_kv_heads = Hkv;
+    d.head_dim_k = d.head_dim_v = D;
+    d.entry_bytes = ek;
+    d.stride_unit = kops::StrideUnit::kByte;
+    d.k_stride_page = static_cast<int64_t>(page) * Hkv * ek;
+    d.k_stride_token = ek;
+    d.k_stride_head = static_cast<int64_t>(page) * ek;
+    d.v_stride_page = static_cast<int64_t>(page) * Hkv * ev;
+    d.v_stride_token = ev;
+    d.v_stride_head = static_cast<int64_t>(page) * ev;
+    d.table_format = kops::kv::PageTableFormat::kSlotMapping;
+    KOPS_EXPECT_OK(lb::lowbit_kv_store(kt, vt, d, st, codec, ctx), "store dims");
+    cudaDeviceSynchronize();
+    const std::vector<uint8_t> hkb = kops_test::copy_out(kb.p, kb.n);
+    const std::vector<uint8_t> hvb = kops_test::copy_out(vb.p, vb.n);
+    for (int t = 0; t < T; ++t) {
+      const int off = static_cast<int>(slots[t] % page);
+      const int64_t ko = (off)*ek, vo = (off)*ev;  // HND, Hkv = 1
+      const std::vector<float> gk = lb_decode(hkb.data() + ko, rk);
+      const std::vector<float> gv = lb_decode(hvb.data() + vo, rv);
+      std::vector<float> xk(kf.begin() + t * D, kf.begin() + (t + 1) * D);
+      std::vector<float> xv(vf.begin() + t * D, vf.begin() + (t + 1) * D);
+      const std::vector<float> refk = lb_decode(lb_encode(xk, rk).data(), rk);
+      const std::vector<float> refv = lb_decode(lb_encode(xv, rv).data(), rv);
+      auto gap = [](const lb::LowBitSide& s) {
+        const int n = 1 << s.code_bits;
+        float g = 0.0f;
+        for (int i = 0; i + 1 < n; ++i) g = std::max(g, s.levels[i + 1] - s.levels[i]);
+        return g;
+      };
+      const float kscale = tb.k.absmax ? 0.5f / tb.k.levels[(1 << tb.k.code_bits) - 1]
+                                       : 0.5f / std::sqrt(static_cast<float>(D));
+      const float vscale = tb.v.absmax ? 0.5f / tb.v.levels[(1 << tb.v.code_bits) - 1]
+                                       : 0.5f / std::sqrt(static_cast<float>(D));
+      const float ktol = 1.01f * gap(tb.k) * kscale + 1e-4f;
+      const float vtol = 1.01f * gap(tb.v) * vscale + 1e-4f;
+      for (int i = 0; i < D; ++i) {
+        KOPS_TEST_CHECK(std::fabs(gk[i] - refk[i]) <= ktol);
+        KOPS_TEST_CHECK(std::fabs(gv[i] - refv[i]) <= vtol);
+      }
+    }
+  }
+}
+
+void test_lowbit_contracts() {
+  using F = lb::LowBitFormat;
+  lb::LowBitCodec codec;
+  KOPS_EXPECT_STATUS(lb::lowbit_codec(F::kUniform4, F::kUniform4, 96, 1, &codec),
+                     Status::kUnsupportedShape, "lowbit codec d96");
+  KOPS_EXPECT_STATUS(lb::lowbit_codec(F::kUniform4, F::kUniform4, 128, 1, nullptr),
+                     Status::kInvalidArgument, "lowbit codec null");
+  KOPS_EXPECT_STATUS(lb::lowbit_codec(F::kFP8, F::kUniform4, 128, 1, &codec),
+                     Status::kUnsupportedDtype, "lowbit codec fp8 K");
+  KOPS_EXPECT_STATUS(lb::lowbit_codec(F::kNVFP4, F::kUniform4, 128, 1, &codec),
+                     Status::kUnsupportedDtype, "lowbit codec nvfp4 K");
+  KOPS_EXPECT_STATUS(lb::lowbit_codec(F::kUniform4, F::kTurboProd3, 128, 1, &codec),
+                     Status::kUnsupportedDtype, "lowbit codec TurboProd V");
+  KOPS_EXPECT_OK(lb::lowbit_codec(F::kTurboProd3, F::kUniform4, 128, 0x1234u, &codec),
+                 "lowbit codec prod3");
+  KOPS_TEST_CHECK(codec.k_format == F::kTurboProd3 && codec.v_format == F::kUniform4);
+  KOPS_TEST_CHECK(codec.k_transform == kops::QuantTransform::kSignedHadamard);
+  KOPS_TEST_CHECK(codec.v_transform == kops::QuantTransform::kNone);
+  KOPS_TEST_CHECK(codec.packing_version == lb::kLowBitPackingVersion);
+  KOPS_TEST_CHECK(codec.head_dim == 128 && codec.transform_seed == 0x1234u);
+  lb::LowBitTables tb;
+  KOPS_EXPECT_OK(lb::lowbit_resolve(codec, &tb), "lowbit resolve prod3");
+  KOPS_TEST_CHECK(tb.k.qjl == 1 && tb.k.code_bits == 2 && tb.v.qjl == 0 && tb.v.code_bits == 4);
+  KOPS_TEST_CHECK(lb::lowbit_entry_bytes(codec, true) == 128 * 2 / 8 + 128 / 8 + 8);
+  KOPS_TEST_CHECK(lb::lowbit_entry_bytes(codec, false) == 128 * 4 / 8 + 4);
+  KOPS_EXPECT_STATUS(lb::lowbit_resolve(codec, nullptr), Status::kInvalidArgument, "resolve null");
+  lb::LowBitCodec bad = codec;
+  bad.packing_version = static_cast<uint16_t>(lb::kLowBitPackingVersion + 1);
+  KOPS_EXPECT_STATUS(lb::lowbit_resolve(bad, &tb), Status::kUnsupportedLayout, "resolve version");
+  bad = codec;
+  bad.v_transform = kops::QuantTransform::kSignedHadamard;  // legal, just not the codec default
+  KOPS_EXPECT_OK(lb::lowbit_resolve(bad, &tb), "resolve uniform V rotated");
+  KOPS_TEST_CHECK(tb.v.rotated == 1);
+  KOPS_EXPECT_OK(lb::lowbit_resolve(codec, &tb), "resolve prod3 again");
+
+  // Store contract.
+  LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  lb::LowBitCodec store_codec;
+  lb::LowBitTables store_tb;
+  KOPS_EXPECT_OK(lb::lowbit_codec(F::kUniform4, F::kUniform4, 128, 7, &store_codec),
+                 "store codec");
+  KOPS_EXPECT_OK(lb::lowbit_resolve(store_codec, &store_tb), "store resolve");
+  const int D = 128, Hkv = 1, T = 2;
+  std::vector<uint16_t> kbuf(static_cast<size_t>(T) * Hkv * D, 0), vbuf(kbuf.size(), 0);
+  std::vector<int64_t> slots = {0, 1};
+  DevArray<uint16_t> k(kbuf.size()), v(vbuf.size());
+  DevArray<int64_t> s(slots.size());
+  upload(k.p, kbuf.data(), kbuf.size() * 2);
+  upload(v.p, vbuf.data(), vbuf.size() * 2);
+  upload(s.p, slots.data(), slots.size() * 8);
+  Tensor kt = tensor3d(k.p, DType::kBFloat16, T, Hkv, D);
+  Tensor vt = tensor3d(v.p, DType::kBFloat16, T, Hkv, D);
+  Tensor st = tensor1d(s.p, DType::kInt64, T);
+  const int ek = store_tb.k.entry_bytes, ev = store_tb.v.entry_bytes;
+  DevArray<uint8_t> cache(static_cast<size_t>(16) * 16 * Hkv * std::max(ek, ev));
+  kops::kv::PagedKVDesc d{};
+  d.k_data = cache.p;
+  d.v_data = cache.p;
+  d.k_dtype = d.v_dtype = DType::kUInt8;
+  d.k_codec = d.v_codec = kops::kv::KVCodec::kLowBitWHT;
+  d.layout = kops::kv::KVLayout::kNHD;
+  d.page_size = 16;
+  d.num_kv_heads = Hkv;
+  d.head_dim_k = d.head_dim_v = D;
+  d.entry_bytes = ek;
+  d.stride_unit = kops::StrideUnit::kByte;
+  d.k_stride_page = static_cast<int64_t>(16) * Hkv * ek;
+  d.k_stride_token = static_cast<int64_t>(Hkv) * ek;
+  d.k_stride_head = ek;
+  d.v_stride_page = static_cast<int64_t>(16) * Hkv * ev;
+  d.v_stride_token = static_cast<int64_t>(Hkv) * ev;
+  d.v_stride_head = ev;
+  Tensor f32k = kt;
+  f32k.dtype = DType::kFloat32;
+  KOPS_EXPECT_STATUS(lb::lowbit_kv_store(f32k, vt, d, st, store_codec, ctx),
+                     Status::kUnsupportedDtype, "store f32");
+  Tensor badshape = kt;
+  badshape.shape[2] = 64;
+  KOPS_EXPECT_STATUS(lb::lowbit_kv_store(badshape, vt, d, st, store_codec, ctx),
+                     Status::kUnsupportedShape, "store shape");
+  kops::kv::PagedKVDesc badcache = d;
+  badcache.k_codec = kops::kv::KVCodec::kNative;
+  KOPS_EXPECT_STATUS(lb::lowbit_kv_store(kt, vt, badcache, st, store_codec, ctx),
+                     Status::kUnsupportedDtype, "store cache codec");
+  badcache = d;
+  badcache.entry_bytes = ek + 4;
+  KOPS_EXPECT_STATUS(lb::lowbit_kv_store(kt, vt, badcache, st, store_codec, ctx),
+                     Status::kUnsupportedLayout, "store entry bytes");
+  badcache = d;
+  badcache.k_stride_token = static_cast<int64_t>(Hkv) * ek + 2;  // not a multiple of 4
+  KOPS_EXPECT_STATUS(lb::lowbit_kv_store(kt, vt, badcache, st, store_codec, ctx),
+                     Status::kMisaligned, "store stride");
+  Tensor badslot = st;
+  badslot.shape[0] = 1;
+  KOPS_EXPECT_STATUS(lb::lowbit_kv_store(kt, vt, d, badslot, store_codec, ctx),
+                     Status::kInvalidArgument, "store slot shape");
+  // A zero-token store is a no-op, not an error.
+  Tensor empty_k = kt, empty_v = vt, empty_s = st;
+  empty_k.shape[0] = empty_v.shape[0] = empty_s.shape[0] = 0;
+  KOPS_EXPECT_OK(lb::lowbit_kv_store(empty_k, empty_v, d, empty_s, store_codec, ctx), "store T=0");
+
+  // Plan contract.
+  kops::attn::AttentionSpec spec;
+  spec.num_q_heads = 4;
+  spec.num_kv_heads = 1;
+  spec.head_dim_qk = spec.head_dim_vo = D;
+  spec.q_dtype = spec.o_dtype = DType::kBFloat16;
+  spec.kv_dtype = DType::kUInt8;
+  spec.k_codec = spec.v_codec = kops::kv::KVCodec::kLowBitWHT;
+  spec.kv_layout = kops::kv::KVLayout::kNHD;
+  spec.page_size = 16;
+  spec.mask = kops::attn::MaskMode::kCausal;
+  spec.return_lse = true;
+  kops::attn::AttentionPlan plan;
+  kops::Workspace ws{};
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(spec, codec, 1, 16, 0, ctx, ws, &plan),
+                     Status::kInvalidArgument, "decode q_len 0");
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(spec, codec, 1, 16, 9, ctx, ws, &plan),
+                     Status::kInvalidArgument, "decode q_len 9");
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(spec, codec, 0, 16, 1, ctx, ws, &plan),
+                     Status::kInvalidArgument, "decode max_batch 0");
+  kops::attn::AttentionSpec custom = spec;
+  custom.mask = kops::attn::MaskMode::kCustom;
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(custom, codec, 1, 16, 1, ctx, ws, &plan),
+                     Status::kUnsupportedShape, "decode custom mask");
+  kops::attn::AttentionSpec fp8tc = spec;
+  fp8tc.fp8_tensor_core = true;
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(fp8tc, codec, 1, 16, 1, ctx, ws, &plan),
+                     Status::kUnsupportedDtype, "decode fp8 compute");
+  kops::attn::AttentionSpec badkv = spec;
+  badkv.kv_dtype = DType::kBFloat16;
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(badkv, codec, 1, 16, 1, ctx, ws, &plan),
+                     Status::kUnsupportedDtype, "decode kv dtype");
+  badkv = spec;
+  badkv.head_dim_qk = badkv.head_dim_vo = 96;
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(badkv, codec, 1, 16, 1, ctx, ws, &plan),
+                     Status::kUnsupportedShape, "decode d96");
+  badkv = spec;
+  badkv.num_q_heads = 6;
+  badkv.num_kv_heads = 4;
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(badkv, codec, 1, 16, 1, ctx, ws, &plan),
+                     Status::kUnsupportedShape, "decode GQA");
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(spec, codec, 1, 16, 1, ctx, ws, nullptr),
+                     Status::kInvalidArgument, "decode null plan");
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_plan(spec, codec, 1, 16, 1, ctx, ws, &plan),
+                     Status::kWorkspaceTooSmall, "decode empty workspace");
+  KOPS_TEST_CHECK(plan.workspace.device_persistent_bytes > 0);
+  kops::attn::DecodeParams dp{};
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_run(plan, dp, codec, ws, ctx),
+                     Status::kInvalidArgument, "decode run bad plan");
+
+  // Prefill plan contract (host int32 tensors).
+  std::vector<int32_t> qo = {0, 4}, kvl = {16};
+  Tensor qot = tensor1d(qo.data(), DType::kInt32, 2), kvt = tensor1d(kvl.data(), DType::kInt32, 1);
+  qot.device = kvt.device = -1;
+  KOPS_EXPECT_STATUS(lb::lowbit_prefill_plan(spec, codec, qot, kvt, ctx, ws, nullptr),
+                     Status::kInvalidArgument, "prefill null plan");
+  KOPS_EXPECT_STATUS(lb::lowbit_prefill_plan(spec, codec, qot, kvt, ctx, ws, &plan),
+                     Status::kWorkspaceTooSmall, "prefill empty workspace");
+  Tensor devqo = qot;
+  devqo.device = 0;
+  KOPS_EXPECT_STATUS(lb::lowbit_prefill_plan(spec, codec, devqo, kvt, ctx, ws, &plan),
+                     Status::kInvalidArgument, "prefill device qo");
+  std::vector<int32_t> badqo = {1, 4};
+  Tensor badqot = tensor1d(badqo.data(), DType::kInt32, 2);
+  badqot.device = -1;
+  KOPS_EXPECT_STATUS(lb::lowbit_prefill_plan(spec, codec, badqot, kvt, ctx, ws, &plan),
+                     Status::kInvalidArgument, "prefill qo[0]");
+  std::vector<int32_t> negkv = {-1};
+  Tensor negkvt = tensor1d(negkv.data(), DType::kInt32, 1);
+  negkvt.device = -1;
+  KOPS_EXPECT_STATUS(lb::lowbit_prefill_plan(spec, codec, qot, negkvt, ctx, ws, &plan),
+                     Status::kInvalidArgument, "prefill negative kv");
+  kops::attn::PagedPrefillParams pp{};
+  KOPS_EXPECT_STATUS(lb::lowbit_prefill_run(plan, pp, codec, ws, ctx),
+                     Status::kInvalidArgument, "prefill run bad plan");
+
+  // The plan is tied to its codec: switching K format invalidates it.
+  lb::LowBitCodec other;
+  KOPS_EXPECT_OK(lb::lowbit_codec(F::kUniform3, F::kUniform4, D, 0x1234u, &other),
+                 "lowbit codec other");
+  kops::Workspace empty{};
+  KOPS_EXPECT_STATUS(lb::lowbit_decode_run(plan, dp, other, empty, ctx),
+                     Status::kInvalidArgument, "decode run foreign plan");
+  KOPS_EXPECT_STATUS(lb::lowbit_prefill_run(plan, pp, other, empty, ctx),
+                     Status::kPlanInvalidated, "prefill run foreign plan");
+}
+
 }  // namespace
 
 int main() {
   LaunchContext probe{};
   if (!kops_test::make_context(&probe)) return 77;
+
+  // Focused run for compute-sanitizer / debugging the experimental B17 paths.
+  if (std::getenv("KOPS_TEST_ONLY_LOWBIT") != nullptr) {
+    test_lowbit_codebook();
+    test_lowbit_store();
+    test_lowbit_store_dims();
+    test_lowbit_decode();
+    test_lowbit_prefill();
+    test_lowbit_contracts();
+    return kops_test::finish("test_merge --lowbit");
+  }
 
   test_merge_state_take_a_and_one_inf();
   test_merge_state_row_mask();
@@ -2507,5 +3530,11 @@ int main() {
   test_decode_modifiers_and_caches();
   test_decode_split_dynamic();
   test_prefill_contracts();
+  test_lowbit_codebook();
+  test_lowbit_store();
+  test_lowbit_store_dims();
+  test_lowbit_decode();
+  test_lowbit_prefill();
+  test_lowbit_contracts();
   return kops_test::finish("test_merge");
 }

@@ -1,0 +1,429 @@
+{
+ "$schema": "manifest.schema.json",
+ "version": 1,
+ "generated_by": "kernel-ops",
+ "source_commit": "pending",
+ "generated_at": "2026-11-10T00:00:00Z",
+ "notes": "Initial manifest. All cases are planned: no .kopsgold files or hashes exist yet. Large 1M cases are output-only and regenerate their KV/input from seed; no 656 MB input cache is stored. The layer* cases document the P8 layer-conformance vectors of tests/unit/test_conformance.cc: that test computes its expected values at runtime from the fp64 oracle (kept in the test TU, because csrc/reference has no gemm/route/permute entry points yet), so no .kopsgold file is committed for them. See tests/golden/README.md.",
+ "cases": [
+  {
+   "id": "attention.decode.sm90a.1m.fp16",
+   "op": "attention.decode",
+   "dtype": "fp16",
+   "shapes": {
+    "q": [
+     1,
+     64,
+     128
+    ],
+    "kv": [
+     1,
+     1048576,
+     2,
+     128
+    ],
+    "output": [
+     1,
+     1,
+     64,
+     128
+    ],
+    "output_lse": [
+     1,
+     1,
+     64
+    ]
+   },
+   "codec": "mla_fp8_ds_v41",
+   "topk": 0,
+   "sink": 0.0,
+   "seed": 20261110,
+   "golden": "cases/attention.decode.sm90a.1m.fp16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.002,
+    "rtol": 0.02,
+    "lse_atol": 0.01
+   },
+   "tier": "full",
+   "on_demand_input": true,
+   "has_lse": true,
+   "status": "planned",
+   "notes": "1M-token KV is generated deterministically from the seed on the target GPU. The golden file will store output and LSE only; no KV cache bytes are committed or copied into the kit."
+  },
+  {
+   "id": "norm.rms_norm.sm100a.512x7168.bf16",
+   "op": "rms_norm",
+   "dtype": "bf16",
+   "shapes": {
+    "input": [
+     512,
+     7168
+    ],
+    "weight": [
+     7168
+    ],
+    "output": [
+     512,
+     7168
+    ]
+   },
+   "codec": "native",
+   "topk": 0,
+   "sink": 0.0,
+   "seed": 42,
+   "golden": "cases/norm.rms_norm.sm100a.512x7168.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.008,
+    "rtol": 0.004
+   },
+   "tier": "standard",
+   "on_demand_input": false,
+   "has_lse": false,
+   "status": "planned",
+   "notes": "stored_output mode: caller supplies the deterministic input; the golden file will store the BF16 output only."
+  },
+  {
+   "id": "attention.merge_state.sm100a.smoke.fp32",
+   "op": "merge_state",
+   "dtype": "fp32",
+   "shapes": {
+    "state": [
+     2,
+     64,
+     128
+    ],
+    "lse": [
+     2,
+     64
+    ],
+    "output": [
+     64,
+     128
+    ],
+    "output_lse": [
+     64
+    ]
+   },
+   "codec": "native",
+   "topk": 0,
+   "sink": 0.0,
+   "seed": 7,
+   "golden": "cases/attention.merge_state.sm100a.smoke.fp32.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 1e-05,
+    "rtol": 1e-05,
+    "lse_atol": 1e-05
+   },
+   "tier": "smoke",
+   "on_demand_input": true,
+   "has_lse": true,
+   "status": "planned",
+   "notes": "Small smoke case for the merge_state contract; inputs are regenerated from the seed."
+  },
+  {
+   "id": "layer1.embed_norm_gemv_residual.sm120a.bf16",
+   "op": "layer1.embed_norm_gemv_residual",
+   "dtype": "bf16",
+   "shapes": {
+    "tokens": [
+     4
+    ],
+    "embed": [
+     64,
+     64
+    ],
+    "output": [
+     4,
+     64
+    ]
+   },
+   "codec": "native",
+   "topk": 0,
+   "sink": 0.0,
+   "seed": 4097,
+   "golden": "cases/layer1.embed_norm_gemv_residual.sm120a.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.008,
+    "rtol": 0.02
+   },
+   "tier": "smoke",
+   "on_demand_input": true,
+   "has_lse": false,
+   "status": "planned",
+   "notes": "ROADMAP 3.5 layer 1 (embedding > rms_norm > GEMV/dense GEMM > residual, captured in a CUDA graph). First version: tests/unit/test_conformance.cc regenerates the inputs with SplitMix64 (seed 0x1001..) and evaluates the fp64 oracle at runtime, so no .kopsgold is committed. A future stored_output case would pin the same numbers."
+  },
+  {
+   "id": "layer2.moe_route_permute_fp8_gemv.sm120a.bf16",
+   "op": "layer2.moe_route_permute_fp8_gemv",
+   "dtype": "bf16",
+   "shapes": {
+    "tokens": [
+     4
+    ],
+    "experts": [
+     8
+    ],
+    "topk": [
+     2
+    ],
+    "output": [
+     4,
+     64
+    ]
+   },
+   "codec": "fp8_per_tensor",
+   "topk": 2,
+   "sink": 0.0,
+   "seed": 8193,
+   "golden": "cases/layer2.moe_route_permute_fp8_gemv.sm120a.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.02,
+    "rtol": 0.02
+   },
+   "tier": "smoke",
+   "on_demand_input": true,
+   "has_lse": false,
+   "status": "planned",
+   "notes": "Layer 2: softmax routing (top-2), align_block_size/permute, grouped FP8 expert GEMV (e4m3 weights, one scale per expert), unpermute+reduce. Expected value computed at runtime in fp64 by test_conformance.cc."
+  },
+  {
+   "id": "layer3.w4a16_sink_swa_chunked.sm120a.bf16",
+   "op": "layer3.w4a16_sink_swa_chunked",
+   "dtype": "bf16",
+   "shapes": {
+    "weight_only_output": [
+     4,
+     64
+    ],
+    "decode_output": [
+     4,
+     64
+    ],
+    "prefill_output": [
+     16,
+     4,
+     64
+    ],
+    "output": [
+     4,
+     64
+    ]
+   },
+   "codec": "native",
+   "topk": 0,
+   "sink": 0.3,
+   "seed": 12289,
+   "golden": "cases/layer3.w4a16_sink_swa_chunked.sm120a.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "lse_atol": 0.004
+   },
+   "tier": "standard",
+   "on_demand_input": true,
+   "has_lse": true,
+   "status": "planned",
+   "notes": "Layer 3: GPTQ W4A16 weight-only GEMV, paged decode with a 32-token sliding window and a learned sink, and a chunked (chunk=8) causal prefill with a full-causal control. Expected value computed at runtime in fp64."
+  },
+  {
+   "id": "layer4.kda_mla_nope_top8.sm120a.bf16",
+   "op": "layer4.kda_mla_nope_top8",
+   "dtype": "bf16",
+   "shapes": {
+    "kda_output": [
+     128,
+     2,
+     64
+    ],
+    "kda_state": [
+     2,
+     64,
+     64
+    ],
+    "mla_output": [
+     1,
+     2,
+     512
+    ],
+    "topk_ids": [
+     3,
+     8
+    ],
+    "output": [
+     1,
+     2,
+     512
+    ]
+   },
+   "codec": "native",
+   "topk": 8,
+   "sink": 0.0,
+   "seed": 16641,
+   "golden": "cases/layer4.kda_mla_nope_top8.sm120a.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "lse_atol": 0.004
+   },
+   "tier": "standard",
+   "on_demand_input": true,
+   "has_lse": true,
+   "status": "planned",
+   "notes": "Layer 4: KDA chunked prefill with a 64-token prefix state snapshot, MLA NoPE decode over a latent cache, and DeepSeek-style top-8 sigmoid routing with a selection bias. Expected value computed at runtime in fp64."
+  },
+  {
+   "id": "layer5.rejection_tree.sm120a.fp32",
+   "op": "layer5.rejection_tree",
+   "dtype": "fp32",
+   "shapes": {
+    "emitted_ids": [
+     256,
+     5
+    ],
+    "tree_out": [
+     2,
+     4
+    ],
+    "output": [
+     2,
+     4
+    ]
+   },
+   "codec": "native",
+   "topk": 0,
+   "sink": 0.0,
+   "seed": 20481,
+   "golden": "cases/layer5.rejection_tree.sm120a.fp32.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.0,
+    "rtol": 0.0
+   },
+   "tier": "standard",
+   "on_demand_input": true,
+   "has_lse": false,
+   "status": "planned",
+   "notes": "Layer 5: rejection sampling with a chi-square check over 96 launches (distribution) plus determinism, and an exact greedy tree-verification path. Integer outputs: exact comparison."
+  },
+  {
+   "id": "layer7.tp2_tp4_virtual.sm120a.bf16",
+   "op": "layer7.tp2_tp4_virtual",
+   "dtype": "fp32",
+   "shapes": {
+    "tp2_output": [
+     4,
+     32
+    ],
+    "tp4_output": [
+     4,
+     32
+    ],
+    "output": [
+     4,
+     32
+    ]
+   },
+   "codec": "native",
+   "topk": 0,
+   "sink": 0.0,
+   "seed": 24577,
+   "golden": "cases/layer7.tp2_tp4_virtual.sm120a.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 1e-05,
+    "rtol": 1e-05
+   },
+   "tier": "standard",
+   "on_demand_input": true,
+   "has_lse": false,
+   "status": "planned",
+   "notes": "Layer 7: one column-parallel TP linear at TP 2 and TP 4 over virtual ranks (K shards + allreduce on one device). fp32 accumulator output compared against the fp64 full-K GEMM."
+  },
+  {
+   "id": "layer9.indexer_topk_sparse_mla.sm120a.bf16",
+   "op": "layer9.indexer_topk_sparse_mla",
+   "dtype": "bf16",
+   "shapes": {
+    "logits": [
+     2,
+     640
+    ],
+    "indices": [
+     2,
+     512
+    ],
+    "output": [
+     2,
+     2,
+     512
+    ]
+   },
+   "codec": "native",
+   "topk": 512,
+   "sink": 0.0,
+   "seed": 28673,
+   "golden": "cases/layer9.indexer_topk_sparse_mla.sm120a.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 0.02,
+    "rtol": 0.02,
+    "lse_atol": 0.004
+   },
+   "tier": "standard",
+   "on_demand_input": true,
+   "has_lse": true,
+   "status": "planned",
+   "notes": "Layer 9 (DSA): lightning indexer -> exact top-512 -> sparse MLA. On SM120a the indexer padding contract and the sparse MLA output currently fail their own unit tests, so test_conformance reports them as known defects instead of committing a golden."
+  },
+  {
+   "id": "layer10.mhc_hash_v41.sm120a.bf16",
+   "op": "layer10.mhc_hash_v41",
+   "dtype": "bf16",
+   "shapes": {
+    "mhc_pre": [
+     3,
+     64
+    ],
+    "mhc_post": [
+     3,
+     2,
+     64
+    ],
+    "topk_ids": [
+     5,
+     2
+    ],
+    "v41_record": [
+     2,
+     528
+    ],
+    "output": [
+     3,
+     64
+    ]
+   },
+   "codec": "mla_fp8_ds_v41",
+   "topk": 2,
+   "sink": 0.0,
+   "seed": 32769,
+   "golden": "cases/layer10.mhc_hash_v41.sm120a.bf16.kopsgold",
+   "sha256": null,
+   "tolerance": {
+    "atol": 1e-05,
+    "rtol": 1e-05
+   },
+   "tier": "standard",
+   "on_demand_input": true,
+   "has_lse": false,
+   "status": "planned",
+   "notes": "Layer 10: mHC stream expand/head/pre/post, hash routing against an explicit table, and the DeepSeek-V4.1 528 B KV record (16 tiles of 32, inline UE8M0 scales) verified byte for byte. CSA/HCA (kv_compress / compressed_attention) and block_select have declarations but no body yet, so they are reported as gaps."
+  }
+ ]
+}

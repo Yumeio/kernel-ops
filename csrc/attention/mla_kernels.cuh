@@ -23,6 +23,10 @@ struct MLADecodeParams {
   void* o;                         // [B * q_len, H, kv_lora_rank]
   int64_t o_stride_n, o_stride_h;
   float* lse;                      // [B * q_len, H] or null
+  // Kimi K3 gated MLA: o *= sigmoid(gate) when gate is non-null. Gate has the same shape as o.
+  const void* output_gate = nullptr;
+  int64_t gate_stride_n = 0, gate_stride_h = 0;
+  DType gate_dtype = DType::kBFloat16;
   SplitKVBuffers split;
   const int32_t* tile_scheduler_metadata;  // [num_sm_parts, 8] from mla_get_metadata_kernel (FlashMLA style)
   const int32_t* num_splits;       // [B + 1]

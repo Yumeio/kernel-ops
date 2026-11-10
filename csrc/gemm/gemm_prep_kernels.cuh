@@ -41,8 +41,27 @@ __global__ void glu_weight_interleave_kernel(
     const int dst_interleave);
 
 /**
+ * Layout atom of a Machete prepacked weight (machete_prepack_kernel / gemm::machete_prepack).
+ * The prepacked block layout is derived from the MMA atom the Machete mainloop issues
+ * (machete_prepacked_layout.cuh: PrepackedLayoutBTemplate::PPBlockShape_NK = 128 x 64, thrfrg_A of
+ * TiledMma, plus the FrgV interleave that W4A16 uses for its prmt upconvert), so the atom must be
+ * named by the caller. Values are ABI: append only.
+ */
+enum class MacheteAtomLayout : int32_t {
+  kInt4Mma16 = 0,   // W4A16: 16-bit MMA atom (wgmma k16), packed int4, interleaved 32-element value blocks
+  kInt8Mma16 = 1,   // W8A16: 16-bit MMA atom, int8 weights, plain value order
+  kInt4Mma8 = 2,    // W4A8: 8-bit MMA atom (k32), packed int4, plain value order
+  kInt8Mma8 = 3,    // W8A8: 8-bit MMA atom (k32), int8 weights, plain value order
+};
+
+/**
  * machete_prepack_kernel — pack (u)int4 / (u)int8 weights [N, K] into the Machete (CUTLASS mixed-input
- * SM90) layout for a given atom shape; scales/zeros reordered accordingly.
+ * SM90) layout for a given atom shape. `out_weight` holds the same N * K elements as `weight`, permuted:
+ * blocks of 128 x 64 elements, block (n_tile, k_tile) in column-major order over (n_tile, k_tile), each
+ * block permuted by the atom's thrfrg/value-order layout (see gemm_prep.cu for the exact bit fields).
+ * N must be a multiple of 128 and K a multiple of 64 (PPBlockShape_NK).
+ * Requires atom_layout_id to agree with weight_bits: kInt4Mma16 / kInt4Mma8 -> 4, kInt8Mma16 /
+ * kInt8Mma8 -> 8.
  */
 __global__ void machete_prepack_kernel(
     void* __restrict__ out_weight,

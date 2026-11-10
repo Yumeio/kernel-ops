@@ -117,6 +117,33 @@ Status attention_f64(const AttentionRefArgs& args);
 Status merge_states_f64(const double* o_states, const double* lse_states, int64_t rows, int64_t n,
                         int64_t heads, int64_t head_dim, double* o, double* lse);
 
+// ---- Low-bit KV records (B17, experimental) -----------------------------------
+/// One side (K or V) of a low-bit codec in fp64: the tables and flags of
+/// kops::experimental::lowbit::LowBitSide plus the transform seed (CONTRACTS §1h).
+struct LowBitRefSide {
+  int32_t dim = 0;                     // 64 / 128 / 256 (Hadamard size)
+  int32_t code_bits = 0;               // 1..4
+  bool qjl = false;                    // sign plane + gain (kTurboProd)
+  bool rotated = true;                 // signed Hadamard before quantization
+  bool absmax = false;                 // scale = absmax / levels[top]; else ||x|| / sqrt(dim)
+  uint32_t seed = 0;
+  uint32_t sign_stream = 0;            // rotation stream; the QJL sketch always uses stream 1
+  const double* levels = nullptr;      // [2^code_bits] ascending
+  const double* thresholds = nullptr;  // [2^code_bits - 1] ascending
+};
+/// Record size: codes (+ signs) + fp32 scale (+ fp32 gain).
+int32_t lowbit_record_bytes(const LowBitRefSide& side);
+/// out = Hn (s .* x) with Hn the Sylvester Hadamard / sqrt(dim) and s the sign stream
+/// (bit set = negate); inverse: out = s .* (Hn x). `out` must not alias `x`.
+Status lowbit_rotate_f64(const double* x, int32_t dim, uint32_t seed, uint32_t stream, bool inverse,
+                         double* out);
+/// Quantize one vector into its record. The scale is rounded to fp32 first and the codes are taken
+/// against that stored scale: code_i = #{thresholds < x_rot[i] / scale} (0 when scale == 0).
+Status lowbit_encode_f64(const double* x, const LowBitRefSide& side, uint8_t* record);
+/// Dequantize a record to the original basis (kTurboProd: including the QJL term, so
+/// <q, decode(record)> is exactly the score the attention kernels estimate).
+Status lowbit_decode_f64(const uint8_t* record, const LowBitRefSide& side, double* x);
+
 // ---- KV cache -----------------------------------------------------------------
 /// Reference page write: slot = page * page_size + offset, slot < 0 skipped.
 /// `entry_bytes`-style packed codecs are NOT modelled here; tests use this for

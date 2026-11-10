@@ -122,6 +122,16 @@ template <typename T, typename W, int BM, int BN, int BK, int NUM_RANKS_PER_NODE
 __global__ void mega_moe_ep_kernel(const __grid_constant__ MegaMoEEPParams params);
 
 // ---- E08 decoder layer (research) -------------------------------------------------------
+/// Host-side parameter block for mega_prepare(MegaKind::kDecoder): the three sub-blocks the
+/// decoder DAG combines. `moe.m > 0` selects the MoE FFN, otherwise the dense `mlp` block runs.
+/// mega_run_decoder() takes the same three blocks separately (no MegaDecoderParams in the hot
+/// path); this aggregate only exists so workspace_requirements/prepare have a typed argument.
+struct MegaDecoderParams {
+  MegaAttentionBlockParams attn;
+  MegaMLPParams mlp;
+  MegaMoELocalParams moe;
+};
+
 /**
  * mega_decoder_layer_kernel — E08 (R, experimental): a full decoder layer (attention block + MLP or
  * MoE + residual / HC / AttnRes mixing) as one DAG; multi-layer chaining bounded by plan capacity.
