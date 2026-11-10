@@ -1040,7 +1040,6 @@ void test_contracts() {
   const Tensor t_ids = tensor1d(d_ids, DType::kInt32, batch);
   const Tensor t_counts = kops_test::tensor2d(d_counts, DType::kInt32, batch, vocab);
   const Tensor t_mask = kops_test::tensor2d(d_mask, DType::kUInt32, batch, words);
-  const Tensor t_temp = tensor1d(d_temp, DType::kFloat32, batch);
   const Tensor t_indptr = tensor1d(d_indptr, DType::kInt32, batch + 1);
   const Tensor t_bias_ids = tensor1d(d_bias_ids, DType::kInt32, 1);
   const Tensor t_values = tensor1d(d_values, DType::kFloat32, 1);
@@ -2626,6 +2625,850 @@ void test_sampling_distribution() {
   kops_test::device_free(d_ids);
 }
 
+// =============================================================================
+// B10 / Mốc 5: speculative decoding (S03)
+// =============================================================================
+std::vector<float> spec_softmax(std::vector<float> logits) {
+  const float m = *std::max_element(logits.begin(), logits.end());
+  double z = 0.0;
+  for (float& x : logits) {
+    x = std::exp(x - m);
+    z += x;
+  }
+  for (float& x : logits) x = static_cast<float>(x / z);
+  return logits;
+}
+
+void fill_prob_rows(float* dst, int rows, int vocab, const std::vector<float>& row) {
+  std::vector<float> all(static_cast<size_t>(rows) * vocab);
+  for (int r = 0; r < rows; ++r) {
+    std::copy(row.begin(), row.end(), all.begin() + static_cast<size_t>(r) * vocab);
+  }
+  kops_test::copy_in(dst, all);
+}
+
+void test_spec_chain_greedy() {
+  constexpr int B = 4, K = 3, V = 8;
+  const int total = 9;
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(total + B) * V);
+  int32_t* d_cu = kops_test::device_alloc<int32_t>(B + 1);
+  int32_t* d_draft = kops_test::device_alloc<int32_t>(total);
+  int32_t* d_argmax = kops_test::device_alloc<int32_t>(total + B);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (K + 1));
+  int32_t* d_num = kops_test::device_alloc<int32_t>(B);
+  uint8_t* d_greedy = kops_test::device_alloc<uint8_t>(B);
+  if (d_tp == nullptr || d_cu == nullptr || d_draft == nullptr || d_argmax == nullptr ||
+      d_out == nullptr || d_num == nullptr || d_greedy == nullptr) {
+    return;
+  }
+  std::vector<float> zeros(static_cast<size_t>(total + B) * V, 0.0f);
+  kops_test::copy_in(d_tp, zeros);
+  kops_test::copy_in(d_cu, std::vector<int32_t>{0, 3, 6, 6, 9});
+  kops_test::copy_in(d_draft, std::vector<int32_t>{1, 2, 3, 1, 2, 3, 0, 0, 0});
+  kops_test::copy_in(d_argmax, std::vector<int32_t>{1, 2, 3, 1, 7, 3, 5, 5, 5, 4, 8, 6, 7});
+  kops_test::copy_in(d_out, std::vector<int32_t>(B * (K + 1), -99));
+  kops_test::copy_in(d_num, std::vector<int32_t>(B, -99));
+  kops_test::copy_in(d_greedy, std::vector<uint8_t>{1, 1, 1, 1});
+
+  kops::sample::SpecVerifyParams p{};
+  p.draft_token_ids = d_draft;
+  p.cu_num_draft = d_cu;
+  p.target_probs = d_tp;
+  p.target_argmax = d_argmax;
+  p.is_greedy = d_greedy;
+  p.output_token_ids = d_out;
+  p.num_accepted = d_num;
+  p.batch_size = B;
+  p.max_draft = K;
+  p.vocab_size = V;
+  p.rng.global_seed = 7;
+  p.rng.stream_id = 1;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  KOPS_EXPECT_OK(kops::sample::rejection_sample(p, ctx), "rejection_sample greedy");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  expect_i32(kops_test::copy_out(d_out, B * (K + 1)),
+             std::vector<int32_t>{1, 2, 3, 4, 1, 7, -1, -1, 6, -1, -1, -1, 5, -1, -1, -1},
+             "chain greedy output");
+  expect_i32(kops_test::copy_out(d_num, B), std::vector<int32_t>{3, 1, 0, 0},
+             "chain greedy accepted");
+
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_cu);
+  kops_test::device_free(d_draft);
+  kops_test::device_free(d_argmax);
+  kops_test::device_free(d_out);
+  kops_test::device_free(d_num);
+  kops_test::device_free(d_greedy);
+}
+
+void test_spec_chain_distribution() {
+  constexpr int B = 2048, K = 4, V = 16, launches = 512;
+  const int total = B * K;
+  std::vector<float> logits(V);
+  fill(logits, 811u, -2.0f, 2.0f);
+  const std::vector<float> p = spec_softmax(logits);
+
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(total + B) * V);
+  float* d_dp = nullptr;  // target-only
+  int32_t* d_cu = kops_test::device_alloc<int32_t>(B + 1);
+  int32_t* d_draft = kops_test::device_alloc<int32_t>(total);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (K + 1));
+  int32_t* d_num = kops_test::device_alloc<int32_t>(B);
+  if (d_tp == nullptr || d_cu == nullptr || d_draft == nullptr || d_out == nullptr ||
+      d_num == nullptr) return;
+  fill_prob_rows(d_tp, total + B, V, p);
+  std::vector<int32_t> cu(B + 1), draft(total);
+  std::mt19937 rng(1919u);
+  std::uniform_int_distribution<int32_t> tok(0, V - 1);
+  for (int b = 0; b <= B; ++b) cu[static_cast<size_t>(b)] = b * K;
+  for (int32_t& x : draft) x = tok(rng);
+  kops_test::copy_in(d_cu, cu);
+  kops_test::copy_in(d_draft, draft);
+
+  kops::sample::SpecVerifyParams pms{};
+  pms.draft_token_ids = d_draft;
+  pms.cu_num_draft = d_cu;
+  pms.target_probs = d_tp;
+  pms.draft_probs = d_dp;
+  pms.output_token_ids = d_out;
+  pms.num_accepted = d_num;
+  pms.batch_size = B;
+  pms.max_draft = K;
+  pms.vocab_size = V;
+  pms.rng.global_seed = 1;
+  pms.rng.stream_id = 1;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  std::vector<double> hist(V, 0.0);
+  for (int it = 0; it < launches; ++it) {
+    pms.rng.global_seed = 100000u + static_cast<uint64_t>(it);
+    KOPS_EXPECT_OK(kops::sample::rejection_sample(pms, ctx), "rejection_sample target-only");
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto out = kops_test::copy_out(d_out, B * (K + 1));
+    for (int b = 0; b < B; ++b) {
+      const int32_t id = out[static_cast<size_t>(b * (K + 1))];
+      KOPS_TEST_CHECK(id >= 0 && id < V);
+      if (id >= 0 && id < V) hist[static_cast<size_t>(id)] += 1.0;
+    }
+  }
+  std::vector<double> expected(V);
+  for (int v = 0; v < V; ++v) expected[static_cast<size_t>(v)] = p[static_cast<size_t>(v)] * B * launches;
+  int df = 0;
+  const double chi = chi_square(hist, expected, &df);
+  KOPS_TEST_CHECK(df >= 1);
+  KOPS_TEST_CHECK(chi < 80.0);
+
+  // Same seed reproduces the same rows.
+  pms.rng.global_seed = 424242u;
+  KOPS_EXPECT_OK(kops::sample::rejection_sample(pms, ctx), "rejection_sample repeat 1");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto out1 = kops_test::copy_out(d_out, B * (K + 1));
+  KOPS_EXPECT_OK(kops::sample::rejection_sample(pms, ctx), "rejection_sample repeat 2");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto out2 = kops_test::copy_out(d_out, B * (K + 1));
+  KOPS_TEST_CHECK(out1 == out2);
+
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_cu);
+  kops_test::device_free(d_draft);
+  kops_test::device_free(d_out);
+  kops_test::device_free(d_num);
+}
+
+void test_spec_chain_probabilistic() {
+  constexpr int B = 1024, K = 4, V = 8, launches = 512;
+  const int total = B * K;
+  std::vector<float> pl(V), ql(V);
+  fill(pl, 313u, -2.0f, 2.0f);
+  fill(ql, 317u, -2.0f, 2.0f);
+  const std::vector<float> p = spec_softmax(pl);
+  const std::vector<float> q = spec_softmax(ql);
+
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(total + B) * V);
+  float* d_dp = kops_test::device_alloc<float>(static_cast<size_t>(total) * V);
+  int32_t* d_cu = kops_test::device_alloc<int32_t>(B + 1);
+  int32_t* d_draft = kops_test::device_alloc<int32_t>(total);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (K + 1));
+  int32_t* d_num = kops_test::device_alloc<int32_t>(B);
+  if (d_tp == nullptr || d_dp == nullptr || d_cu == nullptr || d_draft == nullptr ||
+      d_out == nullptr || d_num == nullptr) return;
+  fill_prob_rows(d_tp, total + B, V, p);
+  fill_prob_rows(d_dp, total, V, q);
+  std::vector<int32_t> cu(B + 1), draft(total);
+  std::mt19937 rng(929u);
+  std::discrete_distribution<int32_t> pick(q.begin(), q.end());
+  for (int b = 0; b <= B; ++b) cu[static_cast<size_t>(b)] = b * K;
+  for (int32_t& x : draft) x = pick(rng);
+  kops_test::copy_in(d_cu, cu);
+  kops_test::copy_in(d_draft, draft);
+
+  kops::sample::SpecVerifyParams pms{};
+  pms.draft_token_ids = d_draft;
+  pms.cu_num_draft = d_cu;
+  pms.target_probs = d_tp;
+  pms.draft_probs = d_dp;
+  pms.output_token_ids = d_out;
+  pms.num_accepted = d_num;
+  pms.batch_size = B;
+  pms.max_draft = K;
+  pms.vocab_size = V;
+  pms.rng.global_seed = 1;
+  pms.rng.stream_id = 1;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  std::vector<double> hist(V, 0.0);
+  for (int it = 0; it < launches; ++it) {
+    for (int32_t& x : draft) x = pick(rng);
+    kops_test::copy_in(d_draft, draft);
+    pms.rng.global_seed = 700000u + static_cast<uint64_t>(it);
+    KOPS_EXPECT_OK(kops::sample::rejection_sample(pms, ctx), "rejection_sample probabilistic");
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto out = kops_test::copy_out(d_out, B * (K + 1));
+    for (int b = 0; b < B; ++b) {
+      const int32_t id = out[static_cast<size_t>(b * (K + 1))];
+      KOPS_TEST_CHECK(id >= 0 && id < V);
+      if (id >= 0 && id < V) hist[static_cast<size_t>(id)] += 1.0;
+    }
+  }
+  std::vector<double> expected(V);
+  for (int v = 0; v < V; ++v) expected[static_cast<size_t>(v)] = p[static_cast<size_t>(v)] * B * launches;
+  int df = 0;
+  const double chi = chi_square(hist, expected, &df);
+  KOPS_TEST_CHECK(df >= 1);
+  KOPS_TEST_CHECK(chi < 80.0);
+
+  // q == p: every draft is accepted with certainty.
+  constexpr int BS = 8;
+  float* d_small = kops_test::device_alloc<float>(static_cast<size_t>(BS * K + BS) * V);
+  int32_t* d_cus = kops_test::device_alloc<int32_t>(BS + 1);
+  int32_t* d_ds = kops_test::device_alloc<int32_t>(BS * K);
+  int32_t* d_os = kops_test::device_alloc<int32_t>(BS * (K + 1));
+  int32_t* d_ns = kops_test::device_alloc<int32_t>(BS);
+  if (d_small != nullptr && d_cus != nullptr && d_ds != nullptr && d_os != nullptr &&
+      d_ns != nullptr) {
+    fill_prob_rows(d_small, BS * K + BS, V, p);
+    std::vector<int32_t> cus(BS + 1), ds(BS * K);
+    for (int b = 0; b <= BS; ++b) cus[static_cast<size_t>(b)] = b * K;
+    for (int i = 0; i < BS * K; ++i) ds[static_cast<size_t>(i)] = static_cast<int32_t>(i % V);
+    kops_test::copy_in(d_cus, cus);
+    kops_test::copy_in(d_ds, ds);
+    pms.draft_token_ids = d_ds;
+    pms.cu_num_draft = d_cus;
+    pms.target_probs = d_small;
+    pms.draft_probs = d_small;  // q == p
+    pms.output_token_ids = d_os;
+    pms.num_accepted = d_ns;
+    pms.batch_size = BS;
+    pms.rng.global_seed = 55;
+    KOPS_EXPECT_OK(kops::sample::rejection_sample(pms, ctx), "rejection_sample q==p");
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto ns = kops_test::copy_out(d_ns, BS);
+    for (int32_t n : ns) KOPS_TEST_CHECK(n == K);
+    const auto os = kops_test::copy_out(d_os, BS * (K + 1));
+    for (int b = 0; b < BS; ++b) {
+      for (int i = 0; i < K; ++i) {
+        KOPS_TEST_CHECK(os[static_cast<size_t>(b * (K + 1) + i)] ==
+                        ds[static_cast<size_t>(b * K + i)]);
+      }
+      KOPS_TEST_CHECK(os[static_cast<size_t>(b * (K + 1) + K)] >= 0);
+    }
+  }
+  kops_test::device_free(d_small);
+  kops_test::device_free(d_cus);
+  kops_test::device_free(d_ds);
+  kops_test::device_free(d_os);
+  kops_test::device_free(d_ns);
+
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_dp);
+  kops_test::device_free(d_cu);
+  kops_test::device_free(d_draft);
+  kops_test::device_free(d_out);
+  kops_test::device_free(d_num);
+}
+
+void test_spec_acceptance_length() {
+  constexpr int B = 1024, K = 8, V = 8, launches = 128;
+  std::vector<float> pl(V), ql(V);
+  fill(pl, 501u, -2.0f, 2.0f);
+  fill(ql, 503u, -2.0f, 2.0f);
+  const std::vector<float> p = spec_softmax(pl);
+  const std::vector<float> q = spec_softmax(ql);
+  double a = 0.0;
+  for (int v = 0; v < V; ++v) a += std::min(p[static_cast<size_t>(v)], q[static_cast<size_t>(v)]);
+  double expected = 0.0;
+  double term = 1.0;
+  for (int i = 0; i < K; ++i) {
+    term *= a;
+    expected += term;
+  }
+
+  const int total = B * K;
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(total + B) * V);
+  float* d_dp = kops_test::device_alloc<float>(static_cast<size_t>(total) * V);
+  int32_t* d_cu = kops_test::device_alloc<int32_t>(B + 1);
+  int32_t* d_draft = kops_test::device_alloc<int32_t>(total);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (K + 1));
+  int32_t* d_num = kops_test::device_alloc<int32_t>(B);
+  if (d_tp == nullptr || d_dp == nullptr || d_cu == nullptr || d_draft == nullptr ||
+      d_out == nullptr || d_num == nullptr) return;
+  fill_prob_rows(d_tp, total + B, V, p);
+  fill_prob_rows(d_dp, total, V, q);
+  std::vector<int32_t> cu(B + 1), draft(total);
+  std::mt19937 rng(777u);
+  std::discrete_distribution<int32_t> pick(q.begin(), q.end());
+  for (int b = 0; b <= B; ++b) cu[static_cast<size_t>(b)] = b * K;
+  kops_test::copy_in(d_cu, cu);
+
+  kops::sample::SpecVerifyParams pms{};
+  pms.draft_token_ids = d_draft;
+  pms.cu_num_draft = d_cu;
+  pms.target_probs = d_tp;
+  pms.draft_probs = d_dp;
+  pms.output_token_ids = d_out;
+  pms.num_accepted = d_num;
+  pms.batch_size = B;
+  pms.max_draft = K;
+  pms.vocab_size = V;
+  pms.rng.stream_id = 1;
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  double sum = 0.0;
+  for (int it = 0; it < launches; ++it) {
+    for (int32_t& x : draft) x = pick(rng);
+    kops_test::copy_in(d_draft, draft);
+    pms.rng.global_seed = 550000u + static_cast<uint64_t>(it);
+    KOPS_EXPECT_OK(kops::sample::rejection_sample(pms, ctx), "rejection_sample acceptance");
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto ns = kops_test::copy_out(d_num, B);
+    for (int32_t n : ns) {
+      KOPS_TEST_CHECK(n >= 0 && n <= K);
+      sum += n;
+    }
+  }
+  const double mean = sum / static_cast<double>(B) / launches;
+  std::fprintf(stderr, "[b10] chain accepted length measured %.4f, expected %.4f\n", mean, expected);
+  KOPS_TEST_CHECK(std::fabs(mean - expected) < 0.08);
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_dp);
+  kops_test::device_free(d_cu);
+  kops_test::device_free(d_draft);
+  kops_test::device_free(d_out);
+  kops_test::device_free(d_num);
+}
+
+void test_spec_chain_contracts() {
+  constexpr int B = 1, K = 1, V = 4;
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(2 * V));
+  int32_t* d_cu = kops_test::device_alloc<int32_t>(2);
+  int32_t* d_draft = kops_test::device_alloc<int32_t>(1);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(2);
+  int32_t* d_num = kops_test::device_alloc<int32_t>(1);
+  uint8_t* d_greedy = kops_test::device_alloc<uint8_t>(1);
+  if (d_tp == nullptr || d_cu == nullptr || d_draft == nullptr || d_out == nullptr ||
+      d_num == nullptr || d_greedy == nullptr) return;
+  kops_test::copy_in(d_tp, std::vector<float>(2 * V, 0.25f));
+  kops_test::copy_in(d_cu, std::vector<int32_t>{0, 1});
+  kops_test::copy_in(d_draft, std::vector<int32_t>{1});
+  kops_test::copy_in(d_out, std::vector<int32_t>{-77, -77});
+  kops_test::copy_in(d_num, std::vector<int32_t>{-77});
+  kops_test::copy_in(d_greedy, std::vector<uint8_t>{1});
+
+  kops::sample::SpecVerifyParams p{};
+  p.draft_token_ids = d_draft;
+  p.cu_num_draft = d_cu;
+  p.target_probs = d_tp;
+  p.output_token_ids = d_out;
+  p.num_accepted = d_num;
+  p.batch_size = B;
+  p.max_draft = K;
+  p.vocab_size = V;
+  p.is_greedy = d_greedy;
+  p.rng.global_seed = 1;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  KOPS_EXPECT_STATUS(kops::sample::rejection_sample(p, ctx), kops::Status::kInvalidArgument,
+                     "chain greedy needs argmax");
+  KOPS_EXPECT_STATUS(kops::sample::rejection_sample(p, ctx), kops::Status::kInvalidArgument,
+                     "chain greedy needs argmax again");
+  auto bad = p;
+  bad.batch_size = -1;
+  KOPS_EXPECT_STATUS(kops::sample::rejection_sample(bad, ctx), kops::Status::kInvalidArgument,
+                     "chain negative batch");
+  bad = p;
+  bad.vocab_size = 0;
+  KOPS_EXPECT_STATUS(kops::sample::rejection_sample(bad, ctx), kops::Status::kInvalidArgument,
+                     "chain zero vocab");
+  bad = p;
+  bad.max_draft = -1;
+  KOPS_EXPECT_STATUS(kops::sample::rejection_sample(bad, ctx), kops::Status::kInvalidArgument,
+                     "chain negative draft");
+  bad = p;
+  bad.target_probs = nullptr;
+  KOPS_EXPECT_STATUS(kops::sample::rejection_sample(bad, ctx), kops::Status::kInvalidArgument,
+                     "chain null target");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto untouched = kops_test::copy_out(d_out, 2);
+  KOPS_TEST_CHECK(untouched[0] == -77 && untouched[1] == -77);
+
+  // Empty batch is a no-op even with null arrays.
+  kops::sample::SpecVerifyParams empty{};
+  empty.batch_size = 0;
+  empty.vocab_size = V;
+  KOPS_EXPECT_OK(kops::sample::rejection_sample(empty, ctx), "chain empty batch");
+
+  kops::LaunchContext hip = ctx;
+  hip.backend = kops::BackendKind::kHip;
+  bad = p;
+  bad.is_greedy = nullptr;
+  KOPS_EXPECT_STATUS(kops::sample::rejection_sample(bad, hip), kops::Status::kUnsupportedBackend,
+                     "chain hip backend");
+
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_cu);
+  kops_test::device_free(d_draft);
+  kops_test::device_free(d_out);
+  kops_test::device_free(d_num);
+  kops_test::device_free(d_greedy);
+}
+
+void test_spec_chain_graph() {
+  constexpr int B = 2, K = 2, V = 4;
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(B * K + B) * V);
+  int32_t* d_cu = kops_test::device_alloc<int32_t>(B + 1);
+  int32_t* d_draft = kops_test::device_alloc<int32_t>(B * K);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (K + 1));
+  int32_t* d_num = kops_test::device_alloc<int32_t>(B);
+  if (d_tp == nullptr || d_cu == nullptr || d_draft == nullptr || d_out == nullptr ||
+      d_num == nullptr) return;
+  kops_test::copy_in(d_tp, std::vector<float>(static_cast<size_t>(B * K + B) * V, 0.25f));
+  kops_test::copy_in(d_cu, std::vector<int32_t>{0, K, 2 * K});
+  kops_test::copy_in(d_draft, std::vector<int32_t>{0, 1, 2, 3});
+  kops::sample::SpecVerifyParams p{};
+  p.draft_token_ids = d_draft;
+  p.cu_num_draft = d_cu;
+  p.target_probs = d_tp;
+  p.output_token_ids = d_out;
+  p.num_accepted = d_num;
+  p.batch_size = B;
+  p.max_draft = K;
+  p.vocab_size = V;
+  p.rng.global_seed = 17;
+
+  cudaStream_t stream = nullptr;
+  if (cudaStreamCreate(&stream) != cudaSuccess) return;
+  kops::LaunchContext gc{};
+  if (!kops_test::make_context(&gc)) return;
+  gc.stream = reinterpret_cast<kops::kops_stream_t>(stream);
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+  KOPS_EXPECT_OK(kops::sample::rejection_sample(p, gc), "graph rejection_sample");
+  cudaStreamEndCapture(stream, &graph);
+  if (graph != nullptr && cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess) {
+    cudaGraphLaunch(exec, stream);
+    cudaStreamSynchronize(stream);
+    const auto n1 = kops_test::copy_out(d_num, B);
+    const auto o1 = kops_test::copy_out(d_out, B * (K + 1));
+    // Replay with new draft data through the same captured pointers.
+    kops_test::copy_in(d_draft, std::vector<int32_t>{1, 2, 3, 0});
+    cudaGraphLaunch(exec, stream);
+    cudaStreamSynchronize(stream);
+    const auto n2 = kops_test::copy_out(d_num, B);
+    const auto o2 = kops_test::copy_out(d_out, B * (K + 1));
+    for (int b = 0; b < B; ++b) {
+      KOPS_TEST_CHECK(n1[static_cast<size_t>(b)] >= 0 && n1[static_cast<size_t>(b)] <= K);
+      KOPS_TEST_CHECK(n2[static_cast<size_t>(b)] >= 0 && n2[static_cast<size_t>(b)] <= K);
+      KOPS_TEST_CHECK(o1[static_cast<size_t>(b * (K + 1))] >= 0);
+      KOPS_TEST_CHECK(o2[static_cast<size_t>(b * (K + 1))] >= 0);
+    }
+    cudaGraphExecDestroy(exec);
+  }
+  if (graph != nullptr) cudaGraphDestroy(graph);
+  cudaStreamDestroy(stream);
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_cu);
+  kops_test::device_free(d_draft);
+  kops_test::device_free(d_out);
+  kops_test::device_free(d_num);
+}
+
+void test_spec_tree_greedy() {
+  constexpr int B = 2, N = 5, D = 3, V = 8;
+  int32_t* d_cand = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_first = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_next = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_argmax = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_acc_idx = kops_test::device_alloc<int32_t>(B * (D + 1));
+  int32_t* d_acc_len = kops_test::device_alloc<int32_t>(B);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (D + 1));
+  if (d_cand == nullptr || d_first == nullptr || d_next == nullptr || d_argmax == nullptr ||
+      d_acc_idx == nullptr || d_acc_len == nullptr || d_out == nullptr) return;
+  std::vector<int32_t> cand, first, next, argmax;
+  for (int b = 0; b < B; ++b) {
+    cand.insert(cand.end(), {0, 1, 2, 3, 4});
+    first.insert(first.end(), {1, 3, 4, -1, -1});
+    next.insert(next.end(), {-1, 2, -1, -1, -1});
+  }
+  argmax = {2, 3, 4, 7, 6, 2, 3, 5, 7, 6};
+  kops_test::copy_in(d_cand, cand);
+  kops_test::copy_in(d_first, first);
+  kops_test::copy_in(d_next, next);
+  kops_test::copy_in(d_argmax, argmax);
+  kops_test::copy_in(d_acc_idx, std::vector<int32_t>(B * (D + 1), -99));
+  kops_test::copy_in(d_acc_len, std::vector<int32_t>(B, -99));
+  kops_test::copy_in(d_out, std::vector<int32_t>(B * (D + 1), -99));
+
+  kops::sample::TreeVerifyParams p{};
+  p.candidates = d_cand;
+  p.first_child = d_first;
+  p.next_sibling = d_next;
+  p.target_argmax = d_argmax;
+  p.accept_index = d_acc_idx;
+  p.accept_length = d_acc_len;
+  p.output_token_ids = d_out;
+  p.batch_size = B;
+  p.num_nodes = N;
+  p.max_depth = D;
+  p.vocab_size = V;
+  p.rng.global_seed = 11;
+  p.rng.stream_id = 1;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  KOPS_EXPECT_OK(kops::sample::tree_verify(p, ctx), "tree_verify greedy");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  expect_i32(kops_test::copy_out(d_acc_len, B), std::vector<int32_t>{2, 1}, "tree greedy length");
+  expect_i32(kops_test::copy_out(d_out, B * (D + 1)),
+             std::vector<int32_t>{2, 4, 6, -1, 2, 5, -1, -1}, "tree greedy output");
+  expect_i32(kops_test::copy_out(d_acc_idx, B * (D + 1)),
+             std::vector<int32_t>{2, 4, -1, -1, 2, -1, -1, -1}, "tree greedy index");
+
+  kops_test::device_free(d_cand);
+  kops_test::device_free(d_first);
+  kops_test::device_free(d_next);
+  kops_test::device_free(d_argmax);
+  kops_test::device_free(d_acc_idx);
+  kops_test::device_free(d_acc_len);
+  kops_test::device_free(d_out);
+}
+
+void test_spec_tree_distribution() {
+  constexpr int B = 1024, N = 4, D = 3, V = 8, launches = 512;
+  std::vector<float> pl(V);
+  fill(pl, 123u, -2.0f, 2.0f);
+  const std::vector<float> p = spec_softmax(pl);
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(B * N) * V);
+  int32_t* d_cand = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_first = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_next = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_ridx = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_acc_idx = kops_test::device_alloc<int32_t>(B * (D + 1));
+  int32_t* d_acc_len = kops_test::device_alloc<int32_t>(B);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (D + 1));
+  if (d_tp == nullptr || d_cand == nullptr || d_first == nullptr || d_next == nullptr ||
+      d_ridx == nullptr || d_acc_idx == nullptr || d_acc_len == nullptr || d_out == nullptr) return;
+  fill_prob_rows(d_tp, B * N, V, p);
+  std::vector<int32_t> cand, first, next, ridx;
+  for (int b = 0; b < B; ++b) {
+    cand.insert(cand.end(), {0, 1, 2, 3});
+    first.insert(first.end(), {1, 2, 3, -1});
+    next.insert(next.end(), {-1, -1, -1, -1});
+    ridx.insert(ridx.end(), {0, 1, 2, 3});
+  }
+  kops_test::copy_in(d_cand, cand);
+  kops_test::copy_in(d_first, first);
+  kops_test::copy_in(d_next, next);
+  kops_test::copy_in(d_ridx, ridx);
+
+  kops::sample::TreeVerifyParams pms{};
+  pms.candidates = d_cand;
+  pms.retrieve_index = d_ridx;
+  pms.first_child = d_first;
+  pms.next_sibling = d_next;
+  pms.target_probs = d_tp;
+  pms.accept_index = d_acc_idx;
+  pms.accept_length = d_acc_len;
+  pms.output_token_ids = d_out;
+  pms.batch_size = B;
+  pms.num_nodes = N;
+  pms.max_depth = D;
+  pms.vocab_size = V;
+  pms.rng.global_seed = 1;
+  pms.rng.stream_id = 1;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  std::vector<double> hist(V, 0.0);
+  for (int it = 0; it < launches; ++it) {
+    pms.rng.global_seed = 900000u + static_cast<uint64_t>(it);
+    KOPS_EXPECT_OK(kops::sample::tree_verify(pms, ctx), "tree_verify target-only");
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto out = kops_test::copy_out(d_out, B * (D + 1));
+    for (int b = 0; b < B; ++b) {
+      const int32_t id = out[static_cast<size_t>(b * (D + 1))];
+      KOPS_TEST_CHECK(id >= 0 && id < V);
+      if (id >= 0 && id < V) hist[static_cast<size_t>(id)] += 1.0;
+    }
+  }
+  std::vector<double> expected(V);
+  for (int v = 0; v < V; ++v) expected[static_cast<size_t>(v)] = p[static_cast<size_t>(v)] * B * launches;
+  int df = 0;
+  const double chi = chi_square(hist, expected, &df);
+  KOPS_TEST_CHECK(df >= 1);
+  KOPS_TEST_CHECK(chi < 80.0);
+
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_cand);
+  kops_test::device_free(d_first);
+  kops_test::device_free(d_next);
+  kops_test::device_free(d_ridx);
+  kops_test::device_free(d_acc_idx);
+  kops_test::device_free(d_acc_len);
+  kops_test::device_free(d_out);
+}
+
+void test_spec_tree_probabilistic() {
+  constexpr int B = 1024, N = 4, D = 1, V = 8, launches = 512;
+  std::vector<float> pl(V);
+  fill(pl, 321u, -2.0f, 2.0f);
+  const std::vector<float> p = spec_softmax(pl);
+  std::vector<float> q(V, 0.0f);
+  q[1] = 0.2f;
+  q[2] = 0.3f;
+  q[3] = 0.5f;
+  float* d_tp = kops_test::device_alloc<float>(static_cast<size_t>(B * N) * V);
+  float* d_dp = kops_test::device_alloc<float>(static_cast<size_t>(B * N) * V);
+  int32_t* d_cand = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_first = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_next = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_ridx = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_acc_idx = kops_test::device_alloc<int32_t>(B * (D + 1));
+  int32_t* d_acc_len = kops_test::device_alloc<int32_t>(B);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (D + 1));
+  if (d_tp == nullptr || d_dp == nullptr || d_cand == nullptr || d_first == nullptr ||
+      d_next == nullptr || d_ridx == nullptr || d_acc_idx == nullptr || d_acc_len == nullptr ||
+      d_out == nullptr) return;
+  fill_prob_rows(d_tp, B * N, V, p);
+  fill_prob_rows(d_dp, B * N, V, q);
+  std::vector<int32_t> cand, first, next, ridx;
+  for (int b = 0; b < B; ++b) {
+    cand.insert(cand.end(), {0, 1, 2, 3});
+    first.insert(first.end(), {1, -1, -1, -1});
+    next.insert(next.end(), {-1, 2, 3, -1});
+    ridx.insert(ridx.end(), {0, 1, 2, 3});
+  }
+  kops_test::copy_in(d_cand, cand);
+  kops_test::copy_in(d_first, first);
+  kops_test::copy_in(d_next, next);
+  kops_test::copy_in(d_ridx, ridx);
+
+  kops::sample::TreeVerifyParams pms{};
+  pms.candidates = d_cand;
+  pms.retrieve_index = d_ridx;
+  pms.first_child = d_first;
+  pms.next_sibling = d_next;
+  pms.target_probs = d_tp;
+  pms.draft_probs = d_dp;
+  pms.accept_index = d_acc_idx;
+  pms.accept_length = d_acc_len;
+  pms.output_token_ids = d_out;
+  pms.batch_size = B;
+  pms.num_nodes = N;
+  pms.max_depth = D;
+  pms.vocab_size = V;
+  pms.rng.global_seed = 1;
+  pms.rng.stream_id = 1;
+
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  std::vector<double> hist(V, 0.0);
+  for (int it = 0; it < launches; ++it) {
+    pms.rng.global_seed = 300000u + static_cast<uint64_t>(it);
+    KOPS_EXPECT_OK(kops::sample::tree_verify(pms, ctx), "tree_verify probabilistic");
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto out = kops_test::copy_out(d_out, B * (D + 1));
+    for (int b = 0; b < B; ++b) {
+      const int32_t id = out[static_cast<size_t>(b * (D + 1))];
+      KOPS_TEST_CHECK(id >= 0 && id < V);
+      if (id >= 0 && id < V) hist[static_cast<size_t>(id)] += 1.0;
+    }
+  }
+  std::vector<double> expected(V);
+  for (int v = 0; v < V; ++v) expected[static_cast<size_t>(v)] = p[static_cast<size_t>(v)] * B * launches;
+  int df = 0;
+  const double chi = chi_square(hist, expected, &df);
+  KOPS_TEST_CHECK(df >= 1);
+  KOPS_TEST_CHECK(chi < 80.0);
+
+  kops_test::device_free(d_tp);
+  kops_test::device_free(d_dp);
+  kops_test::device_free(d_cand);
+  kops_test::device_free(d_first);
+  kops_test::device_free(d_next);
+  kops_test::device_free(d_ridx);
+  kops_test::device_free(d_acc_idx);
+  kops_test::device_free(d_acc_len);
+  kops_test::device_free(d_out);
+}
+
+void test_spec_tree_contracts() {
+  constexpr int B = 1, N = 3, D = 1, V = 4;
+  int32_t* d_cand = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_first = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_next = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_argmax = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_acc_idx = kops_test::device_alloc<int32_t>(B * (D + 1));
+  int32_t* d_acc_len = kops_test::device_alloc<int32_t>(B);
+  int32_t* d_out = kops_test::device_alloc<int32_t>(B * (D + 1));
+  if (d_cand == nullptr || d_first == nullptr || d_next == nullptr || d_argmax == nullptr ||
+      d_acc_idx == nullptr || d_acc_len == nullptr || d_out == nullptr) return;
+  kops_test::copy_in(d_cand, std::vector<int32_t>{0, 1, 2});
+  kops_test::copy_in(d_first, std::vector<int32_t>{1, -1, -1});
+  kops_test::copy_in(d_next, std::vector<int32_t>{-1, 2, -1});
+  kops_test::copy_in(d_argmax, std::vector<int32_t>{1, 2, 3});
+  kops::sample::TreeVerifyParams p{};
+  p.candidates = d_cand;
+  p.first_child = d_first;
+  p.next_sibling = d_next;
+  p.accept_index = d_acc_idx;
+  p.accept_length = d_acc_len;
+  p.output_token_ids = d_out;
+  p.batch_size = B;
+  p.num_nodes = N;
+  p.max_depth = D;
+  p.vocab_size = V;
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  KOPS_EXPECT_STATUS(kops::sample::tree_verify(p, ctx), kops::Status::kInvalidArgument,
+                     "tree needs a mode");
+  auto bad = p;
+  bad.target_argmax = d_argmax;
+  bad.num_nodes = 0;
+  KOPS_EXPECT_STATUS(kops::sample::tree_verify(bad, ctx), kops::Status::kInvalidArgument,
+                     "tree zero nodes");
+  bad = p;
+  bad.target_argmax = d_argmax;
+  bad.max_depth = N;
+  KOPS_EXPECT_STATUS(kops::sample::tree_verify(bad, ctx), kops::Status::kInvalidArgument,
+                     "tree max depth");
+  bad = p;
+  bad.target_argmax = d_argmax;
+  bad.candidates = nullptr;
+  KOPS_EXPECT_STATUS(kops::sample::tree_verify(bad, ctx), kops::Status::kInvalidArgument,
+                     "tree null candidates");
+  kops::sample::TreeVerifyParams empty{};
+  empty.batch_size = 0;
+  empty.num_nodes = N;
+  empty.max_depth = D;
+  empty.vocab_size = V;
+  empty.target_argmax = d_argmax;
+  KOPS_EXPECT_OK(kops::sample::tree_verify(empty, ctx), "tree empty batch");
+  kops_test::device_free(d_cand);
+  kops_test::device_free(d_first);
+  kops_test::device_free(d_next);
+  kops_test::device_free(d_argmax);
+  kops_test::device_free(d_acc_idx);
+  kops_test::device_free(d_acc_len);
+  kops_test::device_free(d_out);
+}
+
+void test_spec_tree_mask() {
+  constexpr int B = 2, N = 4;
+  const int32_t parent[2][4] = {{-1, 0, 0, 2}, {-1, 0, 1, 2}};
+  const int32_t prefix[2] = {5, 3};
+  uint8_t* d_mask = kops_test::device_alloc<uint8_t>(16);
+  int64_t* d_indptr = kops_test::device_alloc<int64_t>(B + 1);
+  int32_t* d_pos = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_parent = kops_test::device_alloc<int32_t>(B * N);
+  int32_t* d_prefix = kops_test::device_alloc<int32_t>(B);
+  if (d_mask == nullptr || d_indptr == nullptr || d_pos == nullptr || d_parent == nullptr ||
+      d_prefix == nullptr) return;
+  std::vector<int32_t> pv, pfx;
+  for (int b = 0; b < B; ++b) {
+    pv.insert(pv.end(), parent[b], parent[b] + N);
+    pfx.push_back(prefix[b]);
+  }
+  kops_test::copy_in(d_parent, pv);
+  kops_test::copy_in(d_prefix, pfx);
+  kops_test::copy_in(d_mask, std::vector<uint8_t>(16, 0xA5));
+  kops_test::copy_in(d_indptr, std::vector<int64_t>(B + 1, -1));
+  kops_test::copy_in(d_pos, std::vector<int32_t>(B * N, -1));
+
+  const Tensor tm = tensor1d(d_mask, DType::kUInt8, 16);
+  const Tensor ti = tensor1d(d_indptr, DType::kInt64, B + 1);
+  const Tensor tp = kops_test::tensor2d(d_pos, DType::kInt32, B, N);
+  const Tensor tpar = kops_test::tensor2d(d_parent, DType::kInt32, B, N);
+  const Tensor tpre = tensor1d(d_prefix, DType::kInt32, B);
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  KOPS_EXPECT_OK(kops::sample::build_tree_attention_mask(tm, ti, tp, tpar, tpre, ctx),
+                 "build_tree_attention_mask");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+
+  std::vector<uint8_t> want(16, 0);
+  int widths[2];
+  int offset[2] = {0, 0};
+  for (int b = 0; b < B; ++b) {
+    widths[b] = prefix[b] + N;
+    if (b > 0) offset[b] = offset[b - 1] + N * widths[b - 1];
+    for (int node = 0; node < N; ++node) {
+      for (int key = 0; key < widths[b]; ++key) {
+        bool vis = key < prefix[b];
+        if (!vis) {
+          int t = key - prefix[b];
+          int cur = node;
+          int guard = 0;
+          while (cur >= 0 && cur < N && guard++ <= N) {
+            if (cur == t) {
+              vis = true;
+              break;
+            }
+            cur = parent[b][cur];
+          }
+        }
+        if (vis) {
+          const int bit = offset[b] + node * widths[b] + key;
+          want[static_cast<size_t>(bit >> 3)] |= static_cast<uint8_t>(1u << (bit & 7));
+        }
+      }
+    }
+  }
+  const auto got = kops_test::copy_out(d_mask, 16);
+  bool same = true;
+  for (int i = 0; i < 16; ++i) same = same && (got[static_cast<size_t>(i)] == want[static_cast<size_t>(i)]);
+  KOPS_TEST_CHECK(same);
+  expect_i32(kops_test::copy_out(d_pos, B * N), std::vector<int32_t>{0, 1, 1, 2, 0, 1, 2, 3},
+             "tree mask depth");
+  const auto indptr = kops_test::copy_out(d_indptr, B + 1);
+  KOPS_TEST_CHECK(indptr[0] == 0 && indptr[1] == 36 && indptr[2] == 64);
+
+  // Contract checks.
+  const Tensor bad_dtype = tensor1d(d_mask, DType::kInt32, 4);
+  KOPS_EXPECT_STATUS(kops::sample::build_tree_attention_mask(bad_dtype, ti, tp, tpar, tpre, ctx),
+                     kops::Status::kUnsupportedDtype, "mask dtype");
+  const Tensor bad_indptr = tensor1d(d_indptr, DType::kInt64, B);
+  KOPS_EXPECT_STATUS(kops::sample::build_tree_attention_mask(tm, bad_indptr, tp, tpar, tpre, ctx),
+                     kops::Status::kInvalidArgument, "mask indptr length");
+  const Tensor bad_pos = kops_test::tensor2d(d_pos, DType::kInt32, B, N - 1);
+  KOPS_EXPECT_STATUS(kops::sample::build_tree_attention_mask(tm, ti, bad_pos, tpar, tpre, ctx),
+                     kops::Status::kInvalidArgument, "mask position shape");
+  const Tensor bad_pre = tensor1d(d_prefix, DType::kInt32, B - 1);
+  KOPS_EXPECT_STATUS(kops::sample::build_tree_attention_mask(tm, ti, tp, tpar, bad_pre, ctx),
+                     kops::Status::kInvalidArgument, "mask prefix length");
+
+  kops_test::device_free(d_mask);
+  kops_test::device_free(d_indptr);
+  kops_test::device_free(d_pos);
+  kops_test::device_free(d_parent);
+  kops_test::device_free(d_prefix);
+}
+
 }  // namespace
 
 int main() {
@@ -2670,5 +3513,16 @@ int main() {
   test_fused_split_batches();
   test_fused_split_reuse();
   test_sampling_distribution();
+  test_spec_chain_greedy();
+  test_spec_chain_distribution();
+  test_spec_chain_probabilistic();
+  test_spec_acceptance_length();
+  test_spec_chain_contracts();
+  test_spec_chain_graph();
+  test_spec_tree_greedy();
+  test_spec_tree_distribution();
+  test_spec_tree_probabilistic();
+  test_spec_tree_contracts();
+  test_spec_tree_mask();
   return kops_test::finish("test_sampling");
 }

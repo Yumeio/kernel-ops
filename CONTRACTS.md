@@ -294,6 +294,73 @@ remain the ABI and shape authority.
   Dv 16..128, Hv / Hk <= 8, (Hv / Hk) Dv <= 1024. Oracles: `ref::causal_conv1d_f64`,
   `ssm_recurrence_f64`, `linear_attention_f64`, `delta_rule_f64`, `delta_rule_gating_f64`.
 
+## 1g. Speculative decoding (B10)
+
+- **Chain rows.** `cu_num_draft[b]..cu_num_draft[b+1]` addresses the ragged draft
+  rows. `target_probs[j]` / `draft_probs[j]` predict draft `j`; the bonus row of
+  request `b` is `num_draft_tokens + b` (`num_draft_tokens = cu_num_draft[B]`).
+  `target_argmax` uses the same layout. Rows outside a request's `cu_num_draft`
+  range are never read.
+- **Chain rules.** Greedy rows accept iff `target_argmax[j] == draft[j]`; the
+  first mismatch emits that argmax. Stochastic rows accept with
+  `min(1, p/q)` when `draft_probs != null`; `draft_probs == null` is the
+  deterministic-drafter (target-only) rule, `q = one-hot(draft)`, so acceptance
+  is `p(draft)` and the recovery draw is `norm(max(0, p - e_draft))`. The first
+  rejection emits the corrected token from the full-vocabulary residual and
+  stops. If every draft is accepted, the bonus token is drawn from the bonus
+  row. `num_accepted` counts accepted drafts; emitted tokens = accepted + 1.
+  `output_token_ids[b, 0..k_b]` holds the accepted drafts, the recovered/bonus
+  token, then `-1` padding to `max_draft + 1`. Probability entries are finite
+  non-negative floats; negative/NaN entries contribute zero. A draft id outside
+  `[0, V)` forces a rejection; an out-of-range argmax emits `-1`.
+- **Chain RNG.** `request_id = b`, `position = per_request_offset[b]` (null = 0),
+  `stream_id` from `RngParams`. Draw indices: acceptance of draft `i` = `2*i`,
+  residual at draft `i` = `2*i + 1`, bonus = `2*k_b + 1`. Greedy rows draw
+  nothing. No host state is read or advanced; graph replay is a pure function of
+  the device RNG fields.
+- **Tree nodes and rows.** Node 0 is the current/root token (not emitted).
+  `first_child`/`next_sibling` enumerate the tree; `candidates[node]` is the
+  node token. `target_probs[b*N + retrieve_index[b,node]]` is the target
+  distribution **after** that node; the same row supplies its argmax in greedy
+  mode. `draft_probs[b*N + node]` is the draft distribution after the node.
+  A child is verified with its parent's target/draft row. `max_depth` is the
+  accepted-draft cap and must be `<= num_nodes - 1`.
+- **Tree rules.** Greedy: follow the first child whose token equals the parent's
+  target argmax; a miss emits that argmax. Probabilistic: normalize `q` over the
+  current children, sample a child by `q`, accept with `min(1, p/q_norm)`, and
+  on rejection sample the full-vocabulary `norm(max(0, p - q))`; `q` has support
+  only on the children. Target-only (`draft_probs == null`): the first child is
+  the proposal with `q = one-hot`, accepted with `p(child)`; a rejection draws
+  `norm(max(0, p - e_child))`; other siblings are ignored. A leaf, a
+  `max_depth` stop, or an accepted path gets one bonus token from the target row
+  of the stopping node. `accept_length` counts accepted drafts;
+  `output_token_ids` holds those candidates, then the recovered/bonus token, then
+  `-1`. `accept_index` holds the accepted node ids, then the recovered node id
+  when the residual token is a tree node (else `-1`), then `-1` padding.
+- **Tree RNG.** Draw indices at depth `d` (0-based): q candidate = `4*d`,
+  acceptance = `4*d + 1`, residual = `4*d + 2`, bonus = `4*d + 3`. Greedy rows
+  draw nothing. Target-only uses the q/acceptance slot for the one-hot test and
+  the residual slot on rejection.
+- **Tree mask (B10).** `parent` describes the draft nodes only; `-1` means the
+  parent is the committed prefix. Columns are `[prefix | nodes]` with
+  `kv_len = prefix_lens[b] + num_nodes`; row `node` starts at
+  `mask_indptr[b] + node * kv_len` and uses **no padding between query rows**.
+  Bits are little-endian (`bit j` in `byte[j>>3]`, mask `1 << (j&7)`), matching
+  the B8 `MaskMode::kCustom` consumer. A query sees every prefix bit plus its
+  ancestor-or-self bits. `mask_indptr[0] = 0` and
+  `mask_indptr[b+1] = mask_indptr[b] + num_nodes * kv_len`; the builder writes
+  it. `position_offsets[b,node]` is the depth (root draft = 0); the engine adds
+  `prefix_lens[b]` for the absolute position. The buffer is zero-filled and each
+  32-bit word is set with `atomicOr`, so an unaligned row base is supported; the
+  engine owns the buffer capacity and must provide a 4-byte aligned base.
+- **Speculative state commit.** `intermediate_slots[b, j]` is the state that
+  must be live after `j` accepted drafts (state after the prefix + `j` draft
+  tokens). `state_commit_accepted` copies it into `live_slots[b]` for
+  `0 <= j < max_draft`; `j == max_draft` performs no copy because the live slot
+  already holds the state after the complete draft forward. Negative slots skip.
+  This is the rollback half of the hybrid B9 contract; the test composes it with
+  `causal_conv1d_update`.
+
 ## 2. Benchmark protocol
 
 - Same GPU, driver, clocks, dtype and shape for kernel-ops and PyTorch.

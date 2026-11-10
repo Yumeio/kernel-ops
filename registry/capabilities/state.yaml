@@ -216,6 +216,24 @@
    "status": "numerically_validated",
    "predicates": "fp32 or bf16 mma.sync; Dk 16/32/64/128, Dv 1..256",
    "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_commit_accepted",
+   "kernel_symbol": "state_commit_accepted_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "numerically_validated",
+   "predicates": "live <- intermediate[num_accepted]; no copy when all drafts accepted; negative slots skip; per-pool byte copy",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_commit_accepted",
+   "kernel_symbol": "state_commit_accepted_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "compiled",
+   "predicates": "compile-only sm86; runtime evidence is on sm89",
+   "evidence": "ci-sm86"
   }
  ]
 }

@@ -93,6 +93,20 @@ gcc 13 with `-O2 -ffp-contract=off`) was run on 1024 pseudo-random blocks per ty
 reference every codebook entry of every table. The kops output is bit-identical for all 20
 supported types, and `tests/unit/test_quantization.cc` pins the FNV-1a-64 hash of that output.
 
+## Dev-only external baselines (B10)
+
+`benchmark/compare/external/` is dev tooling: it is never built by CMake, ctest or the shipped
+library. It contains one vendored SGLang header and one harness that fetches hpc-ops at the pinned
+commit for a local comparison. Neither implementation is linked into `kops_cuda`.
+
+| Area | Source | License | Commit | What is present | kernel-ops file |
+|---|---|---|---|---|---|
+| SGLang tree target-only baseline | `sgl-kernel/csrc/speculative/speculative_sampling.cuh` (`TreeSpeculativeSamplingTargetOnly`, FlashInfer/CUB based) | Apache-2.0, Copyright (c) 2025 SGLang team and 2024-2025 FlashInfer team | `96a04cb` (vendored header) | the header is copied verbatim under `benchmark/compare/external/sglang/`; the harness only calls it | `benchmark/compare/external/sglang/speculative_sampling.cuh`, `benchmark/compare/external/sglang_tree.cu` |
+| hpc-ops single-draw baseline | `src/sampler/fused_sampler_temperature.cu` / `sampler.h` | MIT (Tencent) | `2a2e265` | fetched by `tools/dev/build_external_baselines.sh` into the gitignored `3rd/hpc-ops`; the sampler TU is compiled for SM89 with `HPC_TARGET_ARCH=90` (the source officially lists 90/100/103) | `benchmark/compare/external/hpc_sampler.cu` |
+
+The SGLang kernel is target-only/threshold-based and hpc-ops has no speculative verifier; the
+report labels both as partial external references, not token-for-token oracles.
+
 ## Vendor trees in this checkout
 
 `3rd/` contains read-only reference checkouts used for comparison. They are **not** part of the

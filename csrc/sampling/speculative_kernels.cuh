@@ -10,6 +10,12 @@
 
 namespace kops::sample {
 
+// Row layout, acceptance rules, output padding and the counter-RNG draw map are
+// part of the B10 contract in CONTRACTS.md §1g.  In particular:
+//   * target_probs[j] predicts draft j; the bonus row is total_drafts + b;
+//   * draft_probs == null selects the deterministic-drafter (target-only) rule;
+//   * output_token_ids is [B, max_draft + 1] with -1 padding.
+
 /// Arguments of chain (linear draft) verification.
 struct SpecVerifyParams {
   const int32_t* draft_token_ids;     // [num_draft_tokens] ragged
@@ -32,7 +38,10 @@ struct SpecVerifyParams {
 template <int VEC_SIZE>
 __global__ void rejection_sample_kernel(const __grid_constant__ SpecVerifyParams params);
 
-/// Tree verification (EAGLE-2/3, Medusa): tree encoded as first-child / next-sibling arrays.
+/// Tree verification (EAGLE-2/3, Medusa): tree encoded as first-child / next-sibling
+/// arrays.  Node 0 is the current/root token (not emitted); retrieve_index[node]
+/// selects the target row *after* that node; a child is verified with its parent's
+/// row.  CONTRACTS.md §1g fixes the modes, accept_index layout and RNG draws.
 struct TreeVerifyParams {
   const int32_t* candidates;          // [B, num_nodes] draft token per node (node 0 = root/current)
   const int32_t* retrieve_index;      // [B, num_nodes] row of target logits for each node
@@ -52,8 +61,12 @@ template <int VEC_SIZE>
 __global__ void tree_verify_kernel(const __grid_constant__ TreeVerifyParams params);
 
 /**
- * build_tree_attention_mask_kernel — packed custom mask (attention MaskMode::kCustom) where node i
- * sees the committed prefix plus its ancestors; also writes per-node position offsets (depth).
+ * build_tree_attention_mask_kernel — packed custom mask (attention MaskMode::kCustom)
+ * where node i sees the committed prefix plus its ancestor-or-self nodes; also
+ * writes per-node depth offsets.  parent names draft nodes only (-1 = prefix).
+ * Rows are [prefix_lens[b] + num_nodes] bits, little-endian, with no padding
+ * between query rows; mask_indptr[b] is the bit base of request b.  The engine
+ * owns the packed_mask capacity and alignment (CONTRACTS.md §1g).
  */
 __global__ void build_tree_attention_mask_kernel(
     uint8_t* __restrict__ packed_mask,         // bit-packed [B, num_nodes, prefix_len + num_nodes]

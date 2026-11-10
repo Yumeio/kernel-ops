@@ -266,6 +266,39 @@ std::vector<Case> make_cases() {
              kops::DType::kFloat32, 128, 151936, int64_t{128} * 151936 * 4 + 128 * 16);
   }
 
+  // B10 speculative decoding.  bytes = the rows the verifier must inspect at
+  // least once (target rows, plus draft rows for the p/q mode), matching the
+  // dataflow the kernel and the eager baselines both pay.
+  // The verifier stops at the first rejection, so the guaranteed traffic is one
+  // target row per request (the recovery/bonus draw) plus the O(K) acceptance
+  // probes.  Counting all K target rows would report a bandwidth above DRAM.
+  cases.push_back({"spec.reject.chain.k8.v151936.b32", "spec_reject_chain",
+                   kops::DType::kFloat32, 32, 151936,
+                   int64_t{32} * 151936 * 4 + int64_t{32} * 9 * 8, 0, 5, 30});
+  cases.push_back({"spec.reject.chain.k8.v32768.b128", "spec_reject_chain",
+                   kops::DType::kFloat32, 128, 32768,
+                   int64_t{128} * 32768 * 4 + int64_t{128} * 9 * 8, 0, 5, 30});
+  cases.push_back({"spec.reject.target_only.k8.v151936.b32", "spec_reject_target",
+                   kops::DType::kFloat32, 32, 151936,
+                   int64_t{32} * 151936 * 4 + int64_t{32} * 9 * 8, 0, 5, 30});
+  cases.push_back({"spec.reject.greedy.k8.v151936.b32", "spec_reject_greedy",
+                   kops::DType::kFloat32, 32, 151936,
+                   int64_t{32} * 9 * 8, 0, 10, 100});
+  cases.push_back({"spec.reject.bonus.k0.v120832.b128", "spec_reject_bonus",
+                   kops::DType::kFloat32, 128, 120832,
+                   int64_t{32} * 120832 * 4, 0, 10, 100});
+  cases.push_back({"spec.tree.q.n64.d8.v32000.b8", "spec_tree_q",
+                   kops::DType::kFloat32, 8, 32000,
+                   int64_t{8} * 32000 * 4 + int64_t{8} * 64 * 8, 0, 3, 20});
+  cases.push_back({"spec.tree.target_only.n64.d8.v32000.b8", "spec_tree_target",
+                   kops::DType::kFloat32, 8, 32000,
+                   int64_t{8} * 32000 * 4 + int64_t{8} * 64 * 8, 0, 3, 20});
+  cases.push_back({"spec.tree.greedy.n64.d8.v32000.b256", "spec_tree_greedy",
+                   kops::DType::kFloat32, 256, 32000,
+                   int64_t{8} * 64 * 4 * 3, 0, 10, 100});
+  cases.push_back({"spec.mask.p2048.n64.b64", "spec_mask",
+                   kops::DType::kFloat32, 64, 2048,
+                   int64_t{64} * 64 * (2048 + 64) / 8 + int64_t{64} * 64 * 12, 0, 10, 100});
   return cases;
 }
 
@@ -575,8 +608,14 @@ bool run_sample_matrix(const Case& c, const kops::LaunchContext& ctx, Stats* st)
 bool run_renorm(const Case& c, const kops::LaunchContext& ctx, Stats* st);
 template <typename T>
 bool run_topk_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st);
+bool run_spec_reject(const Case& c, const kops::LaunchContext& ctx, Stats* st);
+bool run_spec_tree(const Case& c, const kops::LaunchContext& ctx, Stats* st);
+bool run_spec_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st);
 
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  if (c.op.rfind("spec_reject", 0) == 0) return run_spec_reject(c, ctx, st);
+  if (c.op.rfind("spec_tree", 0) == 0) return run_spec_tree(c, ctx, st);
+  if (c.op == "spec_mask") return run_spec_mask(c, ctx, st);
   if (c.op == "token_bincount") return run_bincount(c, ctx, st);
   if (c.op == "sample" || c.op == "gumbel") {
     if (c.dtype == kops::DType::kBFloat16) return run_sample<__nv_bfloat16>(c, ctx, st);
@@ -772,6 +811,254 @@ bool run_topk_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   cudaFree(out);
   return ok;
 }
+
+// ---- B10 speculative decoding ---------------------------------------------------------------
+template <typename T>
+void upload(T* dst, const std::vector<T>& src) {
+  if (!src.empty()) {
+    cudaMemcpy(dst, src.data(), src.size() * sizeof(T), cudaMemcpyHostToDevice);
+  }
+}
+
+int spec_int(const std::string& id, const char* key, int def) {
+  const std::string marker = std::string(".") + key;
+  const size_t pos = id.find(marker);
+  if (pos == std::string::npos) return def;
+  return std::atoi(id.c_str() + pos + marker.size());
+}
+
+bool run_spec_reject(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const int B = static_cast<int>(c.rows);
+  const int V = static_cast<int>(c.cols);
+  const int K = spec_int(c.id, "k", 0);
+  const bool greedy = c.op == "spec_reject_greedy";
+  const bool target_only = c.op == "spec_reject_target" || c.op == "spec_reject_bonus";
+  const int total = B * K;
+  const int target_rows = total + B;
+  float* tp = nullptr;
+  float* dp = nullptr;
+  int32_t* cu = nullptr;
+  int32_t* draft = nullptr;
+  int32_t* argmax = nullptr;
+  int32_t* out = nullptr;
+  int32_t* num = nullptr;
+  uint8_t* flags = nullptr;
+  if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&tp),
+                          static_cast<size_t>(target_rows) * V * sizeof(float)), "spec target") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&cu), (B + 1) * sizeof(int32_t)), "spec cu") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&draft),
+                          std::max(1, total) * sizeof(int32_t)), "spec draft") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&out), B * (K + 1) * sizeof(int32_t)),
+               "spec out") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&num), B * sizeof(int32_t)), "spec num")) {
+    return false;
+  }
+  if (!target_only && !greedy) {
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&dp),
+                            std::max(1, total) * V * sizeof(float)), "spec draft probs")) {
+      return false;
+    }
+  }
+  if (greedy) {
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&argmax),
+                            target_rows * sizeof(int32_t)), "spec argmax") ||
+        !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&flags), B * sizeof(uint8_t)), "spec flags")) {
+      return false;
+    }
+  }
+  fill_probs(tp, static_cast<size_t>(target_rows), V, 3.0f);
+  if (dp != nullptr) fill_probs(dp, static_cast<size_t>(total), V, 2.5f);
+  std::vector<int32_t> hcu(B + 1), hdraft(std::max(1, total)), hargmax(target_rows, 0);
+  for (int b = 0; b <= B; ++b) hcu[static_cast<size_t>(b)] = b * K;
+  for (int i = 0; i < total; ++i) hdraft[static_cast<size_t>(i)] = (i * 7919 + 13) % V;
+  for (int i = 0; i < total; ++i) hargmax[static_cast<size_t>(i)] = hdraft[static_cast<size_t>(i)];
+  upload(cu, hcu);
+  if (total > 0) upload(draft, hdraft);
+  if (greedy) {
+    upload(argmax, hargmax);
+    upload(flags, std::vector<uint8_t>(B, 1));
+  }
+  cudaMemset(out, 0, B * (K + 1) * sizeof(int32_t));
+  cudaMemset(num, 0, B * sizeof(int32_t));
+
+  kops::sample::SpecVerifyParams p{};
+  p.draft_token_ids = draft;
+  p.cu_num_draft = cu;
+  p.target_probs = tp;
+  p.draft_probs = dp;
+  p.target_argmax = greedy ? argmax : nullptr;
+  p.is_greedy = greedy ? flags : nullptr;
+  p.output_token_ids = out;
+  p.num_accepted = num;
+  p.batch_size = B;
+  p.max_draft = K;
+  p.vocab_size = V;
+  p.rng.global_seed = 7;
+  p.rng.stream_id = 1;
+  const bool ok = status_ok(kops::sample::rejection_sample(p, ctx), c.id.c_str()) &&
+                  measure(c, [&] { (void)kops::sample::rejection_sample(p, ctx); }, st);
+  cudaFree(tp);
+  if (dp != nullptr) cudaFree(dp);
+  cudaFree(cu);
+  cudaFree(draft);
+  if (argmax != nullptr) cudaFree(argmax);
+  if (flags != nullptr) cudaFree(flags);
+  cudaFree(out);
+  cudaFree(num);
+  return ok;
+}
+
+bool run_spec_tree(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const int B = static_cast<int>(c.rows);
+  const int V = static_cast<int>(c.cols);
+  const int N = spec_int(c.id, "n", 64);
+  const int D = spec_int(c.id, "d", 8);
+  const bool greedy = c.op == "spec_tree_greedy";
+  const bool qmode = c.op == "spec_tree_q";
+  float* tp = nullptr;
+  float* dp = nullptr;
+  int32_t* cand = nullptr;
+  int32_t* first = nullptr;
+  int32_t* next = nullptr;
+  int32_t* ridx = nullptr;
+  int32_t* argmax = nullptr;
+  int32_t* acc_idx = nullptr;
+  int32_t* acc_len = nullptr;
+  int32_t* out = nullptr;
+  if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&tp),
+                          static_cast<size_t>(B) * N * V * sizeof(float)), "tree target") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&cand), B * N * sizeof(int32_t)), "tree cand") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&first), B * N * sizeof(int32_t)), "tree first") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&next), B * N * sizeof(int32_t)), "tree next") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&ridx), B * N * sizeof(int32_t)), "tree ridx") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&acc_idx),
+                          B * (D + 1) * sizeof(int32_t)), "tree index") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&acc_len), B * sizeof(int32_t)), "tree len") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&out),
+                          B * (D + 1) * sizeof(int32_t)), "tree out")) {
+    return false;
+  }
+  if (qmode) {
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&dp),
+                            static_cast<size_t>(B) * N * V * sizeof(float)), "tree draft")) {
+      return false;
+    }
+  }
+  if (greedy) {
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&argmax),
+                            B * N * sizeof(int32_t)), "tree argmax")) {
+      return false;
+    }
+  }
+  fill_probs(tp, static_cast<size_t>(B) * N, V, 3.0f);
+  if (dp != nullptr) fill_probs(dp, static_cast<size_t>(B) * N, V, 2.5f);
+  std::vector<int32_t> cand1(N), first1(N, -1), next1(N, -1), ridx1(N), argmax1(N);
+  for (int i = 0; i < N; ++i) {
+    cand1[static_cast<size_t>(i)] = (i * 13 + 1) % V;
+    ridx1[static_cast<size_t>(i)] = i;
+    if (2 * i + 1 < N) {
+      first1[static_cast<size_t>(i)] = 2 * i + 1;
+      if (2 * i + 2 < N) next1[static_cast<size_t>(2 * i + 1)] = 2 * i + 2;
+    }
+    argmax1[static_cast<size_t>(i)] = first1[static_cast<size_t>(i)] >= 0
+                                          ? cand1[static_cast<size_t>(first1[static_cast<size_t>(i)])]
+                                          : 0;
+  }
+  std::vector<int32_t> hc, hf, hn, hr, ha;
+  for (int b = 0; b < B; ++b) {
+    hc.insert(hc.end(), cand1.begin(), cand1.end());
+    hf.insert(hf.end(), first1.begin(), first1.end());
+    hn.insert(hn.end(), next1.begin(), next1.end());
+    hr.insert(hr.end(), ridx1.begin(), ridx1.end());
+    ha.insert(ha.end(), argmax1.begin(), argmax1.end());
+  }
+  upload(cand, hc);
+  upload(first, hf);
+  upload(next, hn);
+  upload(ridx, hr);
+  if (greedy) upload(argmax, ha);
+  cudaMemset(out, 0, B * (D + 1) * sizeof(int32_t));
+  cudaMemset(acc_len, 0, B * sizeof(int32_t));
+
+  kops::sample::TreeVerifyParams p{};
+  p.candidates = cand;
+  p.retrieve_index = greedy ? nullptr : ridx;
+  p.first_child = first;
+  p.next_sibling = next;
+  p.target_probs = greedy ? nullptr : tp;
+  p.draft_probs = qmode ? dp : nullptr;
+  p.target_argmax = greedy ? argmax : nullptr;
+  p.accept_index = acc_idx;
+  p.accept_length = acc_len;
+  p.output_token_ids = out;
+  p.batch_size = B;
+  p.num_nodes = N;
+  p.max_depth = D;
+  p.vocab_size = V;
+  p.rng.global_seed = 7;
+  p.rng.stream_id = 1;
+  const bool ok = status_ok(kops::sample::tree_verify(p, ctx), c.id.c_str()) &&
+                  measure(c, [&] { (void)kops::sample::tree_verify(p, ctx); }, st);
+  cudaFree(tp);
+  if (dp != nullptr) cudaFree(dp);
+  cudaFree(cand);
+  cudaFree(first);
+  cudaFree(next);
+  cudaFree(ridx);
+  if (argmax != nullptr) cudaFree(argmax);
+  cudaFree(acc_idx);
+  cudaFree(acc_len);
+  cudaFree(out);
+  return ok;
+}
+
+bool run_spec_mask(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const int B = static_cast<int>(c.rows);
+  const int P = static_cast<int>(c.cols);
+  const int N = spec_int(c.id, "n", 64);
+  const int64_t bits = static_cast<int64_t>(B) * N * (P + N);
+  const int64_t bytes = (bits + 7) / 8 + 16;
+  uint8_t* mask = nullptr;
+  int64_t* indptr = nullptr;
+  int32_t* pos = nullptr;
+  int32_t* parent = nullptr;
+  int32_t* prefix = nullptr;
+  if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&mask), bytes), "mask") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&indptr), (B + 1) * sizeof(int64_t)),
+               "mask indptr") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&pos), B * N * sizeof(int32_t)), "mask pos") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&parent), B * N * sizeof(int32_t)),
+               "mask parent") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&prefix), B * sizeof(int32_t)),
+               "mask prefix")) {
+    return false;
+  }
+  std::vector<int32_t> hparent, hprefix(B, P);
+  for (int b = 0; b < B; ++b) {
+    for (int i = 0; i < N; ++i) hparent.push_back(i == 0 ? -1 : (i - 1) / 2);
+  }
+  upload(parent, hparent);
+  upload(prefix, hprefix);
+  const kops::Tensor tm = tensor1d(mask, kops::DType::kUInt8, bytes);
+  const kops::Tensor ti = tensor1d(indptr, kops::DType::kInt64, B + 1);
+  const kops::Tensor tp = tensor2d(pos, kops::DType::kInt32, B, N);
+  const kops::Tensor tpar = tensor2d(parent, kops::DType::kInt32, B, N);
+  const kops::Tensor tpre = tensor1d(prefix, kops::DType::kInt32, B);
+  const bool ok = status_ok(kops::sample::build_tree_attention_mask(tm, ti, tp, tpar, tpre, ctx),
+                            c.id.c_str()) &&
+                  measure(c,
+                          [&] {
+                            (void)kops::sample::build_tree_attention_mask(tm, ti, tp, tpar, tpre,
+                                                                         ctx);
+                          },
+                          st);
+  cudaFree(mask);
+  cudaFree(indptr);
+  cudaFree(pos);
+  cudaFree(parent);
+  cudaFree(prefix);
+  return ok;
+}
 }
 
 int main(int argc, char** argv) {
@@ -785,18 +1072,10 @@ int main(int argc, char** argv) {
 
   std::vector<Case> cases = make_cases();
   if (opt.split_sweep) add_split_cases(&cases);
-  if (opt.only != nullptr) {
-    const std::string only = opt.only;
-    cases.erase(std::remove_if(cases.begin(), cases.end(),
-                               [&](const Case& c) { return c.id.find(only) == std::string::npos; }),
-                cases.end());
-    if (cases.empty()) {
-      std::fprintf(stderr, "[bench] no case matches '%s'\n", opt.only);
-      return 1;
-    }
-  }
-  if (opt.iters > 0) {
-    for (Case& c : cases) c.iters = opt.iters;
+  filter_cases(&cases, opt);
+  if (cases.empty()) {
+    std::fprintf(stderr, "[bench] no case matches the --only/--skip filters\n");
+    return 1;
   }
   if (opt.dump_cases) {
     dump_cases(cases, dev);

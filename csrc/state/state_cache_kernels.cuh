@@ -48,8 +48,9 @@ __global__ void state_zero_kernel(
     const int num_items, const int num_pools);
 
 /**
- * state_commit_accepted_kernel — speculative decoding rollback/commit: for each sequence copy the
- * intermediate state of its last accepted draft position into the live slot.
+ * state_commit_accepted_kernel — speculative decoding rollback/commit: intermediate[b, j] is the
+ * state to adopt when j drafts were accepted (the state after prefix + j draft tokens).  The live
+ * slot already holds the state after the full draft forward, so the all-accepted row needs no copy.
  *   live[b] <- intermediate[b, num_accepted[b]]  (no copy when num_accepted == num_drafts)
  */
 __global__ void state_commit_accepted_kernel(

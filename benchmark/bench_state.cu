@@ -31,7 +31,62 @@ using kops::Tensor;
 
 Tensor t1(void* p, int64_t n) { return tensor1d(p, DType::kInt64, n); }
 
+bool run_state_commit(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  const int B = static_cast<int>(c.rows);
+  const int M = static_cast<int>(c.cols);
+  constexpr int kSlots = 128;
+  constexpr int kB0 = 4096, kB1 = 2048, kPools = 2;
+  void* pool0 = nullptr;
+  void* pool1 = nullptr;
+  int64_t* ptrs = nullptr;
+  int64_t* bytes = nullptr;
+  int32_t* live = nullptr;
+  int32_t* inter = nullptr;
+  int32_t* num = nullptr;
+  if (!cuda_ok(cudaMalloc(&pool0, static_cast<size_t>(kSlots) * kB0), "commit pool0") ||
+      !cuda_ok(cudaMalloc(&pool1, static_cast<size_t>(kSlots) * kB1), "commit pool1") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&ptrs), kPools * 8), "commit ptrs") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&bytes), kPools * 8), "commit bytes") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&live), B * 4), "commit live") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&inter), static_cast<size_t>(B) * M * 4),
+               "commit inter") ||
+      !cuda_ok(cudaMalloc(reinterpret_cast<void**>(&num), B * 4), "commit num")) {
+    return false;
+  }
+  const int64_t pv[kPools] = {reinterpret_cast<int64_t>(pool0), reinterpret_cast<int64_t>(pool1)};
+  const int64_t bv[kPools] = {kB0, kB1};
+  cudaMemcpy(ptrs, pv, sizeof(pv), cudaMemcpyHostToDevice);
+  cudaMemcpy(bytes, bv, sizeof(bv), cudaMemcpyHostToDevice);
+  cudaMemset(pool0, 0x3C, static_cast<size_t>(kSlots) * kB0);
+  cudaMemset(pool1, 0xA5, static_cast<size_t>(kSlots) * kB1);
+  std::vector<int32_t> hl(B), hi(static_cast<size_t>(B) * M), hn(B);
+  for (int b = 0; b < B; ++b) {
+    hl[b] = b % kSlots;
+    hn[b] = b % (M - 1);
+    for (int j = 0; j < M; ++j) hi[static_cast<size_t>(b) * M + j] = 4 + (b * M + j) % (kSlots - 4);
+  }
+  cudaMemcpy(live, hl.data(), hl.size() * 4, cudaMemcpyHostToDevice);
+  cudaMemcpy(inter, hi.data(), hi.size() * 4, cudaMemcpyHostToDevice);
+  cudaMemcpy(num, hn.data(), hn.size() * 4, cudaMemcpyHostToDevice);
+  const Tensor tp = t1(ptrs, kPools);
+  const Tensor tb = t1(bytes, kPools);
+  const Tensor tl = tensor1d(live, DType::kInt32, B);
+  const Tensor ti = tensor2d(inter, DType::kInt32, B, M);
+  const Tensor tn = tensor1d(num, DType::kInt32, B);
+  const auto call = [&] { return kops::state::state_commit_accepted(tp, tb, tl, ti, tn, ctx); };
+  const bool ok = status_ok(call(), c.id.c_str()) && measure(c, [&] { (void)call(); }, st);
+  cudaFree(pool0);
+  cudaFree(pool1);
+  cudaFree(ptrs);
+  cudaFree(bytes);
+  cudaFree(live);
+  cudaFree(inter);
+  cudaFree(num);
+  return ok;
+}
+
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
+  if (c.op == "state_commit") return run_state_commit(c, ctx, st);
   constexpr int kPools = 2, kSlots = 256, kB0 = 4096, kB1 = 2048, kItems = 64;
   const int64_t total = static_cast<int64_t>(kItems) * (kB0 + kB1);
   void* pool0 = nullptr;
@@ -555,6 +610,9 @@ std::vector<Case> make_cases() {
                    0, 10, 100});
   cases.push_back({"state_zero.2pools.64items", "state_zero", DType::kUInt8, 64, 6144, bytes / 2,
                    0, 10, 100});
+  // B10: commit the intermediate state of every accepted speculative position.
+  cases.push_back({"state_commit.2pools.b64.d8", "state_commit", DType::kUInt8, 64, 8,
+                   int64_t{64} * (4096 + 2048) * 2, 0, 10, 100});
   add_b9_cases(cases);
   return cases;
 }
@@ -567,7 +625,8 @@ int main(int argc, char** argv) {
   if (!cuda_ok(cudaSetDevice(0), "cudaSetDevice")) return 1;
   DeviceInfo dev{};
   query_device(&dev);
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  filter_cases(&cases, opt);
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

@@ -108,6 +108,60 @@
    "status": "benchmarked",
    "predicates": "argmax(logit/T + Gumbel) with counter RNG; top-k + min-p truncation; top-p rejected with kNotImplemented (use sample()); greedy T<=0",
    "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S03.rejection_sample",
+   "kernel_symbol": "rejection_sample_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "numerically_validated",
+   "predicates": "chain greedy / target-only / p-q; counter RNG draw map; one CTA per request; no workspace",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S03.tree_verify",
+   "kernel_symbol": "tree_verify_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "numerically_validated",
+   "predicates": "EAGLE tree, greedy / target-only / p-q; first-child/next-sibling; accept path and recovered node",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S03.tree_attention_mask",
+   "kernel_symbol": "build_tree_attention_mask_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "numerically_validated",
+   "predicates": "bit-packed custom mask, little-endian, no padding between rows; depth offsets; atomicOr word writes",
+   "evidence": "test_sampling;bench_sampling"
+  },
+  {
+   "op_id": "S03.rejection_sample",
+   "kernel_symbol": "rejection_sample_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "compiled",
+   "predicates": "compile-only sm86; runtime evidence is on sm89",
+   "evidence": "ci-sm86"
+  },
+  {
+   "op_id": "S03.tree_verify",
+   "kernel_symbol": "tree_verify_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "compiled",
+   "predicates": "compile-only sm86; runtime evidence is on sm89",
+   "evidence": "ci-sm86"
+  },
+  {
+   "op_id": "S03.tree_attention_mask",
+   "kernel_symbol": "build_tree_attention_mask_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "compiled",
+   "predicates": "compile-only sm86; runtime evidence is on sm89",
+   "evidence": "ci-sm86"
   }
  ]
 }
