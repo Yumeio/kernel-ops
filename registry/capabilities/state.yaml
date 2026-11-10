@@ -234,6 +234,222 @@
    "status": "compiled",
    "predicates": "compile-only sm86; runtime evidence is on sm89",
    "evidence": "ci-sm86"
+  },
+  {
+   "op_id": "L03.state_copy",
+   "kernel_symbol": "state_copy_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "byte copy per (pair, pool); negative slots skip; 16-byte vector path",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_gather",
+   "kernel_symbol": "state_gather_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "slot -> contiguous staging row; per-pool byte prefix from device slot_bytes",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_scatter",
+   "kernel_symbol": "state_scatter_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "contiguous staging row -> slot; inverse of state_gather",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L03.state_zero",
+   "kernel_symbol": "state_zero_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "zero selected slots of every pool; graph-capturable",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L01.causal_conv1d_fwd",
+   "kernel_symbol": "causal_conv1d_fwd_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "varlen; width 2-4; x fp32/fp16/bf16, weight x dtype or fp32; SiLU/Identity; 16-byte path when dim stride 1 and dim >= 128*vec; raw-bit history, snapshots",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L01.causal_conv1d_update",
+   "kernel_symbol": "causal_conv1d_update_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "decode 1..S tokens; in-place out==x; intermediate slot per token (spec decode)",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.selective_state_update",
+   "kernel_symbol": "selective_state_update_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "Mamba-1 (a_per_state) / Mamba-2; dstate 8..256 pow2; dt softplus + limit; D, z; intermediate slots",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.selective_scan_fwd",
+   "kernel_symbol": "selective_scan_fwd_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "Mamba-1 varlen; dstate 8/16/32; affine warp scan over 128-token tiles; resume at tile boundary bitwise",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.ssd_chunk_cumsum",
+   "kernel_symbol": "ssd_chunk_cumsum_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "SSD step 1; chunk 64/128/256; dt softplus + clamp",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.ssd_bmm_chunk",
+   "kernel_symbol": "ssd_bmm_chunk_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "SSD step 2; CB = C B^T per chunk/group, lower triangle; N <= 256",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.ssd_chunk_state",
+   "kernel_symbol": "ssd_chunk_state_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "SSD step 3; P, N <= 256",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.ssd_state_passing",
+   "kernel_symbol": "ssd_state_passing_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "SSD step 4; initial states, final state to slot, snapshots at chunk multiples",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.ssd_chunk_scan",
+   "kernel_symbol": "ssd_chunk_scan_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "SSD step 5; D [H] or [H,P], silu(z) gate",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.linear_attention_decode",
+   "kernel_symbol": "linear_attention_decode_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "lightning decode; Dk, Dv 1..256; decay exp(-slope[h])",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.lightning_attention_prefill",
+   "kernel_symbol": "lightning_attention_prefill_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "64-token blocks; Dk, Dv 1..256; snapshots at multiples of 64; resume bitwise",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.fused_recurrent_delta_rule",
+   "kernel_symbol": "fused_recurrent_delta_rule_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "GDN / KDA; Dk 16/32/64/128, Dv 1..256; L2 q/k; state [Dk,Dv] or transposed; snapshots + intermediate slots",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.fused_short_conv_delta_rule_decode",
+   "kernel_symbol": "fused_short_conv_delta_rule_decode_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "conv + gating + L2 + rule + gated RMSNorm; Dk 64/128, Dv 16..128, Hv/Hk <= 8",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.delta_rule_gating",
+   "kernel_symbol": "delta_rule_gating_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "GDN / KDA gates; softplus or bounded (lower_bound < 0); beta = sigmoid",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.chunk_local_cumsum",
+   "kernel_symbol": "chunk_local_cumsum_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "64-token chunks from each sequence start",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.chunk_scaled_dot_kkt",
+   "kernel_symbol": "chunk_scaled_dot_kkt_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "fp32 or bf16 mma.sync (ChunkMath::kTensorCore, bf16 inputs); KDA pairs per channel",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.solve_tril",
+   "kernel_symbol": "solve_tril_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "(I + A)^-1, 64x64 by 16x16 block forward substitution, fp32",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.recompute_w_u",
+   "kernel_symbol": "recompute_w_u_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "fp32 or bf16 mma.sync",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.chunk_state_fwd",
+   "kernel_symbol": "chunk_state_fwd_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "fp32 or bf16 mma.sync; v_new, final state, snapshots at multiples of 64",
+   "evidence": "test_state;bench_state"
+  },
+  {
+   "op_id": "L02.chunk_output_fwd",
+   "kernel_symbol": "chunk_output_fwd_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "fp32 or bf16 mma.sync; Dk 16/32/64/128, Dv 1..256",
+   "evidence": "test_state;bench_state"
   }
  ]
 }

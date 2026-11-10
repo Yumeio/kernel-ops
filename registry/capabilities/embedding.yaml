@@ -11,10 +11,28 @@
    "evidence": "test_embedding;bench_embedding"
   },
   {
+   "op_id": "X02.embedding_lookup",
+   "kernel_symbol": "embedding_lookup_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_embedding;bench_embedding"
+  },
+  {
    "op_id": "X02.embedding_with_position",
    "kernel_symbol": "embedding_with_position_kernel",
    "provider": "native",
    "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_embedding;bench_embedding"
+  },
+  {
+   "op_id": "X02.embedding_with_position",
+   "kernel_symbol": "embedding_with_position_kernel",
+   "provider": "native",
+   "arch_id": 890,
    "status": "benchmarked",
    "predicates": "planned",
    "evidence": "test_embedding;bench_embedding"
@@ -29,8 +47,35 @@
    "evidence": "test_embedding;bench_embedding"
   },
   {
+   "op_id": "X02.gather_rows",
+   "kernel_symbol": "gather_rows_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_embedding;bench_embedding"
+  },
+  {
    "op_id": "X02.scatter_rows",
    "kernel_symbol": "scatter_rows_kernel",
+   "provider": "native",
+   "arch_id": 860,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_embedding;bench_embedding"
+  },
+  {
+   "op_id": "X02.scatter_rows",
+   "kernel_symbol": "scatter_rows_kernel",
+   "provider": "native",
+   "arch_id": 890,
+   "status": "benchmarked",
+   "predicates": "planned",
+   "evidence": "test_embedding;bench_embedding"
+  },
+  {
+   "op_id": "X02.logits_postprocess",
+   "kernel_symbol": "logits_postprocess_kernel",
    "provider": "native",
    "arch_id": 860,
    "status": "benchmarked",
@@ -41,7 +86,7 @@
    "op_id": "X02.logits_postprocess",
    "kernel_symbol": "logits_postprocess_kernel",
    "provider": "native",
-   "arch_id": 860,
+   "arch_id": 890,
    "status": "benchmarked",
    "predicates": "planned",
    "evidence": "test_embedding;bench_embedding"
