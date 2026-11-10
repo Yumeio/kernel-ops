@@ -116,6 +116,16 @@ RTX 5060 Ti; 18.25 GFLOP has a ~0.76 ms floor with all 36 SMs, while PyTorch is
 different head/V tiling. 1M split-KV, the actual long-context target, passes
 with margin.
 
+**sparse_mla topk2048 is CTA-count limited.** 128 heads / 16 heads per CTA is 8
+CTAs on a 36-SM part. The measured body is ~41% latent-tile stream (~250 GB/s
+aggregate), ~15% QK mma and ~11% PV; 4-buffer cp.async and 32-key tiles were
+both tried and regressed or were neutral, so the 8-CTA floor is ~0.11 ms.
+Reaching 2x (<=0.062 ms) requires splitting each row across CTAs and merging the
+per-split `(o_partial, lse)` states. That needs a caller-owned split workspace
+(and therefore an ABI v8 additive overload); the design and expected ~0.07 ms
+result are recorded here for the next wave. The 656/584/528/288 codecs, both
+scopes, sink and exact topk are already in the tensor-core body.
+
 The 1.2x "chính chủ" reference remains pending because FlashMLA/DeepGEMM are
 not installed and the optimized SM90a/SM100a bodies are not ported.
 
