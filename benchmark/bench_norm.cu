@@ -29,6 +29,9 @@ std::vector<Case> make_cases() {
   add_rms("norm.rms_norm.fp32.h4096.b1024", kops::DType::kFloat32, 1024, 4096);
   add_rms("norm.rms_norm.bf16.h1024.b1024", kops::DType::kBFloat16, 1024, 1024);
   add_rms("norm.rms_norm.bf16.h4096.b1024", kops::DType::kBFloat16, 1024, 4096);
+  // Above L2 (64 MB in + 64 MB out): the DRAM-roofline data point.
+  add_rms("norm.rms_norm.bf16.h8192.b4096", kops::DType::kBFloat16, 4096, 8192);
+  add_rms("norm.rms_norm.fp32.h8192.b4096", kops::DType::kFloat32, 4096, 8192);
 
   auto add_fused = [&](const char* id, kops::DType dt, int64_t rows, int64_t hidden) {
     const int es = dtype_size(dt);
@@ -39,26 +42,28 @@ std::vector<Case> make_cases() {
   add_fused("norm.fused_add_rms_norm.bf16.h4096.b1024", kops::DType::kBFloat16, 1024, 4096);
 
   auto add_plain = [&](const char* id, const char* op, kops::DType dt, int64_t rows,
-                       int64_t cols, int64_t reads, int64_t writes, int64_t flops) {
+                       int64_t cols, int64_t reads, int64_t writes, int64_t flops,
+                       int64_t weight_elems = 0) {
     const int es = dtype_size(dt);
-    cases.push_back({id, op, dt, rows, cols, (reads + writes) * rows * cols * es, flops, 20, 200});
+    cases.push_back({id, op, dt, rows, cols,
+                     ((reads + writes) * rows * cols + weight_elems) * es, flops, 20, 200});
   };
   add_plain("norm.layer_norm.bf16.h4096.b1024", "layer_norm", kops::DType::kBFloat16, 1024, 4096,
-            2, 1, 6 * 1024 * 4096);
+            1, 1, 6 * 1024 * 4096, 4096);
   add_plain("norm.layer_norm.fp32.h4096.b1024", "layer_norm", kops::DType::kFloat32, 1024, 4096,
-            2, 1, 6 * 1024 * 4096);
+            1, 1, 6 * 1024 * 4096, 4096);
   add_plain("norm.fused_add_layer_norm.bf16.h4096.b1024", "fused_add_layer_norm",
-            kops::DType::kBFloat16, 1024, 4096, 3, 2, 8 * 1024 * 4096);
+            kops::DType::kBFloat16, 1024, 4096, 2, 2, 8 * 1024 * 4096, 4096);
   add_plain("norm.fused_add_rms_norm_out.bf16.h4096.b1024", "fused_add_rms_norm_out",
-            kops::DType::kBFloat16, 1024, 4096, 3, 2, 7 * 1024 * 4096);
+            kops::DType::kBFloat16, 1024, 4096, 2, 2, 7 * 1024 * 4096, 4096);
   add_plain("norm.l2_norm.bf16.h4096.b1024", "l2_norm", kops::DType::kBFloat16, 1024, 4096, 1, 1,
             3 * 1024 * 4096);
   add_plain("norm.gated_rms_norm.bf16.g128.h4096.b1024", "gated_rms_norm",
-            kops::DType::kBFloat16, 1024, 4096, 3, 1, 6 * 1024 * 4096);
+            kops::DType::kBFloat16, 1024, 4096, 2, 1, 6 * 1024 * 4096, 4096);
   add_plain("norm.qk_norm.bf16.h32kv8.d128.b1024", "qk_norm", kops::DType::kBFloat16, 1024,
             6144, 2, 1, 4 * 1024 * 40 * 128);
   add_plain("norm.norm_quant.bf16.h4096.b1024", "norm_quant", kops::DType::kBFloat16, 1024, 4096,
-            5, 1, 6 * 1024 * 4096);
+            2, 1, 6 * 1024 * 4096, 4096);
 
   return cases;
 }
@@ -320,7 +325,8 @@ int main(int argc, char** argv) {
   DeviceInfo dev{};
   query_device(&dev);
 
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  filter_cases(&cases, opt);
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

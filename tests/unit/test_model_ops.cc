@@ -129,6 +129,200 @@ void test_cast(DType out_dt, DType in_dt, const char* name) {
   kops_test::device_free(dy);
 }
 
+// -----------------------------------------------------------------------------
+// Layout and dtype coverage for the persistent chunk kernel: the same logical
+// row data through the 32 B chunk path (contiguous), the 16 B / padded-stride
+// path and the scalar path (odd stride), plus exact in-place reuse. Every path
+// must agree bit for bit with the contiguous one, because each output element
+// is produced by one thread with one rounding.
+// -----------------------------------------------------------------------------
+
+kops::Tensor view2d(void* data, kops::DType dt, int64_t rows, int64_t cols, int64_t stride) {
+  kops::Tensor t{};
+  t.data = data;
+  t.dtype = dt;
+  t.ndim = 2;
+  t.device = 0;
+  t.shape[0] = rows;
+  t.shape[1] = cols;
+  t.stride[0] = stride;
+  t.stride[1] = 1;
+  return t;
+}
+
+template <typename T>
+std::vector<T> gather_rows(const std::vector<T>& body, int64_t rows, int64_t cols,
+                           int64_t stride) {
+  std::vector<T> out(static_cast<size_t>(rows * cols));
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t c = 0; c < cols; ++c) out[static_cast<size_t>(r * cols + c)] = body[static_cast<size_t>(r * stride + c)];
+  }
+  return out;
+}
+
+template <typename T>
+std::vector<T> spread_rows(const std::vector<T>& flat, int64_t rows, int64_t cols,
+                           int64_t stride) {
+  std::vector<T> body(static_cast<size_t>(rows * stride));
+  for (auto& v : body) kops_test::from_float(v, 7.0f);  // poison the padding
+  for (int64_t r = 0; r < rows; ++r) {
+    for (int64_t c = 0; c < cols; ++c) body[static_cast<size_t>(r * stride + c)] = flat[static_cast<size_t>(r * cols + c)];
+  }
+  return body;
+}
+
+/// One residual_add configuration through every layout path.
+template <typename T>
+void test_residual_layouts(kops::DType dt, const char* name, int64_t rows, int64_t cols,
+                           bool three) {
+  const float as = 0.5f, bs = -1.25f, cs = 2.0f;
+  std::vector<float> af(static_cast<size_t>(rows * cols)), bf(af.size()), cf(af.size());
+  fill(af, 7u);
+  fill(bf, 8u);
+  fill(cf, 9u);
+  const std::vector<T> a = to_type<T>(af), b = to_type<T>(bf), c = to_type<T>(cf);
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+
+  // Reference: contiguous views (the chunk path).
+  T* da = kops_test::device_alloc<T>(a.size());
+  T* db = kops_test::device_alloc<T>(b.size());
+  T* dc = three ? kops_test::device_alloc<T>(c.size()) : nullptr;
+  T* dout = kops_test::device_alloc<T>(a.size());
+  if (da == nullptr || db == nullptr || dout == nullptr || (three && dc == nullptr)) return;
+  kops_test::copy_in(da, a);
+  kops_test::copy_in(db, b);
+  if (three) kops_test::copy_in(dc, c);
+  KOPS_EXPECT_OK(kops::model_ops::residual_add(view2d(dout, dt, rows, cols, cols),
+                                               view2d(da, dt, rows, cols, cols), as,
+                                               view2d(db, dt, rows, cols, cols), bs,
+                                               three ? view2d(dc, dt, rows, cols, cols) : kops::Tensor{},
+                                               cs, ctx),
+                 name);
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto ref = kops_test::copy_out(dout, a.size());
+  const auto ref_d = to_double(ref);
+
+  // Same data with a padded row stride (keeps the vector path) and with an odd
+  // stride (forces the scalar path). Both must match the reference exactly.
+  for (const int64_t pad : {int64_t{8}, int64_t{1}}) {
+    const int64_t stride = cols + pad;
+    const auto ab = spread_rows(a, rows, cols, stride);
+    const auto bb = spread_rows(b, rows, cols, stride);
+    const auto cb = spread_rows(c, rows, cols, stride);
+    T* pa = kops_test::device_alloc<T>(ab.size());
+    T* pb = kops_test::device_alloc<T>(bb.size());
+    T* pc = three ? kops_test::device_alloc<T>(cb.size()) : nullptr;
+    T* po = kops_test::device_alloc<T>(ab.size());
+    if (pa == nullptr || pb == nullptr || po == nullptr || (three && pc == nullptr)) return;
+    kops_test::copy_in(pa, ab);
+    kops_test::copy_in(pb, bb);
+    if (three) kops_test::copy_in(pc, cb);
+    KOPS_EXPECT_OK(kops::model_ops::residual_add(view2d(po, dt, rows, cols, stride),
+                                                 view2d(pa, dt, rows, cols, stride), as,
+                                                 view2d(pb, dt, rows, cols, stride), bs,
+                                                 three ? view2d(pc, dt, rows, cols, stride)
+                                                       : kops::Tensor{},
+                                                 cs, ctx),
+                   name);
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto got = gather_rows(kops_test::copy_out(po, ab.size()), rows, cols, stride);
+    kops_test::compare(got, ref_d, 0.0, 0.0, name);
+    kops_test::device_free(pa);
+    kops_test::device_free(pb);
+    kops_test::device_free(pc);
+    kops_test::device_free(po);
+  }
+
+  // Exact in-place output (out == a) must reproduce the out-of-place result.
+  kops_test::copy_in(da, a);
+  KOPS_EXPECT_OK(kops::model_ops::residual_add(view2d(da, dt, rows, cols, cols),
+                                              view2d(da, dt, rows, cols, cols), as,
+                                              view2d(db, dt, rows, cols, cols), bs,
+                                              three ? view2d(dc, dt, rows, cols, cols) : kops::Tensor{},
+                                              cs, ctx),
+                 name);
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  kops_test::compare(kops_test::copy_out(da, a.size()), ref_d, 0.0, 0.0, name);
+
+  kops_test::device_free(da);
+  kops_test::device_free(db);
+  kops_test::device_free(dc);
+  kops_test::device_free(dout);
+}
+
+/// Odd hidden sizes exercise the tail loops of the scalar path.
+template <typename T>
+void test_residual_odd(kops::DType dt, const char* name, int64_t cols) {
+  const int64_t rows = 5;
+  const float as = 0.75f, bs = -2.0f;
+  std::vector<float> af(static_cast<size_t>(rows * cols)), bf(af.size());
+  fill(af, 21u);
+  fill(bf, 22u);
+  const std::vector<T> a = to_type<T>(af), b = to_type<T>(bf);
+  T* da = kops_test::device_alloc<T>(a.size());
+  T* db = kops_test::device_alloc<T>(b.size());
+  T* dout = kops_test::device_alloc<T>(a.size());
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  kops_test::copy_in(da, a);
+  kops_test::copy_in(db, b);
+  KOPS_EXPECT_OK(kops::model_ops::residual_add(view2d(dout, dt, rows, cols, cols),
+                                               view2d(da, dt, rows, cols, cols), as,
+                                               view2d(db, dt, rows, cols, cols), bs,
+                                               kops::Tensor{}, 0.0f, ctx),
+                 name);
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto got = kops_test::copy_out(dout, a.size());
+  const auto ad = to_double(a), bd = to_double(b);
+  std::vector<double> ref(a.size());
+  for (size_t i = 0; i < ref.size(); ++i) ref[i] = as * ad[i] + bs * bd[i];
+  const double tol = dt == DType::kFloat32 ? 1e-5 : 3e-2;
+  kops_test::compare(got, ref, tol, tol, name);
+  kops_test::device_free(da);
+  kops_test::device_free(db);
+  kops_test::device_free(dout);
+}
+
+/// One cast configuration through the contiguous, padded and odd-stride paths.
+template <typename Out, typename In>
+void test_cast_layouts(DType out_dt, DType in_dt, const char* name, int64_t rows, int64_t cols,
+                       float scale) {
+  std::vector<float> xf(static_cast<size_t>(rows * cols));
+  fill(xf, 31u);
+  const std::vector<In> x = to_type<In>(xf);
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  In* dx = kops_test::device_alloc<In>(x.size());
+  Out* dy = kops_test::device_alloc<Out>(x.size());
+  if (dx == nullptr || dy == nullptr) return;
+  kops_test::copy_in(dx, x);
+  KOPS_EXPECT_OK(kops::model_ops::cast(view2d(dy, out_dt, rows, cols, cols),
+                                       view2d(dx, in_dt, rows, cols, cols), scale, ctx),
+                 name);
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  const auto ref = kops_test::copy_out(dy, x.size());
+  const auto ref_d = to_double(ref);
+
+  for (const int64_t pad : {int64_t{8}, int64_t{1}}) {
+    const int64_t stride = cols + pad;
+    const auto xb = spread_rows(x, rows, cols, stride);
+    In* px = kops_test::device_alloc<In>(xb.size());
+    Out* py = kops_test::device_alloc<Out>(xb.size());
+    if (px == nullptr || py == nullptr) return;
+    kops_test::copy_in(px, xb);
+    KOPS_EXPECT_OK(kops::model_ops::cast(view2d(py, out_dt, rows, cols, stride),
+                                         view2d(px, in_dt, rows, cols, stride), scale, ctx), name);
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto got = gather_rows(kops_test::copy_out(py, xb.size()), rows, cols, stride);
+    kops_test::compare(got, ref_d, 0.0, 0.0, name);
+    kops_test::device_free(px);
+    kops_test::device_free(py);
+  }
+  kops_test::device_free(dx);
+  kops_test::device_free(dy);
+}
+
 void test_contracts() {
   kops::LaunchContext ctx{};
   if (!kops_test::make_context(&ctx)) return;
@@ -200,6 +394,14 @@ void test_registry() {
   KOPS_TEST_CHECK(n >= 1);
   kops::LaunchContext ctx{};
   if (!kops_test::make_context(&ctx)) return;
+  // The capability table is per exact SM. select() can only answer where a row
+  // for this arch_id exists, so only assert it on a machine the table covers
+  // (an exact-SM row outside the table is a registry gap, not a kernel bug).
+  int32_t here = 0;
+  KOPS_EXPECT_OK(
+      kops::registry::find_capabilities("X02.residual_add", ctx.arch_id, rows, 4, &here),
+      "registry find (this arch)");
+  if (here == 0) return;
   const kops::registry::Capability* chosen = nullptr;
   KOPS_EXPECT_OK(kops::registry::select("X02.residual_add", kops::registry::SpecKind::kNone,
                                         nullptr, ctx, kops::registry::Provider::kNative, true,
@@ -218,6 +420,28 @@ int main() {
   test_cast<float, __nv_bfloat16>(DType::kFloat32, DType::kBFloat16, "cast bf16->fp32");
   test_cast<__nv_bfloat16, float>(DType::kBFloat16, DType::kFloat32, "cast fp32->bf16");
   test_cast<float, __half>(DType::kFloat32, DType::kFloat16, "cast fp16->fp32");
+
+  // ---- layout paths, mixed dtypes and odd tails ----------------------------
+  test_residual_layouts<__nv_bfloat16>(DType::kBFloat16, "residual_add bf16 layouts", 9, 4096,
+                                       false);
+  test_residual_layouts<__nv_bfloat16>(DType::kBFloat16, "residual_add bf16 3-in layouts", 7, 512,
+                                       true);
+  test_residual_layouts<__half>(DType::kFloat16, "residual_add fp16 layouts", 6, 1024, false);
+  test_residual_layouts<float>(DType::kFloat32, "residual_add fp32 layouts", 5, 1000, true);
+  // bf16 input with an fp32 output (mixed chunk granule).
+  test_cast_layouts<float, __nv_bfloat16>(DType::kFloat32, DType::kBFloat16,
+                                          "cast bf16->fp32 layouts", 6, 1000, 1.5f);
+  test_cast_layouts<__nv_bfloat16, float>(DType::kBFloat16, DType::kFloat32,
+                                          "cast fp32->bf16 layouts", 6, 1000, 0.5f);
+  test_cast_layouts<__nv_bfloat16, __half>(DType::kBFloat16, DType::kFloat16,
+                                           "cast fp16->bf16 layouts", 5, 4096, 1.0f);
+  test_cast_layouts<__half, __nv_bfloat16>(DType::kFloat16, DType::kBFloat16,
+                                           "cast bf16->fp16 layouts", 5, 4096, 2.0f);
+  test_residual_odd<__nv_bfloat16>(DType::kBFloat16, "residual_add bf16 h1", 1);
+  test_residual_odd<__nv_bfloat16>(DType::kBFloat16, "residual_add bf16 h251", 251);
+  test_residual_odd<__nv_bfloat16>(DType::kBFloat16, "residual_add bf16 h4095", 4095);
+  test_residual_odd<float>(DType::kFloat32, "residual_add fp32 h250", 250);
+  test_residual_odd<__half>(DType::kFloat16, "residual_add fp16 h4097", 4097);
   test_contracts();
   test_graph();
   test_registry();

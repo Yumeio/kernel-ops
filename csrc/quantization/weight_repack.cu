@@ -210,13 +210,60 @@ struct Fp4Source {
   }
 };
 
+/// Work folded into a repack launch instead of a second kernel: the scale permutation and the
+/// identity activation permutation.  Both are tiny next to the repack's own traffic (a 4096x4096
+/// layer permutes 512 KB of scales and writes a 16 KB identity) but each costs a launch, and a
+/// launch serializes behind the repack.  An all-default epilogue means "nothing fused".
+/// The element access mirrors `launch_permute_scales` and `identity_perm_kernel`.
+struct RepackEpilogue {
+  void* scales_out = nullptr;
+  const void* scales_in = nullptr;
+  int64_t scale_total = 0;
+  int scale_bytes = 0;
+  bool per_channel = false;
+  int32_t* perm_out = nullptr;
+  int64_t perm_size = 0;
+  __host__ __device__ bool empty() const { return scale_total <= 0 && perm_out == nullptr; }
+};
+
+/// out[i] = in[i - i % C + perm(i % C)]; see marlin_permute_scales_kernel for the two orders.
+template <typename T>
+__device__ __forceinline__ void marlin_permute_scales_slice(const RepackEpilogue& epi, const int64_t gtid,
+                                                            const int64_t stride) {
+  T* out = static_cast<T*>(epi.scales_out);
+  const T* in = static_cast<const T*>(epi.scales_in);
+  const int chunk = epi.per_channel ? 32 : 64;
+  for (int64_t i = gtid; i < epi.scale_total; i += stride) {
+    const int p = static_cast<int>(i % chunk);
+    const int src = epi.per_channel ? 2 * (p >> 3) + kScalePerChannelOffsets[p & 7] : (p >> 3) + 8 * (p & 7);
+    out[i] = in[i - p + src];
+  }
+}
+
+/// Every thread of the launch takes its share by global thread id.
+__device__ __forceinline__ void marlin_repack_epilogue(const RepackEpilogue& epi) {
+  if (epi.empty()) return;
+  const int64_t gtid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  if (epi.perm_out != nullptr) {
+    for (int64_t i = gtid; i < epi.perm_size; i += stride) epi.perm_out[i] = static_cast<int32_t>(i);
+  }
+  switch (epi.scale_bytes) {
+    case 1: marlin_permute_scales_slice<uint8_t>(epi, gtid, stride); break;
+    case 2: marlin_permute_scales_slice<uint16_t>(epi, gtid, stride); break;
+    case 4: marlin_permute_scales_slice<uint32_t>(epi, gtid, stride); break;
+    default: break;
+  }
+}
+
 /// One thread per (tile, th_id): it produces the words of all four warps of its lane, which are
 /// contiguous in the output (16 B for 4-bit, 32 B for 8-bit).  `kKFastest` walks the tiles of one
 /// n-column strip first (better sector reuse for sources that are row-major in N, such as FP4).
 template <int kBits, bool kKFastest, typename Source>
 __global__ void marlin_repack_tiles_kernel(uint32_t* __restrict__ out, const Source src,
                                            const int k_tiles, const int n_tiles,
-                                           const int64_t total_threads) {
+                                           const int64_t total_threads, const RepackEpilogue epi) {
+  marlin_repack_epilogue(epi);
   constexpr int kTileWords = kMarlinTileK * kMarlinTileN / (32 / kBits);  // 128 or 256
   constexpr int kLaneWords = kTileWords / 32;                              // 4 or 8
   constexpr int kOffsets[4] = {0, 1, 8, 9};
@@ -268,6 +315,66 @@ __global__ void marlin_repack_tiles_kernel(uint32_t* __restrict__ out, const Sou
                                         th_id * kLaneWords);
   dst[0] = make_uint4(res[0], res[1], res[2], res[3]);
   if constexpr (kBits == 8) dst[1] = make_uint4(res[4], res[5], res[6], res[7]);
+}
+
+/// Shared-memory staging for the 4-bit sources whose words run along K: a Marlin tile reads only
+/// the two source rows 2*kt and 2*kt+1 at columns [nt*64, nt*64+64), so one warp can stage its own
+/// 512 B with a single 16-byte load per lane (row 0 in lanes 0-15, row 1 in lanes 16-31) and pack
+/// from there.  The 64 + 4 word stride puts the row-1 reads four banks after row 0's.
+constexpr int kRepackStageStride = kMarlinTileN + 4;
+
+/// One warp per tile for GPTQ-4bit without act-order.  Every source word feeds four output words,
+/// so the previous eight scattered 4-byte loads per output word become one coalesced 16-byte load
+/// per lane plus conflict-free shared-memory reads; `__ldcs` keeps the read-once source out of L2.
+/// A tile's source region is always fully in bounds, so there is no tail path.
+template <int kWarps>
+__global__ void marlin_repack_gptq4_tiles_kernel(uint32_t* __restrict__ out, const GptqSource<4> src,
+                                                 const int n_tiles, const int64_t total_tiles,
+                                                 const RepackEpilogue epi) {
+  constexpr int kTileWords = kMarlinTileK * kMarlinTileN / 8;  // 128
+  __shared__ __align__(16) uint32_t stage[kWarps * 2 * kRepackStageStride];
+  marlin_repack_epilogue(epi);
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  const int64_t tile = static_cast<int64_t>(blockIdx.x) * kWarps + warp;
+  if (tile >= total_tiles) return;
+  const int nt = static_cast<int>(tile % n_tiles);
+  const int kt = static_cast<int>(tile / n_tiles);
+
+  uint32_t* st = &stage[warp * 2 * kRepackStageStride];
+  const int row = lane >> 4;        // the tile's low or high source row
+  const int col = (lane & 15) * 4;  // 16 B of the 64 columns
+  *reinterpret_cast<uint4*>(&st[row * kRepackStageStride + col]) =
+      __ldcs(reinterpret_cast<const uint4*>(src.qweight +
+                                            (static_cast<int64_t>(kt) * 2 + row) * src.size_n +
+                                            nt * kMarlinTileN + col));
+  __syncwarp();
+
+  // Values of a tile word in `marlin_repack_tiles_kernel` order: (k0, n), (k0+1, n), (k0+8, n),
+  // (k0+9, n), (k0, n+8), (k0+1, n+8), (k0+8, n+8), (k0+9, n+8) with k0 = 16*kt + 2*(lane & 3).
+  // Rows 0/1 hold k%8 = 0..7 / 8..15, so one staged word supplies a whole kOffsets pair ({0,1} or
+  // {8,9}) and four words per output word replace the eight scattered source reads.
+  const int shift = 8 * (lane & 3);  // nibble pair 2*(lane&3), 2*(lane&3) + 1
+  const int n_off = lane >> 2;       // column 0..7 of each 8-column group
+  uint32_t res[4];
+  #pragma unroll
+  for (int w = 0; w < 4; ++w) {
+    const uint32_t w0 = st[n_off + w * 16] >> shift;                          // n,    k0
+    const uint32_t w1 = st[kRepackStageStride + n_off + w * 16] >> shift;      // n,    k0 + 8
+    const uint32_t w2 = st[n_off + w * 16 + 8] >> shift;                      // n+8,  k0
+    const uint32_t w3 = st[kRepackStageStride + n_off + w * 16 + 8] >> shift;  // n+8,  k0 + 8
+    const uint32_t vals[8] = {w0 & 0xFu, (w0 >> 4) & 0xFu,
+                              w1 & 0xFu, (w1 >> 4) & 0xFu,
+                              w2 & 0xFu, (w2 >> 4) & 0xFu,
+                              w3 & 0xFu, (w3 >> 4) & 0xFu};
+    constexpr int kPack4[8] = {0, 2, 4, 6, 1, 3, 5, 7};  // nibble i holds vals[kPack4[i]]
+    uint32_t r = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) r |= vals[kPack4[i]] << (i * 4);
+    res[w] = r;
+  }
+  reinterpret_cast<uint4*>(out + (static_cast<int64_t>(kt) * n_tiles + nt) * kTileWords + lane * 4)[0] =
+      make_uint4(res[0], res[1], res[2], res[3]);
 }
 
 /// perm = stable argsort(g_idx): perm[rank(i)] = i with
@@ -1585,7 +1692,7 @@ int64_t scale_rows(int32_t group_size, int64_t size_k) {
 
 template <int kBits, bool kKFastest, typename Source>
 Status launch_marlin_repack(const Tensor& out, const Source& src, int64_t size_k, int64_t size_n,
-                            const LaunchContext& ctx) {
+                            const LaunchContext& ctx, const RepackEpilogue& epi = RepackEpilogue{}) {
   const int k_tiles = static_cast<int>(size_k / kMarlinTileK);
   const int n_tiles = static_cast<int>(size_n / kMarlinTileN);
   const int64_t total = static_cast<int64_t>(k_tiles) * n_tiles * 32;  // one thread per (tile, lane)
@@ -1597,8 +1704,52 @@ Status launch_marlin_repack(const Tensor& out, const Source& src, int64_t size_k
   }
   marlin_repack_tiles_kernel<kBits, kKFastest, Source>
       <<<static_cast<unsigned>(ceil_div(total, 256)), 256, 0, stream_of(ctx)>>>(
-          mut_ptr<uint32_t>(out), src, k_tiles, n_tiles, total);
+          mut_ptr<uint32_t>(out), src, k_tiles, n_tiles, total, epi);
   return last_launch("marlin_repack");
+}
+
+/// Scale permutation folded into a repack launch, or an empty epilogue the caller must follow with
+/// `launch_permute_scales`.  `fused` reports which one happened.
+RepackEpilogue make_repack_epilogue(const Tensor& out, const Tensor& in, bool per_channel, bool* fuse) {
+  const int bytes = byte_size(in.dtype);
+  *fuse = (bytes == 1 || bytes == 2 || bytes == 4) && tensor_present(out) && tensor_present(in);
+  if (!*fuse) return RepackEpilogue{};
+  RepackEpilogue epi;
+  epi.scales_out = static_cast<char*>(out.data) + out.byte_offset;
+  epi.scales_in = data_of(in);
+  epi.scale_total = tensor_numel(in);
+  epi.scale_bytes = bytes;
+  epi.per_channel = per_channel;
+  return epi;
+}
+
+/// 4-bit GPTQ without act-order: one warp stages each tile through shared memory.  Requires two
+/// whole source rows per 16-byte lane load, so it falls back to the generic kernel when the source
+/// columns are not a multiple of 4 words or the buffer is not 16-byte aligned.  `fused` reports
+/// whether the launch absorbed the epilogue.
+Status launch_marlin_repack_gptq4(const Tensor& out, const GptqSource<4>& src, int64_t size_k,
+                                  int64_t size_n, const RepackEpilogue& epi, const LaunchContext& ctx,
+                                  bool* fused) {
+  *fused = false;
+  if (src.perm != nullptr || src.size_n % 4 != 0 || !aligned(src.qweight, 16)) {
+    return launch_marlin_repack<4, false>(out, src, size_k, size_n, ctx);
+  }
+  if (!aligned(data_of(out), 16)) {
+    return detail::set_error(Status::kMisaligned, "marlin repack: output needs 16-byte alignment");
+  }
+  constexpr int kWarps = 4;  // one tile per warp
+  const int n_tiles = static_cast<int>(size_n / kMarlinTileN);
+  const int64_t total_tiles = static_cast<int64_t>(size_k / kMarlinTileK) * n_tiles;
+  if (ceil_div(total_tiles, kWarps) > INT32_MAX) {
+    return detail::set_error(Status::kUnsupportedShape, "marlin repack: matrix too large");
+  }
+  marlin_repack_gptq4_tiles_kernel<kWarps>
+      <<<static_cast<unsigned>(ceil_div(total_tiles, kWarps)), 32 * kWarps, 0, stream_of(ctx)>>>(
+          mut_ptr<uint32_t>(out), src, n_tiles, total_tiles, epi);
+  Status s = last_launch("marlin_repack");
+  if (s != Status::kSuccess) return s;
+  *fused = !epi.empty();
+  return Status::kSuccess;
 }
 
 Status launch_permute_scales(const Tensor& out, const Tensor& in, bool per_channel,
@@ -1672,17 +1823,21 @@ Status awq_to_marlin(const Tensor& out_weight, const Tensor& out_scales, const T
   s = shape_is(out_zeros, {groups, size_n / pack}, "awq_to_marlin.out_zeros");
   if (s != Status::kSuccess) return s;
 
+  const bool per_channel = group_size < 0 || group_size >= size_k;
+  bool fuse = false;
+  const RepackEpilogue epi = make_repack_epilogue(out_scales, scales, per_channel, &fuse);
   if (num_bits == 4) {
     s = launch_marlin_repack<4, false>(out_weight, AwqSource<4>{const_ptr<uint32_t>(qweight), size_n / pack},
-                                       size_k, size_n, ctx);
+                                       size_k, size_n, ctx, fuse ? epi : RepackEpilogue{});
   } else {
     s = launch_marlin_repack<8, false>(out_weight, AwqSource<8>{const_ptr<uint32_t>(qweight), size_n / pack},
-                                       size_k, size_n, ctx);
+                                       size_k, size_n, ctx, fuse ? epi : RepackEpilogue{});
   }
   if (s != Status::kSuccess) return s;
-  const bool per_channel = group_size < 0 || group_size >= size_k;
-  s = launch_permute_scales(out_scales, scales, per_channel, ctx);
-  if (s != Status::kSuccess) return s;
+  if (!fuse) {
+    s = launch_permute_scales(out_scales, scales, per_channel, ctx);
+    if (s != Status::kSuccess) return s;
+  }
   const int64_t words = groups * (size_n / pack);
   const unsigned grid = static_cast<unsigned>(ceil_div(words, 256));
   if (num_bits == 4) {
@@ -1755,26 +1910,42 @@ Status gptq_to_marlin(const Tensor& out_weight, const Tensor& out_scales, const 
         mut_ptr<int32_t>(perm_out), const_ptr<int32_t>(g_idx), static_cast<int>(size_k));
     s = last_launch("gptq_to_marlin.argsort");
     if (s != Status::kSuccess) return s;
-  } else if (has_perm) {
+  }
+  const int32_t* perm = act_order ? const_ptr<int32_t>(perm_out) : nullptr;
+  // Without act-order the activation permutation is the identity: 4*K bytes of stores that the
+  // 4-bit staged launch below absorbs instead of paying a launch of their own.
+  const bool perm_pending = has_perm && !act_order;
+  // With act-order the rows of one tile come from 16 unrelated qweight rows, so each qweight word is
+  // needed by up to 8 tiles; walking one 64-column strip (128 KB of qweight) at a time keeps it in L2.
+  const GptqSource<4> src4{const_ptr<uint32_t>(qweight), perm, size_n};
+  const GptqSource<8> src8{const_ptr<uint32_t>(qweight), perm, size_n};
+  const bool per_channel = group_size < 0 || group_size >= size_k;
+  bool fuse_scales = false;
+  bool staged = false;
+  if (num_bits == 4 && !act_order) {
+    RepackEpilogue epi = make_repack_epilogue(out_scales, scales, per_channel, &fuse_scales);
+    if (!fuse_scales) epi.scale_total = 0;  // odd scale dtype: standalone kernel reports it
+    if (perm_pending) {
+      epi.perm_out = mut_ptr<int32_t>(perm_out);
+      epi.perm_size = size_k;
+    }
+    s = launch_marlin_repack_gptq4(out_weight, src4, size_k, size_n, epi, ctx, &staged);
+  } else if (num_bits == 4) {
+    s = launch_marlin_repack<4, true>(out_weight, src4, size_k, size_n, ctx);
+  } else if (act_order) {
+    s = launch_marlin_repack<8, true>(out_weight, src8, size_k, size_n, ctx);
+  } else {
+    s = launch_marlin_repack<8, false>(out_weight, src8, size_k, size_n, ctx);
+  }
+  if (s != Status::kSuccess) return s;
+  if (perm_pending && !staged) {
     identity_perm_kernel<<<static_cast<unsigned>(ceil_div(size_k, 256)), 256, 0, stream_of(ctx)>>>(
         mut_ptr<int32_t>(perm_out), static_cast<int>(size_k));
     s = last_launch("gptq_to_marlin.identity");
     if (s != Status::kSuccess) return s;
   }
-  const int32_t* perm = act_order ? const_ptr<int32_t>(perm_out) : nullptr;
-  // With act-order the rows of one tile come from 16 unrelated qweight rows, so each qweight word is
-  // needed by up to 8 tiles; walking one 64-column strip (128 KB of qweight) at a time keeps it in L2.
-  const GptqSource<4> src4{const_ptr<uint32_t>(qweight), perm, size_n};
-  const GptqSource<8> src8{const_ptr<uint32_t>(qweight), perm, size_n};
-  if (num_bits == 4) {
-    s = act_order ? launch_marlin_repack<4, true>(out_weight, src4, size_k, size_n, ctx)
-                  : launch_marlin_repack<4, false>(out_weight, src4, size_k, size_n, ctx);
-  } else {
-    s = act_order ? launch_marlin_repack<8, true>(out_weight, src8, size_k, size_n, ctx)
-                  : launch_marlin_repack<8, false>(out_weight, src8, size_k, size_n, ctx);
-  }
-  if (s != Status::kSuccess) return s;
-  return launch_permute_scales(out_scales, scales, group_size < 0 || group_size >= size_k, ctx);
+  if (staged && fuse_scales) return Status::kSuccess;
+  return launch_permute_scales(out_scales, scales, per_channel, ctx);
 }
 
 Status awq_dequantize(const Tensor& out, const Tensor& qweight, const Tensor& scales,

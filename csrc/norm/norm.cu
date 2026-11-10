@@ -6,8 +6,10 @@
 //
 // Shape: every kernel sees one row of `hidden` contiguous elements addressed by
 // a single row stride (leading dims collapse; qk_norm indexes heads by
-// token_stride + head * HEAD_DIM). Vector width is 16 B (8 halves / 4 floats);
-// a scalar tail handles hidden % VEC and every padded row.
+// token_stride + head * HEAD_DIM). The RMSNorm bodies read 32 B per thread (two
+// 16 B packs) and the other vector paths 16 B (8 halves / 4 floats); a scalar
+// tail handles hidden % VEC and a stride that is not a whole number of packs
+// (the public contract already requires 16 B aligned row strides).
 //
 // Numerics: fp32 accumulation, one rounding at the store. RMSNorm accumulates
 // the sum of squares; LayerNorm does mean then centred (biased) variance, like
@@ -19,9 +21,13 @@
 // Launch: one CTA per row (grid == rows) for the row kernels, 4 warps per CTA
 // with one warp per head for per-head qk_norm, and one CTA (or one warp when
 // group_size <= 256) per group for gated_rms_norm. All row kernels are
-// graph-capturable: no allocation, no device query, no host sync. A row is
-// small enough that the barrier-separated passes re-read it from L1/L2, so
-// LayerNorm's extra pass costs no DRAM traffic.
+// graph-capturable: no allocation, no device query, no host sync.
+//
+// rms_norm and the fused add+RMSNorm variants stage the row in dynamic shared
+// memory (46 KB cap, 8 KB for 4096 bf16), so the row crosses HBM once; rows
+// that do not fit re-read it on the second pass from L1/L2, as LayerNorm still
+// does. Staging is worth ~1% of DRAM bandwidth at 4096 wide and keeps the
+// second pass out of L1.
 //
 // Target support: this body is arch-generic (no cp.async, no TMA) and is meant
 // for Tier A/B/C alike; exact-target selection happens in the registry.
@@ -103,46 +109,134 @@ __device__ __forceinline__ int64_t row_offset(int64_t row, int64_t s2, int64_t s
   return i4 * s4 + i3 * s3 + i2 * s2;
 }
 
-template <typename T, int VEC, int NUM_DIMS, bool HasWeight>
+// ---- row staging -------------------------------------------------------------
+// Every row kernel below reads its row once into dynamic shared memory, reduces
+// it, and normalizes from shared memory, so the row crosses HBM once (and the
+// fused variants keep the just-written residual in shared memory instead of
+// re-reading it from L1/L2). 46 KB keeps the static reduction buffer plus the
+// dynamic stage below the 48 KB no-opt-in limit of every supported target;
+// rows that do not fit take the direct path, which reads the row twice.
+constexpr int64_t kNormStageBytes = 46 * 1024;
+
+__host__ __device__ inline bool norm_stage_fits(int hidden, int64_t elem_bytes) {
+  return static_cast<int64_t>(hidden) * elem_bytes <= kNormStageBytes;
+}
+
+/// One 16 B pack through the read-only path (ld.global.nc).
+template <typename T, int VEC>
+__device__ __forceinline__ Pack<T, VEC> ldg16(const T* __restrict__ p) {
+  static_assert(sizeof(Pack<T, VEC>) == 16, "a pack is one 16-byte access");
+  const uint4 u = __ldg(reinterpret_cast<const uint4*>(p));
+  Pack<T, VEC> r;
+  __builtin_memcpy(&r, &u, sizeof(r));
+  return r;
+}
+
+/// One 16 B pack store; used for shared-memory staging and for global stores.
+template <typename T, int VEC>
+__device__ __forceinline__ void st16(T* __restrict__ p, const Pack<T, VEC>& v) {
+  static_assert(sizeof(Pack<T, VEC>) == 16, "a pack is one 16-byte access");
+  *reinterpret_cast<Pack<T, VEC>*>(p) = v;
+}
+
+/// One 16 B pack from a generic address (shared or global): the second pass of a
+/// staged row reads shared memory, the direct path reads global memory again.
+template <typename T, int VEC>
+__device__ __forceinline__ Pack<T, VEC> ld16(const T* __restrict__ p) {
+  static_assert(sizeof(Pack<T, VEC>) == 16, "a pack is one 16-byte access");
+  return *reinterpret_cast<const Pack<T, VEC>*>(p);
+}
+
+/// 16 B stage buffer shared by the row kernels of this file.
+extern __shared__ __align__(16) unsigned char kops_norm_stage[];
+
+/// RMSNorm of one row. Pass 1 reads the row once from global memory (32 B per
+/// thread), stages it in shared memory when it fits, and accumulates the sum of
+/// squares in fp32; pass 2 normalizes from the stage (or re-reads the row on the
+/// direct path). `red` is the float[32] reduction scratch.
+template <typename T, int VEC, bool HasWeight>
 __device__ __forceinline__ void rms_row(const T* __restrict__ x, T* __restrict__ y,
                                         const T* __restrict__ w, int num_weight_groups,
                                         float weight_offset, float eps, int hidden,
-                                        int64_t weight_stride, int64_t row, float* smem) {
+                                        int64_t weight_stride, int64_t row, float* red) {
+  T* const srow = reinterpret_cast<T*>(kops_norm_stage);
+  const bool staged = norm_stage_fits(hidden, static_cast<int64_t>(sizeof(T)));
+  constexpr int CH = (VEC == 1) ? 1 : 2 * VEC;   // 32 B per thread
   float ss = 0.0f;
-  const int nvec = hidden / VEC;
-  for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
-    Pack<T, VEC> p;
-    p = *reinterpret_cast<const Pack<T, VEC>*>(x + i * VEC);
-    for (int k = 0; k < VEC; ++k) {
-      const float v = to_f<T>(p.x[k]);
+  if constexpr (VEC == 1) {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      const float v = to_f<T>(x[i]);
+      if (staged) srow[i] = x[i];
+      ss += v * v;
+    }
+  } else {
+    const int nchunk = hidden / CH;
+    for (int i = threadIdx.x; i < nchunk; i += blockDim.x) {
+      const int k = i * CH;
+      const Pack<T, VEC> p0 = ldg16<T, VEC>(x + k);
+      const Pack<T, VEC> p1 = ldg16<T, VEC>(x + k + VEC);
+      if (staged) {
+        st16<T, VEC>(srow + k, p0);
+        st16<T, VEC>(srow + k + VEC, p1);
+      }
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        const float v = to_f<T>(p0.x[j]);
+        ss += v * v;
+      }
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        const float v = to_f<T>(p1.x[j]);
+        ss += v * v;
+      }
+    }
+    const int nvec = hidden / VEC;
+    for (int i = nchunk * (CH / VEC) + threadIdx.x; i < nvec; i += blockDim.x) {
+      const Pack<T, VEC> p = ldg16<T, VEC>(x + i * VEC);
+      if (staged) st16<T, VEC>(srow + i * VEC, p);
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        const float v = to_f<T>(p.x[j]);
+        ss += v * v;
+      }
+    }
+    for (int i = nvec * VEC + threadIdx.x; i < hidden; i += blockDim.x) {
+      const float v = to_f<T>(x[i]);
+      if (staged) srow[i] = x[i];
       ss += v * v;
     }
   }
-  for (int i = nvec * VEC + threadIdx.x; i < hidden; i += blockDim.x) {
-    const float v = to_f<T>(x[i]);
-    ss += v * v;
-  }
-  ss = block_sum(ss, smem);
+  ss = block_sum(ss, red);
   const float rstd = rsqrtf(ss / static_cast<float>(hidden) + eps);
+  const T* const src = staged ? srow : x;
   const T* wp = w;
   if (HasWeight && num_weight_groups > 1) {
     wp = w + static_cast<int64_t>(row % num_weight_groups) * weight_stride;
   }
-  for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
-    Pack<T, VEC> p;
-    p = *reinterpret_cast<const Pack<T, VEC>*>(x + i * VEC);
-    Pack<T, VEC> q;
-    for (int k = 0; k < VEC; ++k) {
-      const float s = to_f<T>(p.x[k]) * rstd;
-      const float wv = HasWeight ? (to_f<T>(wp[i * VEC + k]) + weight_offset) : 1.0f;
-      from_f<T>(q.x[k], s * wv);
+  if constexpr (VEC == 1) {
+    for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+      const float s = to_f<T>(src[i]) * rstd;
+      const float wv = HasWeight ? (to_f<T>(wp[i]) + weight_offset) : 1.0f;
+      from_f<T>(y[i], s * wv);
     }
-    *reinterpret_cast<Pack<T, VEC>*>(y + i * VEC) = q;
-  }
-  for (int i = nvec * VEC + threadIdx.x; i < hidden; i += blockDim.x) {
-    const float s = to_f<T>(x[i]) * rstd;
-    const float wv = HasWeight ? (to_f<T>(wp[i]) + weight_offset) : 1.0f;
-    from_f<T>(y[i], s * wv);
+  } else {
+    const int nvec = hidden / VEC;
+    for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
+      const Pack<T, VEC> p = ld16<T, VEC>(src + i * VEC);
+      Pack<T, VEC> q;
+#pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        const float s = to_f<T>(p.x[j]) * rstd;
+        const float wv = HasWeight ? (to_f<T>(wp[i * VEC + j]) + weight_offset) : 1.0f;
+        from_f<T>(q.x[j], s * wv);
+      }
+      st16<T, VEC>(y + i * VEC, q);
+    }
+    for (int i = nvec * VEC + threadIdx.x; i < hidden; i += blockDim.x) {
+      const float s = to_f<T>(src[i]) * rstd;
+      const float wv = HasWeight ? (to_f<T>(wp[i]) + weight_offset) : 1.0f;
+      from_f<T>(y[i], s * wv);
+    }
   }
 }
 
@@ -305,9 +399,117 @@ __global__ void rms_norm_kernel(scalar_t* __restrict__ out, const int64_t out_st
   if (row >= num_tokens) return;
   const int64_t off = row_offset<NUM_DIMS>(row, input_stride_d2, input_stride_d3, input_stride_d4,
                                            input_shape_d2, input_shape_d3);
-  rms_row<scalar_t, VEC_SIZE, NUM_DIMS, HasWeight>(
+  rms_row<scalar_t, VEC_SIZE, HasWeight>(
       input + off, out + row * out_stride, weight, num_weight_groups, weight_offset, epsilon,
       hidden_size, weight_stride, row, smem);
+}
+
+/// Fused residual-add + RMSNorm body, shared by the in-place and the
+/// out-of-place entry point so the two agree bit for bit.
+///   * pass 1 writes residual_out = residual_in + input_scale * input (rounded
+///     once to residual_t) and accumulates ss from the unrounded fp32 sum, the
+///     expression both entries used before staging existed;
+///   * pass 2 normalizes the stored residual, read from shared memory when the
+///     row fits (kNormStageBytes) and from residual_out otherwise.
+template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight>
+__device__ __forceinline__ void fused_add_rms_norm_row(
+    const scalar_t* __restrict__ x, const residual_t* __restrict__ rin,
+    residual_t* __restrict__ rout, scalar_t* __restrict__ dst, const scalar_t* __restrict__ weight,
+    float weight_offset, float input_scale, float epsilon, int hidden_size, float* red) {
+  constexpr int VECR = (16 / static_cast<int>(sizeof(residual_t))) < VEC_SIZE
+                           ? 16 / static_cast<int>(sizeof(residual_t))
+                           : VEC_SIZE;
+  constexpr int CH = (VEC_SIZE == 1) ? 1 : 2 * VEC_SIZE;
+  constexpr int NRS = VEC_SIZE / VECR;  // residual packs per VEC-element group
+  residual_t* const srow = reinterpret_cast<residual_t*>(kops_norm_stage);
+  const bool staged = norm_stage_fits(hidden_size, static_cast<int64_t>(sizeof(residual_t)));
+  const int nvec = hidden_size / VEC_SIZE;
+  float ss = 0.0f;
+  if constexpr (VEC_SIZE == 1) {
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+      float rv = to_f<residual_t>(rin[i]) + input_scale * to_f<scalar_t>(x[i]);
+      from_f<residual_t>(rout[i], rv);
+      if (staged) srow[i] = rout[i];
+      ss += rv * rv;
+    }
+  } else {
+    // 32 B per thread per iteration, then whole 16 B groups, then the tail.
+    const int nchunk = hidden_size / CH;
+    for (int i = threadIdx.x; i < nchunk; i += blockDim.x) {
+      const int k = i * CH;
+      Pack<scalar_t, VEC_SIZE> p[CH / VEC_SIZE];
+      Pack<residual_t, VECR> q[CH / VECR];
+#pragma unroll
+      for (int v = 0; v < CH / VEC_SIZE; ++v) p[v] = ldg16<scalar_t, VEC_SIZE>(x + k + v * VEC_SIZE);
+#pragma unroll
+      for (int v = 0; v < CH / VECR; ++v) q[v] = ld16<residual_t, VECR>(rin + k + v * VECR);
+#pragma unroll
+      for (int e = 0; e < CH; ++e) {
+        float rv = to_f<residual_t>(q[e / VECR].x[e % VECR]) +
+                   input_scale * to_f<scalar_t>(p[e / VEC_SIZE].x[e % VEC_SIZE]);
+        from_f<residual_t>(q[e / VECR].x[e % VECR], rv);
+        ss += rv * rv;
+      }
+#pragma unroll
+      for (int v = 0; v < CH / VECR; ++v) {
+        st16<residual_t, VECR>(rout + k + v * VECR, q[v]);
+        if (staged) st16<residual_t, VECR>(srow + k + v * VECR, q[v]);
+      }
+    }
+    for (int i = nchunk * (CH / VEC_SIZE) + threadIdx.x; i < nvec; i += blockDim.x) {
+      const Pack<scalar_t, VEC_SIZE> p = ldg16<scalar_t, VEC_SIZE>(x + i * VEC_SIZE);
+      Pack<residual_t, VECR> q[NRS];
+#pragma unroll
+      for (int v = 0; v < NRS; ++v) q[v] = ld16<residual_t, VECR>(rin + i * VEC_SIZE + v * VECR);
+#pragma unroll
+      for (int e = 0; e < VEC_SIZE; ++e) {
+        float rv = to_f<residual_t>(q[e / VECR].x[e % VECR]) +
+                   input_scale * to_f<scalar_t>(p.x[e]);
+        from_f<residual_t>(q[e / VECR].x[e % VECR], rv);
+        ss += rv * rv;
+      }
+#pragma unroll
+      for (int v = 0; v < NRS; ++v) {
+        st16<residual_t, VECR>(rout + i * VEC_SIZE + v * VECR, q[v]);
+        if (staged) st16<residual_t, VECR>(srow + i * VEC_SIZE + v * VECR, q[v]);
+      }
+    }
+    for (int i = nvec * VEC_SIZE + threadIdx.x; i < hidden_size; i += blockDim.x) {
+      float rv = to_f<residual_t>(rin[i]) + input_scale * to_f<scalar_t>(x[i]);
+      from_f<residual_t>(rout[i], rv);
+      if (staged) srow[i] = rout[i];
+      ss += rv * rv;
+    }
+  }
+  ss = block_sum(ss, red);
+  const float rstd = rsqrtf(ss / static_cast<float>(hidden_size) + epsilon);
+  // Pass 2: normalize the stored residual. residual_out may alias residual_in,
+  // and dst may alias x; everything is read before anything is overwritten.
+  const residual_t* const rsrc = staged ? srow : rout;
+  if constexpr (VEC_SIZE == 1) {
+    for (int i = threadIdx.x; i < hidden_size; i += blockDim.x) {
+      const float wv = HasWeight ? (to_f<scalar_t>(weight[i]) + weight_offset) : 1.0f;
+      from_f<scalar_t>(dst[i], to_f<residual_t>(rsrc[i]) * rstd * wv);
+    }
+  } else {
+    for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
+      Pack<residual_t, VECR> q[NRS];
+#pragma unroll
+      for (int v = 0; v < NRS; ++v) q[v] = ld16<residual_t, VECR>(rsrc + i * VEC_SIZE + v * VECR);
+      Pack<scalar_t, VEC_SIZE> p;
+#pragma unroll
+      for (int e = 0; e < VEC_SIZE; ++e) {
+        const float wv =
+            HasWeight ? (to_f<scalar_t>(weight[i * VEC_SIZE + e]) + weight_offset) : 1.0f;
+        from_f<scalar_t>(p.x[e], to_f<residual_t>(q[e / VECR].x[e % VECR]) * rstd * wv);
+      }
+      st16<scalar_t, VEC_SIZE>(dst + i * VEC_SIZE, p);
+    }
+    for (int i = nvec * VEC_SIZE + threadIdx.x; i < hidden_size; i += blockDim.x) {
+      const float wv = HasWeight ? (to_f<scalar_t>(weight[i]) + weight_offset) : 1.0f;
+      from_f<scalar_t>(dst[i], to_f<residual_t>(rsrc[i]) * rstd * wv);
+    }
+  }
 }
 
 template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight>
@@ -320,47 +522,9 @@ __global__ void fused_add_rms_norm_kernel(scalar_t* __restrict__ input, const in
   __shared__ float smem[32];
   const int64_t row = blockIdx.x;
   if (row >= num_tokens) return;
-  scalar_t* x = input + row * input_stride;
-  residual_t* r = residual + row * input_stride;
-  float ss = 0.0f;
-  const int nvec = hidden_size / VEC_SIZE;
-  for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
-    Pack<scalar_t, VEC_SIZE> p;
-    Pack<residual_t, VEC_SIZE> q;
-    p = *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(x + i * VEC_SIZE);
-    q = *reinterpret_cast<const Pack<residual_t, VEC_SIZE>*>(r + i * VEC_SIZE);
-    for (int k = 0; k < VEC_SIZE; ++k) {
-      float rv = to_f<residual_t>(q.x[k]);
-      rv += input_scale * to_f<scalar_t>(p.x[k]);
-      from_f<residual_t>(q.x[k], rv);
-      ss += rv * rv;
-    }
-    *reinterpret_cast<Pack<residual_t, VEC_SIZE>*>(r + i * VEC_SIZE) = q;
-  }
-  for (int i = nvec * VEC_SIZE + threadIdx.x; i < hidden_size; i += blockDim.x) {
-    float rv = to_f<residual_t>(r[i]);
-    rv += input_scale * to_f<scalar_t>(x[i]);
-    from_f<residual_t>(r[i], rv);
-    ss += rv * rv;
-  }
-  ss = block_sum(ss, smem);
-  const float rstd = rsqrtf(ss / static_cast<float>(hidden_size) + epsilon);
-  for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
-    Pack<scalar_t, VEC_SIZE> p;
-    Pack<residual_t, VEC_SIZE> q;
-    q = *reinterpret_cast<const Pack<residual_t, VEC_SIZE>*>(r + i * VEC_SIZE);
-    for (int k = 0; k < VEC_SIZE; ++k) {
-      const float rv = to_f<residual_t>(q.x[k]);
-      const float wv = HasWeight ? (to_f<scalar_t>(weight[i * VEC_SIZE + k]) + weight_offset) : 1.0f;
-      from_f<scalar_t>(p.x[k], rv * rstd * wv);
-    }
-    *reinterpret_cast<Pack<scalar_t, VEC_SIZE>*>(x + i * VEC_SIZE) = p;
-  }
-  for (int i = nvec * VEC_SIZE + threadIdx.x; i < hidden_size; i += blockDim.x) {
-    const float rv = to_f<residual_t>(r[i]);
-    const float wv = HasWeight ? (to_f<scalar_t>(weight[i]) + weight_offset) : 1.0f;
-    from_f<scalar_t>(x[i], rv * rstd * wv);
-  }
+  fused_add_rms_norm_row<scalar_t, residual_t, VEC_SIZE, HasWeight>(
+      input + row * input_stride, residual + row * input_stride, residual + row * input_stride,
+      input + row * input_stride, weight, weight_offset, input_scale, epsilon, hidden_size, smem);
 }
 
 template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight>
@@ -373,50 +537,10 @@ __global__ void fused_add_rms_norm_out_kernel(
   __shared__ float smem[32];
   const int64_t row = blockIdx.x;
   if (row >= num_tokens) return;
-  const scalar_t* src = input + row * input_stride;
-  const residual_t* rin = residual_in + row * input_stride;
-  residual_t* rout = residual_out + row * input_stride;
-  scalar_t* dst = out + row * static_cast<int64_t>(hidden_size);
-  const int nvec = hidden_size / VEC_SIZE;
-  // Pass 1: residual_out = residual_in + input_scale * input, and the sum of
-  // squares of the value that is written (one rounding to residual_t at the
-  // store, the same rule fused_add_rms_norm uses).
-  float ss = 0.0f;
-  for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
-    const Pack<scalar_t, VEC_SIZE> p =
-        *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(src + i * VEC_SIZE);
-    Pack<residual_t, VEC_SIZE> q =
-        *reinterpret_cast<const Pack<residual_t, VEC_SIZE>*>(rin + i * VEC_SIZE);
-    for (int k = 0; k < VEC_SIZE; ++k) {
-      const float rv = to_f<residual_t>(q.x[k]) + input_scale * to_f<scalar_t>(p.x[k]);
-      from_f<residual_t>(q.x[k], rv);
-      ss += rv * rv;
-    }
-    *reinterpret_cast<Pack<residual_t, VEC_SIZE>*>(rout + i * VEC_SIZE) = q;
-  }
-  for (int i = nvec * VEC_SIZE + threadIdx.x; i < hidden_size; i += blockDim.x) {
-    const float rv = to_f<residual_t>(rin[i]) + input_scale * to_f<scalar_t>(src[i]);
-    from_f<residual_t>(rout[i], rv);
-    ss += rv * rv;
-  }
-  ss = block_sum(ss, smem);
-  const float rstd = rsqrtf(ss / static_cast<float>(hidden_size) + epsilon);
-  // Pass 2: normalize the stored residual (residual_out may alias residual_in).
-  for (int i = threadIdx.x; i < nvec; i += blockDim.x) {
-    const Pack<residual_t, VEC_SIZE> q =
-        *reinterpret_cast<const Pack<residual_t, VEC_SIZE>*>(rout + i * VEC_SIZE);
-    Pack<scalar_t, VEC_SIZE> p;
-    for (int k = 0; k < VEC_SIZE; ++k) {
-      const float wv =
-          HasWeight ? (to_f<scalar_t>(weight[i * VEC_SIZE + k]) + weight_offset) : 1.0f;
-      from_f<scalar_t>(p.x[k], to_f<residual_t>(q.x[k]) * rstd * wv);
-    }
-    *reinterpret_cast<Pack<scalar_t, VEC_SIZE>*>(dst + i * VEC_SIZE) = p;
-  }
-  for (int i = nvec * VEC_SIZE + threadIdx.x; i < hidden_size; i += blockDim.x) {
-    const float wv = HasWeight ? (to_f<scalar_t>(weight[i]) + weight_offset) : 1.0f;
-    from_f<scalar_t>(dst[i], to_f<residual_t>(rout[i]) * rstd * wv);
-  }
+  fused_add_rms_norm_row<scalar_t, residual_t, VEC_SIZE, HasWeight>(
+      input + row * input_stride, residual_in + row * input_stride,
+      residual_out + row * input_stride, out + row * static_cast<int64_t>(hidden_size), weight,
+      weight_offset, input_scale, epsilon, hidden_size, smem);
 }
 
 template <typename scalar_t, int VEC_SIZE, bool HasWeight, bool HasBias>
@@ -703,6 +827,23 @@ inline int block_for(int hidden, int vec) {
   return n;
 }
 
+/// Elements per thread of one row pass: a 32 B chunk where the row stride keeps
+/// every row start 16 B aligned, otherwise one element (the scalar path).
+template <typename T>
+int pick_vec(int64_t rows, int64_t s2, int64_t s3, int64_t s4) {
+  const int v = vec_width<T>();
+  if (rows <= 1) return v;
+  return ((s2 % v) == 0 && (s3 % v) == 0 && (s4 % v) == 0) ? v : 1;
+}
+
+/// Dynamic shared memory for the row stage: 0 when the row does not fit, which
+/// is exactly the condition the kernel re-evaluates to pick the direct path.
+inline size_t stage_bytes(int hidden, int64_t elem_bytes) {
+  return norm_stage_fits(hidden, elem_bytes)
+             ? static_cast<size_t>(hidden) * static_cast<size_t>(elem_bytes)
+             : 0u;
+}
+
 struct RowArgs {
   int num_tokens;
   int hidden;
@@ -717,10 +858,14 @@ Status launch_rms(const Tensor& out, const Tensor& input, const Tensor& weight, 
   T* y = reinterpret_cast<T*>(static_cast<char*>(out.data) + out.byte_offset);
   const T* w = HasWeight ? static_cast<const T*>(weight.data) : nullptr;
   const int64_t out_stride = out.stride[out.ndim - 2];
+  // One 16 B pack per thread of the row: measured best at both the 17 MB and
+  // the 134 MB case (a 32 B-per-thread block halves the CTA and loses ~4% on
+  // small rows). The 32 B chunk loop below still issues two packs per thread.
   const int block = block_for(a.hidden, VEC);
+  const size_t smem = stage_bytes(a.hidden, static_cast<int64_t>(sizeof(T)));
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
 #define KOPS_LAUNCH_RMS(ND)                                                                       \
-  rms_norm_kernel<T, VEC, ND, HasWeight><<<a.num_tokens, block, 0, stream>>>(                     \
+  rms_norm_kernel<T, VEC, ND, HasWeight><<<a.num_tokens, block, smem, stream>>>(                  \
       y, out_stride, x, a.s2, a.s3, a.s4, a.n2, a.n3, w, weight_stride, num_groups, w_off, eps,   \
       a.num_tokens, a.hidden)
   switch (input.ndim) {
@@ -742,8 +887,19 @@ template <typename T>
 Status dispatch_rms(const Tensor& out, const Tensor& input, const Tensor& weight, int num_groups,
                     int64_t weight_stride, float eps, float w_off, const RowArgs& a,
                     const LaunchContext& ctx) {
-  if (tensor_present(weight)) return launch_rms<T, vec_width<T>(), true>(out, input, weight, num_groups, weight_stride, eps, w_off, a, ctx);
-  return launch_rms<T, vec_width<T>(), false>(out, input, weight, num_groups, weight_stride, eps, w_off, a, ctx);
+  const int64_t out_stride = out.stride[out.ndim - 2];
+  const bool wide = pick_vec<T>(a.num_tokens, a.s2, a.s3, a.s4) == vec_width<T>() &&
+                    (a.num_tokens <= 1 || (out_stride % vec_width<T>()) == 0);
+  if (wide) {
+    if (tensor_present(weight))
+      return launch_rms<T, vec_width<T>(), true>(out, input, weight, num_groups, weight_stride, eps,
+                                                 w_off, a, ctx);
+    return launch_rms<T, vec_width<T>(), false>(out, input, weight, num_groups, weight_stride, eps,
+                                                w_off, a, ctx);
+  }
+  if (tensor_present(weight))
+    return launch_rms<T, 1, true>(out, input, weight, num_groups, weight_stride, eps, w_off, a, ctx);
+  return launch_rms<T, 1, false>(out, input, weight, num_groups, weight_stride, eps, w_off, a, ctx);
 }
 
 // ---- operand views and alias rules ------------------------------------------
@@ -907,12 +1063,49 @@ Status launch_fused_norm_out(const RowView& out, const RowView& rout, const RowV
                              float input_scale, const LaunchContext& ctx) {
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
   const int block = block_for(static_cast<int>(in.cols), VEC);
+  const size_t smem = stage_bytes(static_cast<int>(in.cols), static_cast<int64_t>(sizeof(R)));
   fused_add_rms_norm_out_kernel<T, R, VEC, HasWeight>
-      <<<static_cast<unsigned>(in.rows), block, 0, stream>>>(
+      <<<static_cast<unsigned>(in.rows), block, smem, stream>>>(
           static_cast<T*>(out.data), static_cast<R*>(rout.data), static_cast<const T*>(in.data),
           in.row_stride, static_cast<const R*>(rin.data), weight, w_off, input_scale, eps,
           static_cast<int>(in.rows), static_cast<int>(in.cols));
   return check_launch("fused_add_rms_norm_out");
+}
+
+template <typename T, typename R, int VEC, bool HasWeight>
+Status launch_fused_norm(T* x, const int64_t stride, R* residual, const T* weight, float eps,
+                         float w_off, float input_scale, int tokens, int hidden,
+                         const LaunchContext& ctx) {
+  cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
+  const int block = block_for(hidden, VEC);
+  const size_t smem = stage_bytes(hidden, static_cast<int64_t>(sizeof(R)));
+  fused_add_rms_norm_kernel<T, R, VEC, HasWeight><<<tokens, block, smem, stream>>>(
+      x, stride, residual, weight, w_off, input_scale, eps, tokens, hidden);
+  return check_launch("fused_add_rms_norm");
+}
+
+template <typename T, typename R, bool HasWeight>
+Status dispatch_fused_norm(T* x, const int64_t stride, R* residual, const T* weight, float eps,
+                           float w_off, float input_scale, int tokens, int hidden,
+                           const LaunchContext& ctx) {
+  if (pick_vec<T>(tokens, stride, 0, 0) == vec_width<T>()) {
+    return launch_fused_norm<T, R, vec_width<T>(), HasWeight>(x, stride, residual, weight, eps, w_off,
+                                                              input_scale, tokens, hidden, ctx);
+  }
+  return launch_fused_norm<T, R, 1, HasWeight>(x, stride, residual, weight, eps, w_off, input_scale,
+                                               tokens, hidden, ctx);
+}
+
+template <typename T, typename R, bool HasWeight>
+Status dispatch_fused_norm_out(const RowView& out, const RowView& rout, const RowView& in,
+                               const RowView& rin, const T* weight, float eps, float w_off,
+                               float input_scale, const LaunchContext& ctx) {
+  if (pick_vec<T>(in.rows, in.row_stride, 0, 0) == vec_width<T>()) {
+    return launch_fused_norm_out<T, R, vec_width<T>(), HasWeight>(out, rout, in, rin, weight, eps,
+                                                                  w_off, input_scale, ctx);
+  }
+  return launch_fused_norm_out<T, R, 1, HasWeight>(out, rout, in, rin, weight, eps, w_off,
+                                                   input_scale, ctx);
 }
 
 template <typename T, int VEC, bool HasWeight, bool HasBias>
@@ -1186,14 +1379,11 @@ Status fused_add_rms_norm(const Tensor& input_inout, const Tensor& residual_inou
     s = check_tensor(weight, input_inout.dtype, 1, 16, "fused_add_rms_norm.weight");
     if (s != Status::kSuccess) return s;
   }
-  const int block = block_for(hidden, 8);
-  cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
-
 #define KOPS_LAUNCH_ADD(T, R, HW)                                                                 \
-  fused_add_rms_norm_kernel<T, R, 8, HW><<<tokens, block, 0, stream>>>(                           \
-      static_cast<T*>(input_inout.data), input_inout.stride[0],                                   \
-      static_cast<R*>(residual_inout.data), has_w ? static_cast<const T*>(weight.data) : nullptr,  \
-      weight_offset, input_scale, epsilon, tokens, hidden)
+  return dispatch_fused_norm<T, R, HW>(static_cast<T*>(input_inout.data), input_inout.stride[0],  \
+                                       static_cast<R*>(residual_inout.data),                      \
+                                       has_w ? static_cast<const T*>(weight.data) : nullptr,      \
+                                       epsilon, weight_offset, input_scale, tokens, hidden, ctx)
 
   if (input_inout.dtype == DType::kBFloat16) {
     if (residual_inout.dtype == DType::kFloat32) {
@@ -1225,13 +1415,6 @@ Status fused_add_rms_norm(const Tensor& input_inout, const Tensor& residual_inou
                              dtype_name(input_inout.dtype));
   }
 #undef KOPS_LAUNCH_ADD
-
-  const cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(err),
-                                     "fused_add_rms_norm launch: %s", cudaGetErrorString(err));
-  }
-  return Status::kSuccess;
 }
 
 Status fused_add_rms_norm_out(const Tensor& out, const Tensor& residual_out, const Tensor& input,
@@ -1316,7 +1499,7 @@ Status fused_add_rms_norm_out(const Tensor& out, const Tensor& residual_out, con
   if (vi.rows == 0) return Status::kSuccess;
 
 #define KOPS_LAUNCH_FUSED_OUT(T, R, HW)                                                            \
-  return launch_fused_norm_out<T, R, vec_width<T>(), HW>(                                          \
+  return dispatch_fused_norm_out<T, R, HW>(                                                        \
       vo, vro, vi, vri, has_w ? const_ptr<T>(weight) : nullptr, epsilon, weight_offset,            \
       input_scale, ctx)
   if (input.dtype == DType::kBFloat16) {

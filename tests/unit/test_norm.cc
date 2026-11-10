@@ -997,6 +997,85 @@ void test_gated(const char* name, kops::DType dtype, int64_t rows, int64_t hidde
 // Contract errors
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Layout / staging coverage: padded row strides, the direct (non-staged) path
+// for rows larger than the shared-memory stage, and the bit-identity of the
+// in-place and out-of-place fused entries that share one device body.
+// -----------------------------------------------------------------------------
+
+template <typename T, typename R>
+void test_fused_layouts(const char* name, kops::DType dtype, kops::DType rdtype, int64_t rows,
+                        int64_t cols, int64_t pad, float input_scale, bool with_w, double atol,
+                        double rtol) {
+  const int64_t stride = cols + pad;
+  std::vector<float> x_body(static_cast<size_t>(rows * stride), 7.0f);
+  std::vector<float> r_body(static_cast<size_t>(rows * stride), 7.0f);
+  std::vector<float> x_f(static_cast<size_t>(rows * cols)), r_f(x_f.size()), w_f(cols);
+  fill(x_f, 55u);
+  fill(r_f, 56u);
+  fill(w_f, 57u);
+  for (int64_t r = 0; r < rows; ++r) {
+    std::copy(x_f.begin() + r * cols, x_f.begin() + (r + 1) * cols, x_body.begin() + r * stride);
+    std::copy(r_f.begin() + r * cols, r_f.begin() + (r + 1) * cols, r_body.begin() + r * stride);
+  }
+  const std::vector<T> x = cast_from_float<T>(x_body);
+  const std::vector<R> res = cast_from_float<R>(r_body);
+  const std::vector<T> w = cast_from_float<T>(with_w ? w_f : std::vector<float>{});
+  const int64_t n = static_cast<int64_t>(x.size());
+
+  DevBuf<T> d_x(n), d_x2(n), d_out(rows * cols);
+  DevBuf<R> d_res(n), d_res2(n), d_rout(n);
+  DevBuf<T> d_w(std::max<size_t>(w.size(), 1));
+  if (!d_x.ok() || !d_x2.ok() || !d_out.ok() || !d_res.ok() || !d_res2.ok() || !d_rout.ok() ||
+      !d_w.ok()) {
+    return;
+  }
+  kops_test::copy_in(d_x.p, x);
+  kops_test::copy_in(d_x2.p, x);
+  kops_test::copy_in(d_res.p, res);
+  kops_test::copy_in(d_res2.p, res);
+  if (!w.empty()) kops_test::copy_in(d_w.p, w);
+
+  const kops::Tensor t_x = tensor2d_strided(d_x.p, dtype, rows, cols, stride);
+  const kops::Tensor t_res = tensor2d_strided(d_res.p, rdtype, rows, cols, stride);
+  const kops::Tensor t_x2 = tensor2d_strided(d_x2.p, dtype, rows, cols, stride);
+  const kops::Tensor t_res2 = tensor2d_strided(d_res2.p, rdtype, rows, cols, stride);
+  // out must be contiguous; the residual sides may be padded.
+  const kops::Tensor t_out = tensor2d_strided(d_out.p, dtype, rows, cols, cols);
+  const kops::Tensor t_rout = tensor2d_strided(d_rout.p, rdtype, rows, cols, stride);
+  const kops::Tensor t_w = with_w ? tensor1d(d_w.p, dtype, cols) : kops::Tensor{};
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+
+  KOPS_EXPECT_OK(kops::norm::fused_add_rms_norm(t_x, t_res, t_w, kEps, 0.0f, input_scale, ctx),
+                 name);
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+  KOPS_EXPECT_OK(kops::norm::fused_add_rms_norm_out(t_out, t_rout, t_x2, t_res2, t_w, kEps, 0.0f,
+                                                    input_scale, ctx),
+                 name);
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+
+  const auto in_x = compact(kops_test::copy_out(d_x.p, static_cast<size_t>(n)), rows, cols, stride);
+  const auto in_res = compact(kops_test::copy_out(d_res.p, static_cast<size_t>(n)), rows, cols,
+                              stride);
+  const auto out_x = kops_test::copy_out(d_out.p, static_cast<size_t>(rows * cols));
+  const auto out_res =
+      compact(kops_test::copy_out(d_rout.p, static_cast<size_t>(n)), rows, cols, stride);
+  // The two entries share one device body: they must agree bit for bit.
+  kops_test::compare(out_x, as_double(in_x), 0.0, 0.0, name);
+  kops_test::compare(out_res, as_double(in_res), 0.0, 0.0, name);
+
+  // And both must match the fp64 oracle.
+  const auto x_d = as_double(x);
+  const auto res_d = as_double(res);
+  const auto w_d = as_double(w);
+  std::vector<double> res_want, norm_want;
+  ref_fused(x_d, res_d, rows, cols, stride, input_scale, false, with_w ? w_d.data() : nullptr,
+            nullptr, 0.0, kEps, res_want, norm_want);
+  kops_test::compare(in_res, res_want, atol, rtol, name);
+  kops_test::compare(in_x, norm_want, atol, rtol, name);
+}
+
 void test_contracts() {
   kops::LaunchContext ctx{};
   if (!kops_test::make_context(&ctx)) return;
@@ -1360,6 +1439,22 @@ int main() {
   test_fused_add_rms_norm<__half, float>("fused_add_rms_norm fp16/fp32 h256", kops::DType::kFloat16,
                                          kops::DType::kFloat32, 4, 256, 0.25f, false, 0.0f, 1e-3,
                                          1e-3);
+
+  // ---- staging / layout coverage ------------------------------------------
+  // Rows larger than the shared-memory stage take the direct path (two reads).
+  test_rms_norm<__nv_bfloat16>("rms_norm bf16 h24576 direct", kops::DType::kBFloat16, 2, 24576, 0,
+                               1, true, 0.0f, 2e-2, 2e-2);
+  test_rms_norm<float>("rms_norm fp32 h12288 direct", kops::DType::kFloat32, 2, 12288, 0, 1, true,
+                       1.0f, 1e-5, 1e-5);
+  test_fused_layouts<__nv_bfloat16, __nv_bfloat16>(
+      "fused_add_rms_norm bf16 padded stride", kops::DType::kBFloat16, kops::DType::kBFloat16, 5,
+      1024, 8, 1.0f, true, 2e-2, 2e-2);
+  test_fused_layouts<__nv_bfloat16, float>(
+      "fused_add_rms_norm bf16/fp32 padded stride", kops::DType::kBFloat16, kops::DType::kFloat32,
+      4, 512, 8, 0.5f, true, 2e-2, 2e-2);
+  test_fused_layouts<__nv_bfloat16, __nv_bfloat16>(
+      "fused_add_rms_norm bf16 h24576 direct", kops::DType::kBFloat16, kops::DType::kBFloat16, 2,
+      24576, 0, 1.0f, false, 2e-2, 2e-2);
 
   // ---- fused_add_rms_norm_out ---------------------------------------------
   test_fused_add_rms_norm_out<float, float>("fused_add_rms_norm_out fp32 h4096",
