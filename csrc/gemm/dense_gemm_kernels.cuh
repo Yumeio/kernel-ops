@@ -25,15 +25,18 @@ namespace kops::gemm {
 // -----------------------------------------------------------------------------
 
 /**
- * gemm_mma_sync_kernel — multistage cp.async + ldmatrix + mma.sync.m16n8k16 (bf16/fp16) or
- * m16n8k8 (tf32). Traits::mainloop = kMultistageMmaSync. Supports split-K serial/parallel,
- * swap-AB (Traits instantiated with M/N roles exchanged), every EpilogueOp.
+ * gemm_mma_sync_kernel — multistage cp.async + ldmatrix + mma.sync, the shared tensor-core body of B7.
+ * One k-step reads 32 bytes of every operand row: m16n8k16 bf16/fp16, m16n8k32 e4m3 (Sm89+) and s8
+ * (s32 accumulators), m16n8k8 tf32. Traits::mainloop = kMultistageMmaSync. Split-K serial/parallel,
+ * swap-AB (Traits instantiated with M/N roles exchanged), FP8 1x128 x 128x128 promotion per 128 K,
+ * every EpilogueOp. MmaGemmParams::rows (ABI 6) maps logical rows to groups / experts / adapters, so
+ * grouped GEMM, the fused-MoE expert GEMM and LoRA run this body (persistent task loop).
  * Arch   : Sm80 (A100/A30), Sm86 (A10/A40/RTX 30), Sm89 (L4/L40S/RTX 40), Sm120a (no WGMMA/TMEM).
- * Launch : grid = (tiles_n, tiles_m, split_k) with swizzle; block = 128 or 256; dynamic smem =
- *          STAGES * (TILE_M + TILE_N) * TILE_K * sizeof(T).
+ * Launch : grid = (tiles or persistent CTAs, 1, batch x split_k); block = 128; dynamic smem =
+ *          STAGES * (TILE_M + TILE_N) * 64 bytes.
  */
 template <typename Traits>
-__global__ void gemm_mma_sync_kernel(const __grid_constant__ ScaledGemmArgs args);
+__global__ void gemm_mma_sync_kernel(const __grid_constant__ MmaGemmParams params);
 
 /**
  * gemm_wgmma_kernel — Hopper: TMA loads into a STAGES-deep smem ring guarded by mbarriers;

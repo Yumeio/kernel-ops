@@ -716,17 +716,18 @@ Status run_dense(const ScaledGemmArgs& args, const GemmTactic* tactic, const Wor
   if (args.m < 1 || args.n < 1 || args.k < 1 || args.batch < 1) {
     return detail::set_error(Status::kInvalidArgument, "gemm: empty problem");
   }
-  if (args.a.data == nullptr || args.b.data == nullptr || args.d == nullptr) {
+  const bool quant_out = !fp32 && !f64 && (args.epi.ops & kEpiQuantOut) != 0u;   // D is replaced by quant_out.q
+  if (args.a.data == nullptr || args.b.data == nullptr || (args.d == nullptr && !quant_out)) {
     return detail::set_error(Status::kInvalidArgument, "gemm: null operand");
   }
   const bool a_k = args.a.major == MajorOrder::kKMajor;
   const bool b_k = args.b.major == MajorOrder::kKMajor;
   const int64_t d_cols = !fp32 && !f64 && (args.epi.ops & kEpiGLU) != 0u ? args.n / 2 : args.n;   // GLU halves N
-  if (args.a.ld < (a_k ? args.k : args.m) || args.b.ld < (b_k ? args.k : args.n) || args.ldd < d_cols) {
+  if (args.a.ld < (a_k ? args.k : args.m) || args.b.ld < (b_k ? args.k : args.n) || (args.ldd < d_cols && !quant_out)) {
     return detail::set_error(Status::kInvalidArgument, "gemm: leading dimensions smaller than the extents");
   }
   if (!fp32 && !f64) {
-    const bool small_gemv = args.m <= 16 && args.batch == 1 && a_k && b_k && adt == bdt;
+    const bool small_gemv = args.m <= 16 && args.batch == 1 && a_k && b_k && adt == bdt && !quant_out;
     if (!small_gemv || mma_selects(args, tactic, ctx)) return mma_gemm(args, tactic, ws, ctx);
   }
   Status st = Status::kSuccess;
@@ -835,7 +836,7 @@ Status scaled_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBac
     case GemmRecipe::kFP16:
     case GemmRecipe::kTF32:
     case GemmRecipe::kFP32:
-      if (args.recipe == GemmRecipe::kTF32) return detail::set_error(Status::kNotImplemented, "scaled_gemm: kTF32 needs the tensor-core path (B7)");
+      if (args.recipe == GemmRecipe::kTF32) return mma_gemm(args, tactic, ws, ctx);   // tensor core only (B7)
       return run_dense(args, tactic, ws, ctx);
     case GemmRecipe::kFP8Tensorwise:
     case GemmRecipe::kFP8Rowwise:
@@ -845,6 +846,7 @@ Status scaled_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBac
       return fp8_gemm(args, tactic, backend, ws, ctx);
     case GemmRecipe::kINT8Tensorwise:
     case GemmRecipe::kINT8Rowwise:
+    case GemmRecipe::kW4A8IntInt8:   // QServe W4A8: w4a8_int_gemm_kernel in int8_gemm.cu
       return int8_gemm(args, tactic, backend, ws, ctx);
     case GemmRecipe::kNVFP4:
     case GemmRecipe::kMXFP4:
@@ -858,7 +860,6 @@ Status scaled_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBac
     case GemmRecipe::kW4A16MXFP4:
     case GemmRecipe::kW4A16NVFP4:
     case GemmRecipe::kW4A8IntFP8:
-    case GemmRecipe::kW4A8IntInt8:
       if (args.recipe == GemmRecipe::kW4A16MXFP4 || args.recipe == GemmRecipe::kW4A16NVFP4) return fp4_gemm(args, tactic, backend, ws, ctx);
       return mixed_input_gemm(args, tactic, backend, ws, ctx);
     case GemmRecipe::kGGUF:
@@ -1128,25 +1129,27 @@ __device__ __forceinline__ void tc_store_pair(D* dp, float v0, float v1, bool ha
 }  // namespace
 
 /// Compile-time shape of one dual_gemm_kernel instantiation: BM x BN output tile, BK = 32, ST stages,
-/// 2 x 2 warps. Per stage: A [BM, 32], B0 [BN, 32], B1 [BN, 32].
-template <typename T, int BM, int BN, int ST>
+/// 2 x WN warps. Per stage: A [BM, 32], B0 [BN, 32], B1 [BN, 32]. WN = 4 gives eight warps per CTA
+/// (16 warps per SM at two CTAs), which is what the large-M shapes need to reach the tensor pipe.
+template <typename T, int BM, int BN, int ST, int WN = 2>
 struct DualTileTraits {
   using a_type = T;
   static constexpr int tile_m = BM, tile_n = BN, tile_k = 32, stages = ST;
-  static constexpr int warps_m = 2, warps_n = 2, threads = 128;
+  static constexpr int warps_m = 2, warps_n = WN, threads = 64 * WN;
   static constexpr size_t smem_bytes = static_cast<size_t>(ST) * (BM + 2 * BN) * 32 * sizeof(T);
-  static_assert(BM % 32 == 0 && BN % 32 == 0, "warp tile: m16 x (two n8 per ldmatrix)");
+  static_assert(BM % 32 == 0 && BN % (WN * 16) == 0, "warp tile: m16 x (two n8 per ldmatrix)");
 };
 
 template <typename Traits>
-__global__ void __launch_bounds__(128) dual_gemm_kernel(const __grid_constant__ DualGemmParams p) {
+__global__ void __launch_bounds__(Traits::threads) dual_gemm_kernel(const __grid_constant__ DualGemmParams p) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   using T = typename Traits::a_type;
   using Tc = dev::TcFrag<T>;
   constexpr int BM = Traits::tile_m, BN = Traits::tile_n, ST = Traits::stages;
+  constexpr int WN = Traits::warps_n;
   constexpr int MT = BM / 32;        // m16 tiles per warp (two warp rows)
-  constexpr int NT = BN / 16;        // n8 tiles per warp (two warp columns)
-  constexpr int kThreads = 128;
+  constexpr int NT = BN / (WN * 8);  // n8 tiles per warp
+  constexpr int kThreads = Traits::threads;
 
   extern __shared__ __align__(128) unsigned char smem_raw[];
   T* const sA = reinterpret_cast<T*>(smem_raw);
@@ -1193,8 +1196,8 @@ __global__ void __launch_bounds__(128) dual_gemm_kernel(const __grid_constant__ 
     tc_cp_async_commit();
   }
 
-  const int warp_r0 = (warp >> 1) * (BM / 2);
-  const int warp_c0 = (warp & 1) * (BN / 2);
+  const int warp_r0 = (warp / WN) * (BM / 2);
+  const int warp_c0 = (warp % WN) * (BN / WN);
 
   for (int it = 0; it < nk; ++it) {
     tc_cp_async_wait<ST - 2>();
@@ -1253,7 +1256,7 @@ __global__ void __launch_bounds__(128) dual_gemm_kernel(const __grid_constant__ 
   T* const dbase = static_cast<T*>(p.d);
   __syncthreads();
   for (int wi = 0; wi < 2; ++wi) {
-    if ((warp >> 1) == wi) {
+    if ((warp / WN) == wi) {
       #pragma unroll
       for (int mt = 0; mt < MT; ++mt) {
         #pragma unroll
@@ -1436,25 +1439,35 @@ __global__ void __launch_bounds__(128) bmm_kernel(const __grid_constant__ BmmPar
 // ---- host: dual_gemm / bmm --------------------------------------------------------------------------
 namespace {
 
-template <typename T, int BM, int ST>
+template <typename T, int BM, int BN, int ST, int WN = 2>
 Status launch_dual_tile(const DualGemmParams& p, cudaStream_t s) {
-  using Tr = DualTileTraits<T, BM, 64, ST>;
+  using Tr = DualTileTraits<T, BM, BN, ST, WN>;
   static const cudaError_t attr =
       cudaFuncSetAttribute(dual_gemm_kernel<Tr>, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(Tr::smem_bytes));
   if (attr != cudaSuccess) {
     return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(attr), "dual_gemm_kernel: %s", cudaGetErrorString(attr));
   }
-  const int64_t tiles = static_cast<int64_t>((p.m + BM - 1) / BM) * ((p.n + 63) / 64);
+  const int64_t tiles = static_cast<int64_t>((p.m + BM - 1) / BM) * ((p.n + BN - 1) / BN);
   if (tiles > 0x7FFFFFFF) return detail::set_error(Status::kUnsupportedShape, "dual_gemm: too many tiles");
-  dual_gemm_kernel<Tr><<<static_cast<unsigned>(tiles), 128, Tr::smem_bytes, s>>>(p);
+  dual_gemm_kernel<Tr><<<static_cast<unsigned>(tiles), Tr::threads, Tr::smem_bytes, s>>>(p);
   return launch_error("dual_gemm_kernel");
 }
 
 template <typename T>
 Status launch_dual(const DualGemmParams& p, cudaStream_t s) {
-  if (p.m <= 32) return launch_dual_tile<T, 32, 4>(p, s);
-  if (p.m <= 64) return launch_dual_tile<T, 64, 4>(p, s);
-  return launch_dual_tile<T, 128, 3>(p, s);
+  // The 64-column N tile leaves only n / 64 CTAs: at M <= 128 that is half the part, and the run is a
+  // single pass over the two weight matrices (64 MB at 4096 x 4096) with no compute to hide it. The
+  // 32-column tile doubles the grid and halves the weight bytes per CTA, so every SM gets a CTA and
+  // the weight traffic per pass stays the same. From M = 65 the 32 x 64 tile runs eight warps per CTA
+  // (two CTAs per SM), and from M = 129 the 128 x 64 tile keeps the same 16 warps per SM.
+  if (p.m <= 32) return launch_dual_tile<T, 32, 32, 8>(p, s);
+  if (p.m <= 64) return launch_dual_tile<T, 32, 64, 4, 4>(p, s);
+  if (p.m <= 128) return launch_dual_tile<T, 128, 32, 8>(p, s);
+  // The eight-warp variant only pays off while the two weight matrices stay L2-resident; a wide N
+  // streams them from DRAM, where the extra A-fragment traffic of the narrower warp tile costs more
+  // than the extra warps win (measured 1024 x 14336: 2.4 ms at WN = 4 vs 1.7 ms at WN = 2).
+  if (p.n <= 8192) return launch_dual_tile<T, 128, 64, 3, 4>(p, s);
+  return launch_dual_tile<T, 128, 64, 3>(p, s);
 }
 
 template <typename T, typename D, int TM, int TN>

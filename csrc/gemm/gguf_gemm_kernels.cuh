@@ -24,17 +24,18 @@ __global__ void gguf_mmvq_kernel(
     const void* __restrict__ a_q8_1,        // activations pre-quantized to block_q8_1 [M, K/32]
     const int m, const int n, const int k);
 
-/// gguf_mmq_kernel — tiled matrix-matrix variant (prefill), int8 mma on Sm80+ / dp4a fallback.
+/// gguf_mmq_kernel — tiled matrix-matrix variant (prefill), int8 mma.sync on SM80+ (no dp4a fallback).
+/// TILE_M tokens x TILE_N weight rows per CTA (2 * TILE_N threads); grid (ceil(N / TILE_N), ceil(M / TILE_M)).
 template <typename scalar_t, GGUFType kType, int TILE_M, int TILE_N>
 __global__ void gguf_mmq_kernel(
     scalar_t* __restrict__ out,             // [M, N]
-    const uint8_t* __restrict__ qweight,
-    const void* __restrict__ a_q8_1,
+    const uint8_t* __restrict__ qweight,    // ggml blocks of [N, K]
+    const void* __restrict__ a_q8_1,        // activations pre-quantized to block_q8_1 [M, K/32]
     const int m, const int n, const int k);
 
 /**
- * gguf_moe_mmvq_kernel / gguf_moe_mmq_kernel — expert-indexed GGUF GEMMs: rows of A grouped by
- * sorted_token_ids / expert_ids (moe_align_block_size_kernel), weights [E, N, K] ggml blocks.
+ * gguf_moe_mmvq_kernel / gguf_moe_mmq_kernel — expert-indexed GGUF GEMMs: rows of A chosen by
+ * topk_ids [num_tokens, topk] (the mmq kernel groups them per expert itself), weights [E, N, K] ggml blocks.
  * Models : GGUF MoE checkpoints (Mixtral, Qwen3-MoE, DeepSeek, GPT-OSS GGUF, GLM-4.5 GGUF).
  */
 template <typename scalar_t, GGUFType kType, int M_TILE>
@@ -46,15 +47,18 @@ __global__ void gguf_moe_mmvq_kernel(
     const int32_t* __restrict__ topk_ids,         // [num_tokens, topk]
     const int num_tokens, const int topk, const int n, const int k);
 
+/// gguf_moe_mmq_kernel (contract changed in B7 row 10: the host entry gguf_moe_gemm carries topk_ids, not
+/// moe_align_block_size output): grid (ceil(N / TILE_N), E); CTA (n tile, e) gathers the slots
+/// token * topk + j with topk_ids == e in ascending order, TILE_M at a time, and writes out[slot].
+/// Slots whose id is negative or >= E are left untouched.
 template <typename scalar_t, GGUFType kType, int TILE_M, int TILE_N>
 __global__ void gguf_moe_mmq_kernel(
-    scalar_t* __restrict__ out,                   // [num_tokens_post_pad, N]
-    const uint8_t* __restrict__ qweight,
+    scalar_t* __restrict__ out,                   // [num_tokens * topk, N]
+    const uint8_t* __restrict__ qweight,          // [E, N, K] blocks
     const int64_t expert_stride_bytes,
-    const void* __restrict__ a_q8_1,
-    const int32_t* __restrict__ sorted_token_ids,
-    const int32_t* __restrict__ expert_ids,
-    const int32_t* __restrict__ num_tokens_post_pad,
-    const int top_k, const int n, const int k);
+    const void* __restrict__ a_q8_1,              // [num_tokens, K/32]
+    const int32_t* __restrict__ topk_ids,         // [num_tokens, topk]
+    const int num_slots,                          // num_tokens * topk
+    const int topk, const int n, const int k);
 
 }  // namespace kops::gemm

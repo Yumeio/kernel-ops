@@ -4,6 +4,9 @@
 //   gguf_quantize_q8_1_kernel   activations -> block_q8_1 (36 B / 32 elements)
 //   gguf_mmvq_kernel            dense: ggml blocks of [N, K] x q8_1 activations, M <= 8
 //   gguf_moe_mmvq_kernel        expert-indexed: weights [E, N, K] blocks, rows chosen by topk_ids
+// B7 row 10: GGUF prefill on int8 mma.sync (llama.cpp mmq semantics, SM80+).
+//   gguf_mmq_kernel             dense, M > 16 (or ctx.batch_invariant at any M)
+//   gguf_moe_mmq_kernel         expert-indexed, > 16 (token, expert) slots: slots grouped per expert
 // Host entries: gguf_gemm (dense), gguf_quantize_q8_1, gguf_moe_gemm.
 // Types: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.  The IQ (codebook) types
 // return kNotImplemented: their grid tables live inside quantization/weight_repack.cu and the
@@ -307,7 +310,325 @@ __device__ __forceinline__ void mmvq_body(scalar_t* __restrict__ out, const uint
   }
 }
 
+// ---- B7 row 10: mmq (prefill on int8 mma.sync) -----------------------------------------------------
+// Tile: TILE_N weight rows (mma A operand, m16) x TILE_M tokens (mma B operand, n8), 128 K (4 units) per
+// shared-memory stage.  Weights are decoded per stage with decode_unit (the mmvq decoder) to int8 q' plus
+// (alpha, beta) per unit / half unit; activations are the q8_1 blocks.  Integer dot products per unit
+// (m16n8k32) or per 16-element half (m16n8k16, the K-quants with 16-element sub-blocks) are exact; each is
+// rescaled in fp32 into the accumulator, one unit at a time in ascending K order.  The per-element arithmetic
+// does not depend on the tile shape or the position of the row in the batch, so mmq results are
+// batch-invariant and deterministic (no split-K, no atomics).
+//
+// Offset formats (Q4_0, Q5_0, Q3_K, Q6_K: beta = -off * alpha) are stored as signed q' - off, which folds
+// beta into the integer dot product (same real value as mmvq's alpha * isum + beta * asum, one fp32
+// rounding fewer).  int -> float of the mma accumulator uses the 1.5 * 2^23 bias (|isum| <= 32*127*127 < 2^22).
+template <GGUFType T>
+struct MmqTraits {
+  static constexpr int halves = (T == GGUFType::kQ2_K || T == GGUFType::kQ3_K || T == GGUFType::kQ6_K) ? 2 : 1;
+  static constexpr bool has_beta = T == GGUFType::kQ4_1 || T == GGUFType::kQ5_1 || T == GGUFType::kQ2_K ||
+                                   T == GGUFType::kQ4_K || T == GGUFType::kQ5_K;
+  static constexpr uint32_t offset = T == GGUFType::kQ4_0 ? 8u : T == GGUFType::kQ5_0 ? 16u : T == GGUFType::kQ3_K ? 4u
+                                   : T == GGUFType::kQ6_K ? 32u : 0u;
+};
+
+constexpr int kMmqUnits = 4;                  // units (32 K) per stage
+constexpr int kMagicBits = 0x4B400000;        // 1.5 * 2^23 as float bits
+constexpr float kMagic = 12582912.0f;
+
+/// Shared tile of one stage.  w / a rows are 128 B (8 chunks of 16 B), chunk c of row r at c ^ (r & 7).
+template <int TILE_M, int TILE_N, int H, bool BETA>
+struct MmqSmem {
+  uint4 w[TILE_N * 8];
+  uint4 a[TILE_M * 8];
+  float alpha[kMmqUnits][H][TILE_N];
+  float beta[kMmqUnits][BETA ? H : 1][BETA ? TILE_N : 1];
+  float da[kMmqUnits][TILE_M];
+  float dsum[kMmqUnits][BETA ? H : 1][BETA ? TILE_M : 1];
+  int a_row[TILE_M];                          // activation row of tile token i (-1: padding)
+  int o_row[TILE_M];                          // output row of tile token i
+};
+
+__device__ __forceinline__ uint32_t mmq_smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+__device__ __forceinline__ void mmq_ldsm_x4(uint32_t (&r)[4], uint32_t addr) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
+#endif
+}
+__device__ __forceinline__ void mmq_mma_k32(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+__device__ __forceinline__ void mmq_mma_k16(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+      : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
+      : "r"(a0), "r"(a1), "r"(b0));
+#endif
+}
+
+/// Full-K product of one tile: rows n0.. of the weight matrix at `wbase` against the TILE_M activation rows
+/// listed in sm.a_row (filled by the caller, followed by a __syncthreads), written to out[o_row * n + col].
+template <GGUFType T, int TILE_M, int TILE_N, typename scalar_t, typename Smem>
+__device__ __forceinline__ void mmq_tile(Smem& sm, scalar_t* __restrict__ out, const uint8_t* __restrict__ wbase,
+                                         const uint8_t* __restrict__ a_q81, const int n0, const int n, const int k) {
+  using Tr = MmqTraits<T>;
+  constexpr int H = Tr::halves;
+  constexpr bool BETA = Tr::has_beta;
+  constexpr int QK = block_elems(T);
+  constexpr int UPB = QK / 32;
+  constexpr int BYTES = block_bytes(T);
+  constexpr int THREADS = 2 * TILE_N;
+  constexpr int WARPS_N = TILE_N / 32;
+  constexpr int MI = 2;                       // warp tile: 32 weight rows
+  constexpr int NJ = TILE_M / 16;             // ... x TILE_M / 2 tokens
+  static_assert(TILE_N % 32 == 0 && TILE_M % 32 == 0, "tile shape");
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const int g = lane >> 2, t4 = lane & 3;
+  const int wr0 = (warp % WARPS_N) * 32;
+  const int wt0 = (warp / WARPS_N) * (TILE_M / 2);
+  const int units = k / 32;
+  const int64_t row_bytes = static_cast<int64_t>(k / QK) * BYTES;
+  const int64_t a_stride = static_cast<int64_t>(units) * kQ81Bytes;
+
+  float acc[MI][NJ][4];
+  #pragma unroll
+  for (int i = 0; i < MI; ++i)
+    #pragma unroll
+    for (int j = 0; j < NJ; ++j)
+      #pragma unroll
+      for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
+
+  for (int u0 = 0; u0 < units; u0 += kMmqUnits) {
+    // ---- weights: one (row, unit) per task, 4 consecutive threads share a row (contiguous bytes)
+    #pragma unroll
+    for (int task = tid; task < TILE_N * kMmqUnits; task += THREADS) {
+      const int r = task >> 2, uu = task & 3, ug = u0 + uu;
+      uint32_t q[8];
+      float al[2], be[2];
+      if (n0 + r < n && ug < units) {
+        decode_unit<T>(wbase + (n0 + r) * row_bytes + static_cast<int64_t>(ug / UPB) * BYTES, ug % UPB, q, al, be);
+        if constexpr (Tr::offset != 0u) {
+          #pragma unroll
+          for (int i = 0; i < 8; ++i) q[i] = (q[i] + (0x80808080u - Tr::offset * 0x01010101u)) ^ 0x80808080u;
+        }
+      } else {
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) q[i] = 0u;
+        al[0] = al[1] = be[0] = be[1] = 0.0f;
+      }
+      const int sw = r & 7;
+      sm.w[r * 8 + ((2 * uu) ^ sw)] = make_uint4(q[0], q[1], q[2], q[3]);
+      sm.w[r * 8 + ((2 * uu + 1) ^ sw)] = make_uint4(q[4], q[5], q[6], q[7]);
+      #pragma unroll
+      for (int h = 0; h < H; ++h) {
+        sm.alpha[uu][h][r] = al[h];
+        if constexpr (BETA) sm.beta[uu][h][r] = be[h];
+      }
+    }
+    // ---- activations: one (token, unit) per task
+    #pragma unroll
+    for (int task = tid; task < TILE_M * kMmqUnits; task += THREADS) {
+      const int tk = task >> 2, uu = task & 3, ug = u0 + uu;
+      const int arow = sm.a_row[tk];
+      uint32_t w[9];
+      if (arow >= 0 && ug < units) {
+        const uint32_t* p = reinterpret_cast<const uint32_t*>(a_q81 + arow * a_stride + static_cast<int64_t>(ug) * kQ81Bytes);
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) w[i] = __ldg(p + i);
+      } else {
+        #pragma unroll
+        for (int i = 0; i < 9; ++i) w[i] = 0u;
+      }
+      const float d = __half2float(__ushort_as_half(static_cast<unsigned short>(w[0] & 0xFFFFu)));
+      const int sw = tk & 7;
+      sm.a[tk * 8 + ((2 * uu) ^ sw)] = make_uint4(w[1], w[2], w[3], w[4]);
+      sm.a[tk * 8 + ((2 * uu + 1) ^ sw)] = make_uint4(w[5], w[6], w[7], w[8]);
+      sm.da[uu][tk] = d;
+      if constexpr (BETA) {
+        int s0 = 0, s1 = 0;
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          s0 = __dp4a(0x01010101, static_cast<int>(w[1 + i]), s0);
+          s1 = __dp4a(0x01010101, static_cast<int>(w[5 + i]), s1);
+        }
+        if constexpr (H == 1) {
+          sm.dsum[uu][0][tk] = d * static_cast<float>(s0 + s1);
+        } else {
+          sm.dsum[uu][0][tk] = d * static_cast<float>(s0);
+          sm.dsum[uu][1][tk] = d * static_cast<float>(s1);
+        }
+      }
+    }
+    __syncthreads();
+
+    #pragma unroll
+    for (int uu = 0; uu < kMmqUnits; ++uu) {
+      uint32_t af[MI][4];
+      float al[MI][2][H], be[MI][2][BETA ? H : 1];
+      #pragma unroll
+      for (int i = 0; i < MI; ++i) {
+        const int r = wr0 + i * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+        mmq_ldsm_x4(af[i], mmq_smem_u32(&sm.w[r * 8 + ((2 * uu + (lane >> 4)) ^ (r & 7))]));
+        #pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+          #pragma unroll
+          for (int h = 0; h < H; ++h) {
+            al[i][rr][h] = sm.alpha[uu][h][wr0 + i * 16 + g + 8 * rr];
+            if constexpr (BETA) be[i][rr][h] = sm.beta[uu][h][wr0 + i * 16 + g + 8 * rr];
+          }
+        }
+      }
+      #pragma unroll
+      for (int jp = 0; jp < NJ / 2; ++jp) {
+        uint32_t bf[4];
+        const int tr = wt0 + jp * 16 + (lane & 7) + (lane >> 4) * 8;
+        mmq_ldsm_x4(bf, mmq_smem_u32(&sm.a[tr * 8 + ((2 * uu + ((lane >> 3) & 1)) ^ (tr & 7))]));
+        #pragma unroll
+        for (int jj = 0; jj < 2; ++jj) {
+          const int j = 2 * jp + jj;
+          const int c0 = wt0 + j * 8 + 2 * t4;
+          const float2 dA = *reinterpret_cast<const float2*>(&sm.da[uu][c0]);
+          float ds[2][BETA ? H : 1];
+          if constexpr (BETA) {
+            #pragma unroll
+            for (int h = 0; h < H; ++h) {
+              const float2 v = *reinterpret_cast<const float2*>(&sm.dsum[uu][h][c0]);
+              ds[0][h] = v.x;
+              ds[1][h] = v.y;
+            }
+          }
+          const float dav[2] = {dA.x, dA.y};
+          #pragma unroll
+          for (int i = 0; i < MI; ++i) {
+            if constexpr (H == 1) {
+              int c[4] = {kMagicBits, kMagicBits, kMagicBits, kMagicBits};
+              mmq_mma_k32(c, af[i], bf[2 * jj], bf[2 * jj + 1]);
+              #pragma unroll
+              for (int e = 0; e < 4; ++e) {
+                const float f = __int_as_float(c[e]) - kMagic;
+                float a = fmaf(dav[e & 1] * al[i][e >> 1][0], f, acc[i][j][e]);
+                if constexpr (BETA) a = fmaf(ds[e & 1][0], be[i][e >> 1][0], a);
+                acc[i][j][e] = a;
+              }
+            } else {
+              int c0v[4] = {kMagicBits, kMagicBits, kMagicBits, kMagicBits};
+              int c1v[4] = {kMagicBits, kMagicBits, kMagicBits, kMagicBits};
+              mmq_mma_k16(c0v, af[i][0], af[i][1], bf[2 * jj]);
+              mmq_mma_k16(c1v, af[i][2], af[i][3], bf[2 * jj + 1]);
+              #pragma unroll
+              for (int e = 0; e < 4; ++e) {
+                const float f0 = __int_as_float(c0v[e]) - kMagic;
+                const float f1 = __int_as_float(c1v[e]) - kMagic;
+                const float s = fmaf(al[i][e >> 1][1], f1, al[i][e >> 1][0] * f0);
+                float a = fmaf(dav[e & 1], s, acc[i][j][e]);
+                if constexpr (BETA) a = fmaf(ds[e & 1][1], be[i][e >> 1][1], fmaf(ds[e & 1][0], be[i][e >> 1][0], a));
+                acc[i][j][e] = a;
+              }
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  #pragma unroll
+  for (int j = 0; j < NJ; ++j) {
+    #pragma unroll
+    for (int cc = 0; cc < 2; ++cc) {
+      const int tk = wt0 + j * 8 + 2 * t4 + cc;
+      if (sm.a_row[tk] < 0) continue;
+      scalar_t* orow = out + static_cast<int64_t>(sm.o_row[tk]) * n;
+      #pragma unroll
+      for (int i = 0; i < MI; ++i) {
+        #pragma unroll
+        for (int rr = 0; rr < 2; ++rr) {
+          const int col = n0 + wr0 + i * 16 + g + 8 * rr;
+          if (col < n) dev::from_f(orow[col], acc[i][j][2 * rr + cc]);
+        }
+      }
+    }
+  }
+}
+
 }  // namespace
+
+template <typename scalar_t, GGUFType kType, int TILE_M, int TILE_N>
+__global__ void __launch_bounds__(2 * TILE_N) gguf_mmq_kernel(scalar_t* __restrict__ out, const uint8_t* __restrict__ qweight,
+                                                              const void* __restrict__ a_q8_1, const int m, const int n, const int k) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  using Tr = MmqTraits<kType>;
+  __shared__ MmqSmem<TILE_M, TILE_N, Tr::halves, Tr::has_beta> sm;
+  const int m0 = blockIdx.y * TILE_M;
+  for (int i = threadIdx.x; i < TILE_M; i += 2 * TILE_N) {
+    sm.a_row[i] = m0 + i < m ? m0 + i : -1;
+    sm.o_row[i] = m0 + i;
+  }
+  __syncthreads();
+  mmq_tile<kType, TILE_M, TILE_N>(sm, out, qweight, static_cast<const uint8_t*>(a_q8_1), blockIdx.x * TILE_N, n, k);
+#endif
+}
+
+/// MoE variant (contract adjusted in B7, see gguf_gemm_kernels.cuh): CTA (n tile, expert e) scans topk_ids
+/// in ascending slot order, gathers the slots routed to e TILE_M at a time and runs the full-K tile on them.
+template <typename scalar_t, GGUFType kType, int TILE_M, int TILE_N>
+__global__ void __launch_bounds__(2 * TILE_N) gguf_moe_mmq_kernel(scalar_t* __restrict__ out, const uint8_t* __restrict__ qweight,
+                                                                  const int64_t expert_stride_bytes, const void* __restrict__ a_q8_1,
+                                                                  const int32_t* __restrict__ topk_ids, const int num_slots,
+                                                                  const int topk, const int n, const int k) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  using Tr = MmqTraits<kType>;
+  constexpr int THREADS = 2 * TILE_N;
+  constexpr int WARPS = THREADS / 32;
+  __shared__ MmqSmem<TILE_M, TILE_N, Tr::halves, Tr::has_beta> sm;
+  __shared__ int list[TILE_M + THREADS];
+  __shared__ int warp_cnt[WARPS];
+  const int e = blockIdx.y;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const uint8_t* wbase = qweight + e * expert_stride_bytes;
+  const auto* aq = static_cast<const uint8_t*>(a_q8_1);
+  const int n0 = blockIdx.x * TILE_N;
+  int count = 0;
+  for (int base = 0; base < num_slots; base += THREADS) {
+    const int p = base + tid;
+    const bool hit = p < num_slots && __ldg(topk_ids + p) == e;
+    const unsigned bal = __ballot_sync(0xFFFFFFFFu, hit);
+    if (lane == 0) warp_cnt[warp] = __popc(bal);
+    __syncthreads();
+    int off = count, total = 0;
+    #pragma unroll
+    for (int w = 0; w < WARPS; ++w) {
+      const int c = warp_cnt[w];
+      if (w < warp) off += c;
+      total += c;
+    }
+    if (hit) list[off + __popc(bal & ((1u << lane) - 1u))] = p;
+    count += total;
+    __syncthreads();
+    while (count >= TILE_M || (count > 0 && base + THREADS >= num_slots)) {
+      const int take = count < TILE_M ? count : TILE_M;
+      for (int i = tid; i < TILE_M; i += THREADS) {
+        const int slot = i < take ? list[i] : -1;
+        sm.a_row[i] = slot >= 0 ? slot / topk : -1;
+        sm.o_row[i] = slot;
+      }
+      __syncthreads();
+      mmq_tile<kType, TILE_M, TILE_N>(sm, out, wbase, aq, n0, n, k);
+      const int rest = count - take;   // < THREADS: one slot per thread at most
+      const int keep = tid < rest ? list[take + tid] : 0;
+      __syncthreads();
+      if (tid < rest) list[tid] = keep;
+      __syncthreads();
+      count = rest;
+    }
+  }
+#endif
+}
 
 template <typename scalar_t>
 __global__ void gguf_quantize_q8_1_kernel(void* __restrict__ out_q8_1, const scalar_t* __restrict__ a,
@@ -436,6 +757,85 @@ Status dispatch_moe(GGUFType t, scalar_t* out, const uint8_t* qw, int64_t stride
   }
 }
 
+// ---- mmq launchers -------------------------------------------------------------------------------
+// Tile configs (TILE_M tokens, TILE_N weight rows): 128x128 / 64x128 (256 threads), 32x64 (128 threads).
+// The largest tile that still fills one wave of CTAs on the device is chosen; results do not depend on it.
+
+int sm_count_of(const LaunchContext& ctx) {
+  if (ctx.compute_units > 0) return ctx.compute_units;
+  int v = 0;
+  if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, ctx.device) != cudaSuccess || v <= 0) v = 16;
+  return v;
+}
+
+bool mma_arch_missing(const LaunchContext& ctx) {
+  return ctx.arch_id >= KOPS_TARGET_SM70 && ctx.arch_id < KOPS_TARGET_SM80;
+}
+
+template <typename scalar_t, GGUFType T, int TM, int TN>
+Status launch_mmq(scalar_t* out, const uint8_t* qw, const void* aq, int m, int n, int k, cudaStream_t s) {
+  const dim3 grid(static_cast<unsigned>((n + TN - 1) / TN), static_cast<unsigned>((m + TM - 1) / TM));
+  gguf_mmq_kernel<scalar_t, T, TM, TN><<<grid, 2 * TN, 0, s>>>(out, qw, aq, m, n, k);
+  return launch_error("gguf_mmq_kernel");
+}
+
+template <typename scalar_t, GGUFType T>
+Status launch_mmq_cfg(scalar_t* out, const uint8_t* qw, const void* aq, int m, int n, int k, int sms, cudaStream_t s) {
+  auto ctas = [&](int tm, int tn) { return static_cast<int64_t>((m + tm - 1) / tm) * ((n + tn - 1) / tn); };
+  if (ctas(128, 128) >= sms) return launch_mmq<scalar_t, T, 128, 128>(out, qw, aq, m, n, k, s);
+  if (ctas(64, 128) >= sms) return launch_mmq<scalar_t, T, 64, 128>(out, qw, aq, m, n, k, s);
+  return launch_mmq<scalar_t, T, 32, 64>(out, qw, aq, m, n, k, s);
+}
+
+template <typename scalar_t>
+Status dispatch_mmq(GGUFType t, scalar_t* out, const uint8_t* qw, const void* aq, int m, int n, int k, int sms, cudaStream_t s) {
+  switch (t) {
+    case GGUFType::kQ4_0: return launch_mmq_cfg<scalar_t, GGUFType::kQ4_0>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ4_1: return launch_mmq_cfg<scalar_t, GGUFType::kQ4_1>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ5_0: return launch_mmq_cfg<scalar_t, GGUFType::kQ5_0>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ5_1: return launch_mmq_cfg<scalar_t, GGUFType::kQ5_1>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ8_0: return launch_mmq_cfg<scalar_t, GGUFType::kQ8_0>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ2_K: return launch_mmq_cfg<scalar_t, GGUFType::kQ2_K>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ3_K: return launch_mmq_cfg<scalar_t, GGUFType::kQ3_K>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ4_K: return launch_mmq_cfg<scalar_t, GGUFType::kQ4_K>(out, qw, aq, m, n, k, sms, s);
+    case GGUFType::kQ5_K: return launch_mmq_cfg<scalar_t, GGUFType::kQ5_K>(out, qw, aq, m, n, k, sms, s);
+    default: return launch_mmq_cfg<scalar_t, GGUFType::kQ6_K>(out, qw, aq, m, n, k, sms, s);
+  }
+}
+
+template <typename scalar_t, GGUFType T, int TM, int TN>
+Status launch_moe_mmq(scalar_t* out, const uint8_t* qw, int64_t stride, const void* aq, const int32_t* ids, int slots,
+                      int topk, int n, int k, int experts, cudaStream_t s) {
+  const dim3 grid(static_cast<unsigned>((n + TN - 1) / TN), static_cast<unsigned>(experts));
+  gguf_moe_mmq_kernel<scalar_t, T, TM, TN><<<grid, 2 * TN, 0, s>>>(out, qw, stride, aq, ids, slots, topk, n, k);
+  return launch_error("gguf_moe_mmq_kernel");
+}
+
+template <typename scalar_t, GGUFType T>
+Status launch_moe_mmq_cfg(scalar_t* out, const uint8_t* qw, int64_t stride, const void* aq, const int32_t* ids, int slots,
+                          int topk, int n, int k, int experts, cudaStream_t s) {
+  // Average slots per expert decides the token tile (32 or 64).
+  if (slots >= 64 * experts) return launch_moe_mmq<scalar_t, T, 64, 128>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+  return launch_moe_mmq<scalar_t, T, 32, 64>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+}
+
+template <typename scalar_t>
+Status dispatch_moe_mmq(GGUFType t, scalar_t* out, const uint8_t* qw, int64_t stride, const void* aq, const int32_t* ids,
+                        int slots, int topk, int n, int k, int experts, cudaStream_t s) {
+  switch (t) {
+    case GGUFType::kQ4_0: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ4_0>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ4_1: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ4_1>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ5_0: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ5_0>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ5_1: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ5_1>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ8_0: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ8_0>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ2_K: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ2_K>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ3_K: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ3_K>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ4_K: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ4_K>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    case GGUFType::kQ5_K: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ5_K>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+    default: return launch_moe_mmq_cfg<scalar_t, GGUFType::kQ6_K>(out, qw, stride, aq, ids, slots, topk, n, k, experts, s);
+  }
+}
+
 Status check_type(GGUFType t, int64_t k, const char* who) {
   if (!supported_type(t)) {
     return detail::set_error(Status::kNotImplemented, "%s: GGUF type %d has no native decode GEMV (IQ and float types)", who, static_cast<int>(t));
@@ -492,7 +892,6 @@ Status gguf_gemm(const Tensor& out, const Tensor& a, const Tensor& qweight, GGUF
   if ((st = check_type(type, k, "gguf_gemm")) != Status::kSuccess) return st;
   if (out.dtype != a.dtype) return detail::set_error(Status::kUnsupportedDtype, "gguf_gemm: output dtype must equal the activation dtype");
   if (out.shape[0] != m) return detail::set_error(Status::kInvalidArgument, "gguf_gemm: out must be [M, N]");
-  if (m > 16) return detail::set_error(Status::kNotImplemented, "gguf_gemm: M > 16 needs the mmq path (B7)");
   const int64_t row_bytes = k / block_elems(type) * block_bytes(type);
   if (qweight.data == nullptr || qweight.dtype != DType::kUInt8 || qweight.ndim != 1 || qweight.shape[0] != n * row_bytes) {
     return detail::set_error(Status::kInvalidArgument, "gguf_gemm: qweight must be a uint8 vector of N * K/block * block_bytes (%lld)",
@@ -501,10 +900,21 @@ Status gguf_gemm(const Tensor& out, const Tensor& a, const Tensor& qweight, GGUF
   if (out.stride[1] != 1 || out.stride[0] != n || !aligned(byte_ptr(out), 2) || !aligned(byte_ptr(qweight), 2)) {
     return detail::set_error(Status::kMisaligned, "gguf_gemm: contiguous output and 2-byte aligned weights required");
   }
+  // M > 16 (or batch_invariant: one code path for every M) -> mmq on int8 mma.sync, SM80+.
+  const bool mmq = m > 16 || ctx.batch_invariant;
+  if (m > 16 && mma_arch_missing(ctx)) {
+    return detail::set_error(Status::kUnsupportedArch, "gguf_gemm: M > 16 (mmq) needs int8 mma.sync, SM80 or newer (arch %d)", ctx.arch_id);
+  }
   st = gguf_quantize_q8_1(workspace_q8_1, a, ctx);
   if (st != Status::kSuccess) return st;
   const auto* qw = reinterpret_cast<const uint8_t*>(byte_ptr(qweight));
   const auto* aq = reinterpret_cast<const uint8_t*>(byte_ptr(workspace_q8_1));
+  if (mmq && !mma_arch_missing(ctx)) {
+    const int sms = sm_count_of(ctx);
+    return a.dtype == DType::kBFloat16
+               ? dispatch_mmq<__nv_bfloat16>(type, reinterpret_cast<__nv_bfloat16*>(const_cast<char*>(byte_ptr(out))), qw, aq, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), sms, stream_of(ctx))
+               : dispatch_mmq<__half>(type, reinterpret_cast<__half*>(const_cast<char*>(byte_ptr(out))), qw, aq, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), sms, stream_of(ctx));
+  }
   return a.dtype == DType::kBFloat16
              ? dispatch_mmvq<__nv_bfloat16>(type, reinterpret_cast<__nv_bfloat16*>(const_cast<char*>(byte_ptr(out))), qw, aq, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), stream_of(ctx))
              : dispatch_mmvq<__half>(type, reinterpret_cast<__half*>(const_cast<char*>(byte_ptr(out))), qw, aq, static_cast<int>(m), static_cast<int>(n), static_cast<int>(k), stream_of(ctx));
@@ -540,6 +950,17 @@ Status gguf_moe_gemm(const Tensor& out, const Tensor& a_q8_1, const Tensor& qwei
   const void* aq = byte_ptr(a_q8_1);
   const auto* ids = reinterpret_cast<const int32_t*>(byte_ptr(topk_ids));
   void* o = const_cast<char*>(byte_ptr(out));
+  // More than 16 (token, expert) slots (or batch_invariant) -> per-expert grouped mmq on SM80+; the expert
+  // count comes from the qweight extent (a 1-D buffer of E expert matrices at expert_stride_bytes).
+  // Below SM80 the mmvq path serves every count (it is valid for all of them).
+  const int64_t slots = tokens * topk;
+  if ((slots > 16 || ctx.batch_invariant) && !mma_arch_missing(ctx) && qweight.ndim == 1 && qweight.shape[0] >= n * row_bytes) {
+    const int64_t experts = (qweight.shape[0] - n * row_bytes) / expert_stride_bytes + 1;
+    if (experts > 65535) return detail::set_error(Status::kUnsupportedShape, "gguf_moe_gemm: more than 65535 experts");
+    return out.dtype == DType::kBFloat16
+               ? dispatch_moe_mmq<__nv_bfloat16>(type, static_cast<__nv_bfloat16*>(o), qw, expert_stride_bytes, aq, ids, static_cast<int>(slots), static_cast<int>(topk), static_cast<int>(n), static_cast<int>(k), static_cast<int>(experts), stream_of(ctx))
+               : dispatch_moe_mmq<__half>(type, static_cast<__half*>(o), qw, expert_stride_bytes, aq, ids, static_cast<int>(slots), static_cast<int>(topk), static_cast<int>(n), static_cast<int>(k), static_cast<int>(experts), stream_of(ctx));
+  }
   return out.dtype == DType::kBFloat16
              ? dispatch_moe<__nv_bfloat16>(type, static_cast<__nv_bfloat16*>(o), qw, expert_stride_bytes, aq, ids, static_cast<int>(tokens), static_cast<int>(topk), static_cast<int>(n), static_cast<int>(k), stream_of(ctx))
              : dispatch_moe<__half>(type, static_cast<__half*>(o), qw, expert_stride_bytes, aq, ids, static_cast<int>(tokens), static_cast<int>(topk), static_cast<int>(n), static_cast<int>(k), stream_of(ctx));

@@ -5,6 +5,11 @@
 //                     streamed once for every slot of the block
 // Host entry: moe::moe_gemv.
 //
+// B7 row 8: fused_moe_gemm_kernel, the expert GEMM on tensor cores = gemm::gemm_mma_sync_kernel with the
+// kSortedBlocks row map (Triton fused_moe semantics over the B6 sorted blocks): a tile of a block takes that
+// block's expert weights, gathers A rows by slot id, writes C rows by slot id. W13 + GLU (interleaved
+// weights) and W2 + routed weight are epilogue options. Host entry: moe::moe_gemm.
+//
 // Contract: csrc/moe/fused_moe_kernels.cuh + csrc/moe/ops.h.
 //
 // Layout.  `sorted_token_ids` / `expert_ids` / `num_tokens_post_pad` come from
@@ -41,8 +46,17 @@
 #include "csrc/common/device.cuh"
 #include "csrc/common/device_impl.cuh"
 #include "csrc/common/quant.cuh"
+#include "csrc/quantization/weight_repack_kernels.cuh"
 #include "csrc/gemm/gemm_params.cuh"
+#include "csrc/gemm/dense_gemm_kernels.cuh"
+#include "csrc/gemm/fp8_gemm_kernels.cuh"
+#include "csrc/gemm/int8_gemm_kernels.cuh"
+#include "csrc/gemm/fp4_gemm_kernels.cuh"
+#include "csrc/gemm/mixed_input_gemm_kernels.cuh"
+#include "csrc/gemm/gguf_gemm_kernels.cuh"
 #include "csrc/gemm/grouped_gemm_kernels.cuh"
+#include "csrc/gemm/gemm_prep_kernels.cuh"
+#include "csrc/gemm/ops.h"
 #include "csrc/moe/routing_kernels.cuh"
 #include "csrc/moe/permute_kernels.cuh"
 #include "csrc/moe/fused_moe_kernels.cuh"
@@ -298,6 +312,120 @@ Status moe_gemv(const FusedMoEGemmParams& p, int32_t num_local_experts, int32_t 
   }
   return a_dtype == DType::kBFloat16 ? launch_moe<__nv_bfloat16, __nv_bfloat16>(p, mb, slots_per_cta, s)
                                      : launch_moe<__half, __half>(p, mb, slots_per_cta, s);
+}
+
+Status moe_gemm(const FusedMoEGemmParams& p, int32_t num_local_experts, int32_t block_size, DType a_dtype,
+                DType w_dtype, DType c_dtype, const LaunchContext& ctx) {
+  using namespace kops::gemm;
+  if (ctx.backend != BackendKind::kCuda) return detail::set_error(Status::kUnsupportedBackend, "moe_gemm: CUDA backend only");
+  if (block_size != 16 && block_size != 32 && block_size != 64 && block_size != 128 && block_size != 256) {
+    return detail::set_error(Status::kUnsupportedShape, "moe_gemm: block_size (align_block_size) must be 16, 32, 64, 128 or 256");
+  }
+  if (num_local_experts < 1 || p.n < 1 || p.k < 1 || p.top_k < 1 || p.num_valid_slots < 0) {
+    return detail::set_error(Status::kInvalidArgument, "moe_gemm: empty or inconsistent problem");
+  }
+  if (p.a == nullptr || p.w == nullptr || p.c == nullptr || p.sorted_token_ids == nullptr || p.expert_ids == nullptr ||
+      p.num_tokens_post_pad == nullptr || (p.mul_routed_weight && p.topk_weights == nullptr)) {
+    return detail::set_error(Status::kInvalidArgument, "moe_gemm: null operand");
+  }
+  if (p.w_zeros != nullptr) return detail::set_error(Status::kNotImplemented, "moe_gemm: zero points (int4 experts run through marlin_gemm in MoE mode)");
+  if (c_dtype != DType::kBFloat16 && c_dtype != DType::kFloat16 && c_dtype != DType::kFloat32) {
+    return detail::set_error(Status::kUnsupportedDtype, "moe_gemm: output must be bf16, fp16 or fp32");
+  }
+  MmaGemmParams mp{};
+  ScaledGemmArgs& a = mp.args;
+  const ScaleGranularity wg = p.w_quant.granularity;
+  if ((a_dtype == DType::kBFloat16 || a_dtype == DType::kFloat16) && w_dtype == a_dtype) {
+    if (wg != ScaleGranularity::kNone || p.a_scale != nullptr) return detail::set_error(Status::kInvalidArgument, "moe_gemm: 16-bit experts take no scales");
+    a.recipe = a_dtype == DType::kBFloat16 ? GemmRecipe::kBF16 : GemmRecipe::kFP16;
+  } else if (a_dtype == DType::kFloat8E4M3 && w_dtype == DType::kFloat8E4M3) {
+    if (p.w_scale == nullptr) return detail::set_error(Status::kInvalidArgument, "moe_gemm: e4m3 experts need w_scale");
+    if (wg == ScaleGranularity::kPerTensor) {
+      a.recipe = GemmRecipe::kFP8Tensorwise;
+      a.b.granularity = ScaleGranularity::kPerTensor;
+      a.b.scale_batch_stride = p.w_scale_expert_stride > 0 ? p.w_scale_expert_stride : 1;
+    } else if (wg == ScaleGranularity::kPerChannel) {
+      a.recipe = GemmRecipe::kFP8Rowwise;
+      a.b.granularity = ScaleGranularity::kPerChannel;
+      if (p.w_scale_expert_stride < p.n) return detail::set_error(Status::kInvalidArgument, "moe_gemm: per-channel scales need w_scale_expert_stride >= N");
+      a.b.scale_batch_stride = p.w_scale_expert_stride;
+    } else if (wg == ScaleGranularity::kPerBlock2D) {
+      if (p.w_quant.group_m != 128 || p.w_quant.group_k != 128) return detail::set_error(Status::kUnsupportedShape, "moe_gemm: block scales must be 128x128");
+      if (p.a_scale == nullptr) return detail::set_error(Status::kInvalidArgument, "moe_gemm: blockwise experts need 1x128 activation scales");
+      a.recipe = p.w_quant.scale_dtype == DType::kFloat8E8M0 ? GemmRecipe::kFP8BlockwiseUE8M0 : GemmRecipe::kFP8Blockwise;
+      if (p.k % 128 != 0) return detail::set_error(Status::kUnsupportedShape, "moe_gemm: blockwise experts need K %% 128 == 0");
+      a.b.granularity = ScaleGranularity::kPerBlock2D;
+      // [E, ceil(N / 128), K / 128] unless the caller gives the expert stride (same default as moe_gemv)
+      a.b.scale_batch_stride = p.w_scale_expert_stride != 0 ? p.w_scale_expert_stride : static_cast<int64_t>((p.n + 127) / 128) * (p.k / 128);
+      a.a.granularity = ScaleGranularity::kPerGroup;
+      a.a.scale_layout = p.a_quant.scale_layout;
+      a.a.scale_dtype = p.a_quant.scale_dtype == DType::kFloat8E8M0 ? DType::kFloat8E8M0 : DType::kFloat32;
+      if (a.a.scale_layout == ScaleLayout::kColMajorTma) {
+        // [K / 128, round_up(rows of A, 4)]: rows of A are the tokens (W13) or the slots (W2), not the sorted row space
+        const int64_t a_rows = p.a_rows_are_slots ? p.num_valid_slots : (p.num_valid_slots + p.top_k - 1) / p.top_k;
+        a.a.scale_ld = (std::max<int64_t>(a_rows, 1) + 3) / 4 * 4;
+      }
+    } else {
+      return detail::set_error(Status::kInvalidArgument, "moe_gemm: e4m3 experts need per-expert, per-channel or 128x128 scales");
+    }
+    a.b.scale = p.w_scale;
+    a.b.scale_dtype = wg == ScaleGranularity::kPerBlock2D && p.w_quant.scale_dtype == DType::kFloat8E8M0 ? DType::kFloat8E8M0 : DType::kFloat32;
+  } else if (a_dtype == DType::kInt8 && w_dtype == DType::kInt8) {
+    if (wg != ScaleGranularity::kPerChannel || p.w_scale == nullptr || p.w_scale_expert_stride < p.n) {
+      return detail::set_error(Status::kInvalidArgument, "moe_gemm: int8 experts need per-channel w_scale [E, N]");
+    }
+    a.recipe = GemmRecipe::kINT8Rowwise;
+    a.b.scale = p.w_scale;
+    a.b.granularity = ScaleGranularity::kPerChannel;
+    a.b.scale_batch_stride = p.w_scale_expert_stride;
+  } else {
+    return detail::set_error(Status::kUnsupportedDtype, "moe_gemm: weights must match bf16 / fp16 activations, or be e4m3 x e4m3 / int8 x int8 (int4 / FP4: marlin_gemm)");
+  }
+  if (p.a_scale != nullptr && a.a.granularity != ScaleGranularity::kPerGroup) {
+    a.a.scale = p.a_scale;
+    a.a.granularity = p.a_quant.granularity == ScaleGranularity::kPerTensor ? ScaleGranularity::kPerTensor : ScaleGranularity::kPerToken;
+    a.a.scale_dtype = DType::kFloat32;
+  } else if (p.a_scale != nullptr) {
+    a.a.scale = p.a_scale;
+  }
+  a.a.data = p.a;
+  a.a.ld = p.lda;
+  a.a.dtype = a_dtype;
+  a.b.data = p.w;
+  a.b.ld = p.k;
+  a.b.batch_stride = p.w_expert_stride;
+  a.b.dtype = w_dtype;
+  a.d = p.c;
+  a.ldd = p.ldc;
+  a.d_dtype = c_dtype;
+  a.epi = p.epi;
+  if (c_dtype == DType::kFloat32) a.epi.ops |= kEpiOutFp32;
+  if (p.mul_routed_weight) {
+    a.epi.ops |= kEpiRoutingWeight;
+    a.epi.routing_weight = p.topk_weights;
+  }
+  if (p.bias != nullptr) {
+    a.epi.ops |= kEpiBias;
+    a.epi.bias = p.bias;
+    a.epi.bias_dtype = c_dtype;
+    a.epi.bias_group_stride = p.n;
+  }
+  // row space: the capacity of sorted_token_ids (every expert pads at most block_size - 1 slots)
+  const int64_t cap = ((p.num_valid_slots + static_cast<int64_t>(num_local_experts) * (block_size - 1)) + block_size - 1) / block_size * block_size;
+  a.m = cap > 0 ? cap : block_size;
+  a.n = p.n;
+  a.k = p.k;
+  MmaRowMap& rm = mp.rows;
+  rm.schedule = MmaSchedule::kSortedBlocks;
+  rm.block_group = p.expert_ids;
+  rm.num_rows = p.num_tokens_post_pad;
+  rm.block_rows = block_size;
+  rm.row_ids = p.sorted_token_ids;
+  rm.id_limit = p.num_valid_slots;
+  rm.a_rows_by_id = true;
+  rm.a_row_div = p.a_rows_are_slots ? 1 : p.top_k;
+  rm.out_rows_by_id = true;
+  return launch_gemm_mma_sync(mp, nullptr, Workspace{}, ctx);
 }
 
 Status latent_combine_norm(const Tensor& out, const Tensor& expert_out,

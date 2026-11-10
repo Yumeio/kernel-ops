@@ -12,6 +12,8 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 #include "csrc/common/quant.cuh"
@@ -143,13 +145,14 @@ void add_b5_cases(std::vector<Case>* cases) {
 // ---- B7: tensor-core GEMM (gemm_mma_sync_kernel) -------------------------------------------------
 // rows = N, cols = K, M = flops / (2 N K).  Figure of merit: TFLOP/s; bytes is the compulsory A + B + D
 // traffic.  "mma_*" uses the static heuristic, "mma_*_tuned" autotunes the M bucket first (outside the timing).
+// M 32..256 is the bandwidth-bound band: it runs the swap tiles with the 128-byte row fetch (wide_ld).
 void add_b7_cases(std::vector<Case>* cases) {
   char id[128];
   struct S { int64_t m, n, k; const char* tag; };
   const S shapes[] = {{32, 4096, 4096, "m32.4096x4096"},     {64, 4096, 4096, "m64.4096x4096"},
-                      {256, 4096, 4096, "m256.4096x4096"},   {1024, 4096, 4096, "m1024.4096x4096"},
-                      {4096, 4096, 4096, "m4096.4096x4096"}, {2048, 14336, 4096, "m2048.14336x4096"},
-                      {2048, 4096, 14336, "m2048.4096x14336"}};
+                      {128, 4096, 4096, "m128.4096x4096"},   {256, 4096, 4096, "m256.4096x4096"},
+                      {1024, 4096, 4096, "m1024.4096x4096"}, {4096, 4096, 4096, "m4096.4096x4096"},
+                      {2048, 14336, 4096, "m2048.14336x4096"}, {2048, 4096, 14336, "m2048.4096x14336"}};
   for (const S& s : shapes) {
     const int64_t bytes = (s.m * s.k + s.n * s.k + s.m * s.n) * 2;
     for (const char* kind : {"bf16", "fp16", "bf16_tuned"}) {
@@ -159,6 +162,39 @@ void add_b7_cases(std::vector<Case>* cases) {
       std::string op = std::string("mma_") + kind;
       cases->push_back({id, op, kind[0] == 'f' ? kops::DType::kFloat16 : kops::DType::kBFloat16, s.n, s.k, bytes, 2 * s.m * s.n * s.k, 5, 50});
     }
+  }
+}
+
+// ---- B7 row 3: e4m3 x e4m3 on mma.sync (fp8_gemm_mma_sync_kernel, SM89+) -------------------------------
+// rows = N, cols = K, M = flops / (2 N K). Tensorwise / rowwise / 128x128 blockwise scales; the scale
+// buffers are zero-filled (the product is exact in the epilogue, so the timing is the same).
+void add_b7_fp8_cases(std::vector<Case>* cases) {
+  char id[128];
+  const int64_t n = 4096, k = 4096;
+  for (int64_t m : {256, 1024, 4096}) {
+    for (const char* kind : {"tensorwise", "rowwise", "blockwise"}) {
+      const int64_t scales = std::strcmp(kind, "rowwise") == 0 ? (m + n) * 4
+                            : std::strcmp(kind, "blockwise") == 0 ? ((m + (n + 127) / 128) * (k / 128)) * 4
+                                                                  : 0;
+      std::snprintf(id, sizeof(id), "gemm.fp8_mma.%s.m%lld.4096x4096", kind, static_cast<long long>(m));
+      cases->push_back({id, std::string("fp8_mma_") + kind, kops::DType::kFloat8E4M3, n, k,
+                        m * k + n * k + m * n * 2 + scales, 2 * m * n * k, 5, 50});
+    }
+  }
+}
+
+// ---- B7 row 9: multi-LoRA SGMV (lora_shrink_kernel + lora_expand_kernel) -----------------------------
+// T tokens, 4 adapters, K = N = 4096, rank 16 / 64. Figure of merit: the two GEMM passes
+// (2 T rank K + 2 T rank N); the shrink buffer and the adapter pointers are part of the traffic.
+void add_b7_lora_cases(std::vector<Case>* cases) {
+  char id[128];
+  const int64_t k = 4096, n = 4096, t = 512;
+  for (int64_t rank : {16, 64}) {
+    const int64_t bytes = t * k * 2 + t * n * 2 + 4 * rank * k * 2 + 4 * n * rank * 2 + t * rank * 4;
+    std::snprintf(id, sizeof(id), "gemm.lora.rank%lld.t%lld.4096x4096", static_cast<long long>(rank),
+                  static_cast<long long>(t));
+    cases->push_back({id, std::string("lora_rank") + std::to_string(rank), kops::DType::kBFloat16, n, k, bytes,
+                      2 * t * rank * (k + n), 5, 50});
   }
 }
 
@@ -176,6 +212,38 @@ void add_b7_row2_cases(std::vector<Case>* cases) {
       const int64_t k = uv ? 512 : 128, n = uv ? 128 : 512, batch = 128;
       std::snprintf(id, sizeof(id), "gemm.bmm_mla_%s.m%lld", uv ? "uv" : "uk", static_cast<long long>(m));
       cases->push_back({id, uv ? "bmm_mla_uv" : "bmm_mla_uk", kops::DType::kBFloat16, n, k, batch * (m * k + k * n + m * n) * 2, 2 * batch * m * n * k, 5, 50});
+    }
+  }
+}
+
+// ---- B7 row 5: INT8 W8A8 on mma.sync (int8_gemm, M > 16) and QServe W4A8 (w4a8_int_gemm_kernel) ----------
+// rows = N, cols = K, M = flops / (2 N K).  Figure of merit: TOPS (the TFLOP/s column counts int8 ops).
+// bytes: A (s8) + B (s8, or packed u4 + uint8 level-2 scale / zero) + fp32 row / column scales + bf16 D.
+void add_b7_int8_cases(std::vector<Case>* cases) {
+  char id[128];
+  const int64_t n = 4096, k = 4096;
+  for (int64_t m : {256, 1024, 4096}) {
+    const int64_t io = m * k + m * 4 + n * 4 + m * n * 2;
+    std::snprintf(id, sizeof(id), "gemm.int8_mma.m%lld.4096x4096", static_cast<long long>(m));
+    cases->push_back({id, "int8_mma", kops::DType::kInt8, n, k, io + n * k, 2 * m * n * k, 5, 50});
+    std::snprintf(id, sizeof(id), "gemm.w4a8_g128.m%lld.4096x4096", static_cast<long long>(m));
+    cases->push_back({id, "w4a8_g128", kops::DType::kInt8, n, k, io + n * k / 2 + 2 * (k / 128) * n, 2 * m * n * k, 5, 50});
+    std::snprintf(id, sizeof(id), "gemm.w4a8_chn.m%lld.4096x4096", static_cast<long long>(m));
+    cases->push_back({id, "w4a8_chn", kops::DType::kInt8, n, k, io + n * k / 2 + n, 2 * m * n * k, 5, 50});
+  }
+}
+
+// ---- B7 row 10: GGUF mmq (prefill, int8 mma.sync) -------------------------------------------------------
+// rows = N, cols = K, M = flops / (2 N K); bytes = ggml weight blocks + bf16 A + bf16 D (+ q8_1 workspace).
+void add_b7_gguf_cases(std::vector<Case>* cases) {
+  char id[128];
+  struct G { const char* name; int64_t qk, bytes; };
+  for (const G& g : {G{"q4_k", 256, 144}, G{"q8_0", 32, 34}}) {
+    for (int64_t m : {64, 512, 2048}) {
+      const int64_t n = 4096, k = 4096;
+      std::snprintf(id, sizeof(id), "gemm.gguf_mmq.%s.m%lld.4096x4096", g.name, static_cast<long long>(m));
+      const int64_t bytes = n * k / g.qk * g.bytes + m * k * 2 + m * k / 32 * 36 * 2 + m * n * 2;
+      cases->push_back({id, std::string("gguf_mmq_") + g.name, kops::DType::kBFloat16, n, k, bytes, 2 * m * n * k, 5, 50});
     }
   }
 }
@@ -207,7 +275,11 @@ std::vector<Case> make_cases() {
       r, c, 3 * r * c);
   add_b5_cases(&cases);
   add_b7_cases(&cases);
+  add_b7_fp8_cases(&cases);
+  add_b7_lora_cases(&cases);
   add_b7_row2_cases(&cases);
+  add_b7_gguf_cases(&cases);
+  add_b7_int8_cases(&cases);
   return cases;
 }
 
@@ -335,6 +407,18 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     const kops::Tensor tws = tensor1d(ws.p, DType::kUInt8, m * k / 32 * 36);
     return go([&] { return gguf_gemm(to, ta, tw, type, tws, ctx); });
   }
+  if (c.op.rfind("gguf_mmq_", 0) == 0) {
+    const bool q4k = c.op == "gguf_mmq_q4_k";
+    const kops::GGUFType type = q4k ? kops::GGUFType::kQ4_K : kops::GGUFType::kQ8_0;
+    const int64_t qk = q4k ? 256 : 32, bytes = q4k ? 144 : 34;
+    Buf a(m * k * 2), w(n * k / qk * bytes), ws(m * k / 32 * 36), out(m * n * 2);
+    if (!a.p || !w.p || !ws.p || !out.p) return false;
+    const kops::Tensor to = tensor2d(out.p, DType::kBFloat16, m, n);
+    const kops::Tensor ta = tensor2d(a.p, DType::kBFloat16, m, k);
+    const kops::Tensor tw = tensor1d(w.p, DType::kUInt8, n * k / qk * bytes);
+    const kops::Tensor tws = tensor1d(ws.p, DType::kUInt8, m * k / 32 * 36);
+    return go([&] { return gguf_gemm(to, ta, tw, type, tws, ctx); });
+  }
   if (c.op == "router_gemm") {
     Buf x(m * k * 2), w(n * k * 2), logits(m * n * 4);
     if (!x.p || !w.p || !logits.p) return false;
@@ -398,6 +482,75 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     cudaFree(d_sorted); cudaFree(d_blk); cudaFree(d_pp);
     return ok;
   }
+  if (c.op.rfind("lora_rank", 0) == 0) {
+    const int rank = std::atoi(c.op.c_str() + 9);
+    const int slots = 4, nseg = 8;
+    const int64_t t = c.flops / (2 * static_cast<int64_t>(rank) * (k + n));
+    Buf x(t * k * 2), ya(static_cast<size_t>(slots) * rank * k * 2), wb(static_cast<size_t>(slots) * n * rank * 2),
+        buf(t * rank * 4), y(t * n * 2);
+    if (!x.p || !ya.p || !wb.p || !buf.p || !y.p) return false;
+    std::vector<int32_t> indptr(nseg + 1), ids(nseg);
+    for (int i = 0; i <= nseg; ++i) indptr[i] = static_cast<int32_t>(i * t / nseg);
+    for (int i = 0; i < nseg; ++i) ids[i] = i % slots;
+    std::vector<const void*> pa(slots), pb(slots);
+    for (int s = 0; s < slots; ++s) {
+      pa[s] = static_cast<char*>(ya.p) + static_cast<int64_t>(s) * rank * k * 2;
+      pb[s] = static_cast<char*>(wb.p) + static_cast<int64_t>(s) * n * rank * 2;
+    }
+    void *dpa = nullptr, *dpb = nullptr;
+    if (!cuda_ok(cudaMalloc(&dpa, slots * sizeof(void*)), "cudaMalloc lora_a") ||
+        !cuda_ok(cudaMalloc(&dpb, slots * sizeof(void*)), "cudaMalloc lora_b")) return false;
+    cudaMemcpy(dpa, pa.data(), slots * sizeof(void*), cudaMemcpyHostToDevice);
+    cudaMemcpy(dpb, pb.data(), slots * sizeof(void*), cudaMemcpyHostToDevice);
+    Buf dind(indptr.size() * sizeof(int32_t)), dids(ids.size() * sizeof(int32_t));
+    if (!dind.p || !dids.p) return false;
+    cudaMemcpy(dind.p, indptr.data(), indptr.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    cudaMemcpy(dids.p, ids.data(), ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
+    kops::Tensor tbuf{};
+    tbuf.data = buf.p; tbuf.dtype = DType::kFloat32; tbuf.ndim = 2;
+    tbuf.shape[0] = t; tbuf.shape[1] = rank; tbuf.stride[0] = rank; tbuf.stride[1] = 1;
+    LoraSgmvParams sh{}, ex{};
+    const int32_t* const sind = static_cast<const int32_t*>(dind.p);
+    const int32_t* const sids = static_cast<const int32_t*>(dids.p);
+    sh.x = x.p; sh.ldx = k; sh.lora_a = static_cast<const void* const*>(dpa); sh.seg_indptr = sind;
+    sh.seg_lora_ids = sids; sh.num_segments = nseg; sh.in_dim = static_cast<int32_t>(k);
+    sh.rank = rank;
+    ex.lora_a = static_cast<const void* const*>(dpb); ex.y = y.p; ex.ldy = n; ex.seg_indptr = sind;
+    ex.seg_lora_ids = sids; ex.num_segments = nseg; ex.out_dim = static_cast<int32_t>(n);
+    ex.rank = rank; ex.scaling = 0.5f;
+    const bool ok = go([&] { return lora_sgmv(sh, ex, DType::kBFloat16, tbuf, ctx); });
+    cudaFree(dpa);
+    cudaFree(dpb);
+    return ok;
+  }
+  if (c.op.rfind("fp8_mma_", 0) == 0) {
+    const bool row = c.op == "fp8_mma_rowwise";
+    const bool block = c.op == "fp8_mma_blockwise";
+    const int64_t kb = k / 128, nb = (n + 127) / 128;
+    Buf a(m * k), w(n * k), out(m * n * 2), rs(m * 4), cs(n * 4), sa(m * kb * 4), sb(nb * kb * 4), scratch(64u << 20);
+    if (!a.p || !w.p || !out.p || !rs.p || !cs.p || !sa.p || !sb.p || !scratch.p) return false;
+    cudaMemset(a.p, 0x38, m * k);   // e4m3 1.0
+    cudaMemset(w.p, 0x38, n * k);
+    ScaledGemmArgs args{};
+    args.recipe = block ? GemmRecipe::kFP8Blockwise : (row ? GemmRecipe::kFP8Rowwise : GemmRecipe::kFP8Tensorwise);
+    args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kFloat8E4M3;
+    args.b.data = w.p; args.b.ld = k; args.b.dtype = DType::kFloat8E4M3;
+    args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.m = m; args.n = n; args.k = k;
+    if (row) {
+      args.epi.ops = kEpiRowScale | kEpiColScale;
+      args.epi.row_scale = static_cast<const float*>(rs.p);
+      args.epi.col_scale = static_cast<const float*>(cs.p);
+    }
+    if (block) {
+      args.a.scale = sa.p; args.b.scale = sb.p; args.a.scale_dtype = DType::kFloat32; args.b.scale_dtype = DType::kFloat32;
+      args.a.granularity = kops::ScaleGranularity::kPerGroup;
+      args.b.granularity = kops::ScaleGranularity::kPerBlock2D;
+    }
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p; ws.device_scratch_bytes = 64u << 20;
+    return go([&] { return fp8_gemm(args, nullptr, GemmBackend::kNative, ws, ctx); });
+  }
   if (c.op.rfind("mma_", 0) == 0) {
     const bool f16 = c.dtype == DType::kFloat16;
     const bool tuned = c.op.size() > 5 && c.op.compare(c.op.size() - 6, 6, "_tuned") == 0;
@@ -438,6 +591,30 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     p.d = out.p; p.ldd = batch * bn; p.stride_d_batch = bn;
     p.b_k_major = false; p.batch = static_cast<int32_t>(batch); p.m = static_cast<int32_t>(bm); p.n = static_cast<int32_t>(bn); p.k = static_cast<int32_t>(bk);
     return go([&] { return bmm(p, DType::kBFloat16, DType::kBFloat16, DType::kBFloat16, ctx); });
+  }
+  if (c.op == "int8_mma" || c.op == "w4a8_g128" || c.op == "w4a8_chn") {
+    const bool w4 = c.op != "int8_mma";
+    const int64_t groups = c.op == "w4a8_g128" ? k / 128 : 1;
+    Buf a(m * k), w(w4 ? n * k / 2 : n * k), s2(groups * n), zp(groups * n), rs(m * 4), cs(n * 4), out(m * n * 2), scratch(64u << 20);
+    if (!a.p || !w.p || !s2.p || !zp.p || !rs.p || !cs.p || !out.p || !scratch.p) return false;
+    cudaMemset(s2.p, 1, groups * n);   // q * 1 - 0: in the s8 range
+    cudaMemset(zp.p, 0, groups * n);
+    ScaledGemmArgs args{};
+    args.recipe = w4 ? GemmRecipe::kW4A8IntInt8 : GemmRecipe::kINT8Rowwise;
+    args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kInt8;
+    args.b.data = w.p; args.b.ld = w4 ? k / 2 : k; args.b.dtype = w4 ? DType::kUInt4x2 : DType::kInt8;
+    if (w4) {
+      args.b.group_k = static_cast<int16_t>(c.op == "w4a8_g128" ? 128 : 0);
+      args.b.second_level = c.op == "w4a8_g128" ? s2.p : nullptr;
+      args.b.zero_points = zp.p; args.b.zero_dtype = DType::kUInt8;
+    }
+    args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.m = m; args.n = n; args.k = k;
+    args.epi.ops = kEpiRowScale | kEpiColScale;
+    args.epi.row_scale = static_cast<const float*>(rs.p); args.epi.col_scale = static_cast<const float*>(cs.p);
+    kops::Workspace ws{};
+    ws.device_scratch = scratch.p; ws.device_scratch_bytes = 64u << 20;
+    return go([&] { return int8_gemm(args, nullptr, GemmBackend::kNative, ws, ctx); });
   }
   *handled = false;
   return true;
@@ -534,7 +711,8 @@ int main(int argc, char** argv) {
   if (!cuda_ok(cudaSetDevice(0), "cudaSetDevice")) return 1;
   DeviceInfo dev{};
   query_device(&dev);
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  filter_cases(&cases, opt);
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

@@ -38,6 +38,13 @@ Status mma_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, const Work
 bool mma_selects(const ScaledGemmArgs& args, const GemmTactic* tactic, const LaunchContext& ctx);
 Status mma_workspace(const GemmProblem& problem, const GemmTactic* tactic, const LaunchContext& ctx,
                      WorkspaceRequirements* out);
+/// Shared launcher of gemm_mma_sync_kernel (ABI 6) for the B7 rows without a body of their own: the
+/// FP8 (Sm89+), INT8 and TF32 recipes and the grouped / masked / sorted-block row maps (grouped GEMM,
+/// fused MoE, LoRA). Validates operands, picks the tactic (explicit, cached, heuristic) and launches.
+/// Split-K needs Workspace::device_scratch of mma_workspace() size (grouped schedules: rows.max_tasks
+/// counters instead of tiles).
+Status launch_gemm_mma_sync(const MmaGemmParams& params, const GemmTactic* tactic, const Workspace& ws,
+                            const LaunchContext& ctx);
 
 // ---- G01 dense 16/32-bit -------------------------------------------------------------
 /// Workspace is passed explicitly (not through GemmArgs) so every family has one
@@ -81,6 +88,10 @@ Status mixed_input_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, Ge
                         const Workspace& ws, const LaunchContext& ctx);
 Status marlin_gemm(const MarlinParams& params, quant::MarlinWeightType wtype, DType act_dtype,
                    const LaunchContext& ctx);
+/// MoE mode of marlin_gemm (ABI 6, gemm/marlin_moe.cu): rows by sorted_token_ids in blocks of moe_block_size
+/// (16, 32 or 64) with expert_ids per block; marlin_gemm forwards here when sorted_token_ids is set.
+Status marlin_moe_gemm(const MarlinParams& params, quant::MarlinWeightType wtype, DType act_dtype,
+                       const LaunchContext& ctx);
 /// GGUF decode GEMV (M <= 16): quantizes `a` into `workspace_q8_1` (uint8, M * K/32 * 36 bytes) and
 /// multiplies by ggml blocks.  qweight is a uint8 vector of N * K/block * block_bytes; Q4_0/1, Q5_0/1,
 /// Q8_0 and the K-quants are native, the IQ types return kNotImplemented.

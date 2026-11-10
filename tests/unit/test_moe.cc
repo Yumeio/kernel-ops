@@ -1482,6 +1482,487 @@ void test_contracts() {
                      kops::Status::kInvalidArgument, "align null tensors");
 }
 
+// =============================================================================
+// B7 row 8: moe::moe_gemm, the expert GEMM on tensor cores (gemm_mma_sync_kernel over the block-sorted slots
+// of align_block_size). Oracle: fp64 host loops over the decoded operands with the documented row semantics
+// (A row = slot / top_k for W13, slot for W2; C row = slot; padding slots and experts < 0 untouched) and the
+// epilogue order bias -> GLU (interleaved) -> routed weight. bf16 cases are also compared with moe_gemv.
+// =============================================================================
+namespace b7moe {
+
+template <typename T>
+struct Buf {
+  T* p = nullptr;
+  size_t n = 0;
+  explicit Buf(size_t count) : p(kops_test::device_alloc<T>(count ? count : 1)), n(count) {}
+  explicit Buf(const std::vector<T>& h) : Buf(h.size()) { if (!h.empty()) kops_test::copy_in(p, h); }
+  ~Buf() { kops_test::device_free(p); }
+  Buf(const Buf&) = delete;
+  Buf& operator=(const Buf&) = delete;
+  std::vector<T> get() const { return kops_test::copy_out(p, n); }
+};
+
+struct Rng {
+  std::mt19937 g;
+  explicit Rng(unsigned seed) : g(seed) {}
+  float uni(float lo, float hi) { return lo + (hi - lo) * (static_cast<float>(g() >> 8) / 16777216.0f); }
+  int range(int n) { return static_cast<int>(g() % static_cast<uint32_t>(n)); }
+};
+
+uint8_t e4m3_enc(float x) { return static_cast<uint8_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3)); }
+float e4m3_dec(uint8_t b) { return __half2float(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3)); }
+
+enum { W_BF16 = 0, W_FP8_EXPERT, W_FP8_CHANNEL, W_FP8_BLOCK, W_FP8_BLOCK_CM, W_FP8_BLOCK_UE, W_INT8 };
+const char* const kWName[] = {"16-bit", "e4m3 per expert", "e4m3 per channel", "e4m3 128x128", "e4m3 128x128 col-major sA",
+                              "e4m3 128x128 ue8m0", "int8 per channel"};
+
+struct Case {
+  int wmode = W_BF16;
+  int block = 16;
+  bool w2 = false;        // stage W2 (A rows are slots, routed weight) else W13 (GLU on interleaved weights)
+  bool glu = true;        // W13 only
+  int glu_db = 1;
+  bool fp16 = false;      // 16-bit activations / output in fp16
+  bool fp32_out = false;
+  bool drop_expert = true;
+  unsigned seed = 1;
+};
+
+constexpr int kE = 8, kTokens = 40, kTopK = 2, kSlots = kTokens * kTopK;
+constexpr int kEmptyExpert = 5, kEpExpert = 6;
+
+struct Routing {
+  std::vector<int32_t> expert_of;                  // [slots]
+  std::vector<int32_t> sorted, expert_ids;         // device results of align_block_size (expert_ids EP-edited)
+  int32_t post_pad = 0;
+};
+
+/// align_block_size on random routing (expert kEmptyExpert gets nothing); blocks of kEpExpert are set to -1
+/// afterwards, as an EP rank's local id map does.
+Routing route(const kops::LaunchContext& ctx, int block, bool drop, unsigned seed) {
+  Routing R;
+  Rng r(seed);
+  R.expert_of.resize(kSlots);
+  for (auto& e : R.expert_of) {
+    do { e = r.range(kE); } while (e == kEmptyExpert);
+  }
+  R.expert_of[0] = kEpExpert;
+  const int64_t cap = kSlots + static_cast<int64_t>(kE) * (block - 1);
+  const int64_t blocks = (cap + block - 1) / block + 1;
+  Buf<int32_t> ids(R.expert_of), sorted(static_cast<size_t>(cap)), eids(static_cast<size_t>(blocks)), post(1), scratch(kE + 1);
+  kops::Workspace ws{};
+  ws.device_scratch = scratch.p;
+  ws.device_scratch_bytes = (kE + 1) * sizeof(int32_t);
+  KOPS_EXPECT_OK(kops::moe::align_block_size(tensor1d(ids.p, DType::kInt32, kSlots), tensor1d(sorted.p, DType::kInt32, cap),
+                                             tensor1d(eids.p, DType::kInt32, blocks), tensor1d(post.p, DType::kInt32, 1), Tensor{}, kE, block, ws, ctx),
+                 "b7 moe_gemm align_block_size");
+  cudaDeviceSynchronize();
+  R.sorted = sorted.get();
+  R.expert_ids = eids.get();
+  R.post_pad = post.get()[0];
+  if (drop) {
+    for (int b = 0; b < R.post_pad / block; ++b) {
+      if (R.expert_ids[b] == kEpExpert) R.expert_ids[b] = -1;
+    }
+  }
+  return R;
+}
+
+struct Result {
+  std::vector<uint8_t> c;   // raw bytes of C
+  bool ok = false;
+};
+
+/// Element-wise one output ulp + 2e-5 rms, Frobenius 0.6 ulp (the gemm tests' rule). `mag` is the optional
+/// FP8 bound: 2^-11 * sum|a*w*scale|, the e4m3 mma's effective accumulation mantissa (expect_close_fp8).
+void close(const std::vector<double>& got, const std::vector<double>& want, double eps, const char* what,
+           const std::vector<double>* mag = nullptr) {
+  double ss = 0.0, num = 0.0, mag_ss = 0.0;
+  for (double w : want) ss += w * w;
+  if (mag != nullptr) for (double m : *mag) mag_ss += m * m;
+  const double rms = std::sqrt(ss / static_cast<double>(want.empty() ? 1 : want.size()));
+  size_t bad = 0, worst = 0;
+  double worst_err = -1.0;
+  for (size_t i = 0; i < want.size(); ++i) {
+    const double err = std::fabs(got[i] - want[i]);
+    num += err * err;
+    const double lim = eps * std::fabs(want[i]) + 2e-5 * rms + (mag != nullptr ? std::ldexp((*mag)[i], -11) : 0.0);
+    if (!(err <= lim)) {
+      ++bad;
+      if (err > worst_err) { worst_err = err; worst = i; }
+    }
+  }
+  const double frob = ss > 0.0 ? std::sqrt(num / ss) : std::sqrt(num);
+  // FP8: the aggregate bound follows the same 2^-11 sum|p| term (mag_rms / rms is the relative size of
+  // the accumulated magnitudes; 1 for 16-bit / INT8 because mag is then never passed).
+  const double frob_lim = 0.6 * (eps + (mag != nullptr && ss > 0.0 ? std::ldexp(std::sqrt(mag_ss / ss), -11) : 0.0));
+  if (bad != 0 || !(frob <= frob_lim)) {
+    char det[256];
+    std::snprintf(det, sizeof(det), "%zu/%zu off, frobenius %.3g, worst #%zu got %.7g want %.7g", bad, want.size(), frob, worst,
+                  bad ? got[worst] : 0.0, bad ? want[worst] : 0.0);
+    kops_test::record_failure(what, det, __FILE__, __LINE__);
+  }
+}
+
+double silu(double x) { return x / (1.0 + std::exp(-x)); }
+
+/// One moe_gemm stage checked against the oracle. Returns C's bytes for bit comparisons.
+Result run(const kops::LaunchContext& ctx, const Case& cs, const Routing& R, const char* what_in, bool via_gemv = false) {
+  char what[300];
+  std::snprintf(what, sizeof(what), "%s [%s block %d %s glu %d db %d%s%s]", what_in, kWName[cs.wmode], cs.block, cs.w2 ? "W2" : "W13",
+                cs.glu && !cs.w2, cs.glu_db, cs.fp16 ? " fp16" : "", cs.fp32_out ? " fp32 out" : "");
+  Result res;
+  Rng r(777u + cs.seed * 13u + static_cast<unsigned>(cs.wmode) * 7u + (cs.w2 ? 1u : 0u));
+  const bool glu = cs.glu && !cs.w2;
+  const int K = 256, N = cs.w2 ? 192 : 256, n_out = glu ? N / 2 : N, ldc = n_out + 4;
+  const int a_rows = cs.w2 ? kSlots : kTokens;
+  const bool fp8 = cs.wmode >= W_FP8_EXPERT && cs.wmode <= W_FP8_BLOCK_UE;
+  const bool i8 = cs.wmode == W_INT8;
+  const bool block = cs.wmode == W_FP8_BLOCK || cs.wmode == W_FP8_BLOCK_CM || cs.wmode == W_FP8_BLOCK_UE;
+  const bool ue = cs.wmode == W_FP8_BLOCK_UE;
+  const bool cm = cs.wmode == W_FP8_BLOCK_CM;
+  const int kb = K / 128, nb = (N + 127) / 128;
+  // operands
+  std::vector<uint8_t> a_b, w_b;
+  std::vector<float> a_v, w_v;
+  auto gen = [&](size_t n, float lo, float hi, std::vector<uint8_t>* b, std::vector<float>* v) {
+    v->resize(n);
+    b->resize(n * ((fp8 || i8) ? 1 : 2));
+    for (size_t i = 0; i < n; ++i) {
+      if (fp8) {
+        (*b)[i] = e4m3_enc(r.uni(2 * lo, 2 * hi));
+        (*v)[i] = e4m3_dec((*b)[i]);
+      } else if (i8) {
+        const int q = r.range(129) - 64;
+        (*b)[i] = static_cast<uint8_t>(static_cast<int8_t>(q));
+        (*v)[i] = static_cast<float>(q);
+      } else if (cs.fp16) {
+        __half h;
+        kops_test::from_float(h, r.uni(lo, hi));
+        std::memcpy(&(*b)[2 * i], &h, 2);
+        (*v)[i] = kops_test::to_float(h);
+      } else {
+        __nv_bfloat16 h;
+        kops_test::from_float(h, r.uni(lo, hi));
+        std::memcpy(&(*b)[2 * i], &h, 2);
+        (*v)[i] = kops_test::to_float(h);
+      }
+    }
+  };
+  gen(static_cast<size_t>(a_rows) * K, -1.0f, 1.0f, &a_b, &a_v);
+  gen(static_cast<size_t>(kE) * N * K, -0.5f, 0.5f, &w_b, &w_v);
+  // scales (oracle values + device bytes)
+  std::vector<float> sa, sw;
+  std::vector<uint8_t> sa_dev, sw_dev;
+  auto f32_bytes = [](const std::vector<float>& v) {
+    std::vector<uint8_t> b(v.size() * 4);
+    std::memcpy(b.data(), v.data(), b.size());
+    return b;
+  };
+  if (cs.wmode == W_FP8_EXPERT) {
+    sa = {0.8f};
+    sw.resize(kE);
+    for (auto& v : sw) v = r.uni(0.5f, 1.5f);
+  } else if (cs.wmode == W_FP8_CHANNEL || i8) {
+    sa.resize(a_rows);
+    sw.resize(static_cast<size_t>(kE) * N);
+    for (auto& v : sa) v = i8 ? r.uni(0.01f, 0.03f) : r.uni(0.5f, 1.5f);
+    for (auto& v : sw) v = i8 ? r.uni(0.01f, 0.03f) : r.uni(0.5f, 1.5f);
+  } else if (block) {
+    auto pick = [&](uint8_t* e8) {
+      if (ue) { const int p = r.range(5) - 2; *e8 = static_cast<uint8_t>(127 + p); return std::ldexp(1.0f, p); }
+      return r.uni(0.5f, 2.0f);
+    };
+    const int ldm = (a_rows + 3) / 4 * 4;
+    sa.resize(static_cast<size_t>(a_rows) * kb);
+    std::vector<float> sa_f(cm ? static_cast<size_t>(kb) * ldm : sa.size(), 0.0f);
+    std::vector<uint8_t> sa_e(sa_f.size(), 0);
+    for (int row = 0; row < a_rows; ++row) {
+      for (int j = 0; j < kb; ++j) {
+        uint8_t e8 = 0;
+        const float v = pick(&e8);
+        sa[static_cast<size_t>(row) * kb + j] = v;
+        const size_t pos = cm ? static_cast<size_t>(j) * ldm + row : static_cast<size_t>(row) * kb + j;
+        sa_f[pos] = v;
+        sa_e[pos] = e8;
+      }
+    }
+    sw.resize(static_cast<size_t>(kE) * nb * kb);
+    std::vector<uint8_t> sw_e(sw.size());
+    for (size_t i = 0; i < sw.size(); ++i) sw[i] = pick(&sw_e[i]);
+    sa_dev = ue ? sa_e : f32_bytes(sa_f);
+    sw_dev = ue ? sw_e : f32_bytes(sw);
+  }
+  if (!block) {
+    sa_dev = f32_bytes(sa);
+    sw_dev = f32_bytes(sw);
+  }
+  // bias [E, N] in c_dtype, routed weights
+  std::vector<float> bias_v(static_cast<size_t>(kE) * N);
+  std::vector<uint8_t> bias_b(bias_v.size() * (cs.fp32_out ? 4 : 2));
+  for (size_t i = 0; i < bias_v.size(); ++i) {
+    const float x = r.uni(-1.0f, 1.0f);
+    if (cs.fp32_out) { bias_v[i] = x; std::memcpy(&bias_b[4 * i], &x, 4); }
+    else if (cs.fp16) { __half h; kops_test::from_float(h, x); bias_v[i] = kops_test::to_float(h); std::memcpy(&bias_b[2 * i], &h, 2); }
+    else { __nv_bfloat16 h; kops_test::from_float(h, x); bias_v[i] = kops_test::to_float(h); std::memcpy(&bias_b[2 * i], &h, 2); }
+  }
+  std::vector<float> tw(kSlots);
+  for (auto& v : tw) v = r.uni(0.3f, 1.2f);
+  // oracle
+  const int c_rows = kSlots + 8;   // rows past the valid slots catch writes of padding ids
+  std::vector<double> ref(static_cast<size_t>(c_rows) * ldc, 0.0), ref_mag(ref.size(), 0.0);
+  std::vector<char> written(ref.size(), 0);
+  std::vector<double> lin(N), lin_mag(N);
+  for (int s = 0; s < kSlots; ++s) {
+    const int e = R.expert_of[s];
+    if (cs.drop_expert && e == kEpExpert) continue;
+    const int src = cs.w2 ? s : s / kTopK;
+    const float* av = &a_v[static_cast<size_t>(src) * K];
+    for (int c = 0; c < N; ++c) {
+      const float* wv = &w_v[(static_cast<size_t>(e) * N + c) * K];
+      double acc = 0.0, mag = 0.0;
+      if (block) {
+        for (int j = 0; j < kb; ++j) {
+          double part = 0.0, pmag = 0.0;
+          for (int kk = 128 * j; kk < 128 * j + 128; ++kk) {
+            const double p = static_cast<double>(av[kk]) * wv[kk];
+            part += p;
+            pmag += std::fabs(p);
+          }
+          const double sc = static_cast<double>(sa[static_cast<size_t>(src) * kb + j]) *
+                            sw[(static_cast<size_t>(e) * nb + c / 128) * kb + j];
+          acc += part * sc;
+          mag += pmag * std::fabs(sc);
+        }
+      } else {
+        for (int kk = 0; kk < K; ++kk) {
+          const double p = static_cast<double>(av[kk]) * wv[kk];
+          acc += p;
+          mag += std::fabs(p);
+        }
+        if (cs.wmode == W_FP8_EXPERT) {
+          const double sc = static_cast<double>(sa[0]) * sw[e];
+          acc *= sc;
+          mag *= std::fabs(sc);
+        }
+        if (cs.wmode == W_FP8_CHANNEL || i8) {
+          const double sc = static_cast<double>(sa[src]) * sw[static_cast<size_t>(e) * N + c];
+          acc *= sc;
+          mag *= std::fabs(sc);
+        }
+      }
+      acc += bias_v[static_cast<size_t>(e) * N + c];
+      lin[c] = acc;
+      lin_mag[c] = mag;
+    }
+    for (int oc = 0; oc < n_out; ++oc) {
+      double v = lin[oc], mag = lin_mag[oc];
+      if (glu) {
+        const int gc = (oc / cs.glu_db) * 2 * cs.glu_db + oc % cs.glu_db;
+        const double gate = lin[gc], up = lin[gc + cs.glu_db];
+        const double sig = 1.0 / (1.0 + std::exp(-gate));
+        v = silu(gate) * up;
+        mag = std::fabs(silu(gate)) * lin_mag[gc + cs.glu_db] +
+              std::fabs(up) * std::fabs(sig * (1.0 + gate * (1.0 - sig))) * lin_mag[gc];
+      }
+      if (cs.w2) {
+        v *= tw[s];
+        mag *= std::fabs(tw[s]);
+      }
+      ref[static_cast<size_t>(s) * ldc + oc] = v;
+      ref_mag[static_cast<size_t>(s) * ldc + oc] = mag;
+      written[static_cast<size_t>(s) * ldc + oc] = 1;
+    }
+  }
+  // device
+  const int ce = cs.fp32_out ? 4 : 2;
+  Buf<uint8_t> da(a_b), dw(w_b), dsa(sa_dev.empty() ? std::vector<uint8_t>(16) : sa_dev), dsw(sw_dev.empty() ? std::vector<uint8_t>(16) : sw_dev);
+  Buf<uint8_t> dbias(bias_b);
+  Buf<float> dtw(tw);
+  Buf<int32_t> dsorted(R.sorted), deids(R.expert_ids), dpost(std::vector<int32_t>(1, R.post_pad));
+  std::vector<uint8_t> c0(static_cast<size_t>(c_rows) * ldc * ce, 0);
+  {
+    const float sen = 7.0f;
+    for (size_t i = 0; i < ref.size(); ++i) {
+      if (cs.fp32_out) std::memcpy(&c0[4 * i], &sen, 4);
+      else if (cs.fp16) { __half h; kops_test::from_float(h, sen); std::memcpy(&c0[2 * i], &h, 2); }
+      else { __nv_bfloat16 h; kops_test::from_float(h, sen); std::memcpy(&c0[2 * i], &h, 2); }
+    }
+  }
+  Buf<uint8_t> dc(c0);
+  kops::moe::FusedMoEGemmParams p{};
+  p.a = da.p; p.lda = K; p.a_rows_are_slots = cs.w2;
+  p.w = dw.p; p.w_expert_stride = static_cast<int64_t>(N) * K;
+  p.bias = dbias.p; p.c = dc.p; p.ldc = ldc;
+  p.sorted_token_ids = dsorted.p; p.expert_ids = deids.p; p.num_tokens_post_pad = dpost.p;
+  p.topk_weights = dtw.p; p.mul_routed_weight = cs.w2; p.top_k = kTopK; p.n = N; p.k = K;
+  p.num_valid_slots = kSlots;
+  if (glu) {
+    p.epi.ops = kops::gemm::kEpiGLU;
+    p.epi.act = kops::ActFn::kSiLU;
+    p.epi.glu_layout = kops::GateLayout::kInterleaved;
+    p.epi.glu_interleave = cs.glu_db;
+  }
+  if (fp8 || i8) {
+    p.a_scale = dsa.p;
+    p.w_scale = dsw.p;
+    p.w_quant.storage_dtype = fp8 ? DType::kFloat8E4M3 : DType::kInt8;
+    if (cs.wmode == W_FP8_EXPERT) {
+      p.w_quant.granularity = kops::ScaleGranularity::kPerTensor;
+      p.a_quant.granularity = kops::ScaleGranularity::kPerTensor;
+    } else if (block) {
+      p.w_quant.granularity = kops::ScaleGranularity::kPerBlock2D;
+      p.w_quant.group_m = 128; p.w_quant.group_k = 128;
+      p.w_quant.scale_dtype = ue ? DType::kFloat8E8M0 : DType::kFloat32;
+      p.a_quant.granularity = kops::ScaleGranularity::kPerGroup;
+      p.a_quant.group_k = 128;
+      p.a_quant.scale_dtype = ue ? DType::kFloat8E8M0 : DType::kFloat32;
+      p.a_quant.scale_layout = cm ? kops::ScaleLayout::kColMajorTma : kops::ScaleLayout::kRowMajor;
+      p.w_scale_expert_stride = 0;   // default [E, ceil(N / 128), K / 128]
+    } else {
+      p.w_quant.granularity = kops::ScaleGranularity::kPerChannel;
+      p.a_quant.granularity = kops::ScaleGranularity::kPerToken;
+      p.w_scale_expert_stride = N;
+    }
+  }
+  const DType adt = fp8 ? DType::kFloat8E4M3 : (i8 ? DType::kInt8 : (cs.fp16 ? DType::kFloat16 : DType::kBFloat16));
+  const DType cdt = cs.fp32_out ? DType::kFloat32 : (cs.fp16 ? DType::kFloat16 : DType::kBFloat16);
+  const Status st = via_gemv ? kops::moe::moe_gemv(p, kE, cs.block, adt, adt, ctx) : kops::moe::moe_gemm(p, kE, cs.block, adt, adt, cdt, ctx);
+  if (st != Status::kSuccess) {
+    KOPS_EXPECT_OK(st, what);
+    return res;
+  }
+  cudaDeviceSynchronize();
+  res.c = dc.get();
+  res.ok = true;
+  std::vector<double> got, want, want_mag;
+  size_t untouched = 0;
+  for (size_t i = 0; i < ref.size(); ++i) {
+    double g;
+    if (cs.fp32_out) { float f; std::memcpy(&f, &res.c[4 * i], 4); g = f; }
+    else if (cs.fp16) { __half h; std::memcpy(&h, &res.c[2 * i], 2); g = kops_test::to_float(h); }
+    else { __nv_bfloat16 h; std::memcpy(&h, &res.c[2 * i], 2); g = kops_test::to_float(h); }
+    if (written[i]) { got.push_back(g); want.push_back(ref[i]); want_mag.push_back(ref_mag[i]); }
+    else untouched += g != 7.0;
+  }
+  close(got, want, cs.fp32_out ? 2e-6 : (cs.fp16 ? 0.0009765625 : 0.0078125), what, fp8 ? &want_mag : nullptr);
+  if (untouched != 0) {
+    char det[160];
+    std::snprintf(det, sizeof(det), "%zu elements of padding slots / EP experts / ld padding were written", untouched);
+    kops_test::record_failure(what, det, __FILE__, __LINE__);
+  }
+  return res;
+}
+
+}  // namespace b7moe
+
+void test_b7_moe_gemm() {
+  using namespace b7moe;
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  for (int block : {16, 32, 64, 128}) {
+    const Routing R = route(ctx, block, true, 100u + block);
+    if (R.post_pad <= 0) continue;
+    for (int wmode = W_BF16; wmode <= W_INT8; ++wmode) {
+      for (bool w2 : {false, true}) {
+        Case cs;
+        cs.wmode = wmode; cs.block = block; cs.w2 = w2; cs.seed = static_cast<unsigned>(block);
+        const Result r1 = run(ctx, cs, R, "b7 moe_gemm");
+        const Result r2 = run(ctx, cs, R, "b7 moe_gemm (repeat)");
+        if (r1.ok && r2.ok && r1.c != r2.c) kops_test::record_failure("b7 moe_gemm determinism", "repeat run differs", __FILE__, __LINE__);
+      }
+    }
+    // GLU interleave 16 / 64, fp16, fp32 output, no EP drop
+    Case cs;
+    cs.block = block; cs.seed = 3;
+    for (int db : {16, 64}) {
+      cs.glu_db = db;
+      run(ctx, cs, R, "b7 moe_gemm GLU interleave");
+      cs.wmode = W_FP8_BLOCK;
+      run(ctx, cs, R, "b7 moe_gemm GLU interleave");
+      cs.wmode = W_BF16;
+    }
+    cs.glu_db = 1;
+    cs.fp16 = true;
+    run(ctx, cs, R, "b7 moe_gemm fp16");
+    cs.w2 = true;
+    run(ctx, cs, R, "b7 moe_gemm fp16");
+    cs.fp16 = false;
+    cs.fp32_out = true;
+    run(ctx, cs, R, "b7 moe_gemm fp32 out");
+    cs.wmode = W_FP8_CHANNEL;
+    run(ctx, cs, R, "b7 moe_gemm fp32 out");
+  }
+  // bf16 against moe_gemv (same slots, rows independent of the block layout): W13 without GLU and W2
+  for (bool w2 : {false, true}) {
+    const Routing R16 = route(ctx, 16, false, 555u);
+    const Routing R8 = route(ctx, 8, false, 555u);
+    Case cs;
+    cs.block = 16; cs.w2 = w2; cs.glu = false; cs.drop_expert = false; cs.seed = 77;
+    const Result g = run(ctx, cs, R16, "b7 moe_gemm vs moe_gemv: moe_gemm");
+    cs.block = 8;
+    const Result v = run(ctx, cs, R8, "b7 moe_gemm vs moe_gemv: moe_gemv", true);
+    if (g.ok && v.ok) {
+      size_t far = 0;
+      for (size_t i = 0; i + 1 < g.c.size(); i += 2) {
+        __nv_bfloat16 a, b;
+        std::memcpy(&a, &g.c[i], 2);
+        std::memcpy(&b, &v.c[i], 2);
+        const double x = kops_test::to_float(a), y = kops_test::to_float(b);
+        if (!(std::fabs(x - y) <= 2.0 * 0.0078125 * std::max(std::fabs(x), std::fabs(y)) + 1e-3)) ++far;
+      }
+      if (far != 0) kops_test::record_failure("b7 moe_gemm vs moe_gemv", "outputs differ by more than two bf16 ulps", __FILE__, __LINE__);
+    }
+  }
+  // contracts: Status, C untouched
+  {
+    const Routing R = route(ctx, 16, true, 9u);
+    Buf<__nv_bfloat16> a(static_cast<size_t>(kTokens) * 256), w(static_cast<size_t>(kE) * 256 * 256);
+    Buf<float> sc(static_cast<size_t>(kE) * 256), tw(kSlots);
+    Buf<int32_t> dsorted(R.sorted), deids(R.expert_ids), dpost(std::vector<int32_t>(1, R.post_pad));
+    std::vector<uint8_t> c0(static_cast<size_t>(kSlots) * 128 * 2, 0x3C);
+    Buf<uint8_t> c(c0);
+    kops::moe::FusedMoEGemmParams base{};
+    base.a = a.p; base.lda = 256; base.w = w.p; base.w_expert_stride = 256 * 256; base.c = c.p; base.ldc = 128;
+    base.sorted_token_ids = dsorted.p; base.expert_ids = deids.p; base.num_tokens_post_pad = dpost.p;
+    base.topk_weights = tw.p; base.top_k = kTopK; base.n = 256; base.k = 256; base.num_valid_slots = kSlots;
+    base.epi.ops = kops::gemm::kEpiGLU; base.epi.glu_layout = kops::GateLayout::kInterleaved; base.epi.act = kops::ActFn::kSiLU;
+    const DType bf = DType::kBFloat16, e4 = DType::kFloat8E4M3;
+    auto expect = [&](const kops::moe::FusedMoEGemmParams& p, int block, DType ad, DType wd, DType cd, Status want, const char* what) {
+      KOPS_EXPECT_STATUS(kops::moe::moe_gemm(p, kE, block, ad, wd, cd, ctx), want, what);
+      cudaDeviceSynchronize();
+      if (c.get() != c0) kops_test::record_failure(what, "C written by a rejected call", __FILE__, __LINE__);
+    };
+    expect(base, 24, bf, bf, bf, Status::kUnsupportedShape, "b7 moe_gemm: block 24");
+    auto p = base; p.sorted_token_ids = nullptr;
+    expect(p, 16, bf, bf, bf, Status::kInvalidArgument, "b7 moe_gemm: null sorted ids");
+    p = base; p.mul_routed_weight = true; p.topk_weights = nullptr;
+    expect(p, 16, bf, bf, bf, Status::kInvalidArgument, "b7 moe_gemm: routed weight without weights");
+    p = base; p.w_zeros = w.p;
+    expect(p, 16, bf, bf, bf, Status::kNotImplemented, "b7 moe_gemm: zero points");
+    expect(base, 16, bf, DType::kFloat16, bf, Status::kUnsupportedDtype, "b7 moe_gemm: mixed 16-bit dtypes");
+    expect(base, 16, bf, e4, bf, Status::kUnsupportedDtype, "b7 moe_gemm: bf16 x e4m3");
+    expect(base, 16, bf, bf, DType::kInt8, Status::kUnsupportedDtype, "b7 moe_gemm: int8 output");
+    p = base; p.w_quant.granularity = kops::ScaleGranularity::kPerChannel;
+    expect(p, 16, bf, bf, bf, Status::kInvalidArgument, "b7 moe_gemm: 16-bit experts with scales");
+    expect(base, 16, e4, e4, bf, Status::kInvalidArgument, "b7 moe_gemm: e4m3 without scales");
+    p = base; p.w_scale = sc.p; p.w_quant.granularity = kops::ScaleGranularity::kPerChannel; p.w_scale_expert_stride = 100;
+    expect(p, 16, e4, e4, bf, Status::kInvalidArgument, "b7 moe_gemm: per-channel stride < N");
+    p.w_quant.granularity = kops::ScaleGranularity::kPerBlock2D; p.w_quant.group_m = 128; p.w_quant.group_k = 128;
+    expect(p, 16, e4, e4, bf, Status::kInvalidArgument, "b7 moe_gemm: blockwise without activation scales");
+    p.w_quant.group_k = 64; p.a_scale = sc.p;
+    expect(p, 16, e4, e4, bf, Status::kUnsupportedShape, "b7 moe_gemm: 128x64 blocks");
+    p = base; p.w_scale = sc.p;
+    expect(p, 16, DType::kInt8, DType::kInt8, bf, Status::kInvalidArgument, "b7 moe_gemm: int8 without per-channel scales");
+    p = base; p.ldc = 100;
+    expect(p, 16, bf, bf, bf, Status::kInvalidArgument, "b7 moe_gemm: ldc < N / 2");
+    p = base; p.epi.glu_layout = kops::GateLayout::kGateUp;
+    expect(p, 16, bf, bf, bf, Status::kNotImplemented, "b7 moe_gemm: GLU on split gate / up");
+    p = base; p.lda = 260;
+    expect(p, 16, bf, bf, bf, Status::kMisaligned, "b7 moe_gemm: lda not 16 B");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -1503,5 +1984,6 @@ int main() {
   test_permute_quant();
   test_moe_sum_and_latent();
   test_contracts();
+  test_b7_moe_gemm();
   return kops_test::finish("test_moe");
 }

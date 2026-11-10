@@ -139,7 +139,8 @@ remain the ABI and shape authority.
   `ctx.deterministic` is set. For a 16-bit D the atomic adds the addend already rounded to the output
   dtype (`atomicAdd` on `__nv_bfloat16` / `__half`), so it rounds twice; fp32 D rounds once. `ctx.batch_invariant` disables the heuristic's split-K and `swap_ab`.
 - Operands: K-major A and B, 16 B aligned pointers and leading dimensions, `K % 8 == 0`
-  (`kMisaligned` otherwise). MN-major operands and `kTF32` return `kNotImplemented` here.
+  (`kMisaligned` otherwise). `kTF32` runs `m16n8k8` on fp32 operands rounded with `cvt.rna.tf32`
+  and needs `ctx.allow_tf32`; MN-major operands still return `kNotImplemented`.
 - Epilogue order (fp32): `alpha` -> row_scale -> col_scale -> bias -> clamp -> softcap -> act or GLU ->
   routing_weight -> sigmoid gate multiply -> `+ beta * residual` -> round to D -> store -> row_sumsq ->
   KV append. Residual, gate_src and the KV destination are read / written in the output dtype.
@@ -174,8 +175,22 @@ remain the ABI and shape authority.
   aligned pointers, `lda`, `ldb` and the A / B batch strides, `K % 8 == 0`, and `N % 8 == 0` when B is `[K, N]`.
   The K chain per element is the one of `gemm_mma_sync_kernel`, so `bmm` (k-major B) and the batched tile
   GEMM agree bitwise. FP8 operands return `kNotImplemented` (use `fp8_bmm`).
-- Not yet on this path: `kEpiQuantOut` and `kEpiAzpCorrection` (`kNotImplemented`), stream-K, MN-major
-  operands.
+- `kEpiQuantOut` writes OCP e4m3 or int8 with static per-tensor or dynamic per-group scaling; the
+  per-token amax spans CTAs and is `kNotImplemented`. `kEpiAzpCorrection` is the asymmetric-INT8
+  epilogue (`acc -= azp[m] * colsum_b[n]`). Not yet on this path: stream-K and MN-major operands.
+- **B7 variants on the shared body.** `fp8_gemm` / `fp8_bmm` / `fp8_block_gemm_small_m` run OCP e4m3
+  `mma.sync.m16n8k32` on SM89+ with fp32 accumulators (the hardware keeps an effective 11-bit
+  mantissa, so the fp64 oracle allows `2^-11 * sum|p|`); scales are tensorwise, rowwise or
+  `1x128` x `128x128` blockwise (fp32 or UE8M0), and the blockwise small-M path is `swap_ab`.
+  `int8_gemm` / `w4a8_int_gemm` use s8 `m16n8k32` with s32 accumulators and the azp epilogue.
+  `grouped_gemm` maps tiles to (group, m, n) for `kContiguous`, `kContiguousRowIndex`, `kMasked`
+  and `kIndexed` (empty experts emit no tile; the task map matches the in-kernel scan bitwise);
+  `moe_gemm` reads the block-sorted slots of `align_block_size` (block 16–256, expert `-1` skips
+  the block, padding slots are untouched). `lora_sgmv` is SGMV shrink/expand over
+  `seg_indptr` / `seg_lora_ids`, with shrink in fp32 and expand accumulating in the output dtype.
+  `marlin_gemm` covers U4/U4B8/U8B128/FE4M3/FE2M1 dense and the MoE `sorted_token_ids` mode
+  (act-order is dense-only); `gguf_mmq` is the int8-mma prefill path (IQ* stay `kNotImplemented`).
+  Operand scale and bias values are read exactly as passed; destination rounding happens once.
 - Tactic cache key: (recipe, N, K, M bucket = next power of two, `arch_id`, `CUDART_VERSION`). An
   entry is a function of that key alone, so the same conditions give the same tactic; the text file
   written by `tactic_cache_save` carries the ABI version and is refused on any other. `autotune`
