@@ -51,6 +51,7 @@
 namespace {
 
 using kops::DType;
+using kops::Status;
 using kops::Tensor;
 
 Tensor tensor1d(void* data, DType dtype, int64_t n) {
@@ -120,6 +121,8 @@ struct RouteSpec {
   bool renormalize = true;
   float scale = 1.0f;
   float softcap = 0.0f;
+  int stride_pad = 3;   // logits row padding in elements (0 = rows are contiguous)
+  bool bias_nz = false; // fill correction_bias for the unbiased recipes too
 };
 
 void route_ref(const std::vector<double>& logits, int tokens, const RouteSpec& s,
@@ -258,7 +261,7 @@ struct RouterBuffers {
 
 void run_route_case(const char* name, int tokens, const RouteSpec& s, unsigned seed) {
   RouterBuffers b;
-  const int64_t stride = s.experts + 3;
+  const int64_t stride = s.experts + s.stride_pad;
   b.logits.assign(static_cast<size_t>(tokens * stride), 0.0f);
   std::vector<float> dense(static_cast<size_t>(tokens * s.experts));
   fill(dense, seed);
@@ -268,8 +271,8 @@ void run_route_case(const char* name, int tokens, const RouteSpec& s, unsigned s
     }
   }
   b.bias.assign(static_cast<size_t>(s.experts), 0.0f);
-  if (s.score != static_cast<int>(kops::moe::RouterScore::kSigmoid) &&
-      s.score != static_cast<int>(kops::moe::RouterScore::kSqrtSoftplus)) {
+  if (s.bias_nz || (s.score != static_cast<int>(kops::moe::RouterScore::kSigmoid) &&
+                    s.score != static_cast<int>(kops::moe::RouterScore::kSqrtSoftplus))) {
     fill(b.bias, seed + 1u, -0.5f, 0.5f);
   }
   b.ids.assign(static_cast<size_t>(tokens * s.topk), 0);
@@ -479,6 +482,318 @@ void test_route_eplb_shared() {
   kops_test::device_free(d_load);
   kops_test::device_free(d_map);
   kops_test::device_free(d_rep);
+}
+
+// =============================================================================
+// E == 256 fp32 route fast path (two float4 loads per lane, k <= 8). The body is
+// chosen from the tensor layout: rows that are 16 B aligned (stride % 4 == 0) take
+// the vector body, every other shape keeps the scalar body, and both must match the
+// fp64 oracle and each other bit for bit.
+// =============================================================================
+
+namespace e256 {
+
+struct Run {
+  std::vector<int32_t> ids;
+  std::vector<float> weights;
+  std::vector<int32_t> load;
+};
+
+/// route() on E = 256 with an explicit storage stride, optional EPLB mapping, fused
+/// shared expert and expert-load histogram.
+Run route(const std::vector<float>& dense, int tokens, int topk, int stride,
+          kops::moe::RouterScore score, bool eplb, int n_shared) {
+  const int experts = 256;
+  const int out_k = topk + n_shared;
+  Run run;
+  run.ids.assign(static_cast<size_t>(tokens * out_k), -1);
+  run.weights.assign(static_cast<size_t>(tokens * out_k), 0.0f);
+  run.load.assign(static_cast<size_t>(experts), 0);
+  std::vector<float> logits(static_cast<size_t>(tokens) * stride, 0.0f);
+  for (int t = 0; t < tokens; ++t) {
+    for (int e = 0; e < experts; ++e) {
+      logits[static_cast<size_t>(t * stride + e)] = dense[static_cast<size_t>(t * experts + e)];
+    }
+  }
+  std::vector<int32_t> map(static_cast<size_t>(experts) * 2);
+  std::vector<int32_t> rep(static_cast<size_t>(experts), 2);
+  for (int e = 0; e < experts; ++e) {
+    map[static_cast<size_t>(e * 2)] = 100 + e;
+    map[static_cast<size_t>(e * 2 + 1)] = 200 + e;
+  }
+  float* d_logits = kops_test::device_alloc<float>(logits.size());
+  int32_t* d_ids = kops_test::device_alloc<int32_t>(run.ids.size());
+  float* d_w = kops_test::device_alloc<float>(run.weights.size());
+  int32_t* d_load = kops_test::device_alloc<int32_t>(run.load.size());
+  int32_t* d_map = kops_test::device_alloc<int32_t>(map.size());
+  int32_t* d_rep = kops_test::device_alloc<int32_t>(rep.size());
+  kops_test::copy_in(d_logits, logits);
+  kops_test::copy_in(d_map, map);
+  kops_test::copy_in(d_rep, rep);
+  cudaMemset(d_load, 0, run.load.size() * sizeof(int32_t));
+  kops::moe::RouterParams p{};
+  p.logits = d_logits;
+  p.logits_stride = stride;
+  p.num_tokens = tokens;
+  p.num_experts = experts;
+  p.topk = topk;
+  p.num_expert_groups = 1;
+  p.topk_groups = 1;
+  p.renormalize = true;
+  p.routed_scaling_factor = 2.5f;
+  p.topk_ids = d_ids;
+  p.topk_weights = d_w;
+  p.expert_load = d_load;
+  if (eplb) {
+    p.logical_to_physical = d_map;
+    p.replica_count = d_rep;
+    p.max_replicas = 2;
+  }
+  p.num_fused_shared = n_shared;
+  p.shared_weight = 0.5f;
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return run;
+  KOPS_EXPECT_OK(kops::moe::route(p, score, DType::kFloat32, ctx), "e256 route");
+  run.ids = kops_test::copy_out(d_ids, run.ids.size());
+  run.weights = kops_test::copy_out(d_w, run.weights.size());
+  run.load = kops_test::copy_out(d_load, run.load.size());
+  kops_test::device_free(d_logits);
+  kops_test::device_free(d_ids);
+  kops_test::device_free(d_w);
+  kops_test::device_free(d_load);
+  kops_test::device_free(d_map);
+  kops_test::device_free(d_rep);
+  return run;
+}
+
+}  // namespace e256
+
+// Vector body against the fp64 oracle: contiguous rows (the benchmark layout),
+// padded-but-16 B-aligned rows, grouped routing, softcap, bias, after-top-k softmax
+// and short k values. Also the shape tails that stay on the scalar body (E = 200/192
+// are not multiples of the 32-expert lane stride, E = 8 is far below the vector lane
+// count, and an odd stride removes the alignment the vector loads require).
+void test_route_e256_fast() {
+  using kops::moe::GroupScore;
+  using kops::moe::RouterScore;
+
+  RouteSpec a;  // benchmark shape
+  a.experts = 256;
+  a.topk = 8;
+  a.stride_pad = 0;
+  a.score = static_cast<int>(RouterScore::kSigmoid);
+  a.bias_nz = true;
+  a.scale = 2.5f;
+  run_route_case("route e256 sigmoid k8", 33, a, 71u);
+
+  RouteSpec b;  // padded rows that stay 16 B aligned
+  b.experts = 256;
+  b.topk = 8;
+  b.stride_pad = 4;
+  b.score = static_cast<int>(RouterScore::kSqrtSoftplus);
+  b.softcap = 30.0f;
+  run_route_case("route e256 sqrtsoftplus softcap", 17, b, 73u);
+
+  RouteSpec c;  // odd stride: the scalar body
+  c.experts = 256;
+  c.topk = 8;
+  c.stride_pad = 1;
+  c.score = static_cast<int>(RouterScore::kSigmoid);
+  c.bias_nz = true;
+  run_route_case("route e256 sigmoid unaligned", 11, c, 75u);
+
+  RouteSpec d;  // short rank loops with the vector body
+  d.experts = 256;
+  d.topk = 1;
+  d.stride_pad = 0;
+  d.score = static_cast<int>(RouterScore::kSigmoid);
+  run_route_case("route e256 sigmoid k1", 9, d, 77u);
+  d.topk = 2;
+  run_route_case("route e256 sigmoid k2", 9, d, 79u);
+  d.topk = 8;
+  d.stride_pad = 8;
+  d.renormalize = false;
+  d.score = static_cast<int>(RouterScore::kNone);
+  run_route_case("route e256 raw logits k8", 9, d, 80u);
+
+  RouteSpec e;  // after-top-k softmax keeps its exact accumulation order
+  e.experts = 256;
+  e.topk = 6;
+  e.stride_pad = 8;
+  e.score = static_cast<int>(RouterScore::kSoftmaxAfterTopK);
+  e.renormalize = false;
+  run_route_case("route e256 after-topk k6", 13, e, 81u);
+
+  RouteSpec f;  // grouped routing on the vector body
+  f.experts = 256;
+  f.topk = 8;
+  f.groups = 8;
+  f.topk_groups = 4;
+  f.stride_pad = 0;
+  f.score = static_cast<int>(RouterScore::kSigmoid);
+  f.group_score = static_cast<int>(GroupScore::kTop2Sum);
+  f.scale = 2.5f;
+  run_route_case("route e256 grouped sigmoid", 15, f, 83u);
+  f.topk_groups = 2;
+  f.group_score = static_cast<int>(GroupScore::kMax);
+  f.topk = 4;
+  f.stride_pad = 4;
+  run_route_case("route e256 grouped top2 max", 15, f, 84u);
+
+  RouteSpec g;  // expert-count tails: neither shape is covered by the vector body
+  g.experts = 200;
+  g.topk = 5;
+  g.stride_pad = 0;
+  g.score = static_cast<int>(RouterScore::kSoftmax);
+  run_route_case("route e200 softmax tail", 7, g, 85u);
+  RouteSpec h;
+  h.experts = 192;
+  h.topk = 4;
+  h.stride_pad = 0;
+  h.score = static_cast<int>(RouterScore::kSigmoid);
+  h.scale = 2.5f;
+  run_route_case("route e192 sigmoid k4", 7, h, 87u);
+  RouteSpec i;
+  i.experts = 8;
+  i.topk = 2;
+  i.stride_pad = 0;
+  run_route_case("route e8 softmax contiguous", 5, i, 89u);
+
+  RouteSpec j;  // softmax over all E keeps its warp reduction order (scalar body)
+  j.experts = 256;
+  j.topk = 8;
+  j.stride_pad = 0;
+  j.score = static_cast<int>(RouterScore::kSoftmax);
+  j.scale = 2.5f;
+  run_route_case("route e256 softmax k8", 19, j, 91u);
+  j.stride_pad = 4;
+  run_route_case("route e256 softmax padded", 19, j, 92u);
+
+  RouteSpec k;  // k > 8 stays on the scalar body
+  k.experts = 256;
+  k.topk = 16;
+  k.stride_pad = 0;
+  k.score = static_cast<int>(RouterScore::kSigmoid);
+  k.bias_nz = true;
+  k.scale = 2.5f;
+  run_route_case("route e256 sigmoid k16", 13, k, 93u);
+}
+
+// Stable tie-break inside the vector body: equal scores must order by lower expert
+// id, both between candidates of one lane (0..3 / 128..131) and across lanes.
+void test_route_e256_ties() {
+  const int tokens = 3;
+  const int experts = 256;
+  const int topk = 8;
+  std::vector<float> logits(static_cast<size_t>(tokens * experts), 0.0f);
+  logits[1 * experts + 3] = 5.0f;    // same lane, same score
+  logits[1 * experts + 200] = 5.0f;  // other lane
+  logits[2 * experts + 0] = 5.0f;    // first and last expert of the row
+  logits[2 * experts + 255] = 5.0f;
+  float* d_logits = kops_test::device_alloc<float>(logits.size());
+  int32_t* d_ids = kops_test::device_alloc<int32_t>(static_cast<size_t>(tokens * topk));
+  float* d_w = kops_test::device_alloc<float>(static_cast<size_t>(tokens * topk));
+  kops_test::copy_in(d_logits, logits);
+  kops::moe::RouterParams p{};
+  p.logits = d_logits;
+  p.logits_stride = experts;  // contiguous rows -> vector body
+  p.num_tokens = tokens;
+  p.num_experts = experts;
+  p.topk = topk;
+  p.num_expert_groups = 1;
+  p.topk_groups = 1;
+  p.renormalize = false;
+  p.routed_scaling_factor = 1.0f;
+  p.topk_ids = d_ids;
+  p.topk_weights = d_w;
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  KOPS_EXPECT_OK(kops::moe::route(p, kops::moe::RouterScore::kSigmoid, DType::kFloat32, ctx),
+                 "route e256 ties");
+  const auto ids = kops_test::copy_out(d_ids, static_cast<size_t>(tokens * topk));
+  const auto w = kops_test::copy_out(d_w, static_cast<size_t>(tokens * topk));
+  const int32_t want[3][topk] = {{0, 1, 2, 3, 4, 5, 6, 7},
+                                 {3, 200, 0, 1, 2, 4, 5, 6},
+                                 {0, 255, 1, 2, 3, 4, 5, 6}};
+  int bad_id = 0, bad_w = 0;
+  for (int t = 0; t < tokens; ++t) {
+    for (int r = 0; r < topk; ++r) {
+      const size_t i = static_cast<size_t>(t * topk + r);
+      bad_id += ids[i] != want[t][r];
+      // weights are the unbiased score of the selected expert
+      const double x = static_cast<double>(logits[static_cast<size_t>(t * experts + ids[i])]);
+      bad_w += std::fabs(static_cast<double>(w[i]) - 1.0 / (1.0 + std::exp(-x))) > 1e-6;
+    }
+  }
+  KOPS_TEST_CHECK(bad_id == 0);
+  KOPS_TEST_CHECK(bad_w == 0);
+  kops_test::device_free(d_logits);
+  kops_test::device_free(d_ids);
+  kops_test::device_free(d_w);
+}
+
+// The vector body and the scalar body must be interchangeable: same ids, bit-equal
+// weights and same expert-load histogram, with and without EPLB mapping and the
+// fused shared expert.
+void test_route_e256_paths() {
+  const int tokens = 21;
+  const int topk = 8;
+  const int experts = 256;
+  std::vector<float> dense(static_cast<size_t>(tokens) * experts);
+  fill(dense, 95u);
+  for (int eplb = 0; eplb < 2; ++eplb) {
+    for (int shared = 0; shared < 2; ++shared) {
+      const int out_k = topk + shared;
+      const auto fast = e256::route(dense, tokens, topk, experts, kops::moe::RouterScore::kSigmoid,
+                                    eplb != 0, shared);
+      // 259 elements per row: the vector loads would be misaligned, so this run takes
+      // the scalar body on the very same logical data.
+      const auto scalar = e256::route(dense, tokens, topk, experts + 3,
+                                      kops::moe::RouterScore::kSigmoid, eplb != 0, shared);
+      expect_i32(fast.ids, scalar.ids, "e256 vector ids == scalar ids");
+      int bad = 0;
+      for (size_t i = 0; i < fast.weights.size(); ++i) bad += fast.weights[i] != scalar.weights[i];
+      for (size_t i = 0; i < fast.load.size(); ++i) bad += fast.load[i] != scalar.load[i];
+      KOPS_TEST_CHECK(bad == 0);
+      int bad_range = 0, bad_shared = 0, total = 0;
+      for (int e = 0; e < experts; ++e) total += fast.load[static_cast<size_t>(e)];
+      for (int t = 0; t < tokens; ++t) {
+        for (int r = 0; r < topk; ++r) {
+          const int id = fast.ids[static_cast<size_t>(t * out_k + r)];
+          // EPLB maps to 100 + e or 200 + e, so every routed id is in [100, 456).
+          bad_range += eplb != 0 && (id < 100 || id >= 200 + experts);
+        }
+        if (shared != 0) {
+          bad_shared += fast.ids[static_cast<size_t>(t * out_k + topk)] != experts;
+          bad_shared += std::fabs(fast.weights[static_cast<size_t>(t * out_k + topk)] - 0.5f) > 1e-6f;
+        }
+      }
+      KOPS_TEST_CHECK(total == tokens * topk);
+      KOPS_TEST_CHECK(bad_range == 0);
+      KOPS_TEST_CHECK(bad_shared == 0);
+    }
+  }
+
+  // Signed zeros compare equal in the fp32 score, so the raw-logit recipe must still
+  // order the tied experts by id (a key that separated -0.0 from +0.0 would not).
+  std::vector<float> zeros(static_cast<size_t>(tokens) * experts, 0.0f);
+  for (int t = 0; t < tokens; ++t) {
+    zeros[static_cast<size_t>(t * experts + 5)] = -0.0f;
+    zeros[static_cast<size_t>(t * experts + 7)] = 0.0f;
+    zeros[static_cast<size_t>(t * experts + 200)] = -0.0f;
+  }
+  const auto zf = e256::route(zeros, tokens, topk, experts, kops::moe::RouterScore::kNone, false, 0);
+  const auto zs =
+      e256::route(zeros, tokens, topk, experts + 3, kops::moe::RouterScore::kNone, false, 0);
+  expect_i32(zf.ids, zs.ids, "e256 signed-zero ids");
+  int zbad = 0;
+  for (size_t i = 0; i < zf.weights.size(); ++i) zbad += zf.weights[i] != zs.weights[i];
+  KOPS_TEST_CHECK(zbad == 0);
+  int zorder = 0;
+  for (int t = 0; t < tokens; ++t) {
+    for (int r = 0; r < topk; ++r) zorder += zf.ids[static_cast<size_t>(t * topk + r)] != r;
+  }
+  KOPS_TEST_CHECK(zorder == 0);
 }
 
 void test_route_fused() {
@@ -1176,6 +1491,9 @@ int main() {
   test_route_grouped();
   test_route_ties();
   test_route_eplb_shared();
+  test_route_e256_fast();
+  test_route_e256_ties();
+  test_route_e256_paths();
   test_route_fused();
   test_hash_route();
   test_align_and_offsets();

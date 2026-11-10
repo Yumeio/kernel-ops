@@ -249,39 +249,69 @@ __device__ __forceinline__ float tanh_fast(float x) {
 
 /// Load BKV rows x D of K or V (positions [t0, t0 + BKV), valid below `hi`) into smem.
 /// pages == nullptr: contiguous rows (ragged).
+/// FP8 K/V is dequantized on load.  The eight global reads of a thread are issued as one group
+/// before the first convert/store: a dependent load -> convert -> store chain per 8-byte chunk costs
+/// one full memory round trip per chunk, which dominated the FP8 prefill path.
 template <int D, int BKV, typename T, bool FP8>
 __device__ __forceinline__ void load_kv(T* s, const char* base, int64_t sp, int64_t st,
                                         const int32_t* pages, int ps, int t0, int hi, bool e5m2) {
   constexpr int CH = D / 8, N = BKV * CH, IT = (N + 127) / 128;
+  const int tid = static_cast<int>(threadIdx.x);
+  if constexpr (!FP8) {
 #pragma unroll
-  for (int it = 0; it < IT; ++it) {
-    const int idx = it * 128 + static_cast<int>(threadIdx.x);
-    if (N % 128 != 0 && idx >= N) break;
-    const int r = idx / CH, c = idx % CH;
-    const int pos = t0 + r;
-    const bool ok = pos < hi;
-    const char* row = base;
-    if (ok) {
-      row = pages != nullptr
-                ? base + static_cast<int64_t>(pages[pos / ps]) * sp + static_cast<int64_t>(pos % ps) * st
-                : base + static_cast<int64_t>(pos) * st;
-    }
-    T* dst = s + Lay<D>::off(r, c);
-    if constexpr (!FP8) {
-      cp_async16(smem_u32(dst), ok ? row + c * 16 : base, ok);
-    } else {
-      uint4 x = make_uint4(0u, 0u, 0u, 0u);
+    for (int it = 0; it < IT; ++it) {
+      const int idx = it * 128 + tid;
+      if (N % 128 != 0 && idx >= N) break;
+      const int r = idx / CH, c = idx % CH;
+      const int pos = t0 + r;
+      const bool ok = pos < hi;
+      const char* row = base;
       if (ok) {
-        const uint2 w = *reinterpret_cast<const uint2*>(row + c * 8);
-        if (e5m2) {
-          fp8x4_to<T, true>(w.x, x.x, x.y);
-          fp8x4_to<T, true>(w.y, x.z, x.w);
-        } else {
-          fp8x4_to<T, false>(w.x, x.x, x.y);
-          fp8x4_to<T, false>(w.y, x.z, x.w);
-        }
+        row = pages != nullptr
+                  ? base + static_cast<int64_t>(pages[pos / ps]) * sp + static_cast<int64_t>(pos % ps) * st
+                  : base + static_cast<int64_t>(pos) * st;
       }
-      *reinterpret_cast<uint4*>(dst) = x;
+      cp_async16(smem_u32(s + Lay<D>::off(r, c)), ok ? row + c * 16 : base, ok);
+    }
+  } else {
+    constexpr int GRP = 8;
+#pragma unroll
+    for (int g = 0; g < IT; g += GRP) {
+      uint2 w[GRP];
+      bool ok[GRP];
+      int rr[GRP], cc[GRP];
+#pragma unroll
+      for (int j = 0; j < GRP; ++j) {
+        const int it = g + j;
+        const bool live = it < IT;
+        const int idx = (live ? it : 0) * 128 + tid;
+        rr[j] = idx / CH;
+        cc[j] = idx % CH;
+        const int pos = t0 + rr[j];
+        ok[j] = live && pos < hi;
+        const char* row = base;
+        if (ok[j]) {
+          row = pages != nullptr
+                    ? base + static_cast<int64_t>(pages[pos / ps]) * sp + static_cast<int64_t>(pos % ps) * st
+                    : base + static_cast<int64_t>(pos) * st;
+        }
+        w[j] = ok[j] ? *reinterpret_cast<const uint2*>(row + cc[j] * 8) : make_uint2(0u, 0u);
+      }
+#pragma unroll
+      for (int j = 0; j < GRP; ++j) {
+        if (g + j >= IT) break;
+        uint4 x = make_uint4(0u, 0u, 0u, 0u);
+        if (ok[j]) {
+          if (e5m2) {
+            fp8x4_to<T, true>(w[j].x, x.x, x.y);
+            fp8x4_to<T, true>(w[j].y, x.z, x.w);
+          } else {
+            fp8x4_to<T, false>(w[j].x, x.x, x.y);
+            fp8x4_to<T, false>(w[j].y, x.z, x.w);
+          }
+        }
+        *reinterpret_cast<uint4*>(s + Lay<D>::off(rr[j], cc[j])) = x;
+      }
     }
   }
 }
@@ -291,15 +321,26 @@ constexpr int kBQ = 64;      // packed query rows per CTA
 constexpr int kWarps = 4;    // one warp per 16 rows
 constexpr int kThreads = 128;
 
-KOPS_HOST_DEVICE constexpr int bkv_of(int dqk, int dvo) { return (dqk > 128 || dvo > 128) ? 32 : 64; }
+/// Row stride of a smem stage (mirrors Lay<D>::kRow for a runtime head dim).
+KOPS_HOST_DEVICE constexpr int row_stride(int d) { return (d % 64) == 0 ? d : d + 8; }
 
-KOPS_HOST_DEVICE constexpr int fwd_smem_bytes(int dqk, int dvo, int rq, int rqk, int rv) {
-  return (kBQ * rq + bkv_of(dqk, dvo) * rqk + bkv_of(dqk, dvo) * rv) * 2;
+KOPS_HOST_DEVICE constexpr int fwd_smem_bytes(int rq, int rqk, int rv, int bkv) {
+  return (kBQ * rq + bkv * rqk + bkv * rv) * 2;
+}
+
+/// K/V tile width: the widest one whose Q + K + V single buffers still leave two CTAs resident in
+/// the 100 KiB of shared memory one SM has (2 x 50 KiB).  Two CTAs interleave their softmax / mma /
+/// load phases, which is what the balanced cases reach ~70% of the mma.sync peak with.  D = 256
+/// cannot get there (Q alone is 32 KiB), and 16-key tiles make it slower rather than faster, so the
+/// wide dims keep 32 keys and one CTA.
+KOPS_HOST_DEVICE constexpr int bkv_of(int dqk, int dvo) {
+  const int rq = row_stride(dqk), rv = row_stride(dvo);
+  return fwd_smem_bytes(rq, rq, rv, 64) <= 50 * 1024 ? 64 : 32;
 }
 
 template <int DQK, int DVO>
 constexpr int smem_bytes() {
-  return fwd_smem_bytes(DQK, DVO, Lay<DQK>::kRow, Lay<DQK>::kRow, Lay<DVO>::kRow);
+  return fwd_smem_bytes(Lay<DQK>::kRow, Lay<DQK>::kRow, Lay<DVO>::kRow, bkv_of(DQK, DVO));
 }
 
 /// The shared body.  __noinline__: compiled once per (head dims, dtype, FP8) and called by every
@@ -319,8 +360,13 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
   T* sV = sK + BKV * LQ::kRow;
 
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const int item = blockIdx.x, hk = blockIdx.y;
+  const int hk = blockIdx.y;
   const WorkPlan& wp = a.plan;
+  // Heaviest item first.  The plan lists (request, q tile, kv chunk) in order and the visible key
+  // range grows with the q tile, so the causal triangle's CTAs are ordered by increasing work;
+  // launching them in reverse is the longest-processing-time schedule and removes the long tail.
+  // The arithmetic of an item never depends on which CTA runs it, so results are unchanged.
+  const int item = wp.padded_num_items - 1 - static_cast<int>(blockIdx.x);
   if (wp.block_valid_mask != nullptr && wp.block_valid_mask[item] == 0) return;
   const int b = wp.request_indices[item];
   const int qtile = wp.qo_tile_indices[item];
@@ -554,12 +600,17 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
     }
 #pragma unroll
     for (int r = 0; r < 2; ++r) l[r] = l[r] * alpha[r] + rs[r];
+    // The running max stops growing after the first few tiles, so this rescale is usually a no-op
+    // (and it is the widest piece of fp32 work in the loop: NO * 4 values per thread).
 #pragma unroll
-    for (int i = 0; i < NO; ++i) {
-      o[i][0] *= alpha[0];
-      o[i][1] *= alpha[0];
-      o[i][2] *= alpha[1];
-      o[i][3] *= alpha[1];
+    for (int r = 0; r < 2; ++r) {
+      if (alpha[r] != 1.0f) {
+#pragma unroll
+        for (int i = 0; i < NO; ++i) {
+          o[i][2 * r] *= alpha[r];
+          o[i][2 * r + 1] *= alpha[r];
+        }
+      }
     }
 
     cp_async_wait_all();

@@ -552,6 +552,129 @@ void test_append_paged_kv(LaunchContext& ctx) {
   KOPS_TEST_CHECK(std::memcmp(gotk.data(), wantk.data(), gotk.size() * sizeof(__nv_bfloat16)) == 0);
 }
 
+/// append_paged_kv across the shapes that select different thread mappings and code paths:
+/// the dense-NHD 16-byte fast path (2 chunks per lane), a wider KV head count (4 warps per
+/// token), a padded source row and an HND cache (both generic path), a head_dim_v < head_dim_k
+/// case, page_size 1, and tokens that must be skipped (batch index -1, position outside the
+/// request's page list) — those must not write even though the fast path fetches before it
+/// resolves the page table.
+void test_append_paged_kv_shapes(LaunchContext& ctx) {
+  struct Shape {
+    const char* name;
+    int heads, dk, dv, page, tokens, pad_h;
+    bool hnd;
+  };
+  const Shape shapes[] = {
+      {"t61 h4 d128 p16 dense nhd", 4, 128, 128, 16, 61, 0, false},
+      {"t61 h8 d128 p64 dense nhd", 8, 128, 128, 64, 61, 0, false},
+      {"t61 h4 d128 p8 padded src", 4, 128, 128, 8, 61, 32, false},
+      {"t61 h2 d64 dv32 hnd", 2, 64, 32, 8, 61, 0, true},
+      {"t61 h1 d16 p1 dense nhd", 1, 16, 16, 1, 61, 0, false},
+      {"t61 h4 d128 p16 dense hnd", 4, 128, 128, 16, 61, 0, true},
+  };
+  int seed = 900;
+  for (const Shape& s : shapes) {
+    constexpr int kBatch = 2;
+    const int n0 = s.tokens / 3;
+    const int pages_per_req = (s.tokens + s.page - 1) / s.page + 1;
+    const int64_t pages = static_cast<int64_t>(kBatch) * pages_per_req;
+    const int64_t src_h = s.dk + s.pad_h;
+    const int64_t v_src_h = s.dv + s.pad_h;
+
+    DevBuf<__nv_bfloat16> key(static_cast<size_t>(s.tokens) * s.heads * src_h);
+    DevBuf<__nv_bfloat16> val(static_cast<size_t>(s.tokens) * s.heads * v_src_h);
+    const int64_t k_elems = pages * s.page * s.heads * s.dk;
+    const int64_t v_elems = pages * s.page * s.heads * s.dv;
+    DevBuf<__nv_bfloat16> kc(k_elems), vc(v_elems);
+    DevBuf<int32_t> indptr(kBatch + 1), page_ids(pages), batch(s.tokens), pos(s.tokens);
+    if (!key.ok() || !val.ok() || !kc.ok() || !vc.ok() || !indptr.ok() || !page_ids.ok() ||
+        !batch.ok() || !pos.ok()) {
+      return;
+    }
+    std::vector<float> kf(static_cast<size_t>(s.tokens) * s.heads * src_h);
+    std::vector<float> vf(static_cast<size_t>(s.tokens) * s.heads * v_src_h);
+    fill_uniform(kf, static_cast<unsigned>(seed++));
+    fill_uniform(vf, static_cast<unsigned>(seed++));
+    const auto kh = cast_from_float<__nv_bfloat16>(kf);
+    const auto vh = cast_from_float<__nv_bfloat16>(vf);
+    kops_test::copy_in(key.p, kh);
+    kops_test::copy_in(val.p, vh);
+
+    // Request 0 owns page ids [0, pages_per_req), request 1 the next block; both shuffled so a
+    // wrong logical-page lookup cannot pass.
+    std::vector<int32_t> ids(static_cast<size_t>(pages));
+    for (int64_t i = 0; i < pages; ++i) ids[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    for (int r = 0; r < kBatch; ++r) {
+      for (int i = pages_per_req - 1; i > 0; --i) {
+        std::swap(ids[static_cast<size_t>(r * pages_per_req + i)],
+                  ids[static_cast<size_t>(r * pages_per_req + (i * 7919) % (i + 1))]);
+      }
+    }
+    std::vector<int32_t> ip = {0, pages_per_req, 2 * pages_per_req};
+    std::vector<int32_t> bi(static_cast<size_t>(s.tokens)), po(static_cast<size_t>(s.tokens));
+    for (int t = 0; t < s.tokens; ++t) {
+      bi[static_cast<size_t>(t)] = t < n0 ? 0 : 1;
+      po[static_cast<size_t>(t)] = t < n0 ? t : t - n0;
+    }
+    // Skip cases: a negative batch index, and a position past the request's page list.
+    if (s.tokens > 4) {
+      bi[1] = -1;
+      po[2] = pages_per_req * s.page;
+    }
+    kops_test::copy_in(indptr.p, ip);
+    kops_test::copy_in(page_ids.p, ids);
+    kops_test::copy_in(batch.p, bi);
+    kops_test::copy_in(pos.p, po);
+    cudaMemset(kc.p, 0, static_cast<size_t>(k_elems) * 2);
+    cudaMemset(vc.p, 0, static_cast<size_t>(v_elems) * 2);
+
+    PagedKVDesc d = make_desc(s.hnd ? KVLayout::kHND : KVLayout::kNHD, kc.p, vc.p, s.heads, s.dk,
+                              s.dv, s.page, static_cast<int>(pages), kBf16);
+    d.table_format = PageTableFormat::kCSR;
+    d.kv_indptr = indptr.p;
+    d.kv_page_indices = page_ids.p;
+    const Tensor tk = tensor3d(key.p, kBf16, s.tokens, s.heads, src_h);
+    const Tensor tv = tensor3d(val.p, kBf16, s.tokens, s.heads, v_src_h);
+    const Tensor tb = tensor1d(batch.p, DType::kInt32, s.tokens);
+    const Tensor tp = tensor1d(pos.p, DType::kInt32, s.tokens);
+    KOPS_EXPECT_OK(kops::kv::append_paged_kv(tk, tv, d, tb, tp, ctx), s.name);
+
+    const auto got_k = kops_test::copy_out(kc.p, k_elems);
+    const auto got_v = kops_test::copy_out(vc.p, v_elems);
+    std::vector<__nv_bfloat16> want_k(static_cast<size_t>(k_elems));
+    std::vector<__nv_bfloat16> want_v(static_cast<size_t>(v_elems));
+    for (int t = 0; t < s.tokens; ++t) {
+      const int32_t b = bi[static_cast<size_t>(t)];
+      const int64_t p = po[static_cast<size_t>(t)];
+      if (b < 0 || p < 0) continue;
+      const int64_t first = ip[static_cast<size_t>(b)];
+      const int64_t last = ip[static_cast<size_t>(b) + 1];
+      const int64_t logical = p / s.page;
+      if (logical < 0 || first + logical >= last) continue;
+      const int32_t page = ids[static_cast<size_t>(first + logical)];
+      if (page < 0) continue;
+      const int64_t slot_page = page;
+      const int64_t slot_off = p % s.page;
+      for (int h = 0; h < s.heads; ++h) {
+        for (int dd = 0; dd < s.dk; ++dd) {
+          const int64_t dst = s.hnd ? hnd_off(slot_page, slot_off, h, dd, s.heads, s.dk, s.page)
+                                   : nhd_off(slot_page, slot_off, h, dd, s.heads, s.dk, s.page);
+          want_k[static_cast<size_t>(dst)] =
+              kh[static_cast<size_t>((t * s.heads + h) * src_h + dd)];
+        }
+        for (int dd = 0; dd < s.dv; ++dd) {
+          const int64_t dst = s.hnd ? hnd_off(slot_page, slot_off, h, dd, s.heads, s.dv, s.page)
+                                   : nhd_off(slot_page, slot_off, h, dd, s.heads, s.dv, s.page);
+          want_v[static_cast<size_t>(dst)] =
+              vh[static_cast<size_t>((t * s.heads + h) * v_src_h + dd)];
+        }
+      }
+    }
+    KOPS_TEST_CHECK(std::memcmp(got_k.data(), want_k.data(), want_k.size() * 2) == 0);
+    KOPS_TEST_CHECK(std::memcmp(got_v.data(), want_v.data(), want_v.size() * 2) == 0);
+  }
+}
+
 void test_ring_kv(LaunchContext& ctx) {
   constexpr int kSlots = 2, kWindow = 4, kHeads = 2, kD = 8, kT = 5;
   DevBuf<__nv_bfloat16> key(kT * kHeads * kD);
@@ -1786,6 +1909,7 @@ int main() {
   test_reshape_sweep(ctx);
   test_reshape_dk_ne_dv(ctx);
   test_append_paged_kv(ctx);
+  test_append_paged_kv_shapes(ctx);
   test_ring_kv(ctx);
   test_concat_mla(ctx);
   test_copy_zero_pages(ctx);

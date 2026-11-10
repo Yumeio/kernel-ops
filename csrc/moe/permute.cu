@@ -96,20 +96,6 @@ __device__ __forceinline__ void sort_count(int* cnt, const int32_t* __restrict__
   }
 }
 
-/// Pass 2/3: cnt[w][e] <- exclusive prefix over w, tot[e] <- sum over w. Call after __syncthreads().
-__device__ __forceinline__ void sort_scan_columns(int* cnt, int* tot, int E) {
-  const int W = blockDim.x >> 5;
-  for (int e = threadIdx.x; e < E; e += blockDim.x) {
-    int run = 0;
-    for (int w = 0; w < W; ++w) {
-      const int c = cnt[w * E + e];
-      cnt[w * E + e] = run;
-      run += c;
-    }
-    tot[e] = run;
-  }
-}
-
 /// Pass 3/3: write `put(slot, bin, dest)` for every slot; base[bin] is the bin's first destination.
 template <typename BinFn, typename PutFn>
 __device__ __forceinline__ void sort_place(int* cnt, const int* base, const int32_t* __restrict__ topk_ids,
@@ -127,6 +113,141 @@ __device__ __forceinline__ void sort_place(int* cnt, const int* base, const int3
     __syncwarp();
     if (b >= 0 && lane == __ffs(mask) - 1) mine[b] += __popc(mask);
     __syncwarp();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// align_block_size: multi-CTA stable counting sort
+//
+// One CTA per contiguous slot chunk. Every CTA builds the *whole* histogram (a chunk boundary is
+// independent of the expert layout, so an expert's rows come from every chunk) and keeps, on top of
+// it, the histogram of the slots that precede its own chunk: that is exactly the chunk's starting
+// rank per expert, so no cross-CTA prefix scan and no global scratch are needed. Per-chunk ordering
+// is then the usual warp-segment scheme, and the rank inside a 32-slot step comes from a bit-sliced
+// ballot compare instead of __match_any_sync (match.any is serialized in the SM's vote path; on
+// SM89 it costs ~60 cycles per instruction, i.e. 6x the 8-ballot sequence that replaces it).
+// ---------------------------------------------------------------------------
+constexpr int kAlignSortSmemBytes = 48 * 1024;
+constexpr int kAlignMaxCtas = 32;
+constexpr int kAlignSlotsPerCta = 1024;
+
+/// Warps for an align block: rows[W][E+1] + pre[E] + tot[E] + base[E] inside 48 KiB.
+inline int align_warps(int num_experts) {
+  const int w = (kAlignSortSmemBytes / 4 - 3 * num_experts) / (num_experts + 1);
+  return w < 1 ? 1 : (w > 32 ? 32 : w);
+}
+__host__ __device__ inline int align_row_stride(int num_experts) { return num_experts + 1; }
+inline int align_smem_bytes(int num_experts, int warps) {
+  return (warps * align_row_stride(num_experts) + 3 * num_experts) * static_cast<int>(sizeof(int));
+}
+/// CTAs for `numel` slots: every CTA redundantly histograms the whole array (that is what keeps the
+/// chunk prefix local), so the grid is capped instead of scaled with the slot count.
+inline int align_ctas(int64_t numel) {
+  if (numel <= 0) return 1;
+  int64_t g = (numel + kAlignSlotsPerCta - 1) / kAlignSlotsPerCta;
+  if (g > kAlignMaxCtas) g = kAlignMaxCtas;
+  return g < 1 ? 1 : static_cast<int>(g);
+}
+
+/// Lanes of a warp whose key equals this lane's key, over the low `bits` bits of the expert id.
+/// `bits` must be >= 1 and cover num_experts - 1; invalid keys are passed as ~0u.
+__device__ __forceinline__ unsigned align_equal_mask(unsigned key, int bits) {
+  unsigned same = 0xFFFFFFFFu;
+  for (int t = 0; t < bits; ++t) {
+    const unsigned bit = (key >> t) & 1u;
+    const unsigned ball = __ballot_sync(0xFFFFFFFFu, bit);
+    same &= bit ? ball : ~ball;
+  }
+  return same;
+}
+
+/// Histogram [0, numel) in one pass: slots below `split` count into `pre`, the rest into `tot`.
+/// Counting is order-free, so the whole block cooperates (vector loads, warp rows are not needed).
+template <typename BinFn>
+__device__ __forceinline__ void align_hist_split(int* pre, int* tot, const int32_t* __restrict__ ids,
+                                                 int64_t numel, int64_t split, BinFn bin) {
+  const int64_t n4 = numel & ~static_cast<int64_t>(3);
+  if ((reinterpret_cast<uintptr_t>(ids) & 15u) == 0u) {
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * 4;
+    for (int64_t s = static_cast<int64_t>(threadIdx.x) * 4; s < n4; s += stride) {
+      const int4 v = *reinterpret_cast<const int4*>(ids + s);
+      int* dst = s + 3 < split ? pre : (s >= split ? tot : nullptr);
+      const int b0 = bin(v.x), b1 = bin(v.y), b2 = bin(v.z), b3 = bin(v.w);
+      if (dst != nullptr) {
+        if (b0 >= 0) atomicAdd(dst + b0, 1);
+        if (b1 >= 0) atomicAdd(dst + b1, 1);
+        if (b2 >= 0) atomicAdd(dst + b2, 1);
+        if (b3 >= 0) atomicAdd(dst + b3, 1);
+      } else {  // the group straddles the chunk boundary
+        if (b0 >= 0) atomicAdd((s < split ? pre : tot) + b0, 1);
+        if (b1 >= 0) atomicAdd((s + 1 < split ? pre : tot) + b1, 1);
+        if (b2 >= 0) atomicAdd((s + 2 < split ? pre : tot) + b2, 1);
+        if (b3 >= 0) atomicAdd((s + 3 < split ? pre : tot) + b3, 1);
+      }
+    }
+  } else {
+    const int64_t stride = static_cast<int64_t>(blockDim.x) * 4;
+    for (int64_t s = static_cast<int64_t>(threadIdx.x) * 4; s < n4; s += stride) {
+      for (int64_t i = s; i < s + 4; ++i) {
+        const int b = bin(ids[i]);
+        if (b >= 0) atomicAdd((i < split ? pre : tot) + b, 1);
+      }
+    }
+  }
+  for (int64_t i = n4 + threadIdx.x; i < numel; i += blockDim.x) {
+    const int b = bin(ids[i]);
+    if (b >= 0) atomicAdd((i < split ? pre : tot) + b, 1);
+  }
+}
+
+/// Per-warp histogram of [lo, hi) in the placement's own sub-segment layout, so rows[w][e] is the
+/// count of expert e among the slots warp w will place. Counting is order-free; the ordering is
+/// established by pass 2 (`align_place_chunk`), which walks the same sub-segments.
+template <typename BinFn>
+__device__ __forceinline__ void align_hist_rows(int* rows, int row_stride, const int32_t* __restrict__ ids,
+                                                int64_t lo, int64_t hi, BinFn bin) {
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, W = blockDim.x >> 5;
+  const int64_t len = hi - lo;
+  if (len <= 0) return;
+  const int64_t seg = ((len + W - 1) / W + 31) & ~static_cast<int64_t>(31);
+  const int64_t a = lo + static_cast<int64_t>(w) * seg;
+  if (a >= hi) return;
+  const int64_t b_end = a + seg < hi ? a + seg : hi;
+  int* mine = rows + static_cast<int64_t>(w) * row_stride;
+  for (int64_t s = a + lane; s < b_end; s += 32) {
+    const int b = bin(ids[s]);
+    if (b >= 0) atomicAdd(mine + b, 1);
+  }
+}
+
+/// Pass over [lo, hi) in 32-slot warp steps: rows[w][e] holds warp w's exclusive prefix for expert e.
+/// `put(slot, expert, dest)` runs for every valid slot; the order inside an expert is ascending slot.
+template <typename BinFn, typename PutFn>
+__device__ __forceinline__ void align_place_chunk(int* rows, int row_stride, const int* start,
+                                                  const int32_t* __restrict__ ids, int64_t lo, int64_t hi,
+                                                  int bits, BinFn bin, PutFn put) {
+  const int w = threadIdx.x >> 5, lane = threadIdx.x & 31, W = blockDim.x >> 5;
+  const int64_t len = hi - lo;
+  if (len <= 0) return;
+  const int64_t seg = ((len + W - 1) / W + 31) & ~static_cast<int64_t>(31);
+  const int64_t a = lo + static_cast<int64_t>(w) * seg;
+  if (a >= hi) return;
+  const int64_t b_end = a + seg < hi ? a + seg : hi;
+  int* mine = rows + static_cast<int64_t>(w) * row_stride;
+  const unsigned below = (1u << lane) - 1u;
+  int b = a + lane < b_end ? bin(ids[a + lane]) : -1;
+  for (int64_t s = a; s < b_end; s += 32) {
+    const int64_t ns = s + 32;
+    int nb = -1;
+    if (ns < b_end) nb = ns + lane < b_end ? bin(ids[ns + lane]) : -1;
+    const unsigned mask = align_equal_mask(b < 0 ? 0xFFFFFFFFu : static_cast<unsigned>(b), bits);
+    const int rank = __popc(mask & below);
+    if (b >= 0) {
+      const int64_t pos = s + lane;
+      if (pos < b_end) put(pos, b, start[b] + mine[b] + rank);
+    }
+    if (b >= 0 && rank == 0) mine[b] += __popc(mask);
+    b = nb;
   }
 }
 
@@ -173,27 +294,40 @@ __global__ void moe_align_block_size_kernel(
     const int num_experts, const int block_size, const int64_t numel,
     const int max_num_tokens_padded) {
   extern __shared__ int smem[];
+  const int E = num_experts;
   const int W = blockDim.x >> 5;
-  int* cnt = smem;                 // [W][num_experts]
-  int* base = smem + W * num_experts;  // [num_experts] first padded destination of each expert
+  const int row_stride = align_row_stride(E);
+  int* rows = smem;                       // [W][E + 1] per-warp placement counters
+  int* pre = rows + W * row_stride;       // [E] count of [0, chunk_lo), then base + that count
+  int* tot = pre + E;                     // [E] count of [chunk_lo, numel), then first padding slot
+  int* base = tot + E;                    // [E] first destination of every expert
   __shared__ int s_total;
-  for (int i = threadIdx.x; i < W * num_experts; i += blockDim.x) cnt[i] = 0;
-  __syncthreads();
-  const auto bin = [&](int e) {
-    return (e >= 0 && e < num_experts && (expert_map == nullptr || expert_map[e] >= 0)) ? e : -1;
-  };
-  sort_count(cnt, topk_ids, numel, num_experts, bin);
-  __syncthreads();
-  sort_scan_columns(cnt, base, num_experts);  // base[e] temporarily holds the count of expert e
-  __syncthreads();
-  // Warp 0 scans the padded sizes: each lane owns `per` consecutive experts.
   const int bs = block_size > 0 ? block_size : 1;
+  const auto bin = [&](int e) {
+    return (e >= 0 && e < E && (expert_map == nullptr || expert_map[e] >= 0)) ? e : -1;
+  };
+  // Slot chunk owned by this CTA. Placement is ordered by slot id, so (chunk, in-chunk rank) is
+  // exactly the global order and the chunk's per-expert start rank is a plain prefix count.
+  const int64_t chunk = gridDim.x > 0 ? (numel + gridDim.x - 1) / gridDim.x : numel;
+  const int64_t lo = static_cast<int64_t>(blockIdx.x) * chunk;
+  const int64_t hi = lo < numel ? (lo + chunk < numel ? lo + chunk : numel) : numel;
+  for (int i = threadIdx.x; i < W * row_stride; i += blockDim.x) rows[i] = 0;
+  for (int i = threadIdx.x; i < E; i += blockDim.x) pre[i] = 0;
+  for (int i = threadIdx.x; i < E; i += blockDim.x) tot[i] = 0;
+  __syncthreads();
+  align_hist_split(pre, tot, topk_ids, numel, lo, bin);
+  align_hist_rows(rows, row_stride, topk_ids, lo, hi, bin);
+  __syncthreads();
+  for (int i = threadIdx.x; i < E; i += blockDim.x) tot[i] += pre[i];
+  __syncthreads();
+  // Padded layout: base[e] is expert e's first destination (padding included, so `total` stays a
+  // multiple of block_size), tot[e] becomes its first padding slot.
   if (threadIdx.x < 32) {
     const int lane = threadIdx.x;
-    const int per = (num_experts + 31) / 32;
-    const int e0 = min(lane * per, num_experts), e1 = min(e0 + per, num_experts);
+    const int per = (E + 31) / 32;
+    const int e0 = min(lane * per, E), e1 = min(e0 + per, E);
     int sum = 0;
-    for (int e = e0; e < e1; ++e) sum += (base[e] + bs - 1) / bs * bs;
+    for (int e = e0; e < e1; ++e) sum += (tot[e] + bs - 1) / bs * bs;
     int incl = sum;
     #pragma unroll
     for (int off = 1; off < 32; off <<= 1) {
@@ -202,33 +336,62 @@ __global__ void moe_align_block_size_kernel(
     }
     int run = incl - sum;
     for (int e = e0; e < e1; ++e) {
-      const int padded = (base[e] + bs - 1) / bs * bs;
-      base[e] = run;  // count -> first destination; padded size is recovered from the next base
+      const int n = tot[e];
+      const int padded = (n + bs - 1) / bs * bs;
+      base[e] = run;
+      tot[e] = run + n;
       run += padded;
     }
     if (lane == 31) s_total = incl;
   }
-  __syncthreads();
-  const int total = s_total;
-  // Block table: expert e owns blocks [base[e]/bs, next base / bs).
-  for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
-    const int end = e + 1 < num_experts ? base[e + 1] : total;
-    const int first = base[e] / bs, last = end / bs;
-    const int id = expert_map != nullptr ? expert_map[e] : e;
-    for (int b = first; b < last; ++b) {
-      if (b < max_num_tokens_padded / bs + 1) expert_ids[b] = id;
+  // Per-warp exclusive prefix of this chunk's counts: rows[w][e] <- sum of the counts of warps < w.
+  {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    for (int e = warp; e < E; e += W) {
+      int c = lane < W ? rows[lane * row_stride + e] : 0;
+      int incl = c;
+      #pragma unroll
+      for (int off = 1; off < 32; off <<= 1) {
+        const int v = __shfl_up_sync(0xFFFFFFFFu, incl, off);
+        if (lane >= off) incl += v;
+      }
+      if (lane < W) rows[lane * row_stride + e] = incl - c;
     }
   }
-  const int fill = min(total, max_num_tokens_padded);
-  for (int i = threadIdx.x; i < fill; i += blockDim.x) sorted_token_ids[i] = static_cast<int32_t>(numel);
-  if (threadIdx.x == 0) {
+  __syncthreads();
+  const int total = s_total;
+  for (int i = threadIdx.x; i < E; i += blockDim.x) pre[i] += base[i];
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
     num_tokens_post_pad[0] = total;
     cumsum_workspace[0] = total;
   }
   __syncthreads();
-  sort_place(cnt, base, topk_ids, numel, num_experts, bin, [&](int64_t pos, int, int dest) {
-    if (dest < max_num_tokens_padded) sorted_token_ids[dest] = static_cast<int32_t>(pos);
-  });
+  // Block table and padding sentinels, one warp per (CTA, expert) pair. A padded block sits at the
+  // end of every expert, so the sentinels are [first padding slot, next expert's first slot); those
+  // positions are disjoint from the placement's writes, so both halves need no further sync.
+  {
+    const int lane = threadIdx.x & 31;
+    const int gw = blockIdx.x * W + (threadIdx.x >> 5);
+    const int nw = gridDim.x * W;
+    const int32_t sentinel = static_cast<int32_t>(numel);
+    for (int e = gw; e < E; e += nw) {
+      const int first = base[e] / bs;
+      const int end = e + 1 < E ? base[e + 1] : total;
+      const int last = end / bs;
+      const int id = expert_map != nullptr ? expert_map[e] : e;
+      for (int b = first + lane; b < last; b += 32) {
+        if (b < max_num_tokens_padded / bs + 1) expert_ids[b] = id;
+      }
+      const int stop = end < max_num_tokens_padded ? end : max_num_tokens_padded;
+      for (int i = tot[e] + lane; i < stop; i += 32) sorted_token_ids[i] = sentinel;
+    }
+  }
+  int bits = 1;
+  while ((1 << bits) < E) ++bits;
+  align_place_chunk(rows, row_stride, pre, topk_ids, lo, hi, bits, bin,
+                    [&](int64_t pos, int, int dest) {
+                      if (dest < max_num_tokens_padded) sorted_token_ids[dest] = static_cast<int32_t>(pos);
+                    });
 }
 
 // ---------------------------------------------------------------------------
@@ -570,17 +733,10 @@ Status align_block_size(const Tensor& topk_ids, const Tensor& sorted_token_ids,
                              static_cast<long long>(expert_ids.shape[0]),
                              static_cast<long long>(max_blocks));
   }
-  const int sort_threads = 32 * sort_warps(num_experts);
-  const int sort_smem = sort_smem_bytes(num_experts, sort_threads / 32);
-  if (numel == 0) {
-    moe_align_block_size_kernel<<<1, sort_threads, sort_smem, stream_of(ctx)>>>(
-        static_cast<const int32_t*>(topk_ids.data), static_cast<int32_t*>(sorted_token_ids.data),
-        static_cast<int32_t*>(expert_ids.data), static_cast<int32_t*>(num_tokens_post_pad.data),
-        static_cast<int32_t*>(ws.device_scratch), nullptr, num_experts, block_size, 0,
-        static_cast<int>(max_padded));
-    return launch_error("moe_align_block_size_kernel");
-  }
-  moe_align_block_size_kernel<<<1, sort_threads, sort_smem, stream_of(ctx)>>>(
+  const int sort_threads = 32 * align_warps(num_experts);
+  const int sort_smem = align_smem_bytes(num_experts, sort_threads / 32);
+  const int ctas = align_ctas(numel);
+  moe_align_block_size_kernel<<<ctas, sort_threads, sort_smem, stream_of(ctx)>>>(
       static_cast<const int32_t*>(topk_ids.data), static_cast<int32_t*>(sorted_token_ids.data),
       static_cast<int32_t*>(expert_ids.data), static_cast<int32_t*>(num_tokens_post_pad.data),
       static_cast<int32_t*>(ws.device_scratch),
