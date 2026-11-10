@@ -99,6 +99,97 @@ __device__ __forceinline__ uint8_t encode_byte<int8_t>(float x) {
   return static_cast<uint8_t>(int8_from_float(x));
 }
 
+/// One encoded byte. `kAsymmetric` adds the zero point and allows -128, while symmetric INT8 keeps
+/// the historical [-127, 127] clamp. The quotient is the correctly rounded fp32 division in both
+/// cases, so the bytes are a function of the data alone.
+template <typename out_t, bool kAsymmetric>
+__device__ __forceinline__ uint8_t quant_byte(float x, float scale, float zero) {
+  if constexpr (std::is_same<out_t, __nv_fp8_e4m3>::value) {
+    if constexpr (kAsymmetric) {
+      return e4m3_from_float(__fadd_rn(__fdiv_rn(x, scale), zero));
+    } else {
+      return e4m3_from_float(__fdiv_rn(x, scale));
+    }
+  } else {
+    int v = __float2int_rn(kAsymmetric ? __fadd_rn(__fdiv_rn(x, scale), zero)
+                                       : __fdiv_rn(x, scale));
+    if constexpr (kAsymmetric) {
+      v = v > 127 ? 127 : (v < -128 ? -128 : v);
+    } else {
+      v = v > 127 ? 127 : (v < -127 ? -127 : v);
+    }
+    return static_cast<uint8_t>(static_cast<int8_t>(v));
+  }
+}
+
+/// Four encoded values -> one 32-bit word, little-endian. This is deliberately built from scalars
+/// instead of a local byte array: a `uint8_t q[VEC]` reinterpreted as `uint2` made nvcc spill the
+/// pack to local memory (st.local.v2.u8 / ld.local.v2.u32 per pack), which dominated both the
+/// per-tensor and per-token kernels. Words stay in registers.
+template <typename out_t, bool kAsymmetric>
+__device__ __forceinline__ uint32_t quant_word4(float a, float b, float c, float d, float scale,
+                                                float zero) {
+  if constexpr (std::is_same<out_t, __nv_fp8_e4m3>::value) {
+    // Two values per `cvt.rn.satfinite.e4m3x2.f32`: half the conversion instructions of the
+    // scalar intrinsic, same rounding and saturation.
+    if constexpr (kAsymmetric) {
+      a = __fadd_rn(__fdiv_rn(a, scale), zero);
+      b = __fadd_rn(__fdiv_rn(b, scale), zero);
+      c = __fadd_rn(__fdiv_rn(c, scale), zero);
+      d = __fadd_rn(__fdiv_rn(d, scale), zero);
+    } else {
+      a = __fdiv_rn(a, scale);
+      b = __fdiv_rn(b, scale);
+      c = __fdiv_rn(c, scale);
+      d = __fdiv_rn(d, scale);
+    }
+    const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
+    const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
+    return lo | (hi << 16);
+  } else {
+    return static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(a, scale, zero)) |
+           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(b, scale, zero)) << 8) |
+           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(c, scale, zero)) << 16) |
+           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(d, scale, zero)) << 24);
+  }
+}
+
+/// Packed store of one full VEC-byte pack: 4/8/16 B become one naturally aligned store, a misaligned
+/// destination falls back to byte stores. Callers handle a partial trailing pack themselves so no
+/// runtime index is ever applied to `x` (that would spill the pack to local memory).
+template <typename out_t, int VEC, bool kAsymmetric>
+__device__ __forceinline__ void store_quant_pack(uint8_t* __restrict__ dst, const float (&x)[VEC],
+                                                 float scale, float zero) {
+  static_assert(VEC == 4 || VEC == 8 || VEC == 16, "pack width");
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(dst);
+  if constexpr (VEC == 4) {
+    const uint32_t w = quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero);
+    if ((addr & 3u) == 0u) {
+      *reinterpret_cast<uint32_t*>(dst) = w;
+      return;
+    }
+  } else if constexpr (VEC == 8) {
+    const uint2 w = make_uint2(quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero),
+                               quant_word4<out_t, kAsymmetric>(x[4], x[5], x[6], x[7], scale, zero));
+    if ((addr & 7u) == 0u) {
+      *reinterpret_cast<uint2*>(dst) = w;
+      return;
+    }
+  } else {
+    const uint4 w =
+        make_uint4(quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero),
+                   quant_word4<out_t, kAsymmetric>(x[4], x[5], x[6], x[7], scale, zero),
+                   quant_word4<out_t, kAsymmetric>(x[8], x[9], x[10], x[11], scale, zero),
+                   quant_word4<out_t, kAsymmetric>(x[12], x[13], x[14], x[15], scale, zero));
+    if ((addr & 15u) == 0u) {
+      *reinterpret_cast<uint4*>(dst) = w;
+      return;
+    }
+  }
+  #pragma unroll
+  for (int j = 0; j < VEC; ++j) dst[j] = quant_byte<out_t, kAsymmetric>(x[j], scale, zero);
+}
+
 
 
 /// Scale of one (row, group) for a given layout.
@@ -167,10 +258,23 @@ __device__ __forceinline__ float quant_scale_from_amax(float amax, float eps, fl
 template <typename scalar_t, int VEC>
 __device__ __forceinline__ void load_floats(const scalar_t* __restrict__ src, int64_t n, int64_t c,
                                             float (&x)[VEC]) {
-  if (c + VEC <= n) {
-    const dev::Pack<scalar_t, VEC> p = dev::load_pack<VEC>(src + c);
-    #pragma unroll
-    for (int j = 0; j < VEC; ++j) x[j] = to_f<scalar_t>(p.x[j]);
+  // 16 B packs only: VEC == 16 is served as two packs, so no 32 B alignment is assumed. A row whose
+  // start is not 16 B aligned (odd `cols` with a contiguous stride) takes the scalar path.
+  const uintptr_t addr = reinterpret_cast<uintptr_t>(src + c);
+  if (c + VEC <= n && (addr & 15u) == 0u) {
+    if constexpr (VEC <= 8) {
+      const dev::Pack<scalar_t, VEC> p = dev::load_pack<VEC>(src + c);
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j) x[j] = to_f<scalar_t>(p.x[j]);
+    } else {
+      static_assert(VEC % 8 == 0, "wide packs are a whole number of 16 B packs");
+      #pragma unroll
+      for (int v = 0; v < VEC; v += 8) {
+        const dev::Pack<scalar_t, 8> p = dev::load_pack<8>(src + c + v);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) x[v + j] = to_f<scalar_t>(p.x[j]);
+      }
+    }
   } else {
     #pragma unroll
     for (int j = 0; j < VEC; ++j) x[j] = (c + j < n) ? to_f<scalar_t>(src[c + j]) : 0.0f;
@@ -295,17 +399,41 @@ __global__ void quantize_per_tensor_kernel(out_t* __restrict__ out, const int64_
                                            const float* __restrict__ scale, const int64_t num_rows,
                                            const int64_t cols) {
   const float s = scale[0];
-  uint8_t* dst = reinterpret_cast<uint8_t*>(out);
-  const int64_t vpr = (cols + VEC_SIZE - 1) / VEC_SIZE;
-  for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-       i < num_rows * vpr; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
-    const int64_t row = i / vpr;
-    const int64_t c = (i - row * vpr) * VEC_SIZE;
-    float x[VEC_SIZE];
-    load_floats<scalar_t, VEC_SIZE>(input + row * input_row_stride, cols, c, x);
-    uint8_t* q = dst + row * out_row_stride + c;
-    const int64_t valid = (cols - c < VEC_SIZE) ? (cols - c) : VEC_SIZE;
-    for (int64_t j = 0; j < valid; ++j) q[j] = encode_byte<out_t>(__fdiv_rn(x[j], s));
+  uint8_t* const dst = reinterpret_cast<uint8_t*>(out);
+  const int full = static_cast<int>(cols / VEC_SIZE);
+  const int col0 = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int col_step = static_cast<int>(gridDim.x) * blockDim.x;
+  const scalar_t* const src_base = input + static_cast<int64_t>(blockIdx.y) * input_row_stride;
+  uint8_t* const q_base = dst + static_cast<int64_t>(blockIdx.y) * out_row_stride;
+  const int64_t in_step = static_cast<int64_t>(gridDim.y) * input_row_stride;
+  const int64_t out_step = static_cast<int64_t>(gridDim.y) * out_row_stride;
+  // Full packs: one 32 B load and one 16 B store per thread (one 16 B pack for fp32). Pointer
+  // increments in the row loop keep the 64-bit index math out of the inner body, so ptxas needs
+  // ~20 registers instead of ~56 for a fully general int64 loop and keeps eight CTAs per SM.
+  for (int col = col0; col < full; col += col_step) {
+    const scalar_t* src = src_base + static_cast<int64_t>(col) * VEC_SIZE;
+    uint8_t* q = q_base + static_cast<int64_t>(col) * VEC_SIZE;
+    for (int64_t row = blockIdx.y; row < num_rows; row += gridDim.y) {
+      float x[VEC_SIZE];
+      load_floats<scalar_t, VEC_SIZE>(src, VEC_SIZE, 0, x);
+      store_quant_pack<out_t, VEC_SIZE, false>(q, x, s, 0.0f);
+      src += in_step;
+      q += out_step;
+    }
+  }
+  // Partial trailing pack (at most VEC_SIZE-1 values per row): a separate pass so it never adds a
+  // runtime index to the hot loop's value array. One thread owns it; the other CTAs of the row
+  // (grid.x > 1) would only repeat the same bytes.
+  if (full * VEC_SIZE < cols && blockIdx.x == 0 && threadIdx.x == 0) {
+    const int c = full * VEC_SIZE;
+    const int valid = static_cast<int>(cols - c);
+    for (int64_t row = blockIdx.y; row < num_rows; row += gridDim.y) {
+      const scalar_t* src = input + row * input_row_stride + c;
+      uint8_t* q = dst + row * out_row_stride + c;
+      for (int j = 0; j < valid; ++j) {
+        q[j] = quant_byte<out_t, false>(to_f<scalar_t>(src[j]), s, 0.0f);
+      }
+    }
   }
 }
 
@@ -326,15 +454,24 @@ __global__ void quantize_per_token_kernel(out_t* __restrict__ out, const int64_t
   const int64_t r = active ? row : 0;
   const scalar_t* src = input + r * input_row_stride;
   const int64_t vpr = (cols + VEC_SIZE - 1) / VEC_SIZE;
-  float row_max = -__int_as_float(0x7f800000);
-  float row_min = __int_as_float(0x7f800000);
+  // Symmetric rows accumulate |x| through max/min, so a zero start is neutral and keeps an idle
+  // lane from contributing +inf (max(|-inf|, |+inf|)) to the block amax. Asymmetric rows need the
+  // true max/min, so they keep the +-inf identity.
+  float row_max = kAsymmetric ? -__int_as_float(0x7f800000) : 0.0f;
+  float row_min = kAsymmetric ? __int_as_float(0x7f800000) : 0.0f;
   for (int64_t i = warp_row ? lane : threadIdx.x; i < vpr; i += tpr) {
     float x[VEC_SIZE];
     load_floats<scalar_t, VEC_SIZE>(src, cols, i * VEC_SIZE, x);
+    const int64_t c = i * VEC_SIZE;
+    const int64_t valid = (cols - c < VEC_SIZE) ? (cols - c) : VEC_SIZE;
+    // Only real elements take part in the reduction: a zero-filled tail would otherwise pull
+    // row_min to 0 (or row_max, for an all-negative row) and change the asymmetric scale/zero.
     #pragma unroll
     for (int j = 0; j < VEC_SIZE; ++j) {
-      row_max = fmaxf(row_max, x[j]);
-      row_min = fminf(row_min, x[j]);
+      if (j < valid) {
+        row_max = fmaxf(row_max, x[j]);
+        row_min = fminf(row_min, x[j]);
+      }
     }
   }
   float scale = 1.0f;
@@ -381,17 +518,342 @@ __global__ void quantize_per_token_kernel(out_t* __restrict__ out, const int64_t
     load_floats<scalar_t, VEC_SIZE>(src, cols, i * VEC_SIZE, x);
     const int64_t c = i * VEC_SIZE;
     const int64_t valid = (cols - c < VEC_SIZE) ? (cols - c) : VEC_SIZE;
-    for (int64_t j = 0; j < valid; ++j) {
-      if constexpr (kAsymmetric) {
-        const float y = __fadd_rn(__fdiv_rn(x[j], scale), zero);
-        int q = __float2int_rn(y);
-        q = q > 127 ? 127 : (q < -128 ? -128 : q);
-        dst[c + j] = static_cast<uint8_t>(static_cast<int8_t>(q));
-      } else {
-        dst[c + j] = encode_byte<out_t>(__fdiv_rn(x[j], scale));
+    if (valid == VEC_SIZE) {
+      store_quant_pack<out_t, VEC_SIZE, kAsymmetric>(dst + c, x, scale, zero);
+    } else {
+      for (int64_t j = 0; j < valid; ++j) {
+        dst[c + j] = quant_byte<out_t, kAsymmetric>(to_f<scalar_t>(src[c + j]), scale, zero);
       }
     }
   }
+}
+
+/// One CTA per row with the row staged in dynamic shared memory: phase 1 reads the input once from
+/// global memory (two 16 B packs per thread per step), writes it to smem and reduces max/min from
+/// the registers it already holds; phase 2 re-reads smem and emits packed stores. This is the
+/// general body (partial packs, unaligned rows); the two-pass kernel above remains the fallback
+/// when the row does not fit in the default 48 KB smem budget. `VEC` is the 16 B pack width
+/// (8 values of bf16/fp16, 4 of fp32).
+template <typename scalar_t, typename out_t, int VEC, bool kAsymmetric>
+__global__ void quantize_per_token_smem_kernel(
+    out_t* __restrict__ out, const int64_t out_row_stride, float* __restrict__ scales,
+    int32_t* __restrict__ azp, const scalar_t* __restrict__ input, const int64_t input_row_stride,
+    const float* __restrict__ scale_ub, const int num_rows, const int cols) {
+  extern __shared__ __align__(16) unsigned char stage_raw[];
+  scalar_t* const stage = reinterpret_cast<scalar_t*>(stage_raw);
+  __shared__ float smem[32];
+  constexpr int kStep = 2 * VEC;
+  const int64_t row = blockIdx.x;
+  const bool active = row < num_rows;
+  const int64_t r = active ? row : 0;
+  const scalar_t* const src = input + r * input_row_stride;
+  const int tid = threadIdx.x;
+  const int64_t step = static_cast<int64_t>(blockDim.x) * kStep;
+  // Symmetric rows accumulate |x| through max/min, so a zero start is neutral and keeps an idle
+  // lane from contributing +inf (max(|-inf|, |+inf|)) to the block amax. Asymmetric rows need the
+  // true max/min, so they keep the +-inf identity.
+  float row_max = kAsymmetric ? -__int_as_float(0x7f800000) : 0.0f;
+  float row_min = kAsymmetric ? __int_as_float(0x7f800000) : 0.0f;
+  for (int64_t c = static_cast<int64_t>(tid) * kStep; c < cols; c += step) {
+    if (c + kStep <= cols && (reinterpret_cast<uintptr_t>(src + c) & 15u) == 0u) {
+      const dev::Pack<scalar_t, VEC> p0 = dev::load_pack<VEC>(src + c);
+      const dev::Pack<scalar_t, VEC> p1 = dev::load_pack<VEC>(src + c + VEC);
+      dev::store_pack<VEC>(stage + c, p0);
+      dev::store_pack<VEC>(stage + c + VEC, p1);
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        row_max = fmaxf(row_max, to_f<scalar_t>(p0.x[j]));
+        row_min = fminf(row_min, to_f<scalar_t>(p0.x[j]));
+      }
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j) {
+        row_max = fmaxf(row_max, to_f<scalar_t>(p1.x[j]));
+        row_min = fminf(row_min, to_f<scalar_t>(p1.x[j]));
+      }
+    } else {
+      for (int64_t j = 0; c + j < cols; ++j) {
+        const scalar_t v = src[c + j];
+        stage[c + j] = v;
+        const float f = to_f<scalar_t>(v);
+        row_max = fmaxf(row_max, f);
+        row_min = fminf(row_min, f);
+      }
+    }
+  }
+  float scale = 1.0f;
+  float zero = -128.0f;
+  if constexpr (kAsymmetric) {
+    row_max = kops::block_reduce_max<float, 8>(row_max, smem);
+    __syncthreads();
+    row_min = -kops::block_reduce_max<float, 8>(-row_min, smem);
+    scale = __fdiv_rn(row_max - row_min, 255.0f);
+    scale = (scale == scale) ? fmaxf(scale, 1.0f / (127.0f * 512.0f)) : scale;
+    const int z = __float2int_rn(-128.0f - __fdiv_rn(row_min, scale));
+    zero = static_cast<float>(z);
+    if (tid == 0) {
+      if (active) scales[r] = scale;
+      if (active && azp != nullptr) azp[r] = z;
+    }
+  } else {
+    const float m = fmaxf(fabsf(row_max), fabsf(row_min));
+    const float amax = kops::block_reduce_max<float, 8>(m, smem);
+    const float qmax = std::is_same<out_t, int8_t>::value ? kInt8Max : kFp8E4M3Max;
+    scale = fmaxf(__fdiv_rn(amax, qmax), 1.0f / (qmax * 512.0f));
+    if (scale_ub != nullptr) scale = fminf(scale, scale_ub[0]);
+    if (tid == 0 && active) scales[r] = scale;
+  }
+  __syncthreads();
+  if (!active) return;
+  uint8_t* const dst = reinterpret_cast<uint8_t*>(out) + r * out_row_stride;
+  for (int64_t c = static_cast<int64_t>(tid) * kStep; c < cols; c += step) {
+    if (c + kStep <= cols) {
+      const dev::Pack<scalar_t, VEC> p0 = dev::load_pack<VEC>(stage + c);
+      const dev::Pack<scalar_t, VEC> p1 = dev::load_pack<VEC>(stage + c + VEC);
+      float x[kStep];
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j) x[j] = to_f<scalar_t>(p0.x[j]);
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j) x[VEC + j] = to_f<scalar_t>(p1.x[j]);
+      store_quant_pack<out_t, kStep, kAsymmetric>(dst + c, x, scale, zero);
+    } else {
+      for (int64_t j = 0; c + j < cols; ++j) {
+        dst[c + j] = quant_byte<out_t, kAsymmetric>(to_f<scalar_t>(stage[c + j]), scale, zero);
+      }
+    }
+  }
+}
+
+/// Largest staged row: the default dynamic-smem limit minus room for the reduction array.
+constexpr size_t kPerTokenStageLimit = 48u * 1024u - 256u;
+
+/// Full-pack store without alignment or tail handling: the host selected this kernel only when every
+/// row start and the output stride are VEC-byte aligned. Keeping the misaligned/tail fallbacks out
+/// of the hot kernel saves about a third of the registers and a branch per pack.
+template <typename out_t, int VEC, bool kAsymmetric>
+__device__ __forceinline__ void store_quant_pack_aligned(uint8_t* __restrict__ dst,
+                                                         const float (&x)[VEC], float scale,
+                                                         float zero) {
+  if constexpr (VEC == 4) {
+    *reinterpret_cast<uint32_t*>(dst) =
+        quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero);
+  } else if constexpr (VEC == 8) {
+    *reinterpret_cast<uint2*>(dst) =
+        make_uint2(quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero),
+                   quant_word4<out_t, kAsymmetric>(x[4], x[5], x[6], x[7], scale, zero));
+  } else {
+    *reinterpret_cast<uint4*>(dst) =
+        make_uint4(quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero),
+                   quant_word4<out_t, kAsymmetric>(x[4], x[5], x[6], x[7], scale, zero),
+                   quant_word4<out_t, kAsymmetric>(x[8], x[9], x[10], x[11], scale, zero),
+                   quant_word4<out_t, kAsymmetric>(x[12], x[13], x[14], x[15], scale, zero));
+  }
+}
+
+/// One 16 B word (eight 16-bit values) -> eight floats.
+template <typename scalar_t>
+__device__ __forceinline__ void unpack8f(const uint4& v, float* f) {
+  float2 t = dev::unpack2<scalar_t>(v.x); f[0] = t.x; f[1] = t.y;
+  t = dev::unpack2<scalar_t>(v.y); f[2] = t.x; f[3] = t.y;
+  t = dev::unpack2<scalar_t>(v.z); f[4] = t.x; f[5] = t.y;
+  t = dev::unpack2<scalar_t>(v.w); f[6] = t.x; f[7] = t.y;
+}
+
+/// Streaming load of one full vector: 16 B for four fp32 values, two 16 B words for 16 x 16-bit.
+/// The input is read exactly once, so it is loaded with `ld.global.cs` (evict-first) instead of
+/// allocating in L1/L2; on a cold L2 that is worth ~3% over the default load.
+template <typename scalar_t, int VEC>
+__device__ __forceinline__ void load_floats_stream(const scalar_t* __restrict__ src,
+                                                   float (&x)[VEC]) {
+  static_assert(VEC == 4 || VEC % 8 == 0, "vector width");
+  if constexpr (VEC == 4) {
+    if constexpr (std::is_same<scalar_t, float>::value) {
+      const uint4 v = __ldcs(reinterpret_cast<const uint4*>(src));
+      x[0] = __uint_as_float(v.x);
+      x[1] = __uint_as_float(v.y);
+      x[2] = __uint_as_float(v.z);
+      x[3] = __uint_as_float(v.w);
+    } else {
+      const uint2 v = __ldcs(reinterpret_cast<const uint2*>(src));
+      float2 t = dev::unpack2<scalar_t>(v.x); x[0] = t.x; x[1] = t.y;
+      t = dev::unpack2<scalar_t>(v.y); x[2] = t.x; x[3] = t.y;
+    }
+  } else {
+    static_assert(sizeof(scalar_t) == 2, "wide packs hold eight 16-bit values per word");
+    #pragma unroll
+    for (int v = 0; v < VEC; v += 8) {
+      const uint4 w = __ldcs(reinterpret_cast<const uint4*>(src + v));
+      unpack8f<scalar_t>(w, x + v);
+    }
+  }
+}
+
+/// Fast per-tensor body: one CTA row per block (host uses it only when rows <= 65535), full packs
+/// only, VEC values per thread, no tail and no alignment branch.
+template <typename scalar_t, typename out_t, int VEC>
+__global__ void quantize_per_tensor_vec_kernel(out_t* __restrict__ out,
+                                               const int64_t out_row_stride,
+                                               const scalar_t* __restrict__ input,
+                                               const int64_t input_row_stride,
+                                               const float* __restrict__ scale,
+                                               const int64_t num_rows, const int64_t cols) {
+  const float s = scale[0];
+  uint8_t* const dst = reinterpret_cast<uint8_t*>(out);
+  const int vpr = static_cast<int>(cols / VEC);
+  const int col0 = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int col_step = static_cast<int>(gridDim.x) * blockDim.x;
+  const int row = static_cast<int>(blockIdx.y);
+  const scalar_t* const src_base = input + static_cast<int64_t>(row) * input_row_stride;
+  uint8_t* const q_base = dst + static_cast<int64_t>(row) * out_row_stride;
+  (void)num_rows;  // host launches exactly one CTA row per row (rows <= 65535)
+  for (int col = col0; col < vpr; col += col_step) {
+    const scalar_t* src = src_base + static_cast<int64_t>(col) * VEC;
+    uint8_t* q = q_base + static_cast<int64_t>(col) * VEC;
+    float x[VEC];
+    load_floats_stream<scalar_t, VEC>(src, x);
+    store_quant_pack_aligned<out_t, VEC, false>(q, x, s, 0.0f);
+  }
+}
+
+/// Host guard for the fast body: full packs on both sides and 16 B input rows.
+template <typename scalar_t, int VEC>
+bool per_tensor_vec_ok(const scalar_t* input, int64_t input_row_stride, const uint8_t* out,
+                       int64_t out_row_stride, int64_t cols) {
+  return cols % VEC == 0 && (reinterpret_cast<uintptr_t>(input) & 15u) == 0u &&
+         ((input_row_stride * static_cast<int64_t>(sizeof(scalar_t))) & 15u) == 0u &&
+         (reinterpret_cast<uintptr_t>(out) & (VEC - 1)) == 0u &&
+         (out_row_stride & (VEC - 1)) == 0u;
+}
+
+template <typename scalar_t, typename out_t, int VEC>
+void launch_per_tensor(out_t* out, int64_t out_row_stride, const scalar_t* input,
+                       int64_t input_row_stride, const float* scale, int64_t rows, int64_t cols,
+                       dim3 grid, cudaStream_t stream) {
+  if (rows <= 65535 &&
+      per_tensor_vec_ok<scalar_t, VEC>(input, input_row_stride,
+                                       reinterpret_cast<const uint8_t*>(out), out_row_stride,
+                                       cols)) {
+    quantize_per_tensor_vec_kernel<scalar_t, out_t, VEC><<<grid, 256, 0, stream>>>(
+        out, out_row_stride, input, input_row_stride, scale, rows, cols);
+  } else {
+    quantize_per_tensor_kernel<scalar_t, out_t, VEC><<<grid, 256, 0, stream>>>(
+        out, out_row_stride, input, input_row_stride, scale, rows, cols);
+  }
+}
+
+/// One 16 B word held in shared/global memory -> its values as floats (four fp32 or eight 16-bit).
+template <typename scalar_t>
+__device__ __forceinline__ void unpack_word16(const uint4& v, float* f) {
+  if constexpr (sizeof(scalar_t) == 2) {
+    unpack8f<scalar_t>(v, f);
+  } else {
+    f[0] = __uint_as_float(v.x);
+    f[1] = __uint_as_float(v.y);
+    f[2] = __uint_as_float(v.z);
+    f[3] = __uint_as_float(v.w);
+  }
+}
+
+/// One-pass per-token body for a row staged in dynamic shared memory, with whole 16 B packs and
+/// both sides 16 B aligned (host-proved). Same arithmetic as the generic smem kernel above; the
+/// missing tail/alignment branches keep ptxas at 36 registers instead of 48.
+template <typename scalar_t, typename out_t, int VEC, bool kAsymmetric>
+__global__ void quantize_per_token_smem_vec_kernel(
+    out_t* __restrict__ out, const int64_t out_row_stride, float* __restrict__ scales,
+    int32_t* __restrict__ azp, const scalar_t* __restrict__ input, const int64_t input_row_stride,
+    const float* __restrict__ scale_ub, const int num_rows, const int cols) {
+  extern __shared__ __align__(16) unsigned char stage_raw[];
+  scalar_t* const stage = reinterpret_cast<scalar_t*>(stage_raw);
+  __shared__ float smem[32];
+  constexpr int kStep = 2 * VEC;
+  const int64_t row = blockIdx.x;
+  const int64_t r = row < num_rows ? row : 0;
+  const scalar_t* const src = input + r * input_row_stride;
+  const int tid = threadIdx.x;
+  const int64_t step = static_cast<int64_t>(blockDim.x) * kStep;
+  // Symmetric rows accumulate |x| through max/min, so a zero start is neutral and keeps an idle
+  // lane from contributing +inf (max(|-inf|, |+inf|)) to the block amax. Asymmetric rows need the
+  // true max/min, so they keep the +-inf identity.
+  float row_max = kAsymmetric ? -__int_as_float(0x7f800000) : 0.0f;
+  float row_min = kAsymmetric ? __int_as_float(0x7f800000) : 0.0f;
+  for (int64_t c = static_cast<int64_t>(tid) * kStep; c < cols; c += step) {
+    const uint4 w0 = __ldcs(reinterpret_cast<const uint4*>(src + c));
+    const uint4 w1 = __ldcs(reinterpret_cast<const uint4*>(src + c + VEC));
+    *reinterpret_cast<uint4*>(stage + c) = w0;
+    *reinterpret_cast<uint4*>(stage + c + VEC) = w1;
+    float f[kStep];
+    unpack_word16<scalar_t>(w0, f);
+    unpack_word16<scalar_t>(w1, f + VEC);
+    #pragma unroll
+    for (int j = 0; j < kStep; ++j) {
+      row_max = fmaxf(row_max, f[j]);
+      row_min = fminf(row_min, f[j]);
+    }
+  }
+  float scale = 1.0f;
+  float zero = -128.0f;
+  if constexpr (kAsymmetric) {
+    row_max = kops::block_reduce_max<float, 8>(row_max, smem);
+    __syncthreads();
+    row_min = -kops::block_reduce_max<float, 8>(-row_min, smem);
+    scale = __fdiv_rn(row_max - row_min, 255.0f);
+    scale = (scale == scale) ? fmaxf(scale, 1.0f / (127.0f * 512.0f)) : scale;
+    const int z = __float2int_rn(-128.0f - __fdiv_rn(row_min, scale));
+    zero = static_cast<float>(z);
+    if (tid == 0) {
+      if (row < num_rows) scales[r] = scale;
+      if (row < num_rows && azp != nullptr) azp[r] = z;
+    }
+  } else {
+    const float m = fmaxf(fabsf(row_max), fabsf(row_min));
+    const float amax = kops::block_reduce_max<float, 8>(m, smem);
+    const float qmax = std::is_same<out_t, int8_t>::value ? kInt8Max : kFp8E4M3Max;
+    scale = fmaxf(__fdiv_rn(amax, qmax), 1.0f / (qmax * 512.0f));
+    if (scale_ub != nullptr) scale = fminf(scale, scale_ub[0]);
+    if (tid == 0 && row < num_rows) scales[r] = scale;
+  }
+  __syncthreads();
+  if (row >= num_rows) return;
+  uint8_t* const dst = reinterpret_cast<uint8_t*>(out) + r * out_row_stride;
+  for (int64_t c = static_cast<int64_t>(tid) * kStep; c < cols; c += step) {
+    const uint4 w0 = *reinterpret_cast<const uint4*>(stage + c);
+    const uint4 w1 = *reinterpret_cast<const uint4*>(stage + c + VEC);
+    float x[kStep];
+    unpack_word16<scalar_t>(w0, x);
+    unpack_word16<scalar_t>(w1, x + VEC);
+    store_quant_pack_aligned<out_t, kStep, kAsymmetric>(dst + c, x, scale, zero);
+  }
+}
+
+/// Per-token dispatch: rows <= 1024 values keep the four-rows-per-CTA warp kernel; larger rows use
+/// the one-pass smem kernel while they fit (the branch-free body when the row is 16 B aligned and a
+/// whole number of 16-value steps); anything larger falls back to the two-pass block kernel.
+template <typename scalar_t, typename out_t, int VEC, bool kAsymmetric>
+void launch_per_token(out_t* out, int64_t out_row_stride, float* scales, int32_t* azp,
+                      const scalar_t* input, int64_t input_row_stride, const float* scale_ub,
+                      int num_rows, int cols, cudaStream_t stream) {
+  if (cols > 1024 && static_cast<size_t>(cols) * sizeof(scalar_t) <= kPerTokenStageLimit) {
+    const size_t smem = static_cast<size_t>(cols) * sizeof(scalar_t);
+    const bool aligned = (cols % (2 * VEC) == 0) &&
+                         (reinterpret_cast<uintptr_t>(input) & 15u) == 0u &&
+                         ((input_row_stride * static_cast<int64_t>(sizeof(scalar_t))) & 15u) == 0u &&
+                         (reinterpret_cast<uintptr_t>(out) & 15u) == 0u &&
+                         (out_row_stride & 15u) == 0u;
+    if (aligned) {
+      quantize_per_token_smem_vec_kernel<scalar_t, out_t, VEC, kAsymmetric>
+          <<<static_cast<unsigned>(num_rows), 256, smem, stream>>>(
+              out, out_row_stride, scales, azp, input, input_row_stride, scale_ub, num_rows, cols);
+    } else {
+      quantize_per_token_smem_kernel<scalar_t, out_t, VEC, kAsymmetric>
+          <<<static_cast<unsigned>(num_rows), 256, smem, stream>>>(
+              out, out_row_stride, scales, azp, input, input_row_stride, scale_ub, num_rows, cols);
+    }
+    return;
+  }
+  const dim3 block = cols <= 1024 ? dim3(32, 4) : dim3(256);
+  const dim3 grid = cols <= 1024 ? dim3(static_cast<unsigned>((num_rows + 3) / 4))
+                                 : dim3(static_cast<unsigned>(num_rows));
+  quantize_per_token_kernel<scalar_t, out_t, VEC, kAsymmetric><<<grid, block, 0, stream>>>(
+      out, out_row_stride, scales, azp, input, input_row_stride, scale_ub, num_rows, cols);
 }
 
 /// One warp owns one group of 32/64/128 values; lane 0 writes the scale.
@@ -877,40 +1339,37 @@ Status quantize_activation(const ActQuantOut& out, const Tensor& input, const Te
   const int64_t input_expert_stride = masked ? input.stride[0] : 0;
   const cudaStream_t stream = stream_of(ctx);
   const int sms = ctx.compute_units > 0 ? ctx.compute_units : 32;
+  // 16-bit inputs are quantized in 32 B (two 16 B packs) -> 16 B stores; fp32 keeps one 16 B pack.
+  const int64_t row_blocks = std::min<int64_t>(rows, 65535);
+  auto per_tensor_grid = [&](int vec) {
+    const int64_t col_blocks = std::max<int64_t>(1, ceil_div(cols, int64_t(256) * vec));
+    const int64_t want = std::max<int64_t>(1, ceil_div(4 * sms, std::max<int64_t>(1, rows)));
+    return dim3(static_cast<unsigned>(std::min<int64_t>(col_blocks, want)),
+                static_cast<unsigned>(row_blocks));
+  };
+  const dim3 grid16 = per_tensor_grid(16);
+  const dim3 grid4 = per_tensor_grid(4);
 
   if (out.mode == ActQuantMode::kStaticPerTensor) {
     if (out.static_scale == nullptr) {
       return detail::set_error(Status::kInvalidArgument,
                                "quantize_activation: static mode needs static_scale");
     }
-    const int grid = static_cast<int>(std::min<int64_t>(sms * 4, ceil_div(rows * cols, 256)));
     if (fp8) {
       if (input.dtype == DType::kBFloat16) {
-        quantize_per_tensor_kernel<__nv_bfloat16, __nv_fp8_e4m3, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input),
-            input_row_stride, out.static_scale, rows, cols);
+        launch_per_tensor<__nv_bfloat16, __nv_fp8_e4m3, 16>(reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input), input_row_stride, out.static_scale, rows, cols, grid16, stream);
       } else if (input.dtype == DType::kFloat16) {
-        quantize_per_tensor_kernel<__half, __nv_fp8_e4m3, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__half>(input),
-            input_row_stride, out.static_scale, rows, cols);
+        launch_per_tensor<__half, __nv_fp8_e4m3, 16>(reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__half>(input), input_row_stride, out.static_scale, rows, cols, grid16, stream);
       } else {
-        quantize_per_tensor_kernel<float, __nv_fp8_e4m3, 4><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<float>(input),
-            input_row_stride, out.static_scale, rows, cols);
+        launch_per_tensor<float, __nv_fp8_e4m3, 4>(reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<float>(input), input_row_stride, out.static_scale, rows, cols, grid4, stream);
       }
     } else if (int8) {
       if (input.dtype == DType::kBFloat16) {
-        quantize_per_tensor_kernel<__nv_bfloat16, int8_t, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input),
-            input_row_stride, out.static_scale, rows, cols);
+        launch_per_tensor<__nv_bfloat16, int8_t, 16>(reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input), input_row_stride, out.static_scale, rows, cols, grid16, stream);
       } else if (input.dtype == DType::kFloat16) {
-        quantize_per_tensor_kernel<__half, int8_t, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__half>(input),
-            input_row_stride, out.static_scale, rows, cols);
+        launch_per_tensor<__half, int8_t, 16>(reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__half>(input), input_row_stride, out.static_scale, rows, cols, grid16, stream);
       } else {
-        quantize_per_tensor_kernel<float, int8_t, 4><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<float>(input),
-            input_row_stride, out.static_scale, rows, cols);
+        launch_per_tensor<float, int8_t, 4>(reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<float>(input), input_row_stride, out.static_scale, rows, cols, grid4, stream);
       }
     } else {
       return detail::set_error(Status::kUnsupportedDtype,
@@ -954,34 +1413,21 @@ Status quantize_activation(const ActQuantOut& out, const Tensor& input, const Te
       quantize_scale_kernel<<<1, 1, 0, stream>>>(out.amax_out,
                                                  reinterpret_cast<float*>(out.scales), qmax);
     }
-    const int grid = static_cast<int>(std::min<int64_t>(sms * 4, ceil_div(rows * cols, 256)));
     if (fp8) {
       if (input.dtype == DType::kBFloat16) {
-        quantize_per_tensor_kernel<__nv_bfloat16, __nv_fp8_e4m3, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input),
-            input_row_stride, static_cast<float*>(out.scales), rows, cols);
+        launch_per_tensor<__nv_bfloat16, __nv_fp8_e4m3, 16>(reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input), input_row_stride, static_cast<float*>(out.scales), rows, cols, grid16, stream);
       } else if (input.dtype == DType::kFloat16) {
-        quantize_per_tensor_kernel<__half, __nv_fp8_e4m3, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__half>(input),
-            input_row_stride, static_cast<float*>(out.scales), rows, cols);
+        launch_per_tensor<__half, __nv_fp8_e4m3, 16>(reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<__half>(input), input_row_stride, static_cast<float*>(out.scales), rows, cols, grid16, stream);
       } else {
-        quantize_per_tensor_kernel<float, __nv_fp8_e4m3, 4><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<float>(input),
-            input_row_stride, static_cast<float*>(out.scales), rows, cols);
+        launch_per_tensor<float, __nv_fp8_e4m3, 4>(reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride, const_ptr<float>(input), input_row_stride, static_cast<float*>(out.scales), rows, cols, grid4, stream);
       }
     } else if (int8) {
       if (input.dtype == DType::kBFloat16) {
-        quantize_per_tensor_kernel<__nv_bfloat16, int8_t, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input),
-            input_row_stride, static_cast<float*>(out.scales), rows, cols);
+        launch_per_tensor<__nv_bfloat16, int8_t, 16>(reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__nv_bfloat16>(input), input_row_stride, static_cast<float*>(out.scales), rows, cols, grid16, stream);
       } else if (input.dtype == DType::kFloat16) {
-        quantize_per_tensor_kernel<__half, int8_t, 8><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__half>(input),
-            input_row_stride, static_cast<float*>(out.scales), rows, cols);
+        launch_per_tensor<__half, int8_t, 16>(reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<__half>(input), input_row_stride, static_cast<float*>(out.scales), rows, cols, grid16, stream);
       } else {
-        quantize_per_tensor_kernel<float, int8_t, 4><<<grid, 256, 0, stream>>>(
-            reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<float>(input),
-            input_row_stride, static_cast<float*>(out.scales), rows, cols);
+        launch_per_tensor<float, int8_t, 4>(reinterpret_cast<int8_t*>(out.q), q_row_stride, const_ptr<float>(input), input_row_stride, static_cast<float*>(out.scales), rows, cols, grid4, stream);
       }
     } else {
       return detail::set_error(Status::kUnsupportedDtype,
@@ -998,7 +1444,65 @@ Status quantize_activation(const ActQuantOut& out, const Tensor& input, const Te
                                "quantize_activation: per-token needs scales");
     }
     const bool asymmetric = !out.symmetric && int8;
-      const dim3 block = cols <= 1024 ? dim3(32, 4) : dim3(256);
+    if (cols > 1024) {
+      if (fp8) {
+        switch (input.dtype) {
+          case DType::kBFloat16:
+            launch_per_token<__nv_bfloat16, __nv_fp8_e4m3, 8, false>(
+                reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride,
+                static_cast<float*>(out.scales), out.zero_points,
+                const_ptr<__nv_bfloat16>(input), input_row_stride, out.scale_upper_bound,
+                static_cast<int>(rows), static_cast<int>(cols), stream);
+            break;
+          case DType::kFloat16:
+            launch_per_token<__half, __nv_fp8_e4m3, 8, false>(
+                reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride,
+                static_cast<float*>(out.scales), out.zero_points, const_ptr<__half>(input),
+                input_row_stride, out.scale_upper_bound, static_cast<int>(rows),
+                static_cast<int>(cols), stream);
+            break;
+          case DType::kFloat32:
+            launch_per_token<float, __nv_fp8_e4m3, 4, false>(
+                reinterpret_cast<__nv_fp8_e4m3*>(out.q), q_row_stride,
+                static_cast<float*>(out.scales), out.zero_points, const_ptr<float>(input),
+                input_row_stride, out.scale_upper_bound, static_cast<int>(rows),
+                static_cast<int>(cols), stream);
+            break;
+          default:
+            return detail::set_error(Status::kUnsupportedDtype, "quantize_activation per-token dtype");
+        }
+      } else if (int8 && asymmetric) {
+        switch (input.dtype) {
+          case DType::kBFloat16:
+            launch_per_token<__nv_bfloat16, int8_t, 8, true>(
+                reinterpret_cast<int8_t*>(out.q), q_row_stride, static_cast<float*>(out.scales),
+                out.zero_points, const_ptr<__nv_bfloat16>(input), input_row_stride,
+                out.scale_upper_bound, static_cast<int>(rows), static_cast<int>(cols), stream);
+            break;
+          case DType::kFloat16:
+            launch_per_token<__half, int8_t, 8, true>(
+                reinterpret_cast<int8_t*>(out.q), q_row_stride, static_cast<float*>(out.scales),
+                out.zero_points, const_ptr<__half>(input), input_row_stride,
+                out.scale_upper_bound, static_cast<int>(rows), static_cast<int>(cols), stream);
+            break;
+          case DType::kFloat32:
+            launch_per_token<float, int8_t, 4, true>(
+                reinterpret_cast<int8_t*>(out.q), q_row_stride, static_cast<float*>(out.scales),
+                out.zero_points, const_ptr<float>(input), input_row_stride,
+                out.scale_upper_bound, static_cast<int>(rows), static_cast<int>(cols), stream);
+            break;
+          default:
+            return detail::set_error(Status::kUnsupportedDtype, "quantize_activation per-token dtype");
+        }
+      } else {
+        return detail::set_error(Status::kUnsupportedDtype,
+                                 "quantize_activation: per-token supports FP8 / symmetric INT8");
+      }
+      const cudaError_t err = cudaGetLastError();
+      if (err != cudaSuccess) return launch_error("quantize_activation per-token", err);
+      return Status::kSuccess;
+    }
+    const dim3 block = dim3(32, 4);
     if (cols <= 1024) {
       const dim3 grid(static_cast<unsigned>(ceil_div(rows, 4)));
       if (fp8) {

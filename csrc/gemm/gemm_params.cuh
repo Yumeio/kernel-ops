@@ -226,11 +226,18 @@ struct GemmArgs {
 
 enum class SplitKMode : uint8_t {
   kNone = 0,
-  kSerial = 1,               // in-kernel: every slice writes its fp32 partial, the last CTA of the tile sums
-                             //   them in slice order (deterministic) and runs the full epilogue
-  kParallel = 2,             // fp32 partials in workspace + splitk_reduce_kernel
-  kStreamK = 3,              // stream-K with fix-up (persistent)
-  kStreamKHybrid = 4,        // data-parallel full waves + stream-K tail wave
+  kSerial = 1,               // in-kernel: every slice stores its fp32 partial in the tile's register order
+                             //   ([tile][slice][warp][mt][nt][lane][4], coalesced); the last CTA of the tile
+                             //   sums them in slice order (deterministic) and runs the full epilogue. The
+                             //   dense launcher packs (slice, tile) into blockIdx.x so the slices of one tile
+                             //   can share an SM (see gemm_mma.cu / launch_mma).
+  kParallel = 2,             // compact [slice][M][N] fp32 partials in workspace + splitk_reduce_kernel
+  kStreamK = 3,              // stream-K with fix-up (persistent). NOT implemented: the mma.sync path
+                             //   deliberately rejects it (see split_workspace_bytes). On SM89 the serial
+                             //   split-K above is already slower than one CTA per tile at every M <= 512
+                             //   (measured), so a stream-K that only rebalances K cannot win; the remaining
+                             //   small-M gap is the per-CTA mainloop rate, not wave quantization.
+  kStreamKHybrid = 4,        // data-parallel full waves + stream-K tail wave (same status as kStreamK)
 };
 
 enum class RasterOrder : uint8_t { kAlongM = 0, kAlongN = 1, kHeuristic = 2 };
@@ -261,6 +268,59 @@ struct ScaledGemmArgs {
   int32_t split_k_slices = 1;
   RasterOrder raster = RasterOrder::kHeuristic;
   int32_t* split_k_counters = nullptr;   // [tiles_m * tiles_n] zeroed per launch by the host (kSerial)
+};
+
+// -----------------------------------------------------------------------------
+// Row / group map of the shared mma.sync body (ABI 6, B7)
+// -----------------------------------------------------------------------------
+// gemm_mma_sync_kernel serves the dense GEMM and, through this map, every B7 row that has no body of
+// its own: grouped GEMM (contiguous / masked / indexed), the block-sorted fused-MoE expert GEMM and
+// multi-LoRA. A "logical row" is one row of the problem's row space (M); a group (or block) of
+// logical rows uses one operand slot: B = b_ptrs[slot] or b.data + slot * b.batch_stride, and the
+// per-slot epilogue vectors col_scale / bias / colsum_b (+ slot * N) / alpha_ptr and the B operand
+// scales (b.scale + slot * b.scale_batch_stride: blockwise 128x128, per tensor or per channel). Padding rows (id outside [0, id_limit)) are never
+// read or written.
+
+enum class MmaSchedule : uint8_t {
+  kDense = 0,         // tiles of [M, N] (x batch x split-K slices) from blockIdx
+  kRowGroups = 1,     // group g = logical rows [group_rows[g], group_rows[g + 1]) (int64 or int32 offsets)
+  kMaskedGroups = 2,  // group g = logical rows [g * max_rows, g * max_rows + min(masked_rows[g], max_rows))
+  kSortedBlocks = 3,  // block b = logical rows [b * block_rows, (b + 1) * block_rows), slot block_group[b];
+                      //   *num_rows (device, or M when null) logical rows. block_rows == 1: block_group is a
+                      //   per-row group id (DeepGEMM m_indices); a tile takes the group of its first row and
+                      //   skips rows of other groups, so groups must be padded to the tile M
+  kTaskMap = 4,       // task t = task_map[3 t .. 3 t + 2] = (group, m tile, n tile) for t < *num_tasks; the
+                      //   group's rows as kRowGroups (group_rows) or kMaskedGroups (masked_rows != null)
+};
+
+struct MmaRowMap {
+  MmaSchedule schedule = MmaSchedule::kDense;
+  bool a_rows_by_id = false;           // A row (and its blockwise scale row) = row_ids[r] / a_row_div, else r
+  bool out_rows_by_id = false;         // D row and the row-indexed epilogue operands (row_scale, azp, routing
+                                       //   weight, residual, gate_src, scatter_rows, kv_slots, row_sumsq) = id
+  int32_t a_row_div = 1;               // fused MoE W13: top_k (slot id -> token row)
+  int32_t num_groups = 0;              // kRowGroups / kMaskedGroups
+  const int64_t* group_rows = nullptr;     // kRowGroups [G + 1]
+  const int32_t* group_rows32 = nullptr;   // kRowGroups [G + 1] int32 alternative (LoRA seg_indptr)
+  const int32_t* masked_rows = nullptr;    // kMaskedGroups [G]
+  int32_t max_rows = 0;                    // kMaskedGroups rows reserved per group
+  const int32_t* group_slot = nullptr;     // optional [G]: slot of group g (< 0: group skipped); null = g
+  const int32_t* block_group = nullptr;    // kSortedBlocks [blocks]: slot of block b (< 0: block skipped)
+  const int32_t* num_rows = nullptr;       // kSortedBlocks [1]
+  int32_t block_rows = 0;                  // kSortedBlocks; the tile M must divide it
+  const int32_t* task_map = nullptr;       // kTaskMap [capacity, 3] (grouped_gemm_task_map_kernel)
+  const int32_t* num_tasks = nullptr;      // kTaskMap [1]
+  const int32_t* row_ids = nullptr;        // [logical rows] id of row r; null = r
+  int64_t id_limit = 0;                    // ids >= id_limit (or < 0) are padding; 0 = no upper limit
+  const void* const* b_ptrs = nullptr;     // per-slot weight base (ptr-array, LoRA); null = b.data + slot stride
+  int32_t max_tasks = 0;                   // grouped schedules: bound on tiles per N-tile row x tiles_n, sizes
+                                           //   the split-K counters (0 = no split-K on grouped schedules)
+};
+
+/// Kernel parameter of gemm_mma_sync_kernel (ABI 6): the scaled-GEMM arguments plus the row map.
+struct MmaGemmParams {
+  ScaledGemmArgs args;
+  MmaRowMap rows;
 };
 
 // -----------------------------------------------------------------------------

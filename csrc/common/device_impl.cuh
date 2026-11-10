@@ -603,6 +603,435 @@ __device__ __forceinline__ void tc_gemv_body(const T* __restrict__ a, const int6
 #endif
 }
 
+// ---- Marlin GEMM on tensor cores (SM80+), B7 row 6 ----------------------------------------------
+// Shared by gemm/marlin_dense.cu (marlin_gemm_kernel) and gemm/marlin_moe.cu (marlin_moe_gemm_kernel, the
+// sorted_token_ids mode). Same tile layout and fragment mapping as tc_gemv_body: a lane's 4 (4-bit) or 8
+// (8-bit) words of a 16(k) x 64(n) Marlin tile dequantise straight into mma A fragments (weight rows =
+// output columns); the tokens are the mma B operand (ldmatrix from a swizzled shared tile). A CTA is WM x WN
+// x WK warps: WM token groups of TT * 8 tokens, WN Marlin n-tiles (64 columns), WK warps splitting the k16
+// tiles of every 64-K pipeline stage (summed in warp order at the end). Group scales are applied in fp32 to
+// the group's partial accumulator, as in tc_gemv_body (exact weights x activations in the MMA, any scale
+// exponent); per-channel scales and the NVFP4 global scale in the epilogue. WT: 0 kU4 (+ zeros), 1 kU4B8,
+// 2 kU8B128, 3 kFE4M3, 4 kFE2M1 (quant::MarlinWeightType). P is gemm::MarlinParams.
+
+constexpr int kMarlinStageK = 64;   // K elements per pipeline stage (four k16 tiles)
+constexpr int kMarlinStages = 4;
+
+template <typename T, int WT, int TT, int WM, int WN, int WK>
+struct MarlinCfg {
+  static constexpr int kBits = (WT == 2 || WT == 3) ? 8 : 4;
+  static constexpr int kTileBytes = kBits == 4 ? 512 : 1024;   // one 16 x 64 tile
+  static constexpr int kLaneBytes = kTileBytes / 32;
+  static constexpr int kTok = TT * 8 * WM;                       // tokens per CTA
+  static constexpr int kCols = 64 * WN;                          // columns per CTA
+  static constexpr int kAStage = kTok * kMarlinStageK * 2;       // bytes
+  static constexpr int kBStage = 4 * WN * kTileBytes;
+  static constexpr int kPipe = kMarlinStages * (kAStage + kBStage);
+  static constexpr int kRed = WK > 1 ? WK * WM * WN * 32 * 16 * TT * 4 : 0;   // k-split partial sums
+  static constexpr int kSmem = (kPipe > kRed ? kPipe : kRed) + 8 * kTok;     // + row tables
+  static constexpr int kThreads = 32 * WM * WN * WK;
+  static_assert(WM * WN * WK == 4 && (TT == 2 || TT == 4), "four warps; token tiles in pairs");
+};
+
+__device__ __forceinline__ uint32_t marlin_smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+
+__device__ __forceinline__ void marlin_cp16(uint32_t dst, const void* src, bool pred) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "r"(pred ? 16 : 0));
+#endif
+}
+
+template <typename T>
+__device__ __forceinline__ uint32_t marlin_pack2(float lo, float hi) {
+  T a, b;
+  from_f(a, lo);
+  from_f(b, hi);
+  uint16_t ua, ub;
+  __builtin_memcpy(&ua, &a, 2);
+  __builtin_memcpy(&ub, &b, 2);
+  return static_cast<uint32_t>(ua) | (static_cast<uint32_t>(ub) << 16);
+}
+
+/// 8-bit weight byte -> fp32 (exact): WT 2 = uint8 with bias 128, WT 3 = e4m3.
+template <int WT>
+__device__ __forceinline__ float marlin_byte(uint32_t b) {
+  if constexpr (WT == 2) return static_cast<float>(static_cast<int>(b & 0xFFu) - 128);
+  else return e4m3_decode(b & 0xFFu);
+}
+
+/// Per-channel scale permutation of the Marlin repack (32-column chunks): column c sits at position
+/// 8 ((c >> 1) & 3) + 2 (c >> 3) + (c & 1).
+__device__ __forceinline__ int marlin_channel_pos(int n) {
+  const int c = n & 31;
+  return (n - c) + 8 * ((c >> 1) & 3) + 2 * (c >> 3) + (c & 1);
+}
+
+template <typename T, int WT, int TT, int WM, int WN, int WK, bool MOE, typename P>
+__device__ __forceinline__ void marlin_body(const P& p) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+  using Cfg = MarlinCfg<T, WT, TT, WM, WN, WK>;
+  using Tc = TcFrag<T>;
+  constexpr int kTok = Cfg::kTok, kCols = Cfg::kCols, kThreads = Cfg::kThreads;
+  constexpr int kTileWords = Cfg::kTileBytes / 4;
+  extern __shared__ __align__(128) unsigned char marlin_smem[];
+  unsigned char* const sA = marlin_smem;
+  unsigned char* const sB = marlin_smem + kMarlinStages * Cfg::kAStage;
+  int32_t* const s_arow = reinterpret_cast<int32_t*>(marlin_smem + (Cfg::kPipe > Cfg::kRed ? Cfg::kPipe : Cfg::kRed));
+  int32_t* const s_crow = s_arow + kTok;
+
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int wn = warp % WN;
+  const int wm = (warp / WN) % WM;
+  const int wk = warp / (WN * WM);
+  const int g = lane >> 2, c4 = lane & 3;
+  const int N = p.prob_n, K = p.prob_k;
+  const int n_tiles = N / 64;
+  const int tiles_n = (N + kCols - 1) / kCols;
+  const int rows = MOE ? *p.num_tokens_post_pad : p.prob_m;
+  const int tiles_m = (rows + kTok - 1) / kTok;
+  const int kt16 = K / 16;                                     // k16 tiles (K % 16 == 0)
+  const int nst = (K + kMarlinStageK - 1) / kMarlinStageK;     // last stage may be partial
+  const bool channelwise = WT != 4 && (p.group_size < 0 || p.num_groups <= 1);
+  const bool has_zeros = WT == 0 && p.zeros != nullptr;
+  const bool act_order = p.g_idx != nullptr;
+  const int64_t w_expert = static_cast<int64_t>(K) * N * Cfg::kBits / 32;   // words per expert
+  const T* const A = static_cast<const T*>(p.a);
+  // Global K split (dense only, c_tmp + locks given): the host launches exactly tiles x splits CTAs, slice s
+  // of a tile takes stages [s nst / splits, (s + 1) nst / splits) and the slices are summed in slice order
+  // through the fp32 c_tmp under the tile's lock (serial, so deterministic; the last slice runs the epilogue
+  // and re-arms the lock to 0).
+  const int tiles = tiles_m * tiles_n;
+  const int splits = (!MOE && p.c_tmp != nullptr && p.locks != nullptr && static_cast<int>(gridDim.x) >= 2 * tiles)
+                         ? static_cast<int>(gridDim.x) / tiles : 1;
+
+  for (int item = blockIdx.x; item < tiles * splits; item += gridDim.x) {
+    const int tile = item / splits;
+    const int slice = item - tile * splits;
+    const int s_begin = static_cast<int>(static_cast<int64_t>(slice) * nst / splits);
+    const int s_count = static_cast<int>(static_cast<int64_t>(slice + 1) * nst / splits) - s_begin;
+    const int tm = tile % tiles_m;
+    const int tn = tile / tiles_m;
+    const int r0 = tm * kTok;
+    const int c0 = tn * kCols;
+    const int expert = MOE ? p.expert_ids[r0 / p.moe_block_size] : 0;
+    if (expert < 0) continue;   // uniform: no shared state touched yet
+    for (int i = tid; i < kTok; i += kThreads) {
+      int ar = -1, cr = -1;
+      if (MOE) {
+        const int id = r0 + i < rows ? p.sorted_token_ids[r0 + i] : -1;
+        if (id >= 0 && id < p.prob_m * p.top_k) {
+          ar = id / p.top_k;
+          cr = id;
+        }
+      } else if (r0 + i < rows) {
+        ar = cr = r0 + i;
+      }
+      s_arow[i] = ar;
+      s_crow[i] = cr;
+    }
+    __syncthreads();
+
+    const uint32_t* const Bw = p.b + expert * w_expert;
+    const int64_t scale_off = static_cast<int64_t>(expert) * p.num_groups * N;
+    const uint32_t* const Zw = has_zeros ? static_cast<const uint32_t*>(p.zeros) + static_cast<int64_t>(expert) * p.num_groups * (N / 8) : nullptr;
+    auto load_stage = [&](int st, int s) {
+      const int k0 = s * kMarlinStageK;
+      unsigned char* a_st = sA + st * Cfg::kAStage;
+      for (int c = tid; c < kTok * 8; c += kThreads) {
+        const int r = c >> 3, ch = c & 7;
+        const int ar = s_arow[r];
+        const bool ok = ar >= 0 && k0 + ch * 8 < K;
+        const T* src = ok ? A + static_cast<int64_t>(ar) * p.lda + k0 + ch * 8 : A;
+        marlin_cp16(marlin_smem_u32(a_st + r * 128 + ((ch ^ (r & 7)) << 4)), src, ok);
+      }
+      unsigned char* b_st = sB + st * Cfg::kBStage;
+      constexpr int kChunks = Cfg::kTileBytes / 16;
+      for (int c = tid; c < 4 * WN * kChunks; c += kThreads) {
+        const int tl = c / kChunks, ch = c % kChunks;
+        const int j = tl / WN, w = tl % WN;
+        const int nt = c0 / 64 + w;
+        const bool ok = nt < n_tiles && k0 / 16 + j < kt16;
+        const uint32_t* src = ok ? Bw + (static_cast<int64_t>(k0 / 16 + j) * n_tiles + nt) * kTileWords + ch * 4 : Bw;
+        marlin_cp16(marlin_smem_u32(b_st + tl * Cfg::kTileBytes + ch * 16), src, ok);
+      }
+      asm volatile("cp.async.commit_group;");
+    };
+
+    float acc[4][TT][4];
+    float pacc[4][TT][4];
+    #pragma unroll
+    for (int w = 0; w < 4; ++w)
+      #pragma unroll
+      for (int t = 0; t < TT; ++t)
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) acc[w][t][i] = pacc[w][t][i] = 0.0f;
+    float sf[8];
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) sf[j] = 1.0f;
+    uint32_t zlo[4], zhi[4];
+    #pragma unroll
+    for (int w = 0; w < 4; ++w) zlo[w] = zhi[w] = (Tc::kBase | (WT == 0 ? 0u : 8u)) * 0x00010001u;
+    int cur_g = -1;
+    const int nt_w = c0 / 64 + wn;           // this warp's Marlin n-tile
+    const bool w_live = nt_w < n_tiles;
+
+    auto promote = [&]() {
+      #pragma unroll
+      for (int w = 0; w < 4; ++w)
+        #pragma unroll
+        for (int t = 0; t < TT; ++t)
+          #pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            acc[w][t][i] = fmaf(sf[2 * w + (i >> 1)], pacc[w][t][i], acc[w][t][i]);
+            pacc[w][t][i] = 0.0f;
+          }
+    };
+    // Group scales / zeros: the raw words of the group after the current one are fetched into registers
+    // when a group starts (groups are visited in increasing order, also with act-order's sorted g_idx), so
+    // the switch normally finds them loaded; a different group (empty group in a K shard) loads directly.
+    uint4 pf_s = make_uint4(0u, 0u, 0u, 0u);
+    uint32_t pf_z = 0u;
+    int pf_g = -1;
+    auto fetch_group = [&](int grp, uint4& sv, uint32_t& zw) {
+      const int64_t base = scale_off + static_cast<int64_t>(grp) * N + nt_w * 64 + 8 * g;
+      if constexpr (WT == 4) {
+        const uint2 v = __ldg(reinterpret_cast<const uint2*>(static_cast<const uint8_t*>(p.scales) + base));
+        sv = make_uint4(v.x, v.y, 0u, 0u);
+      } else {
+        sv = __ldg(reinterpret_cast<const uint4*>(static_cast<const T*>(p.scales) + base));
+      }
+      if (has_zeros) zw = __ldg(Zw + static_cast<int64_t>(grp) * (N / 8) + nt_w * 8 + g);
+    };
+    auto load_group = [&](int grp) {
+      if (!w_live) return;
+      uint4 sv;
+      uint32_t zw = 0u;
+      if (grp == pf_g) {
+        sv = pf_s;
+        zw = pf_z;
+      } else {
+        fetch_group(grp, sv, zw);
+      }
+      if (!channelwise && grp + 1 < p.num_groups) {
+        fetch_group(grp + 1, pf_s, pf_z);
+        pf_g = grp + 1;
+      }
+      if constexpr (WT == 4) {
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const uint32_t byte = ((j < 4 ? sv.x : sv.y) >> (8 * (j & 3))) & 0xFFu;
+          sf[j] = p.group_size == 16 ? e4m3_decode(byte) : (byte == 0xFFu ? __int_as_float(0x7FC00000) : __uint_as_float(byte << 23));
+        }
+      } else {
+        unpack8<T>(sv, sf);
+      }
+      if (has_zeros) {
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+          zlo[w] = (Tc::kBase | ((zw >> (4 * w)) & 0xFu)) * 0x00010001u;
+          zhi[w] = (Tc::kBase | ((zw >> (4 * (w + 4))) & 0xFu)) * 0x00010001u;
+        }
+      }
+    };
+    if (channelwise && has_zeros) load_group(0);
+    // act-order: group of the warp's next k16 tile, loaded one tile ahead (g_idx[perm[k]])
+    auto act_group = [&](int kt) { return p.g_idx[p.perm != nullptr ? p.perm[kt * 16] : kt * 16]; };
+    int next_ag = (act_order && s_count > 0 && (s_begin * 4 + wk) < kt16) ? act_group(s_begin * 4 + wk) : 0;
+
+    #pragma unroll
+    for (int i = 0; i < kMarlinStages - 1; ++i) {
+      if (i < s_count) load_stage(i, s_begin + i);
+      else asm volatile("cp.async.commit_group;");
+    }
+    for (int i = 0; i < s_count; ++i) {
+      const int s = s_begin + i;
+      asm volatile("cp.async.wait_group %0;" ::"n"(kMarlinStages - 2));
+      __syncthreads();
+      const int nxt = i + kMarlinStages - 1;
+      if (nxt < s_count) load_stage(nxt % kMarlinStages, s_begin + nxt);
+      else asm volatile("cp.async.commit_group;");
+      const int st = i % kMarlinStages;
+      const unsigned char* a_st = sA + st * Cfg::kAStage;
+      const unsigned char* b_st = sB + st * Cfg::kBStage;
+      #pragma unroll
+      for (int jj = 0; jj < 4 / WK; ++jj) {
+        const int j = wk + jj * WK;
+        const int kt = s * 4 + j;
+        if (kt >= kt16) break;   // partial last stage (warp-uniform)
+        if (!channelwise) {
+          int grp;
+          if (act_order) {
+            grp = next_ag;
+            if (kt + WK < kt16) next_ag = act_group(kt + WK);
+          } else {
+            grp = (kt * 16) / p.group_size;
+          }
+          if (grp != cur_g) {
+            if (cur_g >= 0) promote();
+            load_group(grp);
+            cur_g = grp;
+          }
+        }
+        // token fragments (mma B): TT n8 tiles of this warp's tokens
+        uint32_t bt[TT][2];
+        #pragma unroll
+        for (int np = 0; np < TT / 2; ++np) {
+          const int r = wm * TT * 8 + np * 16 + (lane & 7) + (lane >> 4) * 8;
+          const int ch = j * 2 + ((lane >> 3) & 1);
+          uint32_t rr[4];
+          asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];"
+                       : "=r"(rr[0]), "=r"(rr[1]), "=r"(rr[2]), "=r"(rr[3])
+                       : "r"(marlin_smem_u32(a_st + r * 128 + ((ch ^ (r & 7)) << 4))));
+          bt[2 * np][0] = rr[0];
+          bt[2 * np][1] = rr[1];
+          bt[2 * np + 1][0] = rr[2];
+          bt[2 * np + 1][1] = rr[3];
+        }
+        // weight fragments (mma A) of the 4 sub-tiles
+        const unsigned char* wp = b_st + (j * WN + wn) * Cfg::kTileBytes + lane * Cfg::kLaneBytes;
+        uint32_t words[Cfg::kBits == 4 ? 4 : 8];
+        {
+          const uint4 v0 = *reinterpret_cast<const uint4*>(wp);
+          words[0] = v0.x; words[1] = v0.y; words[2] = v0.z; words[3] = v0.w;
+          if constexpr (Cfg::kBits == 8) {
+            const uint4 v1 = *reinterpret_cast<const uint4*>(wp + 16);
+            words[4] = v1.x; words[5] = v1.y; words[6] = v1.z; words[7] = v1.w;
+          }
+        }
+        #pragma unroll
+        for (int w = 0; w < 4; ++w) {
+          uint32_t fa[4];
+          if constexpr (WT == 0 || WT == 1) {
+            const uint32_t q = words[w];
+            fa[0] = Tc::sub2((q & 0x000F000Fu) | Tc::kMagic, zlo[w]);
+            fa[2] = Tc::sub2(((q >> 4) & 0x000F000Fu) | Tc::kMagic, zlo[w]);
+            fa[1] = Tc::sub2(((q >> 8) & 0x000F000Fu) | Tc::kMagic, zhi[w]);
+            fa[3] = Tc::sub2(((q >> 12) & 0x000F000Fu) | Tc::kMagic, zhi[w]);
+          } else if constexpr (WT == 4) {
+            const uint32_t q = words[w];
+            fa[0] = Tc::e2m1x2(q & 0x000F000Fu);
+            fa[2] = Tc::e2m1x2((q >> 4) & 0x000F000Fu);
+            fa[1] = Tc::e2m1x2((q >> 8) & 0x000F000Fu);
+            fa[3] = Tc::e2m1x2((q >> 12) & 0x000F000Fu);
+          } else {
+            // bytes of word 2w: (k0, n) (k8, n) (k1, n) (k9, n); word 2w + 1: the same for n + 8
+            const uint32_t lo = words[2 * w], hi = words[2 * w + 1];
+            fa[0] = marlin_pack2<T>(marlin_byte<WT>(lo), marlin_byte<WT>(lo >> 16));
+            fa[2] = marlin_pack2<T>(marlin_byte<WT>(lo >> 8), marlin_byte<WT>(lo >> 24));
+            fa[1] = marlin_pack2<T>(marlin_byte<WT>(hi), marlin_byte<WT>(hi >> 16));
+            fa[3] = marlin_pack2<T>(marlin_byte<WT>(hi >> 8), marlin_byte<WT>(hi >> 24));
+          }
+          #pragma unroll
+          for (int t = 0; t < TT; ++t) {
+            if (channelwise) Tc::mma(acc[w][t], fa, bt[t][0], bt[t][1]);
+            else Tc::mma(pacc[w][t], fa, bt[t][0], bt[t][1]);
+          }
+        }
+      }
+    }
+    asm volatile("cp.async.wait_group 0;");
+    if (!channelwise && cur_g >= 0) promote();
+    __syncthreads();   // pipeline buffers are dead
+
+    // ---- k-split reduction in warp order ----
+    if constexpr (WK > 1) {
+      float* red = reinterpret_cast<float*>(marlin_smem);
+      const int slot = (wm * WN + wn) * 32 + lane;
+      if (wk > 0) {
+        #pragma unroll
+        for (int w = 0; w < 4; ++w)
+          #pragma unroll
+          for (int t = 0; t < TT; ++t)
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) red[((wk * WM * WN * 32 + slot) * 4 + w) * TT * 4 + t * 4 + i] = acc[w][t][i];
+      }
+      __syncthreads();
+      if (wk == 0) {
+        for (int q = 1; q < WK; ++q) {
+          #pragma unroll
+          for (int w = 0; w < 4; ++w)
+            #pragma unroll
+            for (int t = 0; t < TT; ++t)
+              #pragma unroll
+              for (int i = 0; i < 4; ++i) acc[w][t][i] += red[((q * WM * WN * 32 + slot) * 4 + w) * TT * 4 + t * 4 + i];
+        }
+      }
+    }
+    // ---- global K split: add the earlier slices' sum (fixed slice order), pass it on or finish ----
+    if (splits > 1) {
+      int* const lock = p.locks + tile;
+      if (slice > 0) {
+        if (tid == 0) {
+          int v;
+          do {
+            asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(lock) : "memory");
+          } while (v != slice);
+        }
+        __syncthreads();
+      }
+      if (wk == 0 && w_live) {
+        #pragma unroll
+        for (int w = 0; w < 4; ++w)
+          #pragma unroll
+          for (int h = 0; h < 2; ++h) {
+            const int n = nt_w * 64 + 16 * w + 8 * h + g;
+            #pragma unroll
+            for (int t = 0; t < TT; ++t)
+              #pragma unroll
+              for (int e = 0; e < 2; ++e) {
+                const int cr = s_crow[wm * TT * 8 + t * 8 + 2 * c4 + e];
+                if (cr < 0) continue;
+                float* const ct = p.c_tmp + static_cast<int64_t>(cr) * N + n;
+                float& v = acc[w][t][2 * h + e];
+                if (slice > 0) v = __ldcg(ct) + v;
+                if (slice + 1 < splits) __stcg(ct, v);
+              }
+          }
+      }
+      if (slice + 1 < splits) {
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) asm volatile("st.release.gpu.global.b32 [%0], %1;" ::"l"(lock), "r"(slice + 1) : "memory");
+        continue;   // uniform; s_crow is rewritten only after the next item's first __syncthreads
+      }
+    }
+    // ---- epilogue: (acc x channel scale x 1 / global + bias) x topk weight -> T ----
+    if (wk == 0 && w_live) {
+      const float inv_g = (WT == 4 && p.global_scale != nullptr) ? 1.0f / *p.global_scale : 1.0f;
+      T* const C = static_cast<T*>(p.c);
+      const T* const bias = static_cast<const T*>(p.bias);
+      #pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int n = nt_w * 64 + 16 * w + 8 * h + g;
+          float cs = inv_g;
+          if (channelwise) cs *= to_f(static_cast<const T*>(p.scales)[scale_off + marlin_channel_pos(n)]);
+          const float bv = bias != nullptr ? to_f(bias[static_cast<int64_t>(MOE ? expert : 0) * N + n]) : 0.0f;
+          #pragma unroll
+          for (int t = 0; t < TT; ++t) {
+            #pragma unroll
+            for (int e = 0; e < 2; ++e) {
+              const int tok = wm * TT * 8 + t * 8 + 2 * c4 + e;
+              const int cr = s_crow[tok];
+              if (cr < 0) continue;
+              float v = fmaf(acc[w][t][2 * h + e], cs, bv);
+              if (MOE && p.mul_topk_weights) v *= p.topk_weights[cr];
+              from_f(C[static_cast<int64_t>(cr) * p.ldc + n], v);
+            }
+          }
+        }
+      }
+    }
+    __syncthreads();   // row tables / reduction buffer are rewritten by the next tile
+    if (splits > 1 && tid == 0) p.locks[tile] = 0;   // the tile's slices are all done: re-arm
+  }
+#else
+  (void)p;
+  if (threadIdx.x == 0) __trap();
+#endif
+}
+
 // ---- B9 recurrent helpers (state/conv1d.cu, ssm.cu, linear_attention.cu, delta_rule*.cu) ----
 // Scalar gates and decays in fp32 with the fast exponential (relative error ~2^-21 plus 2^-23
 // per unit of |x|, far below the bf16/fp16 rounding they feed); softplus keeps log1p accurate.

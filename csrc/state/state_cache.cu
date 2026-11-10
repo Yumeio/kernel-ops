@@ -149,6 +149,30 @@ __global__ void state_zero_kernel(void* const* __restrict__ pools,
   zero_bytes(dst, bytes, static_cast<int>(threadIdx.x), static_cast<int>(blockDim.x));
 }
 
+// B10: after speculative verification, adopt the intermediate state that
+// corresponds to the number of accepted drafts.  The live slot already holds
+// the state after the full draft forward, so a row that accepted every draft
+// needs no copy.  intermediate[b, j] is the state after j accepted drafts.
+__global__ void state_commit_accepted_kernel(
+    void* const* __restrict__ pools, const int64_t* __restrict__ slot_bytes,
+    const int32_t* __restrict__ live_slots, const int32_t* __restrict__ intermediate_slots,
+    const int32_t* __restrict__ num_accepted, const int max_draft_plus_one,
+    const int batch_size, const int num_pools) {
+  const int b = static_cast<int>(blockIdx.x);
+  const int pool = static_cast<int>(blockIdx.y);
+  if (b >= batch_size || pool >= num_pools) return;
+  const int accepted = num_accepted[b];
+  if (accepted < 0 || accepted >= max_draft_plus_one - 1) return;
+  const int32_t live = live_slots[b];
+  const int32_t src = intermediate_slots[static_cast<int64_t>(b) * max_draft_plus_one + accepted];
+  if (live < 0 || src < 0) return;
+  const int64_t bytes = slot_bytes[pool];
+  if (bytes <= 0) return;
+  uint8_t* dst = static_cast<uint8_t*>(pools[pool]) + static_cast<int64_t>(live) * bytes;
+  const uint8_t* sp = static_cast<const uint8_t*>(pools[pool]) + static_cast<int64_t>(src) * bytes;
+  copy_bytes(dst, sp, bytes, static_cast<int>(threadIdx.x), static_cast<int>(blockDim.x));
+}
+
 namespace {
 
 // ---- host helpers ------------------------------------------------------------
@@ -323,13 +347,42 @@ Status state_zero(const Tensor& pool_ptrs, const Tensor& slot_bytes, const Tenso
 Status state_commit_accepted(const Tensor& pool_ptrs, const Tensor& slot_bytes,
                              const Tensor& live_slots, const Tensor& intermediate_slots,
                              const Tensor& num_accepted, const LaunchContext& ctx) {
-  (void)pool_ptrs;
-  (void)slot_bytes;
-  (void)live_slots;
-  (void)intermediate_slots;
-  (void)num_accepted;
-  (void)ctx;
-  return detail::set_error(Status::kNotImplemented, "state_commit_accepted lands in B10");
+  Status s = backend_ok(ctx);
+  if (s != Status::kSuccess) return s;
+  int pools = 0;
+  int64_t total = 0;
+  s = check_pools(pool_ptrs, slot_bytes, &pools, &total);
+  if (s != Status::kSuccess) return s;
+  s = check_tensor(live_slots, DType::kInt32, 1, 4, "state_commit_accepted.live_slots");
+  if (s != Status::kSuccess) return s;
+  s = check_tensor(intermediate_slots, DType::kInt32, 2, 4,
+                   "state_commit_accepted.intermediate_slots");
+  if (s != Status::kSuccess) return s;
+  s = check_tensor(num_accepted, DType::kInt32, 1, 4, "state_commit_accepted.num_accepted");
+  if (s != Status::kSuccess) return s;
+  const int64_t batch = live_slots.shape[0];
+  const int64_t max_draft_plus_one = intermediate_slots.shape[1];
+  if (max_draft_plus_one <= 0 || intermediate_slots.shape[0] != batch ||
+      num_accepted.shape[0] != batch || live_slots.stride[0] != 1 ||
+      num_accepted.stride[0] != 1 || intermediate_slots.stride[0] != max_draft_plus_one ||
+      intermediate_slots.stride[1] != 1) {
+    return detail::set_error(Status::kInvalidArgument,
+                             "state_commit_accepted: live/intermediate/num_accepted shapes");
+  }
+  if (batch <= 0) return Status::kSuccess;
+  if (batch > INT32_MAX || max_draft_plus_one > INT32_MAX) {
+    return detail::set_error(Status::kInvalidArgument,
+                             "state_commit_accepted: batch or draft table too large");
+  }
+  const dim3 grid(static_cast<unsigned>(batch), static_cast<unsigned>(pools));
+  state_commit_accepted_kernel<<<grid, kBlock, 0, stream_of(ctx)>>>(
+      reinterpret_cast<void* const*>(const_ptr<int64_t>(pool_ptrs)), const_ptr<int64_t>(slot_bytes),
+      const_ptr<int32_t>(live_slots), const_ptr<int32_t>(intermediate_slots),
+      const_ptr<int32_t>(num_accepted), static_cast<int>(max_draft_plus_one),
+      static_cast<int>(batch), pools);
+  const cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) return launch_error("state_commit_accepted", err);
+  return Status::kSuccess;
 }
 
 }  // namespace kops::state

@@ -392,7 +392,8 @@ int main(int argc, char** argv) {
   if (!cuda_ok(cudaSetDevice(0), "cudaSetDevice")) return 1;
   DeviceInfo dev{};
   query_device(&dev);
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  filter_cases(&cases, opt);
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

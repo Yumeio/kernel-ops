@@ -385,8 +385,12 @@ __global__ void reshape_and_cache_flash_kernel(
     const int64_t page_stride, const int64_t head_stride, const int64_t key_stride,
     const int64_t value_stride, const int num_heads, const int head_size,
     const int head_size_v, const int block_size, const float* __restrict__ k_scale,
-    const float* __restrict__ v_scale, const int kv_scale_stride) {
-  const int64_t slot = slot_mapping[blockIdx.x];
+    const float* __restrict__ v_scale, const int kv_scale_stride, const int64_t num_tokens) {
+  constexpr int kWarps = 8;   // one warp per token
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int64_t token = static_cast<int64_t>(blockIdx.x) * kWarps + warp;
+  if (token >= num_tokens) return;
+  const int64_t slot = slot_mapping[token];
   if (slot < 0) return;
   const int64_t page = slot / block_size;
   const int64_t off = slot % block_size;
@@ -400,35 +404,55 @@ __global__ void reshape_and_cache_flash_kernel(
   const int64_t v_block_stride = static_cast<int64_t>(block_size) * num_heads * head_size_v;
   const int64_t v_base = page * v_block_stride + off * v_page_stride;
 
-  const int kvec = (head_size % static_cast<int>(16 / sizeof(scalar_t)) == 0)
-                       ? static_cast<int>(16 / sizeof(scalar_t))
-                       : 1;
-  const int vvec = (head_size_v % static_cast<int>(16 / sizeof(scalar_t)) == 0)
-                       ? static_cast<int>(16 / sizeof(scalar_t))
-                       : 1;
+  // 32-byte packs for a native 16-bit cache (two uint4), 16 bytes otherwise.
+  constexpr int kVecElems = (kCodec == KVCodec::kNative && sizeof(scalar_t) == 2)
+                                ? 16
+                                : static_cast<int>(16 / sizeof(scalar_t));
+  const int kvec = (head_size % kVecElems == 0) ? kVecElems : 1;
+  const int vvec = (head_size_v % kVecElems == 0) ? kVecElems : 1;
   const int k_packs = head_size / kvec;
   const int v_packs = head_size_v / vvec;
 
-  for (int p = threadIdx.x; p < num_heads * k_packs; p += blockDim.x) {
+  for (int p = lane; p < num_heads * k_packs; p += 32) {
     const int h = p / k_packs;
     const int d = (p % k_packs) * kvec;
     const float scale = head_scale(k_scale, h, kv_scale_stride);
-    const scalar_t* src = key + static_cast<int64_t>(blockIdx.x) * key_stride +
+    const scalar_t* src = key + token * key_stride +
                           static_cast<int64_t>(h) * head_size + d;
     cache_t* dst = key_cache + k_base + static_cast<int64_t>(h) * head_stride + d;
-    if (kvec == 1) {
-      for (int j = 0; j < kvec; ++j) dst[j] = cache_store<cache_t, kCodec>(to_f(src[j]), scale);
-    } else {
-      for (int j = 0; j < kvec; ++j) dst[j] = cache_store<cache_t, kCodec>(to_f(src[j]), scale);
+    if constexpr (kCodec == KVCodec::kNative) {
+      if (kvec == 16 && (reinterpret_cast<uintptr_t>(src) & 31u) == 0 && (reinterpret_cast<uintptr_t>(dst) & 31u) == 0) {
+        const uint4 a = *reinterpret_cast<const uint4*>(src), b = *reinterpret_cast<const uint4*>(src + 8);
+        *reinterpret_cast<uint4*>(dst) = a;
+        *reinterpret_cast<uint4*>(dst + 8) = b;
+        continue;
+      }
+      if (kvec == 8 && (reinterpret_cast<uintptr_t>(src) & 15u) == 0 && (reinterpret_cast<uintptr_t>(dst) & 15u) == 0) {
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+        continue;
+      }
     }
+    for (int j = 0; j < kvec; ++j) dst[j] = cache_store<cache_t, kCodec>(to_f(src[j]), scale);
   }
-  for (int p = threadIdx.x; p < num_heads * v_packs; p += blockDim.x) {
+  for (int p = lane; p < num_heads * v_packs; p += 32) {
     const int h = p / v_packs;
     const int d = (p % v_packs) * vvec;
     const float scale = head_scale(v_scale, h, kv_scale_stride);
-    const scalar_t* src = value + static_cast<int64_t>(blockIdx.x) * value_stride +
+    const scalar_t* src = value + token * value_stride +
                           static_cast<int64_t>(h) * head_size_v + d;
     cache_t* dst = value_cache + v_base + static_cast<int64_t>(h) * v_head_stride + d;
+    if constexpr (kCodec == KVCodec::kNative) {
+      if (vvec == 16 && (reinterpret_cast<uintptr_t>(src) & 31u) == 0 && (reinterpret_cast<uintptr_t>(dst) & 31u) == 0) {
+        const uint4 a = *reinterpret_cast<const uint4*>(src), b = *reinterpret_cast<const uint4*>(src + 8);
+        *reinterpret_cast<uint4*>(dst) = a;
+        *reinterpret_cast<uint4*>(dst + 8) = b;
+        continue;
+      }
+      if (vvec == 8 && (reinterpret_cast<uintptr_t>(src) & 15u) == 0 && (reinterpret_cast<uintptr_t>(dst) & 15u) == 0) {
+        *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+        continue;
+      }
+    }
     for (int j = 0; j < vvec; ++j) dst[j] = cache_store<cache_t, kCodec>(to_f(src[j]), scale);
   }
 }
@@ -473,6 +497,62 @@ __global__ void reshape_and_cache_legacy_kernel(
   }
 }
 
+/// Warps per token for append_paged_kv, shared by the launcher and the kernel so both
+/// agree on the thread -> (token, chunk) mapping.
+///
+/// `chunks` is the number of 16-byte K+V chunks of one token (K chunks first, then V).
+/// Two chunks per lane is the shape that reaches the two-stream copy floor on the dev GPU:
+/// with 32 threads per token each lane owns four dependent chunk copies and the DRAM stream
+/// stays latency bound (measured 13.2 us vs 11.3 us for the same bytes on a 4090), while one
+/// chunk per lane leaves too few loads in flight per thread. The result is a power-of-two
+/// lanes-per-token count so the kernel can split threadIdx.x with a shift instead of an
+/// integer division (~1 us of the append case).
+///
+/// Returns log2(threads per token / 32), i.e. threads per token = 32 << result.
+__host__ __device__ __forceinline__ int append_token_shift(int chunks, int block) {
+  int k = 0;
+  while (k < 3 && chunks > 2 * (32 << k)) ++k;
+  while (k > 0 && (32 << k) > block) --k;
+  return k;
+}
+
+/// Warps per token implied by append_token_shift.
+__host__ __device__ __forceinline__ int append_threads_per_token(int chunks, int block) {
+  return 32 << append_token_shift(chunks, block);
+}
+
+/// One 16-byte chunk of K/V: a raw copy for a native cache, or VEC values packed into one 16/8/4-byte
+/// store for the FP8 codecs. `dst` and `src` are aligned because d is a multiple of VEC.
+template <typename scalar_t, typename cache_t, KVCodec kCodec, int VEC>
+__device__ __forceinline__ void append_vec(cache_t* dst, const scalar_t* src, float scale) {
+  if constexpr (kCodec == KVCodec::kNative) {
+    *reinterpret_cast<uint4*>(dst) = *reinterpret_cast<const uint4*>(src);
+  } else {
+    uint8_t q[VEC];
+    #pragma unroll
+    for (int j = 0; j < VEC; ++j) q[j] = static_cast<uint8_t>(cache_store<cache_t, kCodec>(to_f(src[j]), scale));
+    if constexpr (VEC == 8) {
+      *reinterpret_cast<uint2*>(dst) = *reinterpret_cast<const uint2*>(q);
+    } else if constexpr (VEC == 4) {
+      *reinterpret_cast<uint32_t*>(dst) = *reinterpret_cast<const uint32_t*>(q);
+    } else {
+      #pragma unroll
+      for (int j = 0; j < VEC; ++j) dst[j] = static_cast<cache_t>(q[j]);
+    }
+  }
+}
+
+/// A group of `threads_per_token` lanes owns one token and walks K and V chunks in one index space
+/// (the first `k_chunks` chunks are K, the rest V), so K and V are issued together and
+/// page/offset are computed once.
+///
+/// The native fast path issues its source loads *before* the CSR page-table chain
+/// (batch_indices -> kv_indptr -> kv_page_indices) resolves, so the three dependent metadata
+/// loads overlap the data fetch instead of preceding it, and it uses the chunk index itself as the
+/// row offset when the heads are dense (no integer division on the load path). Both are worth
+/// ~1 us of this 12 us case on the dev GPU. The generic path keeps the codec/alignment fallbacks:
+/// FP8 packing, per-head scales, non 16-byte-aligned strides and head dims, HND rows, and more
+/// than two chunks per lane.
 template <typename scalar_t, typename cache_t, KVCodec kCodec, KVLayout kLayout>
 __global__ void append_paged_kv_kernel(
     const PagedKVDesc desc, const scalar_t* __restrict__ append_key,
@@ -480,44 +560,146 @@ __global__ void append_paged_kv_kernel(
     const int32_t* __restrict__ positions, const int64_t key_stride_n,
     const int64_t key_stride_h, const int64_t value_stride_n, const int64_t value_stride_h,
     const int nnz) {
-  const int64_t token = blockIdx.x;
-  if (token >= nnz) return;
-  const int32_t b = batch_indices[token];
-  const int32_t pos = positions[token];
-  if (b < 0 || pos < 0 || desc.kv_indptr == nullptr || desc.kv_page_indices == nullptr) return;
-  const int64_t first = desc.kv_indptr[b];
-  const int64_t last = desc.kv_indptr[b + 1];
-  const int64_t logical = pos / desc.page_size;
-  if (logical < 0 || first + logical >= last) return;
-  const int32_t page = desc.kv_page_indices[first + logical];
-  if (page < 0) return;
-  const int64_t off = pos % desc.page_size;
+  constexpr int VEC = 16 / static_cast<int>(sizeof(scalar_t));
+  const bool native_vec = kCodec == KVCodec::kNative && (sizeof(scalar_t) == 2 || sizeof(scalar_t) == 4);
+  const int block = static_cast<int>(blockDim.x);
   const int heads = desc.num_kv_heads;
   const int dk = desc.head_dim_k;
   const int dv = desc.head_dim_v;
-  const int64_t k_base = static_cast<int64_t>(page) * desc.k_stride_page + off * desc.k_stride_token;
-  const int64_t v_base = static_cast<int64_t>(page) * desc.v_stride_page + off * desc.v_stride_token;
   cache_t* kc = static_cast<cache_t*>(desc.k_data);
   cache_t* vc = static_cast<cache_t*>(desc.v_data);
+  const bool v_live = append_value != nullptr && desc.v_data != nullptr && dv > 0;
+  const bool vec_k = native_vec && dk > 0 && (dk % VEC) == 0;
+  const bool vec_v = vec_k && v_live && (dv % VEC) == 0;
+  const int nvec_k = vec_k ? dk / VEC : 0;
+  const int k_chunks = vec_k ? heads * nvec_k : 0;
+  const int v_chunks = vec_v ? heads * (dv / VEC) : 0;
+
+  const int chunks = k_chunks + v_chunks;
+  const int shift = append_token_shift(chunks, block);
+  const int tpt = 32 << shift;                  // threads per token
+  const int tpc = block >> (5 + shift);         // tokens per CTA
+  const int64_t token = static_cast<int64_t>(blockIdx.x) * tpc + (threadIdx.x >> (5 + shift));
+  if (token >= nnz) return;
+  const int slot = static_cast<int>(threadIdx.x) & (tpt - 1);
+
   const scalar_t* ksrc = append_key + token * key_stride_n;
-  const scalar_t* vsrc = append_value + token * value_stride_n;
-  for (int idx = threadIdx.x; idx < heads * dk; idx += blockDim.x) {
-    const int h = idx / dk;
-    const int d = idx % dk;
-    const float s = head_scale(desc.k_scale, h, desc.scale_head_stride);
-    const int64_t so = static_cast<int64_t>(h) * key_stride_h + d;
-    const int64_t doff = k_base + static_cast<int64_t>(h) * desc.k_stride_head + d;
-    kc[doff] = cache_store<cache_t, kCodec>(to_f(ksrc[so]), s);
-  }
-  if (vc != nullptr && desc.v_data != nullptr) {
-    for (int idx = threadIdx.x; idx < heads * dv; idx += blockDim.x) {
-      const int h = idx / dv;
-      const int d = idx % dv;
-      const float s = head_scale(desc.v_scale, h, desc.scale_head_stride);
-      const int64_t so = static_cast<int64_t>(h) * value_stride_h + d;
-      const int64_t doff = v_base + static_cast<int64_t>(h) * desc.v_stride_head + d;
-      vc[doff] = cache_store<cache_t, kCodec>(to_f(vsrc[so]), s);
+  const scalar_t* vsrc = append_value != nullptr ? append_value + token * value_stride_n : nullptr;
+
+  // Fast path: a raw 16-byte copy for both components, at most two chunks per lane. Every stride
+  // and base pointer must be 16-byte aligned so the per-token offset stays aligned too.
+  const bool aligned =
+      (reinterpret_cast<uintptr_t>(append_key) & 15u) == 0u &&
+      (reinterpret_cast<uintptr_t>(kc) & 15u) == 0u &&
+      (key_stride_n % VEC) == 0 && (key_stride_h % VEC) == 0 &&
+      (desc.k_stride_page % VEC) == 0 && (desc.k_stride_token % VEC) == 0 &&
+      (desc.k_stride_head % VEC) == 0 &&
+      (!v_live || ((reinterpret_cast<uintptr_t>(append_value) & 15u) == 0u &&
+                   (reinterpret_cast<uintptr_t>(vc) & 15u) == 0u &&
+                   (value_stride_n % VEC) == 0 && (value_stride_h % VEC) == 0 &&
+                   (desc.v_stride_page % VEC) == 0 && (desc.v_stride_token % VEC) == 0 &&
+                   (desc.v_stride_head % VEC) == 0));
+  // Dense heads (NHD with contiguous source rows) make the chunk index itself the row offset, so
+  // the copy needs no integer division and no per-chunk index math: exactly two 16-byte loads and
+  // two stores per lane. vec_k also rejects head_dim_k 0 / head dims that are not a multiple of
+  // the 16-byte chunk, which keep the generic path (it alone can write V when K has no chunks).
+  const bool flat = desc.k_stride_head == dk && key_stride_h == dk &&
+                    (!v_live || (desc.v_stride_head == dv && value_stride_h == dv));
+  const bool store_path = vec_k && flat && aligned && chunks <= tpt * 2;
+
+  // Resolve the CSR page id of the logical page that holds `positions[token]` into the K/V
+  // element bases. Kept separate so the fast path can issue its loads before it runs.
+  const int32_t b = batch_indices[token];
+  const int32_t pos = positions[token];
+  auto resolve = [&](int64_t* k_base, int64_t* v_base) {
+    if (b < 0 || pos < 0 || desc.kv_indptr == nullptr || desc.kv_page_indices == nullptr) return false;
+    const int64_t first = desc.kv_indptr[b];
+    const int64_t last = desc.kv_indptr[b + 1];
+    const int64_t logical = pos / desc.page_size;
+    if (logical < 0 || first + logical >= last) return false;
+    const int32_t page = desc.kv_page_indices[first + logical];
+    if (page < 0) return false;
+    const int64_t off = pos % desc.page_size;
+    *k_base = static_cast<int64_t>(page) * desc.k_stride_page + off * desc.k_stride_token;
+    *v_base = static_cast<int64_t>(page) * desc.v_stride_page + off * desc.v_stride_token;
+    return true;
+  };
+
+  // 1. Fast path: two 16-byte chunks per lane, raw copy, page table resolved last.
+  if (store_path) {
+    uint4 r0, r1;
+    int64_t row_off0 = 0, row_off1 = 0;
+    bool is_v0 = false, is_v1 = false;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int c = slot + tpt * i;
+      if (c >= chunks) continue;
+      const bool is_v = c >= k_chunks;
+      const int64_t row_off = static_cast<int64_t>(c - (is_v ? k_chunks : 0)) * VEC;
+      const uint4 v = *reinterpret_cast<const uint4*>(is_v ? (vsrc + row_off) : (ksrc + row_off));
+      if (i == 0) {
+        r0 = v;
+        row_off0 = row_off;
+        is_v0 = is_v;
+      } else {
+        r1 = v;
+        row_off1 = row_off;
+        is_v1 = is_v;
+      }
     }
+    int64_t k_base = 0, v_base = 0;
+    if (!resolve(&k_base, &v_base)) return;
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      if (slot + tpt * i >= chunks) continue;
+      const bool is_v = i == 0 ? is_v0 : is_v1;
+      cache_t* dst = (is_v ? vc + v_base : kc + k_base) + (i == 0 ? row_off0 : row_off1);
+      *reinterpret_cast<uint4*>(dst) = (i == 0 ? r0 : r1);
+    }
+    return;
+  }
+
+  // 2. Generic path: any codec, scale layout, alignment and head dim.
+  int64_t k_base = 0, v_base = 0;
+  if (!resolve(&k_base, &v_base)) return;
+
+  auto stream = [&](const scalar_t* src, cache_t* dst_cache, int64_t base, int64_t src_head_stride,
+                    int64_t dst_head_stride, int dim, const float* scale_ptr) {
+    const bool vec_ok = (reinterpret_cast<uintptr_t>(src) & 15u) == 0 && src_head_stride % VEC == 0 &&
+                        (reinterpret_cast<uintptr_t>(dst_cache) & 15u) == 0 && dst_head_stride % VEC == 0 &&
+                        base % VEC == 0;
+    if (!vec_ok) {
+      for (int i = slot; i < heads * dim; i += tpt) {
+        const int h = i / dim;
+        const int d = i - h * dim;
+        const float s = head_scale(scale_ptr, h, desc.scale_head_stride);
+        dst_cache[base + static_cast<int64_t>(h) * dst_head_stride + d] =
+            cache_store<cache_t, kCodec>(to_f(src[static_cast<int64_t>(h) * src_head_stride + d]), s);
+      }
+      return;
+    }
+    const int nvec = dim / VEC;
+    const int tail = dim - nvec * VEC;
+    for (int i = slot; i < heads * nvec; i += tpt) {
+      const int h = i / nvec;
+      const int d = (i - h * nvec) * VEC;
+      const float s = head_scale(scale_ptr, h, desc.scale_head_stride);
+      append_vec<scalar_t, cache_t, kCodec, VEC>(dst_cache + base + static_cast<int64_t>(h) * dst_head_stride + d,
+                                                 src + static_cast<int64_t>(h) * src_head_stride + d, s);
+    }
+    if (tail != 0) {
+      for (int i = slot; i < heads * tail; i += tpt) {
+        const int h = i / tail;
+        const int d = nvec * VEC + (i - h * tail);
+        const float s = head_scale(scale_ptr, h, desc.scale_head_stride);
+        dst_cache[base + static_cast<int64_t>(h) * dst_head_stride + d] =
+            cache_store<cache_t, kCodec>(to_f(src[static_cast<int64_t>(h) * src_head_stride + d]), s);
+      }
+    }
+  };
+  stream(ksrc, kc, k_base, key_stride_h, desc.k_stride_head, dk, desc.k_scale);
+  if (vc != nullptr && desc.v_data != nullptr && vsrc != nullptr) {
+    stream(vsrc, vc, v_base, value_stride_h, desc.v_stride_head, dv, desc.v_scale);
   }
   (void)kLayout;
 }
@@ -1616,16 +1798,19 @@ Status launch_reshape_flash(const Tensor& key, const Tensor& value, const PagedK
   const int64_t default_head = hnd ? static_cast<int64_t>(d.page_size) * dk : dk;
   Status s = element_strides<cache_t>(d, default_token, default_page, default_head, &e);
   if (s != Status::kSuccess) return s;
-  const int block = threads_for(static_cast<int64_t>(heads) * dk, 32, 512);
-  const int64_t grid = num_tokens;
-  if (grid > INT32_MAX) return detail::set_error(Status::kCapacityExceeded, "reshape: %lld tokens",
-                                                 static_cast<long long>(grid));
+  // One warp per token, eight tokens per CTA: the kernel works in 16-byte packs, not elements, and a
+  // 512-thread block for 512 elements left 448 threads idle.
+  constexpr int kWarps = 8;
+  const int block = 32 * kWarps;
+  if (num_tokens > INT32_MAX) return detail::set_error(Status::kCapacityExceeded, "reshape: %lld tokens",
+                                                       static_cast<long long>(num_tokens));
+  const int64_t grid = (num_tokens + kWarps - 1) / kWarps;
   reshape_and_cache_flash_kernel<scalar_t, cache_t, kCodec>
       <<<static_cast<int>(grid), block, 0, stream>>>(
           const_ptr<scalar_t>(key), const_ptr<scalar_t>(value), static_cast<cache_t*>(d.k_data),
           static_cast<cache_t*>(d.v_data), const_ptr<int64_t>(slots), e.k_stride_page,
           e.k_stride_token, e.k_stride_head, key.stride[0], value.stride[0], heads, dk, dv,
-          d.page_size, d.k_scale, d.v_scale, d.scale_head_stride);
+          d.page_size, d.k_scale, d.v_scale, d.scale_head_stride, num_tokens);
   const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return launch_error("reshape_and_cache_flash", err);
   return Status::kSuccess;
@@ -1674,9 +1859,22 @@ Status launch_append(const Tensor& key, const Tensor& value, const PagedKVDesc& 
   if (e.v_stride_page == 0) e.v_stride_page = static_cast<int64_t>(heads) * d.page_size * dv;
   if (e.v_stride_token == 0) e.v_stride_token = hnd ? dv : static_cast<int64_t>(heads) * dv;
   if (e.v_stride_head == 0) e.v_stride_head = hnd ? static_cast<int64_t>(d.page_size) * dv : dv;
-  const int block = threads_for(static_cast<int64_t>(heads) * dk, 32, 512);
+  constexpr int kAppendThreads = 256;
+  // Thread mapping must match append_paged_kv_kernel: warps per token from the 16-byte chunk
+  // count of one token (K chunks then V), tokens per CTA from the CTA size.
+  constexpr int kVec = 16 / static_cast<int>(sizeof(scalar_t));
+  const bool v_present = tensor_present(value) && dv > 0;
+  const int k_chunks = (dk > 0 && dk % kVec == 0) ? heads * (dk / kVec) : 0;
+  const int v_chunks = (v_present && dv % kVec == 0) ? heads * (dv / kVec) : 0;
+  const int tpt = append_threads_per_token(k_chunks + v_chunks, kAppendThreads);
+  const int tpc = kAppendThreads / tpt > 0 ? kAppendThreads / tpt : 1;
+  const int64_t grid64 = (nnz + tpc - 1) / tpc;
+  if (grid64 > INT32_MAX) {
+    return detail::set_error(Status::kCapacityExceeded, "append_paged_kv: %lld tokens",
+                             static_cast<long long>(nnz));
+  }
   append_paged_kv_kernel<scalar_t, cache_t, kCodec, kLayout>
-      <<<static_cast<int>(nnz), block, 0, stream>>>(
+      <<<static_cast<int>(grid64), kAppendThreads, 0, stream>>>(
           e, const_ptr<scalar_t>(key), const_ptr<scalar_t>(value),
           const_ptr<int32_t>(batch_indices), const_ptr<int32_t>(positions), key.stride[0],
           key.stride[1], value.stride[0], value.stride[1], static_cast<int>(nnz));
@@ -3393,10 +3591,17 @@ Status copy_batch_async(const BatchCopyDesc& desc, const LaunchContext& ctx) {
         attr_idxs[static_cast<size_t>(i)] = static_cast<size_t>(i);
       }
       size_t fail_idx = 0;
+#if CUDART_VERSION >= 13000   // CUDA 13 dropped the failIdx out-parameter
+      (void)fail_idx;
+      const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                                                   static_cast<size_t>(n), attrs.data(),
+                                                   attr_idxs.data(), static_cast<size_t>(n), stream);
+#else
       const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
                                                    static_cast<size_t>(n), attrs.data(),
                                                    attr_idxs.data(), static_cast<size_t>(n),
                                                    &fail_idx, stream);
+#endif
       if (err == cudaSuccess) continue;
       if (err != cudaErrorCallRequiresNewerDriver && err != cudaErrorNotSupported) {
         return launch_error("copy_batch_async", err);

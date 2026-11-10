@@ -27,6 +27,8 @@ struct MarlinParams {
   const void* zeros;                // AWQ / GPTQ-asym zero points (Marlin layout) or null
   const int32_t* g_idx;             // act-order group index [K] or null
   const int32_t* perm;              // act-order permutation of A columns [K] or null
+  void* a_tmp;                      // [M, K] activations scratch for act-order (ABI 6): A[:, perm] is written
+                                    //   here by marlin_permute_cols_kernel before the GEMM; null without perm
   // MoE extension (null for dense): rows are gathered by sorted_token_ids per expert block.
   const int32_t* sorted_token_ids;  // [num_tokens_post_pad]
   const int32_t* expert_ids;        // [num_blocks]

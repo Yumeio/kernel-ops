@@ -96,6 +96,285 @@ __device__ __forceinline__ void warp_top2(float& b1, float& b2) {
   }
 }
 
+/// Order-preserving u32 image of an fp32 value: unsigned comparison of the image
+/// is float comparison of the value (-inf < ... < +inf, NaN excluded by the
+/// caller), so a warp-wide integer max is a warp-wide score max. kZerosEqual maps
+/// -0.0 onto +0.0: the generic body compares scores with `==`, where the two zeros
+/// are equal and the lower expert id wins, so the image must not separate them.
+template <bool kZerosEqual>
+__device__ __forceinline__ unsigned order_key(float v) {
+  const unsigned u = __float_as_uint(v);
+  unsigned k = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+  if constexpr (kZerosEqual) k = (k == 0x7FFFFFFFu) ? 0x80000000u : k;
+  return k;
+}
+
+/// Warp max/min of one u32, one instruction on sm_80+ (redux.sync).
+__device__ __forceinline__ unsigned warp_max_u32(unsigned v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  unsigned r;
+  asm("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(v));
+  return r;
+#else
+  for (int off = 16; off > 0; off >>= 1) {
+    v = max(v, __shfl_xor_sync(0xFFFFFFFFu, v, off));
+  }
+  return v;
+#endif
+}
+
+__device__ __forceinline__ unsigned warp_min_u32(unsigned v) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  unsigned r;
+  asm("redux.sync.min.u32 %0, %1, 0xffffffff;" : "=r"(r) : "r"(v));
+  return r;
+#else
+  for (int off = 16; off > 0; off >>= 1) {
+    v = min(v, __shfl_xor_sync(0xFFFFFFFFu, v, off));
+  }
+  return v;
+#endif
+}
+
+/// Score recipe as a compile-time constant (kScore is a kernel template
+/// parameter), identical formulas to score_of().
+template <RouterScore kScore>
+__device__ __forceinline__ float score_fixed(float x) {
+  if constexpr (kScore == RouterScore::kSigmoid) {
+    return sigmoid(x);
+  } else if constexpr (kScore == RouterScore::kSqrtSoftplus) {
+    return sqrtf(softplus(x));
+  } else {
+    return x;
+  }
+}
+
+/// Preconditions of route_row_e256: E == 256 fp32 logits, k <= 8, and 16 B
+/// alignment of the row vector loads. Warp-uniform, so every lane agrees.
+__device__ __forceinline__ bool route_e256_ok(const RouterParams& p) {
+  return p.num_experts == 256 && p.topk <= 8 && (p.logits_stride & 3) == 0 &&
+         (reinterpret_cast<uintptr_t>(p.logits) & 15u) == 0u &&
+         (p.correction_bias == nullptr ||
+          (reinterpret_cast<uintptr_t>(p.correction_bias) & 15u) == 0u);
+}
+
+/// Specialized body for E == 256 fp32 logits and topk <= 8: two float4 vectors
+/// per lane (experts 4*lane..+3 and 128+4*lane..+3, i.e. two 128 B transactions
+/// per warp) instead of eight strided scalar loads. The eight candidates live in
+/// registers as (score, 255 - expert) 64-bit keys sorted once by a bitonic
+/// network, so each rank costs one warp max plus one warp min (both redux.sync)
+/// and the removal is a register shift. Semantics match route_row exactly:
+/// NaN -> -inf, softcap, correction bias for selection only, group-limited
+/// routing, stable "lower expert id wins" tie-break, weight from the unbiased
+/// score, softmax-after-top-k, renormalize, EPLB mapping and fused shared
+/// experts. kSoftmax normalizes over all E with a warp reduction whose
+/// association order is part of the fused-router bit-equality contract, so that
+/// recipe stays on route_row.
+template <RouterScore kScore, bool kGrouped>
+__device__ __forceinline__ void route_row_e256(const RouterParams& p, const float* row, int token,
+                                               int32_t* ids_out, float* weights_out) {
+  const int lane = threadIdx.x & 31;
+  const int K = p.topk;
+  const int E = 256;
+  const int e0 = 4 * lane;
+
+  const float4 xa = *reinterpret_cast<const float4*>(row + e0);
+  const float4 xb = *reinterpret_cast<const float4*>(row + 128 + e0);
+  float xv[8] = {xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w};
+  const float cap = p.logit_softcap;
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    xv[j] = (xv[j] == xv[j]) ? xv[j] : -INFINITY;  // NaN -> -inf
+  }
+  if (cap > 0.0f) {
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) xv[j] = softcap(xv[j], cap);
+  }
+
+  float wv[8];  // unbiased weight source
+  float sv[8];  // selection score (bias applied)
+  if (p.correction_bias != nullptr) {
+    const float4 ba = *reinterpret_cast<const float4*>(p.correction_bias + e0);
+    const float4 bb = *reinterpret_cast<const float4*>(p.correction_bias + 128 + e0);
+    const float bv[8] = {ba.x, ba.y, ba.z, ba.w, bb.x, bb.y, bb.z, bb.w};
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      wv[j] = score_fixed<kScore>(xv[j]);
+      sv[j] = wv[j] + bv[j];
+    }
+  } else {
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      wv[j] = score_fixed<kScore>(xv[j]);
+      sv[j] = wv[j];
+    }
+  }
+
+  // Group-limited routing: keep topk_groups groups by group score; the survivors
+  // are applied once, as -inf masks, so the rank loop needs no group test.
+  if constexpr (kGrouped) {
+    const int G = p.num_expert_groups;
+    const int keep = p.topk_groups < G ? p.topk_groups : G;
+    if (keep < G) {
+      float gscore[kMaxGroups];
+      for (int g = 0; g < G; ++g) {
+        float b1 = -INFINITY, b2 = -INFINITY;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int e = e0 + (j < 4 ? j : 124 + j);
+          const int eg = (e * G) / E;
+          if (eg != g) continue;
+          const float v = sv[j];
+          if (v > b1) {
+            b2 = b1;
+            b1 = v;
+          } else if (v > b2) {
+            b2 = v;
+          }
+        }
+        warp_top2(b1, b2);
+        gscore[g] = (p.group_score == GroupScore::kMax) ? b1 : (b1 + b2);
+      }
+      uint32_t kept = 0;
+      for (int r = 0; r < keep; ++r) {
+        float best = -INFINITY;
+        int bg = INT32_MAX;
+        for (int g = 0; g < G; ++g) {
+          if (kept & (1u << g)) continue;
+          if (gscore[g] > best || (gscore[g] == best && g < bg)) {
+            best = gscore[g];
+            bg = g;
+          }
+        }
+        kept |= (1u << bg);
+      }
+      #pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int e = e0 + (j < 4 ? j : 124 + j);
+        if ((kept & (1u << ((e * G) / E))) == 0u) sv[j] = -INFINITY;
+      }
+    }
+  }
+
+  // (score, 255 - expert) descending: a larger key is a better expert, and equal
+  // scores order by lower expert id, so the key carries the stable tie-break. Only
+  // raw-logit recipes can produce -0.0, which the generic body treats as +0.0.
+  constexpr bool kZerosEqual =
+      kScore == RouterScore::kNone || kScore == RouterScore::kSoftmaxAfterTopK;
+  unsigned long long key[8];
+  #pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const int e = e0 + (j < 4 ? j : 124 + j);
+    key[j] = (static_cast<unsigned long long>(order_key<kZerosEqual>(sv[j])) << 32) |
+             static_cast<unsigned>(255 - e);
+  }
+  // Batcher odd-even merge network for eight keys: 19 compare-exchanges, fully
+  // in registers, no local memory.
+  const auto ce = [&key](int a, int b) {
+    const unsigned long long ka = key[a];
+    const unsigned long long kb = key[b];
+    const bool sw = ka < kb;
+    key[a] = sw ? kb : ka;
+    key[b] = sw ? ka : kb;
+  };
+  ce(0, 1); ce(2, 3); ce(4, 5); ce(6, 7);
+  ce(0, 2); ce(1, 3); ce(4, 6); ce(5, 7);
+  ce(0, 4); ce(1, 5); ce(2, 6); ce(3, 7);
+  ce(2, 4); ce(3, 5);
+  ce(1, 2); ce(3, 4); ce(5, 6);
+  ce(2, 3); ce(4, 5);
+
+  float sel[8] = {};
+  int sel_id[8] = {};
+  #pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    if (r >= K) break;
+    const unsigned head_key = static_cast<unsigned>(key[0] >> 32);
+    const int head_id = 255 - static_cast<int>(key[0] & 0xFFu);
+    const unsigned gkey = warp_max_u32(head_key);
+    // Lowest expert id among the lanes holding the winning score.
+    const int gid = static_cast<int>(warp_min_u32(
+        head_key == gkey ? static_cast<unsigned>(head_id) : 0x7FFFFFFFu));
+    const int rel = gid & 127;
+    const int owner = rel >> 2;
+    const int q = (gid & 128) ? 4 + (rel & 3) : (rel & 3);
+    float wsel = wv[0];
+    #pragma unroll
+    for (int j = 1; j < 8; ++j) wsel = (j == q) ? wv[j] : wsel;
+    sel[r] = __shfl_sync(0xFFFFFFFFu, wsel, owner);
+    sel_id[r] = gid;
+    if (head_id == gid) {  // this lane owns the winner: drop it
+      #pragma unroll
+      for (int j = 0; j < 7; ++j) key[j] = key[j + 1];
+      key[7] = 0ull;
+    }
+  }
+
+  if constexpr (kScore == RouterScore::kSoftmaxAfterTopK) {
+    float m = -INFINITY;
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      if (r < K) m = fmaxf(m, sel[r]);
+    }
+    float sum = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      if (r < K) {
+        sel[r] = m == -INFINITY ? 0.0f : __expf(sel[r] - m);
+        sum += sel[r];
+      }
+    }
+    const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      if (r < K) sel[r] *= inv;
+    }
+  }
+  if (p.renormalize) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int r = 0; r < 8; ++r) {
+      if (r < K) sum += sel[r];
+    }
+    if (sum > 0.0f) {
+      const float inv = 1.0f / sum;
+      #pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        if (r < K) sel[r] *= inv;
+      }
+    }
+  }
+
+  // One rank per lane: rank r is written by lane r.
+  if (lane < K) {
+    const int r = lane;
+    const float w = (r == 0) ? sel[0] : (r == 1) ? sel[1] : (r == 2) ? sel[2] : (r == 3) ? sel[3]
+                    : (r == 4) ? sel[4] : (r == 5) ? sel[5] : (r == 6) ? sel[6] : sel[7];
+    int id = (r == 0) ? sel_id[0] : (r == 1) ? sel_id[1] : (r == 2) ? sel_id[2] : (r == 3) ? sel_id[3]
+                  : (r == 4) ? sel_id[4] : (r == 5) ? sel_id[5] : (r == 6) ? sel_id[6] : sel_id[7];
+    const int logical = id;
+    if (p.logical_to_physical != nullptr && id >= 0 && id < E) {
+      const int count = p.replica_count != nullptr ? p.replica_count[id] : 0;
+      if (count > 0 && p.max_replicas > 0) {
+        const int replica = token % count;
+        const int mapped = p.logical_to_physical[id * p.max_replicas + replica];
+        if (mapped >= 0) id = mapped;
+      }
+    }
+    weights_out[r] = w * p.routed_scaling_factor;
+    ids_out[r] = id;
+    if (p.expert_load != nullptr && logical >= 0 && logical < E) {
+      atomicAdd(&p.expert_load[logical], 1);
+    }
+  }
+  if (lane == 0) {
+    for (int s = 0; s < p.num_fused_shared; ++s) {
+      weights_out[K + s] = p.shared_weight;
+      ids_out[K + s] = E + s;
+    }
+  }
+}
+
 /// Full routing body for one token. `row` points at the fp32 or 16-bit logits of
 /// the token (stride in elements), `score` is a RouterScore value.
 template <typename logits_t, int MAXV>
@@ -351,9 +630,17 @@ __global__ void moe_topk_kernel(const __grid_constant__ RouterParams params) {
                     static_cast<int64_t>(token) * params.logits_stride;
   const int out_k = params.topk + params.num_fused_shared;
   constexpr int kMaxV = (NUM_EXPERTS > 0 && NUM_EXPERTS <= 256) ? 8 : 32;
-  route_row<logits_t, kMaxV>(params, row, 1, token, static_cast<int>(kScore),
-                             params.topk_ids + static_cast<int64_t>(token) * out_k,
-                             params.topk_weights + static_cast<int64_t>(token) * out_k);
+  int32_t* ids = params.topk_ids + static_cast<int64_t>(token) * out_k;
+  float* weights = params.topk_weights + static_cast<int64_t>(token) * out_k;
+  if constexpr (std::is_same<logits_t, float>::value && NUM_EXPERTS == 256 &&
+                kScore != RouterScore::kSoftmax) {
+    if (route_e256_ok(params)) {
+      route_row_e256<kScore, false>(params, reinterpret_cast<const float*>(row), token, ids,
+                                    weights);
+      return;
+    }
+  }
+  route_row<logits_t, kMaxV>(params, row, 1, token, static_cast<int>(kScore), ids, weights);
 }
 
 template <typename logits_t, RouterScore kScore, int NUM_EXPERTS, int NUM_GROUPS, int MAX_TOPK>
@@ -365,9 +652,16 @@ __global__ void moe_grouped_topk_kernel(const __grid_constant__ RouterParams par
                     static_cast<int64_t>(token) * params.logits_stride;
   const int out_k = params.topk + params.num_fused_shared;
   constexpr int kMaxV = (NUM_EXPERTS > 0 && NUM_EXPERTS <= 256) ? 8 : 32;
-  route_row<logits_t, kMaxV>(params, row, 1, token, static_cast<int>(kScore),
-                             params.topk_ids + static_cast<int64_t>(token) * out_k,
-                             params.topk_weights + static_cast<int64_t>(token) * out_k);
+  int32_t* ids = params.topk_ids + static_cast<int64_t>(token) * out_k;
+  float* weights = params.topk_weights + static_cast<int64_t>(token) * out_k;
+  if constexpr (std::is_same<logits_t, float>::value && NUM_EXPERTS == 256 &&
+                kScore != RouterScore::kSoftmax) {
+    if (route_e256_ok(params)) {
+      route_row_e256<kScore, true>(params, reinterpret_cast<const float*>(row), token, ids, weights);
+      return;
+    }
+  }
+  route_row<logits_t, kMaxV>(params, row, 1, token, static_cast<int>(kScore), ids, weights);
 }
 
 // ---------------------------------------------------------------------------

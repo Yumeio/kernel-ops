@@ -1,6 +1,6 @@
 # ayaka-kernel — ROADMAP triển khai (từ dễ đến khó, theo phụ thuộc)
 
-Cập nhật 2026-11-02. Roadmap này liệt kê 233 `__global__` kernel trong 18 bước và 125 nhịp. Checkout này hiện có **125 kernel có thân**: toàn bộ B0 (2/2), B1 (32/32), B2 (20/20), B3 (21/21), B4 (18/18), B5 (16/16) và B6 (15/15), cùng nhịp đầu của B7 (1/16: `gemm_mma_sync_kernel`); 108 kernel còn lại là contract trong header, chưa có định nghĩa. Repo là `ayaka-kernel`; namespace C++ và tiền tố ABI là `kops` (không phải `ayaka`).
+Cập nhật 2026-11-10. Roadmap này liệt kê 236 `__global__` kernel trong 18 bước. Checkout này hiện có **174 kernel có thân** trong B0–B10: toàn bộ B0 (2/2), B1 (32/32), B2 (20/20), B3 (21/21), B4 (18/18), B5 (16/16), B6 (18/18), B7 (16/16), B8 (7/7), B9 (20/20) và B10 (4/4); 62 kernel còn lại của B11–B17 là contract trong header, chưa có định nghĩa. Repo là `ayaka-kernel`; namespace C++ và tiền tố ABI là `kops` (không phải `ayaka`).
 
 **Chiến lược 2026-10-31, đọc §0.7 và §3 trước.** Roadmap được xây đủ **chỉ với một RTX 3050 Laptop (SM86, 4 GB)**, không thuê GPU, và **không dùng PyTorch, torch binding, CUTLASS/CuTe hay provider adapter**. API duy nhất là `csrc/<family>/ops.h` (`kops::Status` + `Tensor`/`LaunchContext`/`Workspace`); thân kernel và launcher viết ngay trong `csrc/<family>/<stem>.cu`; test và benchmark là C++/ctest. FlashMLA, DeepGEMM, vLLM, SGLang, hpc-ops và attention.rs trong `3rd/` chỉ là **nguồn đọc** (thuật toán, layout, edge case), không được link hay build. §2 nói mỗi ô đạt tới đâu khi chỉ có SM86; §3 nói thứ tự P0–P8 và kỹ thuật K1–K7 (K1/K2/K6 deferred vì cần PyTorch).
 
@@ -9,7 +9,7 @@ Cập nhật 2026-11-02. Roadmap này liệt kê 233 `__global__` kernel trong 1
 - `tools/check_roadmap.py` (đã có; mở rộng theo §1.6) kiểm tra quy tắc trên mỗi khi bảng kernel hoặc file nguồn thay đổi.
 - **Cột Reference** trong mọi bảng kernel trỏ tới code tương tự trong vLLM, SGLang, hpc-ops, attention.rs, FlashMLA và DeepGEMM để đối chiếu khi viết kernel (§0.6).
 - **Nhịp và ngân sách file (§1).** Đơn vị công việc là một hàng của bảng kernel, gọi là *nhịp*, và mọi nhịp theo cùng một vòng năm việc. Số file mới tăng theo family, theo nhóm kernel (một file `.cu`) và theo ô arch (một ô của lưới family × arch), không tăng theo kernel; trần nằm ở Phụ lục E.
-- **Hiện trạng (2026-11-02).** 132/233 kernel có thân: B0 đủ 2/2, B1 đủ 32/32, B2 đủ 20/20, B3 đủ 21/21, B4 đủ 18/18, B5 đủ 16/16, B6 đủ 15/15, B7 1/16, B8 đủ 7/7 (`csrc/attention/{prefill,decode}.cu`, xem "Hiện trạng" của B8). Các file `csrc/{model_ops,norm,activation,position,embedding,sampling,attention,kvcache,state,quantization}/*.cu` có launcher, test C++ (`test_m1`, `test_model_ops`, `test_norm`, `test_activation`, `test_position`, `test_embedding`, `test_sampling`, `test_merge`, `test_kvcache`, `test_state`, `test_quantization`, `test_gemm`, `test_moe`) và benchmark C++ (`bench_model_ops`, `bench_norm`, `bench_activation`, `bench_position`, `bench_embedding`, `bench_sampling`, `bench_merge`, `bench_chains`, `bench_kvcache`, `bench_state`, `bench_quantization`, `bench_gemm`, `bench_moe`). `KOPS_ABI_VERSION` là 5 do bốn host entry B6 (`route_fused`, `moe_sum`, `latent_combine_norm`, `gumbel_max_sample`) được thêm; layout struct không đổi. `tools/check_roadmap.py` đang pass với 233 kernel được gán đúng một bước.
+- **Hiện trạng (2026-11-10).** 174/236 kernel có thân: B0 đủ 2/2, B1 đủ 32/32, B2 đủ 20/20, B3 đủ 21/21, B4 đủ 18/18, B5 đủ 16/16, B6 đủ 18/18, B7 đủ 16/16, B8 đủ 7/7 (`csrc/attention/{prefill,decode}.cu`, xem "Hiện trạng" của B8), B9 đủ 20/20, B10 đủ 4/4 (`csrc/sampling/speculative.cu`, `csrc/state/state_cache.cu`). Các file `csrc/{model_ops,norm,activation,position,embedding,sampling,attention,kvcache,state,quantization}/*.cu` có launcher, test C++ (`test_m1`, `test_model_ops`, `test_norm`, `test_activation`, `test_position`, `test_embedding`, `test_sampling`, `test_merge`, `test_kvcache`, `test_state`, `test_quantization`, `test_gemm`, `test_moe`) và benchmark C++ (`bench_model_ops`, `bench_norm`, `bench_activation`, `bench_position`, `bench_embedding`, `bench_sampling`, `bench_merge`, `bench_chains`, `bench_kvcache`, `bench_state`, `bench_quantization`, `bench_gemm`, `bench_moe`). `KOPS_ABI_VERSION` là 6 (chưa phát hành): B6 thêm bốn host entry (`route_fused`, `moe_sum`, `latent_combine_norm`, `gumbel_max_sample`), B7 thêm `launch_gemm_mma_sync`, `marlin_moe_gemm`, `moe::moe_gemm`, `MmaGemmParams`/`MmaRowMap`, `MarlinParams::a_tmp` và đổi tham số `gemm_mma_sync_kernel`/`gguf_moe_mmq_kernel`, B8 đổi mask thành trường runtime. Registry đã có hàng SM89 cho B0–B9; B7 mới có 3 hàng (`gemm_mma_sync`, `dual`, `bmm`) nên các nhịp 3–10 còn chờ evidence. `tools/check_roadmap.py` đang pass với 236 kernel được gán đúng một bước.
 - **Phần cứng (§2).** Máy dev chỉ có một GPU SM86 (RTX 3050 Laptop, 4 GB VRAM), chạy WSL2 với CUDA 12.9, nên compile được cả 8 exact SM. Kernel nhắm SM khác (SM80, SM89, SM90a, SM100a/103a/120a/121a), nhiều GPU hoặc VRAM lớn vẫn được viết đủ theo vòng năm việc, sau khi đọc code đã chạy thật trong sáu project reference. Chúng không chạy được ở máy dev: ô (kernel, SM) đó dừng ở `authored`/`compiled` kèm evidence twin và SASS (§2.2 mục 6, §3.2). Bộ test C++ viết sẵn thành gói bàn giao cho bất kỳ ai có đúng phần cứng (§2.5, Phụ lục B). Không thêm file: test nằm trong `tests/unit/test_<family>.cc`, benchmark trong `benchmark/bench_<family>.cc`, evidence nằm trong registry.
 
 Bước được đặt tên `B0…B17`, mốc model là `Mốc 1…10`. Cách đặt tên này tránh trùng với nhãn ưu tiên P0/P1/P2 của proposal và với mã catalog (A01, M01, …). Bước mở nhiều việc cùng lúc được chia thành đợt, đặt tên `B0.1…B0.2` và `B1.1…B1.3` (§1.4).
@@ -540,11 +540,11 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B3 | 21 / 21 | 0 |
 | B4 | 18 / 18 | 0 |
 | B5 | 16 / 16 | 0 |
-| B6 | 15 / 15 | 0 |
-| B7 | 1 / 16 | 15 |
+| B6 | 18 / 18 | 0 |
+| B7 | 16 / 16 | 0 |
 | B8 | 7 / 7 | 0 |
 | B9 | 20 / 20 | 0 |
-| B10 | 0 / 4 | 4 |
+| B10 | 4 / 4 | 0 |
 | B11 | 0 / 12 | 12 |
 | B12 | 0 / 11 | 11 |
 | B13 | 0 / 12 | 12 |
@@ -552,9 +552,9 @@ Mục tiêu của chiến lược: mọi kernel trong bảng có thân, launcher
 | B15 | 0 / 8 | 8 |
 | B16 | 0 / 6 | 6 |
 | B17 | 0 / 5 | 5 |
-| **Tổng** | **152 / 233** | **81** |
+| **Tổng** | **174 / 236** | **62** |
 
-B0, B1, B2, B3, B4, B5, B6, B8 và B9 đã đủ thân; B7 có nhịp 1. Các launcher còn lại của B7 và B10+ vẫn trả `kNotImplemented`; 233 kernel / 125 nhịp / 112 file không đổi. B0–B4 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
+B0–B10 đã đủ thân; B7 đủ 16/16. Các launcher của B11–B17 vẫn trả `kNotImplemented`; 236 kernel, 62 kernel còn là contract. B0–B4 có test C++ và benchmark C++; chain suite `bench_chains` (gồm `chain_pre_norm_quant` và `chain_glu_quant`) đạt geometric mean **5.75x** so với PyTorch eager (HF-style) trên SM86 cho các chain B1, với mọi chain ≥4.29x; hai chain B3 đạt **5.96x**, và `bench_quantization` đạt **4.75x** qua 13 case so với PyTorch 2.14.1+cu126. Report chi tiết nằm trong `out/b1/report.md` và `out/b3/` (không commit).
 
 Không còn "nợ hiệu năng" hay report cũ trong checkout này: mọi số đo sẽ được sinh lại bằng benchmark C++ khi kernel tương ứng có thân.
 
@@ -1162,7 +1162,7 @@ Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn ch�
 
 **Nhịp.** 10 nhịp · 16 kernel · không mở gì, chỉ thêm vào file có sẵn · file mới: 3 (`gemm_mma.cu`, `marlin_dense.cu`, `marlin_moe.cu`). Đích của cả 10 nhịp là các `.cu` của `gemm` (mở ở B4, B5) và của `moe` (B5). Đây là chỗ ngưỡng tách file (§1.5) dễ bị chạm nhất.
 
-**Hiện trạng (2026-11-02).** 1/16 kernel có thân: nhịp 1, `gemm_mma_sync_kernel` (bf16/fp16, `csrc/gemm/gemm_mma.cu`), kèm khung dùng chung: `GemmTactic` (6 tile, `swap_ab`, split-K Serial/Parallel), `get_tactics`, `autotune`, tactic cache (lookup/save/load), 15 trong 17 `EpilogueOp` trên đường `mma.sync` (`kEpiQuantOut` và `kEpiAzpCorrection` còn `kNotImplemented`; hai op mới `kEpiRowSumSq`, `kEpiKvAppend` thêm ở ABI 6, ngữ nghĩa ở CONTRACTS §1d). Chưa có: `kTF32`, toán hạng MN-major, stream-K, 15 kernel của các nhịp 2–10. Đo trên RTX 3050 Laptop (SM86): 12,4 TFLOP/s ở M = 1024–4096 (K = N = 4096), bằng 0,86× cuBLAS qua PyTorch (14,5 TFLOP/s); M = 64 đạt 1,07×, M = 256 đạt 0,96–1,02×, M = 32 đạt 0,91×. Chưa đạt mốc ≥ 90% ở M ≥ 1024. Test: `test_mma_*` trong `tests/unit/test_gemm.cc`; benchmark: `gemm.mma_*` trong `bench_gemm`.
+**Hiện trạng (2026-11-10).** 16/16 kernel có thân. Tám kernel có `__global__` riêng (`gemm_mma_sync_kernel`, `dual_gemm_kernel`, `bmm_kernel`, `w4a8_int_gemm_kernel`, `marlin_gemm_kernel`, `grouped_gemm_task_map_kernel`, `gguf_mmq_kernel`, `gguf_moe_mmq_kernel`); tám hàng còn lại (`fp8_gemm_mma_sync_kernel`, `fp8_bmm_kernel`, `fp8_block_gemm_small_m_kernel`, `int8_gemm_mma_sync_kernel`, `grouped_gemm_mma_sync_kernel`, `fused_moe_gemm_kernel`, `lora_shrink_kernel`, `lora_expand_kernel`) chạy qua thân dùng chung `gemm_mma_sync_kernel` / `launch_gemm_mma_sync`, đúng quy ước "Biến thể thân kernel" (§1.6). Khung dùng chung (`csrc/gemm/gemm_mma.cu`): 6 tile, `swap_ab`, split-K Serial/Parallel, raster, `get_tactics`, `autotune`, tactic cache (lookup/save/load), **17/17 `EpilogueOp`** (gồm `kEpiQuantOut` static per-tensor và per-group, `kEpiAzpCorrection`; `kEpiRowSumSq` / `kEpiKvAppend` ở ABI 6) và `kTF32` (`m16n8k8`, cần `ctx.allow_tf32`). Nhịp 2–10: `dual_gemm`/`bmm`; FP8 e4m3 tensorwise/rowwise/1×128×128×128 + UE8M0, `fp8_bmm`, swap tile M ≤ 64; INT8 + QServe W4A8; Marlin dense + MoE (U4/U4B8/U8B128/FE4M3/FE2M1, `marlin_dense.cu`, `marlin_moe.cu`); grouped `kContiguous`/`kContiguousRowIndex`/`kMasked`/`kIndexed` + task map; fused MoE sorted-block 16–256; LoRA SGMV shrink/expand; GGUF mmq dense + MoE. Test: `test_mma_*`, `test_dual*`, `test_bmm*` và `test_b7_*` trong `tests/unit/test_gemm.cc`, `test_b7_moe_gemm` trong `tests/unit/test_moe.cc` — **pass toàn bộ trên SM89** (FP8 so oracle fp64 với ngưỡng `1 ulp + 2^-11·sum|p|`; `ctest` toàn bộ 13/13 trên SM89). Đo trên RTX 4090 (SM89, 128 SM): bf16 mma 154,5 TFLOP/s ở M = 4096 (0,91× cuBLAS), 142,2 ở M = 1024, 74,2 ở M = 256, 25,3 ở M = 64 (tuned); dual 140,5, bmm MLA 42,8–60,4; FP8 mma 279,7 / 236,3 / 121,9 TFLOP/s ở M = 4096 / 1024 / 256; INT8 341,5 TOPS, W4A8 250,4, GGUF mmq q8_0 141,0 TFLOP/s; LoRA SGMV 0,130–0,133 ms cho T = 512, rank 16/64. **Còn mở:** stream-K (mới có enum), toán hạng MN-major, `kEpiQuantOut` per-token (amax vắt qua CTA), Marlin MoE act-order, GGUF IQ*; hiệu năng M ≤ 256 còn 0,47–0,65× cuBLAS; registry có 3 hàng B7 (`gemm_mma_sync`, `dual`, `bmm`; arch 860/890) nên cần bổ sung hàng cho các nhịp 3–10.
 
 **Phần cứng.** Máy dev chạy được `mma.sync` m16n8k16 BF16/FP16 và s8 (SM80+) cho `gemm_mma_sync_kernel`, `dual_gemm_kernel`, `bmm_kernel`, `int8_gemm_mma_sync_kernel`, `w4a8_int_gemm_kernel`, `marlin_gemm_kernel`, các `grouped_gemm_*` và `fused_moe_gemm_kernel` ở BF16/INT8, `lora_*`, `gguf_mmq_*`. **Viết sẵn, không chạy ở dev:** mọi đường FP8 `mma.sync` e4m3 (`fp8_gemm_mma_sync_kernel`, `fp8_bmm_kernel`, `fp8_block_gemm_small_m_kernel`, nhánh FP8 của `grouped_gemm_mma_sync_kernel` và `fused_moe_gemm_kernel`) cần SM89 hoặc SM120a: handoff kit `sm89` trước, rồi `sm120a`; `fp8_block_gemm_small_m_kernel` còn chạy một lần ở `sm90a`. Tactic cache khóa theo SM nên tactic SM86 không dùng cho SM khác; mục tiêu benchmark là roofline và self-baseline, so cuBLASLt/vLLM là tuỳ chọn.
 
@@ -1338,9 +1338,21 @@ Ba case dưới 3x (GEMV dense bf16 hai shape và `gemv_argmax`) không còn ch�
 
 **Phần cứng.** Máy dev chạy các kiểm định thống kê và tree verify. "Acceptance length trên draft thật" cần checkpoint target và draft: lô có VRAM đủ.
 
-**Hiện trạng (2026-10-31).** 0/4 kernel có thân. Toàn bộ là declaration trong `csrc/sampling/speculative_kernels.cuh` và `csrc/state/state_cache_kernels.cuh`; chưa có test, benchmark hay registry.
-có ô SM86 `benchmarked` (diagnostic) và các SM khác `compiled` (chưa chạy). Còn mở: chạy exact SM khác, acceptance
-length trên draft thật (MTP/EAGLE checkpoint) và commit sạch.
+**Hiện trạng (2026-11-10).** 4/4 kernel có thân: `rejection_sample_kernel`, `tree_verify_kernel`,
+`build_tree_attention_mask_kernel` trong `csrc/sampling/speculative.cu`; `state_commit_accepted_kernel` trong
+`csrc/state/state_cache.cu`. Test C++ nằm trong `tests/unit/test_sampling.cc` và `test_state.cc`; benchmark trong
+`benchmark/bench_sampling.cu` và `bench_state.cu`; registry có dòng `S03.*`/`L03.state_commit_accepted` cho SM89
+(bằng chứng chạy thật) và SM86 (compile-only). Đã kiểm: χ² ≥ 10^6 mẫu cho chain/tree target-only và p/q, greedy
+chain/tree khớp argmax, mask bit-exact, commit byte-exact, hybrid conv state == sequential, và acceptance-length
+tổng hợp khớp lý thuyết (1,4876 so với 1,4950). Đo lạnh L2 (flush 256 MB), RTX 4090 SM89: geometric mean
+**13,02×** so với PyTorch eager trên 9 case (mọi case ≥ 3,11×), `state_commit` **267,6×**. Baseline ngoài:
+kops nhanh hơn SGLang tree target-only **1,70×**; hpc-ops chỉ có sampler nên ở bước bonus một-lượt kops **0,93×**
+(parity băng thông, không phải verifier). **Method benchmark (vLLM 0.32, dev-only):** EAGLE-3 trên Qwen3.5-9B
+1,98× (accept length 4,25), EAGLE-3 trên Qwen3-8B 1,55× (1,875), draft-model 1,36× (4,375), ngram trên Qwen3-8B
+1,72× (1,875), MTP built-in trên Qwen3.5-9B 1,46× (2,00), EAGLE-2 trên Llama-3.1-8B 1,33× (2,625), EAGLE-3 trên
+Llama-3.1-8B 1,70× (2,00); verifier tái tạo đúng accepted tokens 8/8 trace cho mọi method. vLLM 0.32 từ chối head
+`LlamaForCausalLMEagle` trên target Qwen3 nên EAGLE-2 được đo trên target Llama. Còn mở: commit sạch để nâng
+registry lên `benchmarked`.
 
 | File | Kernel | Độ khó | Điểm cần chú ý | Reference |
 |---|---|---|---|---|
@@ -1361,6 +1373,20 @@ length trên draft thật (MTP/EAGLE checkpoint) và commit sạch.
 - EAGLE / EAGLE-3 cho Llama, Qwen.
 - n-gram, draft model.
 - Speculative cho Qwen3-Next và Kimi Linear (state commit).
+
+**Repo gate (2026-11-10, SM89).** `tests/unit/test_sampling.cc` chạy χ² ≥ 10^6 mẫu cho chain target-only,
+chain p/q, tree target-only và tree p/q; greedy chain/tree khớp argmax; `test_spec_tree_mask` bit-exact với
+oracle host; `tests/unit/test_state.cc` phủ commit byte-exact và hybrid `causal_conv1d_update` + commit bằng
+chạy tuần tự. `test_spec_acceptance_length` đo 1,4876 so với lý thuyết 1,4950 cho chain p/q K=8. Model-level
+(MTP/EAGLE checkpoint) vẫn deferred: repo không có engine/checkpoint; khi có checkpoint, dùng cùng harness
+C++ trong handoff kit. Gate này không thay Mốc model-level.
+
+**Model-level benchmark (dev-only, vLLM 0.32, 2026-11-10).** Qwen3.5-9B: EAGLE-3 1,98× (accept length 4,25),
+MTP built-in 1,46× (2,00), ngram 0,90× (1,875); Qwen3-8B: EAGLE-3 1,55× (1,875), draft-model 1,36× (4,375),
+ngram 1,72× (1,875); Llama-3.1-8B: EAGLE-2 1,33× (2,625), EAGLE-3 1,70× (2,00). Trace của GPU rejection
+sampler được replay qua `rejection_sample` của repo: accepted drafts và token khớp engine 8/8 trace cho mọi
+method. vLLM 0.32 không nhận head `LlamaForCausalLMEagle` trên target Qwen3, nên EAGLE-2 được đo trên target
+Llama-3.1-8B.
 
 ---
 

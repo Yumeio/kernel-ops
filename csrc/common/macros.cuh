@@ -44,6 +44,9 @@
 //     are declared before ScaledGemmArgs.
 //     sample::SamplingPlan, sample::FusedSamplingParams and the sample_fused / sampling_plan /
 //     sampling_fused_workspace_requirements entry points (C++ only, no C mirror).
+//     B7: gemm::MmaRowMap / MmaGemmParams, MarlinParams::a_tmp, and the gemm_mma_sync_kernel /
+//     gguf_moe_mmq_kernel parameter contracts; B8: runtime mask mode in the prefill parameter blocks.
+//     ABI 6 is not released yet, so these share the version instead of opening a v7 line.
 #define KOPS_ABI_VERSION 6
 
 // =============================================================================

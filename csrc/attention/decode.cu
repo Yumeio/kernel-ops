@@ -3,7 +3,9 @@
 // B8 rows 3-5: paged decode on SM80-class GPUs (fallback on SM90a/SM100a).
 //   paged_decode_kernel          A03 CUDA-core decode, any page size, FP8 K/V, split-KV
 //   paged_decode_tc_kernel       A03/A06 tensor-core decode: the G * q_len rows of a kv head are
-//                                the M of mma.sync (GQA packing, MTP / EAGLE verification)
+//                                the M of mma.sync (GQA packing, MTP / EAGLE verification); two
+//                                warps and two cp.async stages per CTA at D = 128, so two CTAs
+//                                (two independent KV streams) are resident per SM
 //   assign_decode_tasks_kernel   A05 device planner: KV split into uniform tasks inside the graph
 //   paged_decode_dynamic_kernel  A05 persistent decode over the DecodeTask list
 // Host entries (ops.h): decode_plan, decode_run.  Split partials are combined by
@@ -452,17 +454,31 @@ struct Lay {
   }
 };
 
-constexpr int kTcWarps = 4;
 constexpr int kTcRows = 16;  // packed query rows per CTA (the mma M)
 constexpr int kTcKW = 16;    // keys per warp step
+
+/// CTA shape of the tensor-core decode kernel: keys per CTA step (16 per warp) and prefetch stages.
+/// The mainloop is a kStages-deep cp.async ring, so a CTA needs kStageBytes = keys_in_flight x D x
+/// 2 bytes x 2 (K | V) of shared memory.  At D = 128 four warps and two stages need 68 KiB and only
+/// one CTA fits per SM; two warps (32 keys per step) halve that, so two CTAs -- two independent KV
+/// streams -- are resident per SM and a static grid of B x Hkv x splits no longer runs in lockstep
+/// waves.  D = 256 keeps one stage: its 16-bit tiles are 8 KiB each.
+struct TcCfg {
+  int tile_kv;
+  int stages;
+};
+constexpr TcCfg tc_cfg(int d) {
+  return d == 256 ? TcCfg{64, 1} : (d == 128 ? TcCfg{32, 2} : TcCfg{64, 2});
+}
 
 /// Per-warp smem: kStages load buffers (K | V), plus for FP8 (D <= 128) one 16-bit K | V tile the
 /// raw codes are converted into right before the MMAs (the raw tiles arrive by cp.async, one tile
 /// ahead).  D = 256 uses one stage (16-bit tiles of 8 KiB each) and FP8 converts on load.
-template <int D, bool FP8>
+template <int D, bool FP8, int WARPS, int STAGES>
 struct TcGeom {
   static constexpr int kRow = Lay<D>::kRow;
-  static constexpr int kStages = D <= 128 ? 2 : 1;
+  static constexpr int kWarps = WARPS;
+  static constexpr int kStages = STAGES;
   static constexpr bool kRaw8 = FP8 && D <= 128;
   static constexpr int kWarpTile = kTcKW * kRow;                         // elements of one K or V tile
   static constexpr int kTile16 = kWarpTile * 2;                          // bytes of one 16-bit tile
@@ -470,27 +486,52 @@ struct TcGeom {
   static constexpr int kStageBuf = kRaw8 ? 2 * kRawTile : 2 * kTile16;
   static constexpr int kWarpBytes = kStages * kStageBuf + (kRaw8 ? 2 * kTile16 : 0);
   static constexpr int kQBytes = kTcRows * kRow * 2;
-  static constexpr int kStageBytes = kTcWarps * kWarpBytes;
-  static constexpr int kMergeBytes = kTcWarps * kTcRows * (D + 2) * 4;
+  static constexpr int kStageBytes = kWarps * kWarpBytes;
+  static constexpr int kMergeBytes = kWarps * kTcRows * (D + 2) * 4;
   static constexpr int kSmem = (kQBytes + kStageBytes) > kMergeBytes ? (kQBytes + kStageBytes) : kMergeBytes;
+  static constexpr int kStep = kWarps * kTcKW;                           // keys per CTA step
+  static constexpr int kThreads = kWarps * 32;
 };
 
+/// Page base (bytes) of the page that holds key `t` for K or V.
+template <bool kIsK>
+__device__ __forceinline__ const char* tc_page_base(const DecKv& kv, int pg) {
+  const int64_t sp = kIsK ? kv.k_sp : kv.v_sp;
+  const char* base = kIsK ? kv.k : kv.v;
+  return base + static_cast<int64_t>(kv.pages[pg]) * sp;
+}
+
+/// Byte address of key row `r` of the 16-key tile that starts at t, for K or V.  One page-table read
+/// and one division per tile serve all 16-byte chunks while the tile stays inside one page (the
+/// common case: page sizes are >= 16 and tiles are 16-aligned); crossing a page boundary falls back
+/// to the per-row lookup.  `single` reports which case applies.
+template <bool kIsK>
+__device__ __forceinline__ const char* tc_row(const DecKv& kv, int pg0, const char* page0, int off0, int t,
+                                             int r, bool single) {
+  const int64_t st = kIsK ? kv.k_st : kv.v_st;
+  if (single) return page0 + static_cast<int64_t>(off0 + r) * st;
+  const int pos = t + r, pg = pos / kv.ps;
+  if (pg == pg0) return page0 + static_cast<int64_t>(pos - pg * kv.ps) * st;
+  return tc_page_base<kIsK>(kv, pg) + static_cast<int64_t>(pos - pg * kv.ps) * st;
+}
+
 /// Load the 16 keys at [t, t + 16) (valid below hi) of K or V into one warp tile.
-template <int D, typename T, bool FP8>
-__device__ __forceinline__ void tc_load(T* s, const char* base, int64_t sp, int64_t st, const DecKv& kv,
-                                        int t, int hi, int lane) {
-  constexpr int CH = D / 8, N = kTcKW * CH;
+template <int D, int KW, typename T, bool FP8, bool kIsK>
+__device__ __forceinline__ void tc_load(T* s, const DecKv& kv, int t, int hi, int lane) {
+  constexpr int CH = D / 8, N = KW * CH;
+  const int pg0 = t / kv.ps, off0 = t - pg0 * kv.ps;
+  const char* page0 = tc_page_base<kIsK>(kv, pg0);
+  const bool single = off0 + KW <= kv.ps;
 #pragma unroll
   for (int it = 0; it < (N + 31) / 32; ++it) {
     const int idx = it * 32 + lane;
     if (N % 32 != 0 && idx >= N) break;
     const int r = idx / CH, c = idx % CH, pos = t + r;
     const bool ok = pos < hi;
-    const char* row = base;
-    if (ok) row = base + static_cast<int64_t>(kv.pages[pos / kv.ps]) * sp + static_cast<int64_t>(pos % kv.ps) * st;
+    const char* row = tc_row<kIsK>(kv, pg0, page0, off0, t, r, single);
     T* dst = s + Lay<D>::off(r, c);
     if constexpr (!FP8) {
-      cp_async16(smem_u32(dst), ok ? row + c * 16 : base, ok);
+      cp_async16(smem_u32(dst), ok ? row + c * 16 : row, ok);
     } else {
       uint4 w4 = make_uint4(0u, 0u, 0u, 0u);
       if (ok) {
@@ -514,26 +555,27 @@ __device__ __forceinline__ void tc_load(T* s, const char* base, int64_t sp, int6
 }
 
 /// Raw FP8 codes of the 16 keys at [t, t + 16) into a [16][D]-byte tile (cp.async, zero past hi).
-template <int D>
-__device__ __forceinline__ void tc_load_raw(char* dst, const char* base, int64_t sp, int64_t st, const DecKv& kv,
-                                            int t, int hi, int lane) {
-  constexpr int CH = D / 16, N = kTcKW * CH;
+template <int D, int KW, bool kIsK>
+__device__ __forceinline__ void tc_load_raw(char* dst, const DecKv& kv, int t, int hi, int lane) {
+  constexpr int CH = D / 16, N = KW * CH;
+  const int pg0 = t / kv.ps, off0 = t - pg0 * kv.ps;
+  const char* page0 = tc_page_base<kIsK>(kv, pg0);
+  const bool single = off0 + KW <= kv.ps;
 #pragma unroll
   for (int it = 0; it < (N + 31) / 32; ++it) {
     const int idx = it * 32 + lane;
     if (N % 32 != 0 && idx >= N) break;
     const int r = idx / CH, c = idx % CH, pos = t + r;
     const bool ok = pos < hi;
-    const char* row = base;
-    if (ok) row = base + static_cast<int64_t>(kv.pages[pos / kv.ps]) * sp + static_cast<int64_t>(pos % kv.ps) * st;
-    cp_async16(smem_u32(dst + r * D + c * 16), ok ? row + c * 16 : base, ok);
+    const char* row = tc_row<kIsK>(kv, pg0, page0, off0, t, r, single);
+    cp_async16(smem_u32(dst + r * D + c * 16), ok ? row + c * 16 : row, ok);
   }
 }
 
 /// [16][D] raw FP8 codes -> the 16-bit ldmatrix tile (exact conversion).
-template <int D, typename T>
+template <int D, int KW, typename T>
 __device__ __forceinline__ void tc_convert(const char* raw, T* dst, bool e5m2, int lane) {
-  constexpr int CH = D / 8, N = kTcKW * CH;
+  constexpr int CH = D / 8, N = KW * CH;
 #pragma unroll
   for (int it = 0; it < N / 32; ++it) {
     const int idx = it * 32 + lane, r = idx / CH, c = idx % CH;
@@ -552,27 +594,29 @@ __device__ __forceinline__ void tc_convert(const char* raw, T* dst, bool e5m2, i
 }
 
 /// Issue the loads of one warp step (K then V) into a stage buffer.
-template <int D, typename T, bool FP8>
+template <int D, int KW, typename T, bool FP8>
 __device__ __forceinline__ void tc_issue(char* buf, const DecKv& kv, int t, int hi, int lane) {
-  using Geo = TcGeom<D, FP8>;
-  if constexpr (Geo::kRaw8) {
-    tc_load_raw<D>(buf, kv.k, kv.k_sp, kv.k_st, kv, t, hi, lane);
-    tc_load_raw<D>(buf + Geo::kRawTile, kv.v, kv.v_sp, kv.v_st, kv, t, hi, lane);
+  constexpr bool kRaw8 = FP8 && D <= 128;
+  constexpr int kTile16 = KW * Lay<D>::kRow * 2;  // bytes of one 16-bit K or V tile
+  constexpr int kRawTile = KW * D;                // bytes of one raw FP8 tile
+  if constexpr (kRaw8) {
+    tc_load_raw<D, KW, true>(buf, kv, t, hi, lane);
+    tc_load_raw<D, KW, false>(buf + kRawTile, kv, t, hi, lane);
   } else {
-    tc_load<D, T, FP8>(reinterpret_cast<T*>(buf), kv.k, kv.k_sp, kv.k_st, kv, t, hi, lane);
-    tc_load<D, T, FP8>(reinterpret_cast<T*>(buf + Geo::kTile16), kv.v, kv.v_sp, kv.v_st, kv, t, hi, lane);
+    tc_load<D, KW, T, FP8, true>(reinterpret_cast<T*>(buf), kv, t, hi, lane);
+    tc_load<D, KW, T, FP8, false>(reinterpret_cast<T*>(buf + kTile16), kv, t, hi, lane);
   }
 }
 
 /// One tensor-core decode item: request b, kv head hk, packed rows [row0, row0 + 16), keys [lo, hi).
 /// split_index >= 0 writes partial rows merge_indptr[row] + split_index (no sink); < 0 writes o.
-template <int D, typename T, bool FP8>
+template <int D, typename T, bool FP8, int WARPS, int STAGES>
 __device__ __forceinline__ void decode_tc_item(const DecodeParams& p, unsigned char* smem, int b, int hk,
                                                int row0, int lo, int hi, int split_index) {
   constexpr bool kQRegs = D <= 128;
   constexpr int KQ = D / 16, NO = D / 8;
   using L = Lay<D>;
-  using Geo = TcGeom<D, FP8>;
+  using Geo = TcGeom<D, FP8, WARPS, STAGES>;
   T* sQ = reinterpret_cast<T*>(smem);
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   const int G = p.num_qo_heads / p.num_kv_heads, q_len = p.q_len, R = G * q_len;
@@ -588,7 +632,7 @@ __device__ __forceinline__ void decode_tc_item(const DecodeParams& p, unsigned c
   // Q tile (rows beyond R are zero)
   {
     constexpr int CH = D / 8;
-    for (int idx = tid; idx < kTcRows * CH; idx += kTcWarps * 32) {
+    for (int idx = tid; idx < kTcRows * CH; idx += Geo::kThreads) {
       const int r = idx / CH, c = idx % CH;
       const bool ok = r < rows;
       const int pr = row0 + (ok ? r : 0), i = pr / G, h = hk * G + (pr - i * G);
@@ -653,24 +697,25 @@ __device__ __forceinline__ void decode_tc_item(const DecodeParams& p, unsigned c
     const int rlo = rg == 0 ? jlo : r1lo, rhi = rg == 0 ? r0hi : jhi;
     if (rlo >= rhi) continue;
     int t = rlo + warp * kTcKW;
-    if (Geo::kStages == 2 && t < rhi) tc_issue<D, T, FP8>(wbuf, kv, t, rhi, lane);
-    cp_async_commit();
-    for (int st = 0; t < rhi; t += kTcWarps * kTcKW, st = (st + 1) % Geo::kStages) {
-      if constexpr (Geo::kStages == 2) {  // prefetch the warp's next tile, wait for this one
-        const int tn = t + kTcWarps * kTcKW;
-        if (tn < rhi) tc_issue<D, T, FP8>(wbuf + (st ^ 1) * Geo::kStageBuf, kv, tn, rhi, lane);
-        cp_async_commit();
-        cp_async_wait<1>();
-      } else {  // one buffer: load, wait (the other warps overlap)
-        tc_issue<D, T, FP8>(wbuf, kv, t, rhi, lane);
-        cp_async_commit();
-        cp_async_wait<0>();
-      }
+    // Fill kStages - 1 tiles ahead, then keep exactly kStages - 1 groups in flight: the tile being
+    // computed and the ones behind it overlap with the loads of the tiles ahead.
+#pragma unroll
+    for (int pf = 0; pf < Geo::kStages - 1; ++pf) {
+      const int tp = t + pf * Geo::kStep;
+      if (tp < rhi) tc_issue<D, kTcKW, T, FP8>(wbuf + pf * Geo::kStageBuf, kv, tp, rhi, lane);
+      cp_async_commit();
+    }
+    for (int st = 0; t < rhi; t += Geo::kStep, st = (st + 1) % Geo::kStages) {
+      const int tn = t + (Geo::kStages - 1) * Geo::kStep;
+      const int sn = (st + Geo::kStages - 1) % Geo::kStages;
+      if (tn < rhi) tc_issue<D, kTcKW, T, FP8>(wbuf + sn * Geo::kStageBuf, kv, tn, rhi, lane);
+      cp_async_commit();
+      cp_async_wait<Geo::kStages - 1>();
       __syncwarp();
       const char* sb = wbuf + st * Geo::kStageBuf;
       if constexpr (Geo::kRaw8) {
-        tc_convert<D, T>(sb, reinterpret_cast<T*>(cbuf), kv.e5m2, lane);
-        tc_convert<D, T>(sb + Geo::kRawTile, reinterpret_cast<T*>(cbuf + Geo::kTile16), kv.e5m2, lane);
+        tc_convert<D, kTcKW, T>(sb, reinterpret_cast<T*>(cbuf), kv.e5m2, lane);
+        tc_convert<D, kTcKW, T>(sb + Geo::kRawTile, reinterpret_cast<T*>(cbuf + Geo::kTile16), kv.e5m2, lane);
         __syncwarp();
         sb = cbuf;
       }
@@ -757,8 +802,8 @@ __device__ __forceinline__ void decode_tc_item(const DecodeParams& p, unsigned c
   }
   __syncthreads();
   float* sm_m = reinterpret_cast<float*>(smem);           // [W][16]
-  float* sm_l = sm_m + kTcWarps * kTcRows;                // [W][16]
-  float* sm_o = sm_l + kTcWarps * kTcRows;                // [W][16][D]
+  float* sm_l = sm_m + Geo::kWarps * kTcRows;             // [W][16]
+  float* sm_o = sm_l + Geo::kWarps * kTcRows;             // [W][16][D]
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
     const int row = (lane >> 2) + 8 * r;
@@ -774,15 +819,15 @@ __device__ __forceinline__ void decode_tc_item(const DecodeParams& p, unsigned c
   }
   __syncthreads();
   const int Hq = p.num_qo_heads;
-  for (int idx = tid; idx < rows * D; idx += kTcWarps * 32) {
+  for (int idx = tid; idx < rows * D; idx += Geo::kThreads) {
     const int r = idx / D, d = idx - (idx / D) * D;
     float mxx = ninf();
 #pragma unroll
-    for (int w = 0; w < kTcWarps; ++w) mxx = fmaxf(mxx, sm_m[w * kTcRows + r]);
+    for (int w = 0; w < Geo::kWarps; ++w) mxx = fmaxf(mxx, sm_m[w * kTcRows + r]);
     float den = 0.0f, acc = 0.0f;
     if (mxx != ninf()) {
 #pragma unroll
-      for (int w = 0; w < kTcWarps; ++w) {
+      for (int w = 0; w < Geo::kWarps; ++w) {
         const float wt = exp2f(sm_m[w * kTcRows + r] - mxx);
         den = __fmaf_rn(sm_l[w * kTcRows + r], wt, den);
         acc = __fmaf_rn(sm_o[(w * kTcRows + r) * D + d], wt, acc);
@@ -830,15 +875,18 @@ __global__ void __launch_bounds__(kDecThreads)
   decode_simt_body<HEAD_DIM, DTypeQ, Variant::fp8_kv, GQA_GROUP == 1 ? 1 : kDecRows>(params);
 }
 
-/// Grid (B, Hkv * ceil(G * q_len / 16), splits).  ROWS_PER_CTA = 16 (the mma M), CTA_TILE_KV = 64
-/// (4 warps x 16 keys, each warp double-buffers its own tile: no block barrier in the mainloop).
+/// Grid (B, Hkv * ceil(G * q_len / 16), splits).  ROWS_PER_CTA = 16 (the mma M), CTA_TILE_KV = the
+/// keys of one CTA step (16 per warp, so 2..8 warps), NUM_STAGES = prefetch ring depth.  Each warp
+/// keeps its own K | V ring, so the mainloop has no block barrier.
 template <int HEAD_DIM_QK, int HEAD_DIM_VO, int ROWS_PER_CTA, int CTA_TILE_KV, int NUM_STAGES,
           typename DTypeQ, typename DTypeKV, typename DTypeO, typename Variant, kv::KVLayout kLayout,
           typename ArchTag>
-__global__ void __launch_bounds__(kTcWarps * 32)
+__global__ void __launch_bounds__(CTA_TILE_KV / kTcKW * 32)
     paged_decode_tc_kernel(const __grid_constant__ DecodeParams params) {
-  static_assert(HEAD_DIM_QK == HEAD_DIM_VO && ROWS_PER_CTA == kTcRows &&
-                    CTA_TILE_KV == kTcWarps * kTcKW && NUM_STAGES == 2,
+  constexpr int kWarps = CTA_TILE_KV / kTcKW;
+  static_assert(HEAD_DIM_QK == HEAD_DIM_VO && ROWS_PER_CTA == kTcRows && CTA_TILE_KV == kWarps * kTcKW &&
+                    CTA_TILE_KV % kTcKW == 0 && kWarps >= 1 && kWarps <= 8 && NUM_STAGES >= 1 &&
+                    NUM_STAGES <= 3,
                 "B8 tensor-core decode geometry");
   static_assert(std::is_same_v<DTypeQ, DTypeO> && kLayout == kv::KVLayout::kNHD, "o = q dtype, strided pages");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
@@ -852,8 +900,8 @@ __global__ void __launch_bounds__(kTcWarps * 32)
   split_range(kv.kv_len, blockIdx.z, gridDim.z, p.plan.kv_chunk_size != nullptr ? *p.plan.kv_chunk_size : 0,
               &lo, &hi);
   const bool split = p.plan.split_kv && p.split.o_partial != nullptr;
-  decode_tc_item<HEAD_DIM_QK, DTypeQ, Variant::fp8_kv>(p, tc_smem, b, hk, row0, lo, hi,
-                                                       split ? static_cast<int>(blockIdx.z) : -1);
+  decode_tc_item<HEAD_DIM_QK, DTypeQ, Variant::fp8_kv, kWarps, NUM_STAGES>(
+      p, tc_smem, b, hk, row0, lo, hi, split ? static_cast<int>(blockIdx.z) : -1);
 #else
   (void)params;
   if (threadIdx.x == 0) __trap();  // host refuses sm < 80 (attention_supports / decode_plan)
@@ -1002,11 +1050,13 @@ __global__ void __launch_bounds__(kTaskThreads) assign_decode_tasks_kernel(
 template <int HEAD_DIM_QK, int HEAD_DIM_VO, int GQA_GROUP, int CTA_TILE_KV, int NUM_STAGES,
           typename DTypeQ, typename DTypeKV, typename DTypeO, typename Variant, kv::KVLayout kLayout,
           typename ArchTag>
-__global__ void __launch_bounds__(kTcWarps * 32)
+__global__ void __launch_bounds__(CTA_TILE_KV / kTcKW * 32)
     paged_decode_dynamic_kernel(const __grid_constant__ DecodeParams params,
                                 uint32_t* __restrict__ task_counter, const uint32_t epoch) {
-  static_assert(HEAD_DIM_QK == HEAD_DIM_VO && GQA_GROUP == 0 && CTA_TILE_KV == kTcWarps * kTcKW &&
-                    NUM_STAGES == 2,
+  constexpr int kWarps = CTA_TILE_KV / kTcKW;
+  static_assert(HEAD_DIM_QK == HEAD_DIM_VO && GQA_GROUP == 0 && CTA_TILE_KV == kWarps * kTcKW &&
+                    CTA_TILE_KV % kTcKW == 0 && kWarps >= 1 && kWarps <= 8 && NUM_STAGES >= 1 &&
+                    NUM_STAGES <= 3,
                 "B8 dynamic decode geometry");
   static_assert(std::is_same_v<DTypeQ, DTypeO> && kLayout == kv::KVLayout::kNHD, "o = q dtype, strided pages");
   (void)epoch;
@@ -1025,8 +1075,8 @@ __global__ void __launch_bounds__(kTcWarps * 32)
     if (t >= n) break;
     const DecodeTask k = p.tasks[t];
     for (int rb = 0; rb < nrb; ++rb) {
-      decode_tc_item<HEAD_DIM_QK, DTypeQ, Variant::fp8_kv>(p, dyn_smem, k.request, k.kv_head, rb * kTcRows,
-                                                           k.kv_begin, k.kv_end, k.split_index);
+      decode_tc_item<HEAD_DIM_QK, DTypeQ, Variant::fp8_kv, kWarps, NUM_STAGES>(
+          p, dyn_smem, k.request, k.kv_head, rb * kTcRows, k.kv_begin, k.kv_end, k.split_index);
     }
   }
   if (threadIdx.x == 0) {
@@ -1154,43 +1204,75 @@ Status launch_simt(const DecodeParams& p, dim3 grid, cudaStream_t st) {
   return Status::kSuccess;
 }
 
-template <int D, typename T, bool FP8>
-Status launch_static(int path, int rows, const DecodeParams& p, dim3 grid, cudaStream_t st) {
+/// Shared memory of the tensor-core decode geometry selected for (D, FP8) and the number of CTAs of
+/// that shape that fit on one SM (shared memory limited, at most four).
+template <int D, bool FP8>
+constexpr int tc_smem() {
+  constexpr TcCfg c = tc_cfg(D);
+  return TcGeom<D, FP8, c.tile_kv / kTcKW, c.stages>::kSmem;
+}
+
+int tc_smem_for(int d, bool fp8) {
+  return fp8 ? (d == 64 ? tc_smem<64, true>() : (d == 128 ? tc_smem<128, true>() : tc_smem<256, true>()))
+             : (d == 64 ? tc_smem<64, false>() : (d == 128 ? tc_smem<128, false>() : tc_smem<256, false>()));
+}
+
+int tc_ctas_per_sm(int smem, int device) {
+  int per_sm_bytes = 0;
+  if (cudaDeviceGetAttribute(&per_sm_bytes, cudaDevAttrMaxSharedMemoryPerMultiprocessor, device) != cudaSuccess ||
+      per_sm_bytes <= 0) {
+    per_sm_bytes = 100 * 1024;
+  }
+  return std::max(1, std::min(4, (per_sm_bytes - 1024) / (smem + 1024)));
+}
+
+template <int D, typename T, bool FP8, int WARPS, int STAGES>
+Status launch_tc(const DecodeParams& p, dim3 grid, int ctas, uint32_t* counter, cudaStream_t st) {
   using V = AttentionVariant<true, true, true, true, true, FP8>;
   using KVT = std::conditional_t<FP8, __nv_fp8_e4m3, T>;
+  constexpr int smem = TcGeom<D, FP8, WARPS, STAGES>::kSmem;
+  if (counter == nullptr) {
+    auto* fn = paged_decode_tc_kernel<D, D, kTcRows, WARPS * kTcKW, STAGES, T, KVT, T, V, kv::KVLayout::kNHD, Sm80>;
+    static const cudaError_t attr = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (attr != cudaSuccess) return (cudaGetLastError(), launch_error("paged_decode_tc smem attribute", attr));
+    fn<<<grid, WARPS * 32, smem, st>>>(p);
+  } else {
+    auto* fn =
+        paged_decode_dynamic_kernel<D, D, 0, WARPS * kTcKW, STAGES, T, KVT, T, V, kv::KVLayout::kNHD, Sm80>;
+    static const cudaError_t attr = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    if (attr != cudaSuccess) return (cudaGetLastError(), launch_error("paged_decode_dynamic smem attribute", attr));
+    fn<<<ctas, WARPS * 32, smem, st>>>(p, counter, 0u);
+  }
+  const cudaError_t err = cudaGetLastError();
+  return err == cudaSuccess ? Status::kSuccess : launch_error("decode launch", err);
+}
+
+/// Launch the tensor-core decode kernel with the CTA shape tc_cfg(D) picks; counter != 0 selects the
+/// persistent (device planner) kernel.
+template <int D, typename T, bool FP8>
+Status launch_tc_pick(const DecodeParams& p, dim3 grid, int ctas, uint32_t* counter, cudaStream_t st) {
+  if constexpr (D == 64 || D == 128 || D == 256) {
+    constexpr TcCfg c = tc_cfg(D);
+    return launch_tc<D, T, FP8, c.tile_kv / kTcKW, c.stages>(p, grid, ctas, counter, st);
+  } else {
+    return detail::set_error(Status::kUnsupportedShape, "paged_decode_tc: head dim %d not compiled", D);
+  }
+}
+
+template <int D, typename T, bool FP8>
+Status launch_static(int path, int rows, const DecodeParams& p, dim3 grid, cudaStream_t st) {
   if (path == kPathSimt) {
     const Status s = rows == 1 ? launch_simt<D, T, FP8, 1>(p, grid, st) : launch_simt<D, T, FP8, 0>(p, grid, st);
     if (s != Status::kSuccess) return s;
-  } else {
-    if constexpr (D == 64 || D == 128 || D == 256) {
-      auto* fn = paged_decode_tc_kernel<D, D, kTcRows, kTcWarps * kTcKW, 2, T, KVT, T, V, kv::KVLayout::kNHD, Sm80>;
-      constexpr int smem = TcGeom<D, FP8>::kSmem;
-      static const cudaError_t attr = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-      if (attr != cudaSuccess) return (cudaGetLastError(), launch_error("paged_decode_tc smem attribute", attr));
-      fn<<<grid, kTcWarps * 32, smem, st>>>(p);
-    } else {
-      return detail::set_error(Status::kUnsupportedShape, "paged_decode_tc: head dim %d not compiled", D);
-    }
+    const cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? Status::kSuccess : launch_error("paged_decode launch", err);
   }
-  const cudaError_t err = cudaGetLastError();
-  return err == cudaSuccess ? Status::kSuccess : launch_error("paged_decode launch", err);
+  return launch_tc_pick<D, T, FP8>(p, grid, 0, nullptr, st);
 }
 
 template <int D, typename T, bool FP8>
 Status launch_dynamic(const DecodeParams& p, int ctas, uint32_t* counter, cudaStream_t st) {
-  if constexpr (D == 64 || D == 128 || D == 256) {
-    using V = AttentionVariant<true, true, true, true, true, FP8>;
-    using KVT = std::conditional_t<FP8, __nv_fp8_e4m3, T>;
-    auto* fn = paged_decode_dynamic_kernel<D, D, 0, kTcWarps * kTcKW, 2, T, KVT, T, V, kv::KVLayout::kNHD, Sm80>;
-    constexpr int smem = TcGeom<D, FP8>::kSmem;
-    static const cudaError_t attr = cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-    if (attr != cudaSuccess) return (cudaGetLastError(), launch_error("paged_decode_dynamic smem attribute", attr));
-    fn<<<ctas, kTcWarps * 32, smem, st>>>(p, counter, 0u);
-    const cudaError_t err = cudaGetLastError();
-    return err == cudaSuccess ? Status::kSuccess : launch_error("paged_decode_dynamic launch", err);
-  } else {
-    return detail::set_error(Status::kUnsupportedShape, "paged_decode_dynamic: head dim %d not compiled", D);
-  }
+  return launch_tc_pick<D, T, FP8>(p, dim3(1), ctas, counter, st);
 }
 
 template <typename T, bool FP8>
@@ -1209,14 +1291,7 @@ Status dispatch_d(const DKey& k, const DecodeParams& p, dim3 grid, int ctas, uin
 
 /// Persistent CTAs for the dynamic kernel: SMs x CTAs that fit the SM's shared memory (at most 4).
 int dynamic_ctas(const DKey& k, const LaunchContext& ctx) {
-  const int smem = k.fp8 ? (k.d == 64 ? TcGeom<64, true>::kSmem : (k.d == 128 ? TcGeom<128, true>::kSmem : TcGeom<256, true>::kSmem))
-                         : (k.d == 64 ? TcGeom<64, false>::kSmem : (k.d == 128 ? TcGeom<128, false>::kSmem : TcGeom<256, false>::kSmem));
-  int per_sm_bytes = 0;
-  if (cudaDeviceGetAttribute(&per_sm_bytes, cudaDevAttrMaxSharedMemoryPerMultiprocessor, ctx.device) !=
-          cudaSuccess || per_sm_bytes <= 0) {
-    per_sm_bytes = 100 * 1024;
-  }
-  const int per_sm = std::max(1, std::min(4, (per_sm_bytes - 1024) / (smem + 1024)));
+  const int per_sm = tc_ctas_per_sm(tc_smem_for(k.d, k.fp8 != 0), ctx.device);
   return std::max(1, ctx.compute_units) * per_sm;
 }
 
@@ -1300,6 +1375,18 @@ Status decode_plan(const AttentionSpec& spec, int32_t max_batch, int32_t max_kv_
       if (base < target) {
         S = static_cast<int>(std::min<int64_t>({(target + base - 1) / base, kDecodeMaxSplits,
                                                 std::max<int64_t>(1, max_kv_len / 256)}));
+      }
+      // A single long request can dominate a batch that otherwise has enough CTAs: the static grid
+      // is (batch, kv-head, split), so with split=1 the 32k-token request runs on 8 CTAs while the
+      // rest of the batch is already idle. Split long-context batches into kDecodeInvariantChunk-key
+      // chunks whenever the grid is still short of four waves; short requests simply get a few
+      // tiny splits and exit quickly.
+      if (max_kv_len >= 4 * kDecodeInvariantChunk && base < 4 * target) {
+        const int64_t desired = std::min<int64_t>(
+            {static_cast<int64_t>(kDecodeMaxSplits),
+             (static_cast<int64_t>(max_kv_len) + kDecodeInvariantChunk - 1) / kDecodeInvariantChunk,
+             std::max<int64_t>(1, max_kv_len / 256)});
+        if (desired > S) S = static_cast<int>(desired);
       }
       k.split = S > 1 ? 1 : 0;
     }

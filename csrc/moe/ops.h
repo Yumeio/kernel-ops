@@ -53,6 +53,15 @@ Status latent_combine_norm(const Tensor& out, const Tensor& expert_out,
 /// expert or 128x128 block).  num_local_experts bounds the number of padded slot blocks.
 Status moe_gemv(const FusedMoEGemmParams& params, int32_t num_local_experts, int32_t slots_per_cta,
                 DType a_dtype, DType w_dtype, const LaunchContext& ctx);
+/// M03 expert GEMM on tensor cores (ABI 6, B7): fused_moe_gemm_kernel = gemm::gemm_mma_sync_kernel over the
+/// block-sorted slots of align_block_size(block_size) (16, 32, 64, 128 or 256). Same row semantics as
+/// moe_gemv (A row = slot or slot / top_k, C row = slot, padding slots and experts < 0 untouched), with the
+/// full gemm epilogue: GLU on interleaved W13 (C has N / 2 columns), routed weight, bias [E, N] in c_dtype,
+/// quantized output. Recipes by dtype: bf16 / fp16 weights = activations; e4m3 x e4m3 (SM89+) with
+/// w_quant per expert, per channel or 128x128 blocks (a_scale per token or 1x128); int8 x int8 per channel
+/// with per-token a_scale. c_dtype bf16 / fp16 / fp32.
+Status moe_gemm(const FusedMoEGemmParams& params, int32_t num_local_experts, int32_t block_size,
+                DType a_dtype, DType w_dtype, DType c_dtype, const LaunchContext& ctx);
 
 Status moe_workspace_requirements(const MoELayerParams& params, const LaunchContext& ctx,
                                   WorkspaceRequirements* out);

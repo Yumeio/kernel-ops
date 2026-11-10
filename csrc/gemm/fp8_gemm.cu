@@ -2,7 +2,14 @@
 // kernel-ops | csrc/gemm/fp8_gemm.cu
 // B5 row 7: FP8-weight GEMV on CUDA cores.
 //   fp8_gemv_kernel   e4m3 weights [N, K] widened in registers, M <= 16
-// Host entry: fp8_gemm (kFP8Tensorwise / kFP8Rowwise / kFP8Blockwise, M <= 16).
+// B7 rows 3-4: FP8 on tensor cores (SM89 / SM120a / SM90a fallback), bodies in gemm_mma.cu:
+//   fp8_gemm_mma_sync_kernel       e4m3 x e4m3 mma.sync.m16n8k32, tensorwise / rowwise scales in the
+//                                  epilogue (or as ScaledOperand scales), = gemm_mma_sync_kernel<AtomE4M3>
+//   fp8_bmm_kernel                 strided batched form, per-batch operand scales (MLA W_UK / W_UV FP8)
+//   fp8_block_gemm_small_m_kernel  DeepSeek 1x128 x 128x128 blockwise for decode M <= 64: the swap_ab
+//                                  tiles (16 / 32 / 64 tokens x 128 channels) with per-128-K promotion
+// Host entries: fp8_gemm (every FP8 recipe; M <= 16 -> GEMV unless a tactic or the tactic cache names the
+// tensor core), fp8_bmm.
 //
 // Contract: csrc/gemm/fp8_gemm_kernels.cuh + csrc/gemm/ops.h.
 //
@@ -242,8 +249,6 @@ constexpr uint32_t kFp8EpiAllowed = kEpiRowScale | kEpiColScale | kEpiBias | kEp
 
 Status fp8_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBackend backend,
                 const Workspace& ws, const LaunchContext& ctx) {
-  (void)tactic;
-  (void)ws;
   if (ctx.backend != BackendKind::kCuda) {
     return detail::set_error(Status::kUnsupportedBackend, "fp8_gemm: CUDA backend only");
   }
@@ -251,8 +256,24 @@ Status fp8_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBacken
     return detail::set_error(Status::kUnsupportedBackend, "fp8_gemm: only the native provider exists");
   }
   const GemmRecipe rc = args.recipe;
-  if (rc != GemmRecipe::kFP8Tensorwise && rc != GemmRecipe::kFP8Rowwise && rc != GemmRecipe::kFP8Blockwise) {
+  if (rc != GemmRecipe::kFP8Tensorwise && rc != GemmRecipe::kFP8Rowwise && rc != GemmRecipe::kFP8Blockwise &&
+      rc != GemmRecipe::kFP8BlockwiseUE8M0) {
     return detail::set_error(Status::kNotImplemented, "fp8_gemm: recipe %d has no native body yet", static_cast<int>(rc));
+  }
+  // Tensor-core path (B7): M > 16, a batch, or a tactic / cache entry naming mma.sync. e4m3 x e4m3 only; the
+  // shared launcher validates the operands before it checks for SM89+.
+  if (args.m > 16 || args.batch != 1 || mma_selects(args, tactic, ctx) || rc == GemmRecipe::kFP8BlockwiseUE8M0) {
+    if (args.b.dtype != DType::kFloat8E4M3 || args.b.fp8 != Fp8Encoding::kOCP) {
+      return detail::set_error(Status::kUnsupportedDtype, "fp8_gemm: weights must be OCP e4m3");
+    }
+    if (args.a.dtype != DType::kFloat8E4M3) {
+      return detail::set_error(Status::kUnsupportedDtype,
+                               "fp8_gemm: the tensor-core path takes e4m3 activations (quantize them, or run FP8 weights as kW8A16FP8 through marlin_gemm)");
+    }
+    if (args.batch != 1) return detail::set_error(Status::kInvalidArgument, "fp8_gemm: batched FP8 goes through fp8_bmm");
+    MmaGemmParams p{};
+    p.args = args;
+    return launch_gemm_mma_sync(p, tactic, ws, ctx);
   }
   if (args.b.dtype != DType::kFloat8E4M3 || args.b.fp8 != Fp8Encoding::kOCP) {
     return detail::set_error(Status::kUnsupportedDtype, "fp8_gemm: weights must be OCP e4m3");
@@ -270,9 +291,7 @@ Status fp8_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBacken
   if (args.a.major != MajorOrder::kKMajor || args.b.major != MajorOrder::kKMajor) {
     return detail::set_error(Status::kUnsupportedLayout, "fp8_gemm: K-major operands only (weight_transpose first)");
   }
-  if (args.batch != 1) return detail::set_error(Status::kNotImplemented, "fp8_gemm: batch > 1");
   if (args.m < 1 || args.n < 1 || args.k < 1) return detail::set_error(Status::kInvalidArgument, "fp8_gemm: empty problem");
-  if (args.m > 16) return detail::set_error(Status::kNotImplemented, "fp8_gemm: M > 16 needs the tensor-core path (B7)");
   if (args.k % 16 != 0) return detail::set_error(Status::kUnsupportedShape, "fp8_gemm: K must be a multiple of 16");
   if (args.a.data == nullptr || args.b.data == nullptr || args.d == nullptr) {
     return detail::set_error(Status::kInvalidArgument, "fp8_gemm: null operand");
@@ -317,6 +336,26 @@ Status fp8_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBacken
     case DType::kFloat16: return launch_fp8_recipe<__half>(args, s);
     default: return launch_fp8_recipe<f8e4m3_t>(args, s);
   }
+}
+
+/// fp8_bmm_kernel: D[b] = A[b] . B[b]^T on e4m3 with per-batch scales, on the shared mma.sync body. A, B, D
+/// may be head-strided views (lda / ldd and the batch strides); scales are the ScaledOperand scales (per
+/// tensor [batch] with scale_batch_stride 1, or per token / per channel with a batch stride) and / or the
+/// epilogue alpha.
+Status fp8_bmm(const ScaledGemmArgs& args, const LaunchContext& ctx) {
+  if (ctx.backend != BackendKind::kCuda) return detail::set_error(Status::kUnsupportedBackend, "fp8_bmm: CUDA backend only");
+  if (args.recipe != GemmRecipe::kFP8Tensorwise && args.recipe != GemmRecipe::kFP8Rowwise) {
+    return detail::set_error(Status::kNotImplemented, "fp8_bmm: tensorwise and rowwise recipes only (recipe %d)", static_cast<int>(args.recipe));
+  }
+  if (args.a.dtype != DType::kFloat8E4M3 || args.b.dtype != DType::kFloat8E4M3 || args.a.fp8 != Fp8Encoding::kOCP ||
+      args.b.fp8 != Fp8Encoding::kOCP) {
+    return detail::set_error(Status::kUnsupportedDtype, "fp8_bmm: OCP e4m3 activations and weights (bf16 activations are not quantized in the prologue)");
+  }
+  if (args.batch < 1) return detail::set_error(Status::kInvalidArgument, "fp8_bmm: batch < 1");
+  if (args.batch > 1 && args.batch_stride_d == 0) return detail::set_error(Status::kInvalidArgument, "fp8_bmm: batched output needs batch_stride_d");
+  MmaGemmParams p{};
+  p.args = args;
+  return launch_gemm_mma_sync(p, nullptr, Workspace{}, ctx);
 }
 
 }  // namespace kops::gemm

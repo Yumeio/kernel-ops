@@ -400,7 +400,8 @@ int main(int argc, char** argv) {
   DeviceInfo dev{};
   query_device(&dev);
 
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  filter_cases(&cases, opt);
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

@@ -632,19 +632,26 @@ bool run_b3(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
       if (ok) ok = measure(c, fn, st);
       cudaFree(key); cudaFree(cache);
     }
-  } else if (c.op == "fused_qkv_append") {
-    const int Hq = 32, Hkv = 8;
+  } else if (c.op == "fused_qkv_append" || c.op == "fused_kv_append") {
+    // fused_qkv_append: full QKV projection tile (Q head count included).
+    // fused_kv_append : the append case's own shape (Hq = 0, Hkv = 4, D = 128), so the only work
+    //                   is norm + RoPE on K plus the K/V cache write — the same bytes append moves,
+    //                   which is what "fusion instead of a separate norm+RoPE pass" has to beat.
+    const bool kv_only = c.op == "fused_kv_append";
+    const int Hq = kv_only ? 0 : 32, Hkv = kv_only ? 4 : 8;
     const int64_t width = static_cast<int64_t>(Hq + 2 * Hkv) * D;
     const int64_t pages = (tokens + kPage - 1) / kPage;
     void* qkv = nullptr; void* qw = nullptr; void* kw = nullptr; void* pos = nullptr;
     void* cs = nullptr; void* kc = nullptr; void* vc = nullptr;
     if (cuda_ok(cudaMalloc(&qkv, tokens * width * 2), "qkv") &&
-        cuda_ok(cudaMalloc(&qw, D * 2), "qw") && cuda_ok(cudaMalloc(&kw, D * 2), "kw") &&
+        cuda_ok(cudaMalloc(&kw, D * 2), "kw") &&
         cuda_ok(cudaMalloc(&pos, tokens * 8), "pos") &&
         cuda_ok(cudaMalloc(&cs, 4096 * D * 4), "cs") &&
         cuda_ok(cudaMalloc(&kc, pages * kPage * Hkv * D * 2), "kc") &&
-        cuda_ok(cudaMalloc(&vc, pages * kPage * Hkv * D * 2), "vc")) {
+        cuda_ok(cudaMalloc(&vc, pages * kPage * Hkv * D * 2), "vc") &&
+        (!kv_only || cuda_ok(cudaMalloc(&qw, D * 2), "qw"))) {
       cudaMemcpy(pos, sh.data(), static_cast<size_t>(tokens) * 8, cudaMemcpyHostToDevice);
+      cudaMemset(cs, 0x3c, 4096 * D * 4);   // normal floats, not zero pages
       PagedKVDesc cache = desc_nhd(kc, vc, Hkv, D, D, kPage);
       kops::kv::FusedQKVAppendParams p{};
       p.qkv = qkv; p.qkv_token_stride = width; p.q_norm_weight = qw; p.k_norm_weight = kw;
@@ -731,8 +738,8 @@ bool run_b3(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
 
 bool run_case(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   if (c.op == "reshape_per_token_head" || c.op == "ds_mla" || c.op == "indexer_fp8" ||
-      c.op == "fused_qkv_append" || c.op == "requantize_pages" || c.op == "kv_scale_update" ||
-      c.op == "mla_rope_fused") {
+      c.op == "fused_qkv_append" || c.op == "fused_kv_append" ||
+      c.op == "requantize_pages" || c.op == "kv_scale_update" || c.op == "mla_rope_fused") {
     return run_b3(c, ctx, st);
   }
   if (c.op == "reshape_and_cache") return run_reshape(c, ctx, st);
@@ -793,6 +800,8 @@ std::vector<Case> make_cases() {
       static_cast<int64_t>(2048) * (128 + 4) * 3);
   add("fused_qkv_append.bf16.t2048.hq32.hkv8.d128", "fused_qkv_append", 2048, 128,
       static_cast<int64_t>(2048) * (32 + 16) * 128 * 2 * 3);
+  add("fused_kv_append.bf16.t2048.hkv4.d128", "fused_kv_append", 2048, 128,
+      static_cast<int64_t>(2048) * (0 + 8) * 128 * 2 * 2);
   add("requantize.int8.t2048.h8.d128", "requantize_pages", 2048, 128,
       static_cast<int64_t>(2048) * 8 * 128 * 4);
   add("kv_scale_update.bf16.t2048.h8.d128", "kv_scale_update", 2048, 128,
@@ -810,7 +819,8 @@ int main(int argc, char** argv) {
   if (!cuda_ok(cudaSetDevice(0), "cudaSetDevice")) return 1;
   DeviceInfo dev{};
   query_device(&dev);
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  filter_cases(&cases, opt);
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

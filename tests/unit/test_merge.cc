@@ -2337,6 +2337,19 @@ void test_decode_modifiers_and_caches() {
   AttnCase f = decode_case("decode simt fp8 d80", 80, 4, 4, 1, {200, 33});
   f.kv_dt = DType::kFloat8E4M3;
   run_decode_case(f, seed++, 0);
+  // A 16-key tile that straddles a page boundary: the sliding window moves the first visible key off
+  // the tile grid, so the tensor-core V/K addressing has to fall back from one page base per tile to
+  // a per-row page lookup in the middle of the tile (page 4 offset 49 of the 64-token page, tile
+  // 305..320 crosses into page 5).
+  for (DType pad : {DType::kInvalid, DType::kFloat8E4M3}) {
+    AttnCase s = decode_case(pad == DType::kInvalid ? "decode tc page-straddling tile"
+                                                    : "decode tc fp8 page-straddling tile",
+                             128, 16, 2, 1, {380, 70});
+    s.page_size = 64;
+    s.window_left = 74;
+    s.kv_dt = pad;
+    run_decode_case(s, seed++, 1);
+  }
 }
 
 void test_decode_split_dynamic() {

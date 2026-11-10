@@ -25,7 +25,9 @@
 #include "csrc/common/rng.cuh"
 #include "csrc/kvcache/kv_layout.cuh"
 #include "csrc/gemm/gemm_params.cuh"
+#include "csrc/quantization/weight_repack_kernels.cuh"
 #include "csrc/gemm/grouped_gemm_kernels.cuh"
+#include "csrc/gemm/mixed_input_gemm_kernels.cuh"
 #include "csrc/moe/routing_kernels.cuh"
 #include "csrc/moe/fused_moe_kernels.cuh"
 #include "csrc/attention/attention_params.cuh"
@@ -68,6 +70,9 @@ KOPS_ABI_STANDARD_LAYOUT(kops::kv::PagedKVDesc);
 KOPS_ABI_STANDARD_LAYOUT(kops::gemm::ScaledOperand);
 KOPS_ABI_STANDARD_LAYOUT(kops::gemm::EpilogueParams);
 KOPS_ABI_STANDARD_LAYOUT(kops::gemm::ScaledGemmArgs);
+KOPS_ABI_STANDARD_LAYOUT(kops::gemm::MmaRowMap);
+KOPS_ABI_STANDARD_LAYOUT(kops::gemm::MmaGemmParams);
+KOPS_ABI_STANDARD_LAYOUT(kops::gemm::MarlinParams);
 KOPS_ABI_STANDARD_LAYOUT(kops::gemm::GemmTactic);
 KOPS_ABI_STANDARD_LAYOUT(kops::gemm::GemmProblem);
 KOPS_ABI_STANDARD_LAYOUT(kops::gemm::GroupedGemmParams);
@@ -163,6 +168,8 @@ static_assert(offsetof(kops::sample::FusedSplitDevice, barriers) == 16, "FusedSp
                 #T " exceeds KOPS_KERNARG_LIMIT_BYTES (CUDA 32764 / HIP ~4096)")
 
 KOPS_FITS_KERNARG(kops::gemm::ScaledGemmArgs);
+KOPS_FITS_KERNARG(kops::gemm::MmaGemmParams);
+KOPS_FITS_KERNARG(kops::gemm::MarlinParams);
 KOPS_FITS_KERNARG(kops::gemm::GemmTmaParams);
 KOPS_FITS_KERNARG(kops::gemm::GroupedGemmParams);
 KOPS_FITS_KERNARG(kops::moe::MoELayerParams);

@@ -87,3 +87,52 @@ timing. `smoothquant_compute_scales` has no benchmark case (K elements, launch b
   TPOT, tokens/s) come from vLLM/SGLang scripts run in their own environment.
 - A PyTorch result is a comparison, not evidence for the registry; the evidence
   is the C++ JSON with its provenance fields.
+
+## Third-party adapters (SM89 Stage 1)
+
+`thirdparty.py` runs the same `--dump-cases` table through a library adapter and
+writes the shared schema plus an `impl` field and a `skipped` list:
+
+```bash
+build/bench/benchmark/bench_norm --dump-cases > out/cases-norm.json
+build/bench/benchmark/bench_norm --flush-l2 256 --rounds 3 --json out/kops-norm.json
+
+python benchmark/compare/thirdparty.py --cases out/cases-norm.json --impl vllm \
+    --flush-l2 256 --rounds 3 --json out/vllm-norm.json
+python benchmark/compare/thirdparty.py --cases out/cases-norm.json --impl flashinfer \
+    --flush-l2 256 --rounds 3 --json out/flashinfer-norm.json
+
+python benchmark/compare/compare_results.py out/kops-norm.json \
+    out/torch-norm.json out/vllm-norm.json out/flashinfer-norm.json
+```
+
+Current adapters: `vllm` (rms/fused norm, rope, fp8/int8 quant, reshape/append
+KV, Marlin repack, topk/align/sum; the source build also exposes
+`torch.ops._C.silu_and_mul` and `per_token_group_fp8_quant`), `flashinfer`
+(norm, silu_and_mul, softmax, top-k mask, paged append, prefill/decode
+attention), `sdpa` (prefill attention), `fa2` (dense prefill when the
+`flash_attn` package is installed), `sglang` (sgl_kernel norm/rope/act/moe from
+the v0.5.15 clone), `bnb` (NF4 GEMV M=1). Cases a library cannot express are
+listed under `skipped` instead of aborting the run. `calibrate.py` records the
+D2D copy and cuBLAS roofline; `report.py` renders the per-family markdown tables.
+
+## llama.cpp GGUF GEMV
+
+`llamacpp_mmvq.cpp` is a dev-only exact-shape `ggml_mul_mat` harness. It links
+the local llama.cpp build, quantizes the weight with `ggml_quantize_chunk`, and
+times a group of 20 launches after a 256 MB copy:
+
+```bash
+g++ -O2 -std=c++17 -I/usr/local/cuda/include \
+    -I3rd/llama.cpp/ggml/include -I3rd/llama.cpp/ggml/src \
+    benchmark/compare/llamacpp_mmvq.cpp -o /tmp/llamacpp_mmvq \
+    -L3rd/llama.cpp/build-sm89/bin -lggml -lggml-base -lggml-cpu -lggml-cuda \
+    -L/usr/local/cuda/lib64 -lcudart -lcuda \
+    -Wl,-rpath,$PWD/3rd/llama.cpp/build-sm89/bin \
+    -Wl,-rpath,/usr/local/cuda/lib64
+/tmp/llamacpp_mmvq
+```
+
+The harness flushes once per group, not once per launch, so its numbers are
+**hot-L2** and only comparable to a kops run without `--flush-l2`. Use the same
+protocol on both sides or add a per-launch flush before quoting a ratio.

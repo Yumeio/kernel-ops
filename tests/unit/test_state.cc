@@ -225,6 +225,98 @@ void test_graph(LaunchContext& ctx) {
   cudaStreamDestroy(stream);
 }
 
+void test_commit(LaunchContext& ctx) {
+  constexpr int kSlots = 8, kB0 = 64, kB1 = 32, B = 4, M = 4;
+  DevBuf<uint8_t> pool0(static_cast<size_t>(kSlots) * kB0);
+  DevBuf<uint8_t> pool1(static_cast<size_t>(kSlots) * kB1);
+  DevBuf<int64_t> ptrs(2);
+  DevBuf<int64_t> bytes(2);
+  DevBuf<int32_t> live(B);
+  DevBuf<int32_t> inter(B * M);
+  DevBuf<int32_t> num(B);
+  if (!pool0.ok() || !pool1.ok() || !ptrs.ok() || !bytes.ok() || !live.ok() || !inter.ok() ||
+      !num.ok()) return;
+  std::vector<uint8_t> a(static_cast<size_t>(kSlots) * kB0);
+  std::vector<uint8_t> b(static_cast<size_t>(kSlots) * kB1);
+  for (int s = 0; s < kSlots; ++s) {
+    for (int i = 0; i < kB0; ++i) a[static_cast<size_t>(s * kB0 + i)] = static_cast<uint8_t>(s * 17 + i * 3);
+    for (int i = 0; i < kB1; ++i) b[static_cast<size_t>(s * kB1 + i)] = static_cast<uint8_t>(s * 29 + i * 5);
+  }
+  kops_test::copy_in(pool0.p, a);
+  kops_test::copy_in(pool1.p, b);
+  const int64_t pv[2] = {reinterpret_cast<int64_t>(pool0.p), reinterpret_cast<int64_t>(pool1.p)};
+  const int64_t bv[2] = {kB0, kB1};
+  kops_test::copy_in(ptrs.p, std::vector<int64_t>(pv, pv + 2));
+  kops_test::copy_in(bytes.p, std::vector<int64_t>(bv, bv + 2));
+  kops_test::copy_in(live.p, std::vector<int32_t>{0, 1, 2, -1});
+  kops_test::copy_in(inter.p, std::vector<int32_t>{4, 5, 6, 7, 5, 6, 7, 4, 6, 7, 4, 5, 4, 5, 6, 7});
+  kops_test::copy_in(num.p, std::vector<int32_t>{0, 2, 3, 1});
+
+  const Tensor tp = tensor1d(ptrs.p, DType::kInt64, 2);
+  const Tensor tb = tensor1d(bytes.p, DType::kInt64, 2);
+  const Tensor tl = tensor1d(live.p, DType::kInt32, B);
+  const Tensor ti = tensor2d(inter.p, DType::kInt32, B, M);
+  const Tensor tn = tensor1d(num.p, DType::kInt32, B);
+  KOPS_EXPECT_OK(kops::state::state_commit_accepted(tp, tb, tl, ti, tn, ctx), "state_commit");
+  KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+
+  auto p0 = kops_test::copy_out(pool0.p, static_cast<size_t>(kSlots) * kB0);
+  auto p1 = kops_test::copy_out(pool1.p, static_cast<size_t>(kSlots) * kB1);
+  // row 0: accepted 0 -> slot 4; row 1: accepted 2 -> slot 7; row 2 all
+  // accepted -> live untouched; row 3 negative live -> untouched.
+  for (int i = 0; i < kB0; ++i) {
+    KOPS_TEST_CHECK(p0[static_cast<size_t>(0 * kB0 + i)] == a[static_cast<size_t>(4 * kB0 + i)]);
+    KOPS_TEST_CHECK(p0[static_cast<size_t>(1 * kB0 + i)] == a[static_cast<size_t>(7 * kB0 + i)]);
+    KOPS_TEST_CHECK(p0[static_cast<size_t>(2 * kB0 + i)] == a[static_cast<size_t>(2 * kB0 + i)]);
+  }
+  for (int i = 0; i < kB1; ++i) {
+    KOPS_TEST_CHECK(p1[static_cast<size_t>(0 * kB1 + i)] == b[static_cast<size_t>(4 * kB1 + i)]);
+    KOPS_TEST_CHECK(p1[static_cast<size_t>(1 * kB1 + i)] == b[static_cast<size_t>(7 * kB1 + i)]);
+    KOPS_TEST_CHECK(p1[static_cast<size_t>(2 * kB1 + i)] == b[static_cast<size_t>(2 * kB1 + i)]);
+  }
+
+  // Graph replay: the recorded pointers stay valid, only num_accepted changes.
+  cudaStream_t stream = nullptr;
+  if (cudaStreamCreate(&stream) == cudaSuccess) {
+    LaunchContext gc = ctx;
+    gc.stream = reinterpret_cast<kops::kops_stream_t>(stream);
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+    KOPS_EXPECT_OK(kops::state::state_commit_accepted(tp, tb, tl, ti, tn, gc), "graph commit");
+    cudaStreamEndCapture(stream, &graph);
+    if (graph != nullptr && cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess) {
+      kops_test::copy_in(num.p, std::vector<int32_t>{1, 1, 1, 1});
+      cudaGraphLaunch(exec, stream);
+      cudaStreamSynchronize(stream);
+      p0 = kops_test::copy_out(pool0.p, static_cast<size_t>(kSlots) * kB0);
+      for (int i = 0; i < kB0; ++i) {
+        KOPS_TEST_CHECK(p0[static_cast<size_t>(0 * kB0 + i)] == a[static_cast<size_t>(5 * kB0 + i)]);
+        KOPS_TEST_CHECK(p0[static_cast<size_t>(1 * kB0 + i)] == a[static_cast<size_t>(6 * kB0 + i)]);
+        KOPS_TEST_CHECK(p0[static_cast<size_t>(2 * kB0 + i)] == a[static_cast<size_t>(7 * kB0 + i)]);
+      }
+      cudaGraphExecDestroy(exec);
+    }
+    if (graph != nullptr) cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+  }
+
+  // Contract checks.
+  const Tensor bad_live = tensor1d(live.p, DType::kInt32, B - 1);
+  KOPS_EXPECT_STATUS(kops::state::state_commit_accepted(tp, tb, bad_live, ti, tn, ctx),
+                     Status::kInvalidArgument, "commit live length");
+  const Tensor bad_inter = tensor2d(inter.p, DType::kInt32, B + 1, M);
+  KOPS_EXPECT_STATUS(kops::state::state_commit_accepted(tp, tb, tl, bad_inter, tn, ctx),
+                     Status::kInvalidArgument, "commit intermediate rows");
+  const Tensor bad_num = tensor1d(num.p, DType::kInt64, B);
+  KOPS_EXPECT_STATUS(kops::state::state_commit_accepted(tp, tb, tl, ti, bad_num, ctx),
+                     Status::kUnsupportedDtype, "commit num dtype");
+  Tensor padded = tensor2d(inter.p, DType::kInt32, B, M);
+  padded.stride[0] = M + 1;
+  KOPS_EXPECT_STATUS(kops::state::state_commit_accepted(tp, tb, tl, padded, tn, ctx),
+                     Status::kInvalidArgument, "commit padded rows");
+}
+
 void test_contracts(LaunchContext& ctx) {
   Fixture f;
   if (!f.ok()) return;
@@ -248,7 +340,7 @@ void test_contracts(LaunchContext& ctx) {
                                                ts, ctx),
                      Status::kInvalidArgument, "state empty out");
   KOPS_EXPECT_STATUS(kops::state::state_commit_accepted(f.tp(), f.tb(), ts, ts, ts, ctx),
-                     Status::kNotImplemented, "state_commit_accepted B10");
+                     Status::kInvalidArgument, "state_commit_accepted shape");
 }
 
 // =============================================================================
@@ -550,6 +642,96 @@ void test_conv1d(LaunchContext& ctx) {
                      "conv1d int8");
   KOPS_EXPECT_STATUS(kops::state::causal_conv1d_fwd(p, DType::kBFloat16, ctx), Status::kInvalidArgument,
                      "conv1d null x");
+}
+
+// ---- B10 hybrid consistency: speculative conv state == sequential decode ---------------------
+
+void test_commit_hybrid(LaunchContext& ctx) {
+  constexpr int B = 1, K = 4, dim = 32, width = 4, H = width - 1;
+  constexpr int kSlots = 8;
+  constexpr int kPrefix = 0, kLive = 1, kRef = 2, kSnap0 = 3, kSnap1 = 4, kSnap2 = 5,
+                kSnap3 = 6, kSnap4 = 7;
+  Lcg rng(4242u);
+  std::vector<double> xd, wd, sd;
+  const auto x = rand_t<float>(static_cast<size_t>(B) * K * dim, rng, -1.0, 1.0, &xd);
+  const auto w = rand_t<float>(static_cast<size_t>(dim) * width, rng, -0.6, 0.6, &wd);
+  const auto states0 = rand_t<float>(static_cast<size_t>(kSlots) * dim * H, rng, -1.0, 1.0, &sd);
+
+  Arena ar;
+  float* states = ar.put(states0);
+  float* xp = ar.put(x);
+  float* out = ar.put(std::vector<float>(x.size(), 0.0f));
+  int64_t* ptrs = ar.put(std::vector<int64_t>{reinterpret_cast<int64_t>(states)});
+  int64_t* slot_bytes = ar.put(std::vector<int64_t>{static_cast<int64_t>(dim) * H * sizeof(float)});
+  int32_t* copy_pair = ar.put(std::vector<int32_t>{kPrefix, kLive});
+  int32_t* copy_pair0 = ar.put(std::vector<int32_t>{kPrefix, kSnap0});
+  int32_t* live = ar.put(std::vector<int32_t>{kLive});
+  int32_t* ref = ar.put(std::vector<int32_t>{kRef});
+  int32_t* inter = ar.put(std::vector<int32_t>{kSnap1, kSnap2, kSnap3, kSnap4});
+  int32_t* table = ar.put(std::vector<int32_t>{kSnap0, kSnap1, kSnap2, kSnap3, kSnap4});
+  int32_t* accepted = ar.put(std::vector<int32_t>{0});
+
+  const Tensor tp = tensor1d(ptrs, DType::kInt64, 1);
+  const Tensor tb = tensor1d(slot_bytes, DType::kInt64, 1);
+  const Tensor tc = tensor2d(copy_pair, DType::kInt32, 1, 2);
+  const Tensor tc0 = tensor2d(copy_pair0, DType::kInt32, 1, 2);
+  const Tensor tl = tensor1d(live, DType::kInt32, 1);
+  const Tensor ti = tensor2d(table, DType::kInt32, 1, 5);
+  const Tensor tn = tensor1d(accepted, DType::kInt32, 1);
+
+  kops::state::Conv1dUpdateParams p{};
+  p.x = xp;
+  p.x_batch_stride = static_cast<int64_t>(K) * dim;
+  p.x_token_stride = dim;
+  p.weight = ar.put(w);
+  p.weight_dim_stride = width;
+  p.weight_width_stride = 1;
+  p.bias = nullptr;
+  p.out = out;
+  p.out_batch_stride = static_cast<int64_t>(K) * dim;
+  p.out_token_stride = dim;
+  p.conv_states = states;
+  p.conv_state_slot_stride = static_cast<int64_t>(dim) * H;
+  p.conv_state_dim_stride = H;
+  p.conv_state_len_stride = 1;
+  p.num_slots = kSlots;
+  p.cache_indices = live;
+  p.intermediate_state_slots = inter;
+  p.batch_size = B;
+  p.seqlen = K;
+  p.dim = dim;
+  p.width = width;
+  p.pad_slot_id = 100;
+  p.act = ActFn::kSiLU;
+  p.weight_dtype = DType::kFloat32;
+
+  // Snapshot slot 0 is the prefix state (state after zero accepted drafts).
+  KOPS_EXPECT_OK(kops::state::state_copy(tp, tb, tc0, ctx), "hybrid copy prefix");
+  for (int r : {0, 2, 4}) {
+    KOPS_EXPECT_OK(kops::state::state_copy(tp, tb, tc, ctx), "hybrid reset live");
+    KOPS_EXPECT_OK(kops::state::causal_conv1d_update(p, DType::kFloat32, ctx),
+                   "hybrid draft update");
+    kops_test::copy_in(accepted, std::vector<int32_t>{r});
+    KOPS_EXPECT_OK(kops::state::state_commit_accepted(tp, tb, tl, ti, tn, ctx), "hybrid commit");
+
+    // Reference: decode just the accepted prefix + drafts from the same state.
+    int32_t reset_pair[2] = {kPrefix, kRef};
+    kops_test::copy_in(copy_pair, std::vector<int32_t>(reset_pair, reset_pair + 2));
+    KOPS_EXPECT_OK(kops::state::state_copy(tp, tb, tensor2d(copy_pair, DType::kInt32, 1, 2), ctx),
+                   "hybrid reset ref");
+    if (r > 0) {
+      auto pr = p;
+      pr.cache_indices = ref;
+      pr.intermediate_state_slots = nullptr;
+      pr.seqlen = r;
+      KOPS_EXPECT_OK(kops::state::causal_conv1d_update(pr, DType::kFloat32, ctx),
+                     "hybrid reference update");
+    }
+    KOPS_TEST_CHECK(cudaDeviceSynchronize() == cudaSuccess);
+    const auto got = kops_test::copy_out(states + kLive * dim * H, dim * H);
+    const auto want = kops_test::copy_out(states + kRef * dim * H, dim * H);
+    KOPS_TEST_CHECK(std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) == 0);
+  }
 }
 
 // ---- shared helpers of the recurrent tests ---------------------------------------------------
@@ -1707,8 +1889,10 @@ int main() {
   test_gather_scatter(ctx);
   test_zero(ctx);
   test_graph(ctx);
+  test_commit(ctx);
   test_contracts(ctx);
   test_conv1d(ctx);
+  test_commit_hybrid(ctx);
   test_ssm(ctx);
   test_linear_and_delta(ctx);
   test_long(ctx);

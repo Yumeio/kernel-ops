@@ -400,6 +400,192 @@ void test_per_group(LaunchContext& ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// Pack-edge coverage: widths that are not a multiple of the vector, padded input/output rows,
+// tiny rows, fp16/fp32 inputs, asymmetric INT8 and scale_upper_bound. Oracles are the same fp32
+// formulas the kernels document (correctly rounded division, nearest-even, saturating stores).
+// -----------------------------------------------------------------------------
+
+template <typename T>
+std::vector<T> pad_rows(const std::vector<T>& src, int rows, int cols, int pad) {
+  std::vector<T> out(static_cast<size_t>(rows) * (cols + pad), T{});
+  for (int r = 0; r < rows; ++r) {
+    std::copy_n(src.begin() + static_cast<size_t>(r) * cols, cols,
+                out.begin() + static_cast<size_t>(r) * (cols + pad));
+  }
+  return out;
+}
+
+template <typename T>
+std::vector<float> rounded_values(const std::vector<T>& v) {
+  std::vector<float> out(v.size());
+  for (size_t i = 0; i < v.size(); ++i) out[i] = kops_test::to_float(v[i]);
+  return out;
+}
+
+struct EdgeCase {
+  int rows;
+  int cols;
+  int in_pad;
+  int out_pad;
+  float scale;
+};
+
+template <typename T>
+void run_per_tensor_edge(LaunchContext& ctx, DType dtype, bool fp8, const EdgeCase& c,
+                         unsigned seed) {
+  const int64_t in_stride = c.cols + c.in_pad;
+  const int64_t out_stride = c.cols + c.out_pad;
+  std::vector<float> host(static_cast<size_t>(c.rows) * c.cols);
+  fill_uniform(host, seed, -5.0f, 5.0f);
+  const std::vector<T> rounded = cast_from_float<T>(host);
+  const std::vector<float> vals = rounded_values(rounded);
+  const size_t q_count = static_cast<size_t>(c.rows) * out_stride;
+  DevBuf<T> in(static_cast<size_t>(c.rows) * in_stride);
+  DevBuf<uint8_t> q(q_count);
+  DevBuf<float> scale(1);
+  if (!in.ok() || !q.ok() || !scale.ok()) return;
+  kops_test::copy_in(in.p, pad_rows(rounded, c.rows, c.cols, c.in_pad));
+  kops_test::copy_in(scale.p, std::vector<float>{c.scale});
+  const std::vector<uint8_t> sentinel(q_count, 0xCDu);
+  kops_test::copy_in(q.p, sentinel);
+  ActQuantOut out = make_out(q.p, out_stride, nullptr, 0,
+                             fp8 ? DType::kFloat8E4M3 : DType::kInt8,
+                             ActQuantMode::kStaticPerTensor);
+  out.static_scale = scale.p;
+  KOPS_EXPECT_OK(kops::quant::quantize_activation(
+                     out, tensor2d(in.p, dtype, c.rows, c.cols, in_stride), Tensor{}, 0, ctx),
+                 "per-tensor pack edge");
+  const std::vector<uint8_t> got = kops_test::copy_out(q.p, q_count);
+  for (int r = 0; r < c.rows; ++r) {
+    for (int col = 0; col < c.cols; ++col) {
+      const float x = vals[static_cast<size_t>(r) * c.cols + col];
+      uint8_t want;
+      if (fp8) {
+        want = e4m3_byte(x / c.scale);
+      } else {
+        int v = static_cast<int>(std::nearbyint(x / c.scale));
+        v = std::max(-127, std::min(127, v));
+        want = static_cast<uint8_t>(static_cast<int8_t>(v));
+      }
+      KOPS_TEST_CHECK(got[static_cast<size_t>(r) * out_stride + col] == want);
+    }
+    for (int col = c.cols; col < out_stride; ++col) {
+      KOPS_TEST_CHECK(got[static_cast<size_t>(r) * out_stride + col] == 0xCDu);  // row padding
+    }
+  }
+}
+
+template <typename T>
+void run_per_token_edge(LaunchContext& ctx, DType dtype, bool fp8, const EdgeCase& c,
+                        bool use_ub, unsigned seed) {
+  const int64_t in_stride = c.cols + c.in_pad;
+  const int64_t out_stride = c.cols + c.out_pad;
+  std::vector<float> host(static_cast<size_t>(c.rows) * c.cols);
+  fill_uniform(host, seed, -6.0f, 5.0f);
+  const std::vector<T> rounded = cast_from_float<T>(host);
+  const std::vector<float> vals = rounded_values(rounded);
+  const size_t q_count = static_cast<size_t>(c.rows) * out_stride;
+  DevBuf<T> in(static_cast<size_t>(c.rows) * in_stride);
+  DevBuf<uint8_t> q(q_count);
+  DevBuf<float> scales(c.rows), ub(1);
+  DevBuf<int32_t> zero(c.rows);
+  if (!in.ok() || !q.ok() || !scales.ok() || !ub.ok() || !zero.ok()) return;
+  kops_test::copy_in(in.p, pad_rows(rounded, c.rows, c.cols, c.in_pad));
+  const float ub_value = 0.005f;  // below amax/448 for the [-6, 5] data: always binds
+  kops_test::copy_in(ub.p, std::vector<float>{ub_value});
+  const std::vector<uint8_t> sentinel(q_count, 0xCDu);
+  kops_test::copy_in(q.p, sentinel);
+  ActQuantOut out = make_out(q.p, out_stride, scales.p, 1,
+                             fp8 ? DType::kFloat8E4M3 : DType::kInt8,
+                             ActQuantMode::kDynamicPerToken);
+  out.symmetric = fp8;
+  if (!fp8) out.zero_points = zero.p;
+  out.scale_upper_bound = use_ub ? ub.p : nullptr;
+  KOPS_EXPECT_OK(kops::quant::quantize_activation(
+                     out, tensor2d(in.p, dtype, c.rows, c.cols, in_stride), Tensor{}, 0, ctx),
+                 "per-token pack edge");
+  const std::vector<uint8_t> got = kops_test::copy_out(q.p, q_count);
+  const std::vector<float> gs = kops_test::copy_out(scales.p, c.rows);
+  const std::vector<int32_t> gz = kops_test::copy_out(zero.p, c.rows);
+  for (int r = 0; r < c.rows; ++r) {
+    float mx = -1e30f, mn = 1e30f;
+    for (int col = 0; col < c.cols; ++col) {
+      const float x = vals[static_cast<size_t>(r) * c.cols + col];
+      mx = std::max(mx, x);
+      mn = std::min(mn, x);
+    }
+    float s;
+    int z = 0;
+    if (fp8) {
+      const float amax = std::max(std::fabs(mx), std::fabs(mn));
+      s = std::fmax(amax / 448.0f, 1.0f / (448.0f * 512.0f));
+      if (use_ub) s = std::fmin(s, ub_value);
+    } else {
+      s = (mx - mn) / 255.0f;
+      s = std::fmax(s, 1.0f / (127.0f * 512.0f));
+      z = static_cast<int>(std::nearbyint(-128.0f - mn / s));
+      KOPS_TEST_CHECK(gz[static_cast<size_t>(r)] == z);
+    }
+    KOPS_TEST_CHECK(std::fabs(gs[static_cast<size_t>(r)] - s) <= 1e-7f + 1e-6f * s);
+    for (int col = 0; col < c.cols; ++col) {
+      const float x = vals[static_cast<size_t>(r) * c.cols + col];
+      uint8_t want;
+      if (fp8) {
+        want = e4m3_byte(x / s);
+      } else {
+        int v = static_cast<int>(std::nearbyint(x / s + static_cast<float>(z)));
+        v = std::max(-128, std::min(127, v));
+        want = static_cast<uint8_t>(static_cast<int8_t>(v));
+      }
+      KOPS_TEST_CHECK(got[static_cast<size_t>(r) * out_stride + col] == want);
+    }
+    for (int col = c.cols; col < out_stride; ++col) {
+      KOPS_TEST_CHECK(got[static_cast<size_t>(r) * out_stride + col] == 0xCDu);
+    }
+  }
+}
+
+void test_quant_pack_edges(LaunchContext& ctx) {
+  const EdgeCase tensor_cases[] = {
+      {1, 1, 0, 0, 1.0f},        // one element, power-of-two scale
+      {3, 7, 0, 0, 0.0125f},     // shorter than one pack
+      {2, 17, 4, 3, 1.0e-3f},    // padded input and output rows
+      {5, 1031, 0, 1, 1.0f},     // not a multiple of the pack
+      {4, 4095, 2, 0, 0.02f},    // just below a pack-aligned row
+      {3, 4096, 0, 0, 0.0125f},  // vector fast path
+  };
+  unsigned seed = 301;
+  for (const EdgeCase& c : tensor_cases) {
+    run_per_tensor_edge<__nv_bfloat16>(ctx, DType::kBFloat16, true, c, seed++);
+    run_per_tensor_edge<__nv_bfloat16>(ctx, DType::kBFloat16, false, c, seed++);
+    run_per_tensor_edge<__half>(ctx, DType::kFloat16, true, c, seed++);
+    run_per_tensor_edge<__half>(ctx, DType::kFloat16, false, c, seed++);
+    run_per_tensor_edge<float>(ctx, DType::kFloat32, true, c, seed++);
+    run_per_tensor_edge<float>(ctx, DType::kFloat32, false, c, seed++);
+  }
+  const EdgeCase token_cases[] = {
+      {1, 1, 0, 0, 0.0f},       // single value
+      {5, 17, 0, 1, 0.0f},      // warp path
+      {4, 33, 2, 0, 0.0f},      // warp path, padded input
+      {3, 1024, 0, 0, 0.0f},    // warp path boundary
+      {2, 1025, 0, 3, 0.0f},    // smem fallback (not pack aligned)
+      {4, 1031, 0, 1, 0.0f},    // smem fallback, odd width
+      {2, 4095, 0, 0, 0.0f},    // smem fallback, just below aligned
+      {3, 4096, 0, 0, 0.0f},    // vector fast path
+      {2, 4097, 2, 0, 0.0f},    // smem fallback, padded input
+  };
+  for (const EdgeCase& c : token_cases) {
+    run_per_token_edge<__nv_bfloat16>(ctx, DType::kBFloat16, true, c, false, seed++);
+    run_per_token_edge<__nv_bfloat16>(ctx, DType::kBFloat16, true, c, true, seed++);
+    run_per_token_edge<__nv_bfloat16>(ctx, DType::kBFloat16, false, c, false, seed++);
+    run_per_token_edge<__half>(ctx, DType::kFloat16, true, c, false, seed++);
+    run_per_token_edge<__half>(ctx, DType::kFloat16, false, c, false, seed++);
+    run_per_token_edge<float>(ctx, DType::kFloat32, true, c, false, seed++);
+    run_per_token_edge<float>(ctx, DType::kFloat32, false, c, false, seed++);
+  }
+}
+
+// -----------------------------------------------------------------------------
 // MX / NVFP4
 // -----------------------------------------------------------------------------
 
@@ -1842,6 +2028,7 @@ int main() {
   test_per_tensor_int8(ctx);
   test_per_token_fp8(ctx);
   test_per_token_int8_asym(ctx);
+  test_quant_pack_edges(ctx);
   test_per_group(ctx);
   test_mx(ctx);
   test_nvfp4(ctx);

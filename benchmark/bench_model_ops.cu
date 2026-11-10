@@ -30,6 +30,10 @@ std::vector<Case> make_cases() {
   add_res("model_ops.residual_add.fp32.3.t1024.h4096", kops::DType::kFloat32, 1024, 4096, true);
   add_res("model_ops.residual_add.bf16.2.t1024.h4096", kops::DType::kBFloat16, 1024, 4096, false);
   add_res("model_ops.residual_add.bf16.3.t1024.h4096", kops::DType::kBFloat16, 1024, 4096, true);
+  // Above L2 (64 MB per operand): the DRAM-roofline data point, where the
+  // benchmark's 256 MB L2 flush no longer dominates the sample.
+  add_res("model_ops.residual_add.bf16.2.t4096.h8192", kops::DType::kBFloat16, 4096, 8192, false);
+  add_res("model_ops.residual_add.fp32.2.t4096.h8192", kops::DType::kFloat32, 4096, 8192, false);
 
   auto add_cast = [&](const char* id, kops::DType in, kops::DType out, int64_t rows, int64_t d) {
     const int es = dtype_size(in) + dtype_size(out);
@@ -41,6 +45,8 @@ std::vector<Case> make_cases() {
            kops::DType::kBFloat16, 1024, 4096);
   add_cast("model_ops.cast.fp16_to_fp32.t1024.h4096", kops::DType::kFloat16,
            kops::DType::kFloat32, 1024, 4096);
+  add_cast("model_ops.cast.bf16_to_fp32.t4096.h8192", kops::DType::kBFloat16,
+           kops::DType::kFloat32, 4096, 8192);
   return cases;
 }
 
@@ -119,7 +125,8 @@ int main(int argc, char** argv) {
   if (!cuda_ok(cudaSetDevice(0), "cudaSetDevice")) return 1;
   DeviceInfo dev{};
   query_device(&dev);
-  const std::vector<Case> cases = make_cases();
+  std::vector<Case> cases = make_cases();
+  filter_cases(&cases, opt);
   if (opt.dump_cases) {
     dump_cases(cases, dev);
     return 0;

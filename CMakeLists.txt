@@ -153,10 +153,13 @@ add_library(kops_cuda STATIC
   csrc/sampling/sampling.cu
   csrc/sampling/fused_sampler.cu
   csrc/sampling/logits_processor.cu
+  csrc/sampling/speculative.cu
   csrc/quantization/quant.cu
   csrc/quantization/weight_repack.cu
   csrc/gemm/gemm_prep.cu
   csrc/gemm/mixed_input_gemm.cu
+  csrc/gemm/marlin_dense.cu
+  csrc/gemm/marlin_moe.cu
   csrc/gemm/fp8_gemm.cu
   csrc/gemm/int8_gemm.cu
   csrc/gemm/fp4_gemm.cu
