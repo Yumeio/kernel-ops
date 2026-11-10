@@ -591,6 +591,99 @@ void test_gather_scatter_family(bool host) {
 // ======================================================================================================
 // (d) system: arrival order, slot reuse across mixed calls, graph replay, timeout
 // ======================================================================================================
+/// The chunked producer/consumer pipeline (run_pipeline): a message above the single-phase threshold
+/// runs one producer CTA plus kPipeConsumers consumer CTAs, and the producer posts one system-scope
+/// release per chunk. Cover the switch-over size, an odd chunk count, a last chunk shorter than the
+/// others, both staging-slot parities, the collectives that share the skeleton, and graph replay.
+template <typename T>
+void test_pipeline_chunked(bool host) {
+  const int W = host ? 2 : 4;
+  const size_t epv = 16 / sizeof(T);
+  // 128 KiB + 16 B is the first size above the single-phase threshold (2 chunks, the last one a
+  // single vector), 384 KiB gives an odd number of 128 KiB chunks, 1 MiB + 8 KiB a short last chunk,
+  // 4 MiB the 16-chunk cap.
+  std::vector<size_t> sizes = {(size_t(128) << 10) + 16, size_t(384) << 10, (size_t(1) << 20) + 8192};
+  if (kops_test::tier_enabled(g_opt, "standard")) sizes.push_back(size_t(4) << 20);
+  size_t max_elem = 0;
+  for (size_t b : sizes) max_elem = std::max(max_elem, b / sizeof(T));
+  const size_t cap = 2 * (max_elem * sizeof(T) + 128);
+  const int reps = kops_test::tier_enabled(g_opt, "standard") ? 3 : 2;
+  World w;
+  if (!w.init(W, host, cap, 0)) return;
+  for (size_t b : sizes) {
+    const size_t n = ((b / sizeof(T)) / epv) * epv;
+    for (int rep = 0; rep < reps; ++rep) {
+      // alternating algorithms and repeats cover both staging-slot parities (the slot is epoch & 1)
+      const AllReduceAlgo algo = rep % 3 == 0 ? AllReduceAlgo::kOneShot
+                                : rep % 3 == 1 ? AllReduceAlgo::kTwoShot
+                                               : AllReduceAlgo::kDeterministic;
+      char tag[160];
+      std::snprintf(tag, sizeof(tag), "chunked allreduce %s %s W=%d n=%zu %s", host ? "host" : "virtual",
+                    algo_name(algo), W, n, kops::dtype_name(dtype_of<T>()));
+      run_allreduce_case<T>(w, algo, n, 31 + rep, tag);
+    }
+  }
+  // allgather and reduce_scatter share run_pipeline, so they also switch to the producer/consumer split
+  const size_t per_rank = ((size_t(1) << 20) / sizeof(T) / epv) * epv;
+  for (int rep = 0; rep < reps; ++rep) {
+    char tag[160];
+    std::snprintf(tag, sizeof(tag), "chunked allgather %s W=%d n=%zu", host ? "host" : "virtual", W, per_rank);
+    run_allgather_case<T>(w, per_rank, 41 + rep, tag);
+    std::snprintf(tag, sizeof(tag), "chunked reduce_scatter %s W=%d m=%zu", host ? "host" : "virtual", W,
+                  per_rank);
+    run_reduce_scatter_case<T>(w, per_rank, 43 + rep, tag);
+  }
+  {
+    // Graph replay of a chunked call: the per-chunk flags are epoch-tagged, so a captured graph must
+    // replay without any host update and every replay must reduce the inputs of that replay.
+    const size_t n = ((size_t(1) << 20) / sizeof(T) / epv) * epv;
+    const int calls = 3;
+    std::vector<RankBuf<T>> in(W), out(W);
+    std::vector<cudaGraph_t> graph(W);
+    std::vector<cudaGraphExec_t> exec(W);
+    for (int k = 0; k < W; ++k) {
+      const int dev = w.r[k].device;
+      in[k].alloc(dev, n);
+      out[k].alloc(dev, n);
+      out[k].fill_bytes(0);
+      CUDA_OK(cudaSetDevice(dev));
+      CUDA_OK(cudaStreamBeginCapture(w.r[k].stream, cudaStreamCaptureModeThreadLocal));
+      for (int c = 0; c < calls; ++c) {
+        KOPS_EXPECT_OK(allreduce(flat(out[k].p, dtype_of<T>(), n, dev), flat(in[k].p, dtype_of<T>(), n, dev),
+                                 w.r[k].peers, AllReduceAlgo::kOneShot, 0, w.r[k].ctx),
+                       "capture chunked allreduce");
+      }
+      CUDA_OK(cudaStreamEndCapture(w.r[k].stream, &graph[k]));
+      CUDA_OK(cudaGraphInstantiate(&exec[k], graph[k], 0));
+    }
+    const int replays = kops_test::tier_enabled(g_opt, "standard") ? 4 : 2;
+    for (int it = 0; it < replays; ++it) {
+      std::vector<std::vector<T>> hin(W);
+      for (int k = 0; k < W; ++k) {
+        hin[k] = random_vec<T>(n, 700 + it * 11 + k);
+        in[k].put(hin[k]);
+      }
+      for (int k = 0; k < W; ++k) {
+        CUDA_OK(cudaSetDevice(w.r[k].device));
+        CUDA_OK(cudaGraphLaunch(exec[k], w.r[k].stream));
+      }
+      w.sync_all();
+      const std::vector<T> want = sum_ranks<T>(hin, 0, n);
+      for (int k = 0; k < W; ++k) {
+        char what[128];
+        std::snprintf(what, sizeof(what), "chunked graph replay %d rank %d", it, k);
+        expect_bits(out[k].get(), want, what);
+      }
+    }
+    for (int k = 0; k < W; ++k) {
+      CUDA_OK(cudaSetDevice(w.r[k].device));
+      cudaGraphExecDestroy(exec[k]);
+      cudaGraphDestroy(graph[k]);
+    }
+  }
+  w.destroy();
+}
+
 void test_arrival_order_determinism(bool host) {
   const int W = host ? 2 : 4;
   World w;
@@ -1806,6 +1899,8 @@ int main(int argc, char** argv) {
   test_allreduce_family<float>(false);
   test_allreduce_family<__nv_bfloat16>(true);
   test_allreduce_family<float>(true);
+  test_pipeline_chunked<__nv_bfloat16>(false);
+  test_pipeline_chunked<__nv_bfloat16>(true);
   test_gather_scatter_family<__nv_bfloat16>(false);
   test_gather_scatter_family<float>(false);
   test_gather_scatter_family<__nv_bfloat16>(true);

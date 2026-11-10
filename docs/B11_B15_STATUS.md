@@ -132,8 +132,10 @@ not installed and the optimized SM90a/SM100a bodies are not ported.
 
 ## Handoff
 
-`out/handoff/sm90a/` and `out/handoff/sm100a/` are built and package-validated
-with `check_env.py --skip-gpu` (13 PASS, 3 WARN, 0 FAIL each; 23 tests and 17
+`out/handoff/sm90a/` and `out/handoff/sm100a/` are built from commit
+`5160ea7` (`source_dirty: false`) and package-validated with
+`check_env.py --skip-gpu` (14 PASS, 2 WARN, 0 FAIL each; the warnings are the
+skipped GPU probe and the planned-but-empty golden set; 26 tests and 18
 benchmarks per kit). On the target run:
 
 ```bash
@@ -142,9 +144,8 @@ cd out/handoff/sm90a
 ./run_all.sh --arch sm90a --kit . --json-dir results
 ```
 
-The kit was built from a dirty tree; commit it before treating results as
-evidence. Tests without `KOPS_GOLDEN_DIR` still run; the 1M golden cases are
-planned but not generated, so they skip 77.
+Tests without `KOPS_GOLDEN_DIR` still run; the 1M golden cases are planned but
+not generated, so they skip 77.
 
 ## Remaining gaps
 
@@ -159,4 +160,3 @@ planned but not generated, so they skip 77.
 5. 1M output-only golden files are not generated yet; the analytic 1M test is
    present, and the manifest/schema/tooling are ready (currently 0 ready / 11
    planned cases, including the conformance fixtures).
-6. `benchmark/compare/torch_baseline.py` has no handlers for the new ops yet.

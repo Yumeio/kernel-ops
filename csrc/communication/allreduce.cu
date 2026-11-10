@@ -13,14 +13,19 @@
 //   * over P2P / NVLink peer mappings, and
 //   * over pinned host memory when the GPUs have no P2P (this repo's dev box: 2 x RTX 5060 Ti).
 // Pull model: a rank copies its input into its own staging slot, publishes a flag, and reads the
-// peers' slots after their flags arrive. No rank ever writes another rank's memory.
+// peers' slots after their flags arrive. No rank ever writes another rank's memory. A message above
+// the single-phase threshold splits the two directions over separate CTAs of the same launch: one
+// producer stages chunk by chunk and publishes a flag per chunk, the consumers read the peers' chunks
+// (see run_pipeline). That is what keeps a read-only PCIe link busy in both directions at once.
 //
 // Epoch / graph replay. The call epoch is E = generation + calls + 1, read from the rank's private
 // scratch at kernel start; the last CTA to finish advances `calls`, so a captured graph replays any
 // number of times. The staging slot of a call is E & 1. One flag per phase is posted by the last CTA
 // to finish staging (device-scope arrival counter), because a system-scope release costs ~1.5 us and
-// the GPU serialises them across CTAs. All CTAs of a rank must be co-resident (the host never launches
-// more than one wave); across ranks only the usual rule applies: ranks run concurrently. Slot reuse is
+// the GPU serialises them across CTAs; a chunked call instead posts one release per chunk from its
+// producer (at most kPipeMaxChunks per call), which is what buys the read/write overlap. All CTAs of a
+// rank must be co-resident (the host never launches more than one wave); across ranks only the usual
+// rule applies: ranks run concurrently. Slot reuse is
 // safe without an end-of-call barrier: rank p posts its flag for call E only after its call E - 1
 // finished, so a rank that observed that flag in the previous call (it needs it to read the data)
 // knows the slot of call E - 2 is no longer being read.
@@ -168,11 +173,6 @@ __device__ __forceinline__ uint32_t atom_add_acqrel_gpu(uint32_t* p, uint32_t v)
   asm volatile("atom.add.acq_rel.gpu.global.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
   return old;
 }
-__device__ __forceinline__ uint32_t ld_acq_gpu(const uint32_t* p) {
-  uint32_t v;
-  asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-  return v;
-}
 __device__ __forceinline__ uint32_t ld_vol(const uint32_t* p) { return *reinterpret_cast<const volatile uint32_t*>(p); }
 
 /// Thread 0 reads the call counter and the timeout from the rank's private scratch.
@@ -282,9 +282,30 @@ __device__ __forceinline__ void cta_sub_stripe(int64_t a, int64_t b, int64_t* lo
   *hi = (*lo + per) < b ? (*lo + per) : b;
 }
 
-/// Independent 16 B loads in flight per thread: W * unroll uint4 registers stay constant, so a CTA of
-/// kCommThreads threads fits several CTAs per SM (virtual ranks need every rank's CTAs resident).
-__host__ __device__ constexpr int unroll_for(int w) { return w <= 2 ? 4 : (w <= 4 ? 2 : 1); }
+/// Independent 16 B loads in flight per thread: the staging (write) and consume (read) loops of a
+/// message above the single-phase threshold are PCIe-bound, so each thread keeps kStreamVectors
+/// vectors in flight; a CTA of kCommThreads threads then holds ~32 KiB of requests.
+constexpr int kStreamVectors = 8;
+__host__ __device__ constexpr int unroll_for(int w) { return w <= 2 ? 8 : (w <= 4 ? 4 : 2); }
+
+/// Streaming copy over the 16 B vectors of [lo, hi): kStreamVectors vectors in flight per thread, so
+/// the loop keeps a full PCIe burst outstanding instead of one 16 B request per thread step.
+template <typename Load, typename Emit>
+__device__ __forceinline__ void stream_vectors(int64_t lo, int64_t hi, Load&& load, Emit&& emit) {
+  for (int64_t i0 = lo + threadIdx.x; i0 < hi; i0 += static_cast<int64_t>(kCommThreads) * kStreamVectors) {
+    uint4 v[kStreamVectors];
+#pragma unroll
+    for (int u = 0; u < kStreamVectors; ++u) {
+      const int64_t i = i0 + static_cast<int64_t>(u) * kCommThreads;
+      if (i < hi) v[u] = load(i);
+    }
+#pragma unroll
+    for (int u = 0; u < kStreamVectors; ++u) {
+      const int64_t i = i0 + static_cast<int64_t>(u) * kCommThreads;
+      if (i < hi) emit(i, v[u]);
+    }
+  }
+}
 
 // ---- barrier -------------------------------------------------------------------------------------
 template <int W>
@@ -298,65 +319,71 @@ __global__ void __launch_bounds__(kCommThreads)
 }
 
 // ---- one-phase collectives, pipelined over chunks ---------------------------------------------------------
-// allreduce (one-shot), allgather and reduce_scatter share one skeleton: the iteration space of
-// `space16` 16-byte vectors is cut into `chunks`; the CTAs stage chunk c into the own staging slot,
-// count their arrival, and consume chunk c - 1 of the peers while chunk c drains over the link (posted
-// stores do not stall the thread). One flag per chunk is posted in order: by the last arriving CTA for a
-// single chunk, by a dedicated poster CTA (blockIdx.x == workers) for a pipelined call.
-/// Poster CTA of a pipelined call: waits for the workers' arrival counter and posts chunk flags in order.
-__device__ __forceinline__ void poster_loop(const PeerBuffers& peers, CtaState* st, int chunks) {
-  if (threadIdx.x == 0) {
-    const uint64_t t0 = global_timer_ns();
-    for (int r = 1; r <= chunks; ++r) {
-      const uint32_t target = static_cast<uint32_t>(r) * st->workers;
-      while (ld_acq_gpu(peers.scratch + kScrArrive1) < target) {
-        if (global_timer_ns() - t0 > st->timeout_ns) {
-          peers.scratch[kScrError] = static_cast<uint32_t>(CommError::kPeerTimeout);
-          return;
-        }
-      }
-      st_rel_sys(peers.flags[peers.rank] + kSigReady1, flag_value(st->epoch, static_cast<uint32_t>(r)));
-    }
-    peers.scratch[kScrArrive1] = 0u;
-  }
+// allreduce (one-shot), allgather and reduce_scatter share one skeleton over the iteration space of
+// `space16` 16-byte vectors.
+//
+// Small messages run in a single phase: every worker CTA stages its stripe into its own staging slot,
+// the last arriving CTA posts one flag with a system-scope release, every CTA consumes its stripe.
+//
+// Above the chunk threshold the call is split into two roles that run in the same launch:
+//   * blockIdx.x == 0 is the producer: it stages chunk c into this rank's slot and publishes chunk c
+//     with one system-scope release per chunk;
+//   * blockIdx.x > 0 are the consumers: each waits for every peer's chunk-c flag and then reduces /
+//     gathers its stripe of chunk c.
+// The reason is the host-staged transport (no P2P): a PCIe Gen4 x8 slot does ~12.5 GB/s in one
+// direction, and a CTA that stages and then consumes alternates the two, so the read of chunk c only
+// starts once the write of chunk c - 1 finished. A dedicated producer and consumer keep both
+// directions busy; measured on 2 x RTX 5060 Ti this is ~18 GB/s of combined traffic instead of ~7.
+// The protocol is also progress-safe by construction: a rank's producer never waits for a peer, so a
+// rank can always publish, and only its consumers wait (bounded by kScrTimeoutUs like every other wait).
+/// Producer: publish "chunk c of call E is staged". Preceded by __syncthreads() so the release covers
+/// the stores of every thread of the CTA.
+__device__ __forceinline__ void cta_post_chunk(const PeerBuffers& peers, const CtaState& s, uint32_t chunk) {
+  st_rel_sys(peers.flags[peers.rank] + kSigReady1, flag_value(s.epoch, chunk));
 }
 
 template <int W, typename Stage, typename Consume>
 __device__ __forceinline__ void run_pipeline(const PeerBuffers& peers, CtaState* st, int64_t space16, int chunks,
                                              int64_t chunk16, Stage&& stage, Consume&& consume) {
-  if (chunks > 1) {
-    if (threadIdx.x == 0) st->workers = gridDim.x - 1u;
-    __syncthreads();
-    if (blockIdx.x == st->workers) {
-      poster_loop(peers, st, chunks);
+  auto chunk_range = [&](int c, int64_t* a, int64_t* b) {
+    *a = static_cast<int64_t>(c) * chunk16;
+    *b = (*a + chunk16) < space16 ? (*a + chunk16) : space16;
+  };
+  if (chunks > 1 && gridDim.x > 1) {
+    if (blockIdx.x == 0) {
+      for (int c = 0; c < chunks; ++c) {
+        int64_t a, b;
+        chunk_range(c, &a, &b);
+        if (st->ok != 0u) stage(a, b);
+        __syncthreads();
+        if (threadIdx.x == 0) cta_post_chunk(peers, *st, static_cast<uint32_t>(c + 1));
+      }
       return;
     }
-  }
-  for (int c = 0; c <= chunks; ++c) {
-    if (c < chunks) {
-      const int64_t a = static_cast<int64_t>(c) * chunk16;
-      const int64_t b = (a + chunk16) < space16 ? (a + chunk16) : space16;
-      int64_t lo, hi;
-      cta_sub_stripe(a, b, &lo, &hi, st->workers);
-      if (st->ok != 0u) stage(lo, hi);
-      if (chunks == 1) {
-        cta_arrive_post<kScrArrive1, kSigReady1>(peers, *st);
-      } else {
-        __syncthreads();
-        if (threadIdx.x == 0) atom_add_acqrel_gpu(peers.scratch + kScrArrive1, 1u);
-      }
+    // Consumer stripe over the whole message; the per-chunk range is intersected with it. A consumer
+    // then streams one long contiguous range (a quarter of the message at four consumers), which
+    // measured faster here than giving every consumer a slice of every chunk.
+    const int64_t consumers = gridDim.x - 1;
+    const int64_t per = (space16 + consumers - 1) / consumers;
+    const int64_t s_lo = static_cast<int64_t>(blockIdx.x - 1) * per;
+    const int64_t s_hi = (s_lo + per) < space16 ? (s_lo + per) : space16;
+    for (int c = 0; c < chunks; ++c) {
+      cta_wait_peers<kSigReady1>(peers, st, W, static_cast<uint32_t>(c + 1));
+      if (st->ok == 0u) continue;
+      int64_t a, b;
+      chunk_range(c, &a, &b);
+      const int64_t lo = a > s_lo ? a : s_lo;
+      const int64_t hi = b < s_hi ? b : s_hi;
+      if (lo < hi) consume(lo, hi);
     }
-    if (c >= 1) {
-      cta_wait_peers<kSigReady1>(peers, st, W, static_cast<uint32_t>(c));
-      if (st->ok != 0u) {
-        const int64_t a = static_cast<int64_t>(c - 1) * chunk16;
-        const int64_t b = (a + chunk16) < space16 ? (a + chunk16) : space16;
-        int64_t lo, hi;
-        cta_sub_stripe(a, b, &lo, &hi, st->workers);
-        consume(lo, hi);
-      }
-    }
+    return;
   }
+  int64_t lo, hi;
+  cta_stripe(space16, &lo, &hi, st->workers);
+  if (st->ok != 0u) stage(lo, hi);
+  cta_arrive_post<kScrArrive1, kSigReady1>(peers, *st);
+  cta_wait_peers<kSigReady1>(peers, st, W);
+  if (st->ok != 0u) consume(lo, hi);
 }
 
 // ---- one-shot allreduce ---------------------------------------------------------------------------
@@ -376,7 +403,9 @@ __global__ void __launch_bounds__(kCommThreads)
   run_pipeline<W>(
       peers, &st, n16, chunks, chunk16,
       [&](int64_t lo, int64_t hi) {
-        for (int64_t i = lo + threadIdx.x; i < hi; i += kCommThreads) st16(mine + i, ld_local16(in + i));
+        stream_vectors(
+            lo, hi, [&](int64_t i) { return ld_local16(in + i); },
+            [&](int64_t i, const uint4& v) { st16(mine + i, v); });
       },
       [&](int64_t lo, int64_t hi) {
         constexpr int kUnroll = unroll_for(W);
@@ -486,11 +515,12 @@ __global__ void __launch_bounds__(kCommThreads)
   run_pipeline<W>(
       peers, &st, n16, chunks, chunk16,
       [&](int64_t lo, int64_t hi) {
-        for (int64_t i = lo + threadIdx.x; i < hi; i += kCommThreads) {
-          const uint4 v = ld_local16(in + i);
-          st16(mine + i, v);
-          st16(out + static_cast<int64_t>(rank) * n16 + i, v);
-        }
+        stream_vectors(
+            lo, hi, [&](int64_t i) { return ld_local16(in + i); },
+            [&](int64_t i, const uint4& v) {
+              st16(mine + i, v);
+              st16(out + static_cast<int64_t>(rank) * n16 + i, v);
+            });
       },
       [&](int64_t lo, int64_t hi) {
         constexpr int kUnroll = unroll_for(W) * 2;
@@ -536,8 +566,10 @@ __global__ void __launch_bounds__(kCommThreads)
       [&](int64_t lo, int64_t hi) {
         for (int k = 0; k < W; ++k) {
           if (k == rank) continue;
-          for (int64_t i = lo + threadIdx.x; i < hi; i += kCommThreads)
-            st16(mine + static_cast<int64_t>(k) * m16 + i, ld_local16(in + static_cast<int64_t>(k) * m16 + i));
+          const int64_t off = static_cast<int64_t>(k) * m16;
+          stream_vectors(
+              lo, hi, [&](int64_t i) { return ld_local16(in + off + i); },
+              [&](int64_t i, const uint4& v) { st16(mine + off + i, v); });
         }
       },
       [&](int64_t lo, int64_t hi) {
@@ -843,8 +875,12 @@ int pick_ctas(size_t bytes, const LaunchContext& ctx) {
   return n < 1 ? 1 : n;
 }
 
-/// Chunking of a one-phase collective: messages above 128 KiB are cut into chunks of at least 64 KiB
-/// (at most 128 chunks); a pipelined call adds one poster CTA to the `workers` data CTAs.
+/// Chunking of a one-phase collective. A message above 128 KiB is cut into at most kPipeMaxChunks
+/// chunks of at least kPipeMinChunk bytes and runs as a producer/consumer pipeline (see run_pipeline);
+/// `workers` stays the phase-oriented CTA count the two-shot kernel uses.
+constexpr int kPipeConsumers = 4;          // consumer CTAs of a chunked call (one producer + these)
+constexpr size_t kPipeMinChunk = 128u << 10;
+constexpr size_t kPipeMaxChunks = 32;
 struct Pipe {
   int workers;
   int chunks;
@@ -858,10 +894,13 @@ Pipe plan_pipe(size_t bytes, const LaunchContext& ctx) {
   p.chunks = 1;
   const int64_t n16 = static_cast<int64_t>(bytes / 16);
   p.chunk16 = n16;
-  size_t thresh = 128u << 10, minchunk = 32u << 10, maxchunks = 128;  // TUNING-ONLY env overrides below
+  size_t thresh = 128u << 10;  // TUNING-ONLY env overrides below
+  size_t minchunk = kPipeMinChunk;
+  size_t maxchunks = kPipeMaxChunks;
   if (const char* e = std::getenv("KOPS_COMM_THRESH_KB")) thresh = size_t(std::atoi(e)) << 10;
   if (const char* e = std::getenv("KOPS_COMM_CHUNK_KB")) minchunk = size_t(std::atoi(e)) << 10;
   if (const char* e = std::getenv("KOPS_COMM_MAXCHUNKS")) maxchunks = size_t(std::atoi(e));
+  if (maxchunks > 255) maxchunks = 255;  // the chunk number is the low byte of a flag value
   if (bytes > thresh) {
     size_t chunk_bytes = (bytes + maxchunks - 1) / maxchunks;
     if (chunk_bytes < minchunk) chunk_bytes = minchunk;
@@ -869,23 +908,26 @@ Pipe plan_pipe(size_t bytes, const LaunchContext& ctx) {
     p.chunks = static_cast<int>((bytes + chunk_bytes - 1) / chunk_bytes);
     p.chunk16 = static_cast<int64_t>(chunk_bytes / 16);
   }
-  const int sms = ctx.compute_units > 0 ? ctx.compute_units : 1;
-  if (p.chunks > 1 && p.workers + 1 > sms) p.workers = sms > 1 ? sms - 1 : 1;
-  p.grid = p.workers + (p.chunks > 1 ? 1 : 0);
+  p.grid = p.workers;
+  if (p.chunks > 1) {
+    int consumers = kPipeConsumers;
+    if (const char* e = std::getenv("KOPS_COMM_CONSUMERS")) consumers = std::atoi(e);  // TUNING-ONLY
+    if (consumers < 1) consumers = 1;
+    const int sms = ctx.compute_units > 0 ? ctx.compute_units : 1;
+    if (consumers + 1 > sms) consumers = sms > 1 ? sms - 1 : 1;
+    p.grid = consumers + 1;
+  }
   return p;
 }
 
-/// Co-residency guard. A chunked pipeline needs every CTA of one rank resident at the same time.
-/// Multiple data CTAs plus a poster can saturate a small device; a delayed poster then leaves the
-/// peers waiting and a mixed set of staged chunks was observed at world 4/8. Two CTAs per rank
-/// (one data + one poster) keep the protocol progress-safe on every device the rank model supports;
-/// unchunked messages keep the bandwidth-oriented worker count.
+/// A chunked call needs its producer and its consumers co-resident; one producer plus a couple of
+/// consumers per rank is small enough for every device the rank model supports (the producer never
+/// waits for a peer, so a late consumer delays only its own rank). Unchunked messages keep the
+/// bandwidth-oriented worker count. The two-shot kernel is phase-oriented (each phase moves data in a
+/// single direction) and does not pipeline, so it keeps one CTA per phase above the threshold.
 Pipe plan_pipe_world(size_t bytes, const LaunchContext& ctx, int world) {
   Pipe p = plan_pipe(bytes, ctx);
-  if (p.chunks > 1) {
-    p.workers = 1;
-    p.grid = 2;
-  }
+  if (p.chunks > 1) p.workers = 1;
   (void)world;
   return p;
 }
