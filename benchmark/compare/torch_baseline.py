@@ -680,6 +680,14 @@ def make_op(case: dict, device: torch.device):
     if b6 is not None:
         return b6
 
+    b10 = make_b10_op(case, device)
+    if b10 is not None:
+        return b10
+
+    b7 = make_b7_op(case, device)
+    if b7 is not None:
+        return b7
+
     raise SystemExit(f"unsupported op: {op}")
 
 
@@ -992,6 +1000,30 @@ def make_b4_op(case: dict, device: torch.device):
 # HF fp8 fallbacks do.  Scales that apply per output channel are applied on the output.
 
 
+def make_b7_op(case: dict, device: torch.device):
+    op = case["op"]
+    if op not in ("mma_bf16", "mma_fp16", "mma_bf16_tuned", "dual_bf16", "bmm_mla_uk", "bmm_mla_uv"):
+        return None
+    n = int(case["rows"])
+    k = int(case["cols"])
+    m = int(case["flops"]) // (2 * n * k) if op.startswith("mma_") else int(case["flops"]) // (4 * n * k)
+    dt = torch.bfloat16 if case["dtype"] == "bfloat16" else torch.float16
+    if op.startswith("mma_"):
+        x = torch.randn(m, k, device=device, dtype=dt)
+        w = torch.randn(n, k, device=device, dtype=dt)
+        return lambda: F.linear(x, w)
+    if op == "dual_bf16":
+        x = torch.randn(m, k, device=device, dtype=dt)
+        w0 = torch.randn(n, k, device=device, dtype=dt)
+        w1 = torch.randn(n, k, device=device, dtype=dt)
+        return lambda: F.silu(F.linear(x, w0)) * F.linear(x, w1)
+    batch = 128
+    m = int(case["flops"]) // (2 * batch * n * k)
+    a = torch.randn(batch, m, k, device=device, dtype=dt)
+    b = torch.randn(batch, k, n, device=device, dtype=dt)
+    return lambda: torch.bmm(a, b)
+
+
 def make_b5_op(case: dict, device: torch.device):
     op = case["op"]
     if op not in ("w4a16_awq", "w4a16_gptq", "nf4_lut", "fp8_gemv_rowwise", "fp8_gemv_blockwise",
@@ -1149,7 +1181,7 @@ def make_b5_op(case: dict, device: torch.device):
     return lambda: ((a8.to(bf) @ w8.to(bf).t()).float() * row_s * col_s).to(bf)
 
 
-def bench(fn, warmup: int, iters: int) -> dict:
+def bench(fn, warmup: int, iters: int, flush_mb: int = 0, rounds: int = 1) -> dict:
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
@@ -1157,12 +1189,29 @@ def bench(fn, warmup: int, iters: int) -> dict:
     start = torch.cuda.Event(enable_timing=True)
     stop = torch.cuda.Event(enable_timing=True)
     samples = []
-    for _ in range(iters):
-        start.record()
-        fn()
-        stop.record()
-        stop.synchronize()
-        samples.append(start.elapsed_time(stop))
+    flush = None
+    if flush_mb > 0:
+        flush = (torch.empty(flush_mb * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+                 torch.empty(flush_mb * 1024 * 1024, dtype=torch.uint8, device="cuda"))
+        flush[1].fill_(0x5A)
+    rounds = max(1, rounds)
+    if flush is not None:
+        for _ in range(rounds):
+            for _ in range(iters):
+                flush[0].copy_(flush[1])
+                start.record()
+                fn()
+                stop.record()
+                stop.synchronize()
+                samples.append(start.elapsed_time(stop))
+    else:
+        for _ in range(rounds):
+            for _ in range(iters):
+                start.record()
+                fn()
+                stop.record()
+                stop.synchronize()
+                samples.append(start.elapsed_time(stop))
     samples.sort()
 
     n = len(samples)
@@ -1394,12 +1443,205 @@ def make_b6_op(case: dict, device: torch.device):
     return None
 
 
+# ---- B10 speculative decoding baselines ------------------------------------------------
+def make_b10_op(case: dict, device: torch.device):
+    op = case["op"]
+    cid = case["id"]
+    if op.startswith("spec_reject"):
+        B = int(case["rows"])
+        V = int(case["cols"])
+        k = _id_int(cid, "k", 0)
+        p = torch.softmax(torch.randn(B, k + 1, V, device=device), dim=-1)
+        u = torch.rand(B, k, device=device) if k > 0 else None
+        if op == "spec_reject_chain":
+            q = torch.softmax(torch.randn(B, k, V, device=device), dim=-1)
+            draft = torch.multinomial(q.reshape(B * k, V), 1).reshape(B, k)
+
+            def run_chain():
+                alive = torch.ones(B, dtype=torch.bool, device=device)
+                for i in range(k):
+                    pi = p[:, i, :].gather(1, draft[:, i:i + 1]).squeeze(1)
+                    qi = q[:, i, :].gather(1, draft[:, i:i + 1]).squeeze(1)
+                    alive = alive & (u[:, i] < (pi / qi).clamp(max=1.0))
+                # Every rejected row draws once from the first residual; doing
+                # all rows keeps the comparison stable and is the same work an
+                # eager engine would perform before compacting.
+                resid = (p[:, 0, :] - q[:, 0, :]).clamp_min(0)
+                return torch.multinomial(resid, 1)
+
+            return run_chain
+
+        if op == "spec_reject_greedy":
+            target_argmax = torch.argmax(p, dim=-1)
+            draft = torch.randint(0, V, (B, k), device=device)
+
+            def run_greedy():
+                alive = torch.ones(B, dtype=torch.bool, device=device)
+                for i in range(k):
+                    alive = alive & (target_argmax[:, i] == draft[:, i])
+                return alive
+
+            return run_greedy
+
+        draft = torch.randint(0, V, (B, k), device=device) if k > 0 else None
+
+        def run_target_only():
+            alive = torch.ones(B, dtype=torch.bool, device=device)
+            for i in range(k):
+                pi = p[:, i, :].gather(1, draft[:, i:i + 1]).squeeze(1)
+                alive = alive & (u[:, i] < pi)
+            if k == 0:
+                return torch.multinomial(p[:, 0, :], 1)
+            resid = p[:, 0, :].clone()
+            resid.scatter_(1, draft[:, 0:1], 0.0)
+            resid = resid.clamp_min(0)
+            return torch.multinomial(resid, 1)
+
+        return run_target_only
+
+    if op.startswith("spec_tree"):
+        B = int(case["rows"])
+        V = int(case["cols"])
+        N = _id_int(cid, "n", 64)
+        D = _id_int(cid, "d", 8)
+        parent = [(-1 if i == 0 else (i - 1) // 2) for i in range(N)]
+        children = [[] for _ in range(N)]
+        for i in range(1, N):
+            children[parent[i]].append(i)
+        cand = [(i * 13 + 1) % V for i in range(N)]
+        greedy = op == "spec_tree_greedy"
+        if greedy:
+            # The verifier receives target_argmax as an input; the eager walk
+            # compares those integers with a batched GPU update per depth.
+            argmax = torch.tensor(
+                [[cand[children[i][0]] if children[i] else 0 for i in range(N)]
+                 for _ in range(B)], device=device, dtype=torch.long)
+            cand_t = torch.tensor(cand, device=device, dtype=torch.long)
+            p = None
+            q = None
+        else:
+            p = torch.softmax(torch.randn(B, N, V, device=device), dim=-1)
+            q = torch.softmax(torch.randn(B, N, V, device=device), dim=-1) if op == "spec_tree_q" else None
+
+        if greedy:
+            def run_tree_greedy():
+                bidx = torch.arange(B, device=device)
+                cur = torch.zeros(B, device=device, dtype=torch.long)
+                alive = torch.ones(B, device=device, dtype=torch.bool)
+                for _ in range(D):
+                    am = argmax[bidx, cur]
+                    c1 = 2 * cur + 1
+                    c2 = c1 + 1
+                    i1 = c1.clamp(max=N - 1)
+                    i2 = c2.clamp(max=N - 1)
+                    m1 = (c1 < N) & (cand_t[i1] == am)
+                    m2 = (c2 < N) & (cand_t[i2] == am)
+                    nxt = torch.where(m1, c1, torch.where(m2, c2, torch.full_like(cur, -1)))
+                    alive = alive & (nxt >= 0)
+                    cur = torch.where(nxt >= 0, nxt, cur)
+                return alive.sum()
+
+            return run_tree_greedy
+
+        # The eager stochastic tree walk materialises one child distribution per
+        # decision, the same operation an engine without a fused tree kernel runs.
+        def run_tree():
+            total = 0
+            for b in range(B):
+                cur = 0
+                for _ in range(D):
+                    if not children[cur]:
+                        break
+                    kids = children[cur]
+                    toks = torch.tensor([cand[c] for c in kids], device=device, dtype=torch.long)
+                    if q is None:
+                        w = p[b, cur].gather(0, toks).clamp_min(0)
+                        pick = int(torch.multinomial(w, 1).item())
+                        total += 1
+                        cur = kids[pick]
+                    else:
+                        wq = q[b, cur].gather(0, toks).clamp_min(0)
+                        wq = wq / wq.sum()
+                        pick = int(torch.multinomial(wq, 1).item())
+                        c = kids[pick]
+                        pv = float(p[b, cur, cand[c]].item())
+                        qv = float(wq[pick].item())
+                        ratio = 1.0 if qv <= 0 else min(1.0, pv / qv)
+                        if float(torch.rand((), device=device).item()) >= ratio:
+                            break
+                        total += 1
+                        cur = c
+            return total
+
+        return run_tree
+
+    if op == "spec_mask":
+        B = int(case["rows"])
+        P = int(case["cols"])
+        N = _id_int(cid, "n", 64)
+        parent = [(-1 if i == 0 else (i - 1) // 2) for i in range(N)]
+        par = torch.tensor([parent] * B, device=device, dtype=torch.long)
+        idx = torch.arange(N, device=device)
+        eye = torch.eye(N, device=device, dtype=torch.bool)
+        ones = torch.ones(B, N, P, device=device, dtype=torch.bool)
+        ar = torch.arange(N, device=device)
+        W = ((N * (P + N) + 31) // 32) * 32
+        weights = (1 << torch.arange(32, device=device, dtype=torch.long))
+
+        def run_mask():
+            anc = eye.unsqueeze(0).expand(B, N, N).clone()
+            cur = idx.unsqueeze(0).expand(B, N).clone()
+            for _ in range(N):
+                pv = par.gather(1, cur.clamp_min(0))
+                anc |= (pv.unsqueeze(-1) == ar.view(1, 1, N))
+                cur = pv.clamp_min(0)
+            vis = torch.cat([ones, anc], dim=-1).reshape(B, N * (P + N))
+            if W > vis.shape[1]:
+                pad = torch.zeros(B, W - vis.shape[1], device=device, dtype=torch.bool)
+                vis = torch.cat([vis, pad], dim=-1)
+            words = (vis.view(B, W // 32, 32).to(torch.long) * weights).sum(-1)
+            return words.to(torch.int32)
+
+        return run_mask
+
+    if op == "state_commit":
+        B = int(case["rows"])
+        M = int(case["cols"])
+        slots = 128
+        pools = [torch.zeros(slots, 4096, device=device, dtype=torch.uint8),
+                 torch.zeros(slots, 2048, device=device, dtype=torch.uint8)]
+        live = torch.arange(B, device=device) % slots
+        inter = torch.randint(4, slots, (B, M), device=device)
+        num = torch.arange(B, device=device) % max(1, M - 1)
+
+        def run_commit():
+            ns = num.cpu().tolist()
+            for b, n in enumerate(ns):
+                if n >= M - 1:
+                    continue
+                src = int(inter[b, n].item())
+                dst = int(live[b].item())
+                if dst < 0 or src < 0:
+                    continue
+                for pool in pools:
+                    pool[dst].copy_(pool[src])
+            return B
+
+        return run_commit
+
+    return None
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cases", required=True, help="JSON from bench_<family> --dump-cases")
     ap.add_argument("--json", required=True, help="output results JSON")
     ap.add_argument("--style", choices=("builtin", "hf"), default="builtin",
                     help="builtin: strongest fused PyTorch primitive; hf: eager multi-op path")
+    ap.add_argument("--only", default=None, help="comma-separated case-id substrings")
+    ap.add_argument("--skip", default=None, help="comma-separated case-id substrings")
+    ap.add_argument("--flush-l2", type=int, default=0, metavar="MB")
+    ap.add_argument("--rounds", type=int, default=1)
     args = ap.parse_args()
     global STYLE
     STYLE = args.style
@@ -1413,10 +1655,30 @@ def main() -> int:
     with open(args.cases, "r", encoding="utf-8") as f:
         spec = json.load(f)
 
+    def matches(case_id: str, csv: str | None) -> bool:
+        if not csv:
+            return False
+        return any(tok.strip() and tok.strip() in case_id for tok in csv.split(","))
+
+    cases = spec["cases"]
+    if args.only:
+        cases = [c for c in cases if matches(c["id"], args.only)]
+    if args.skip:
+        cases = [c for c in cases if not matches(c["id"], args.skip)]
+    if not cases:
+        print("torch: no case matches the filters", file=sys.stderr)
+        return 1
+
     results = []
-    for case in spec["cases"]:
-        fn = make_op(case, device)
-        st = bench(fn, int(case["warmup"]), int(case["iters"]))
+    skipped = 0
+    for case in cases:
+        try:
+            fn = make_op(case, device)
+        except SystemExit:
+            skipped += 1
+            continue
+        st = bench(fn, int(case["warmup"]), int(case["iters"]),
+                   flush_mb=args.flush_l2, rounds=args.rounds)
         ms = st["median_ms"]
         results.append(
             {

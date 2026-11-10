@@ -80,6 +80,58 @@ struct Result {
   Stats s;
 };
 
+struct Options {
+  bool dump_cases = false;
+  bool split_sweep = false;
+  bool strict = false;
+  int iters = 0;
+  int rounds = 1;
+  int flush_l2_mb = 0;
+  const char* only = nullptr;
+  const char* skip = nullptr;
+  const char* json_path = nullptr;
+};
+
+inline Options g_options;
+inline int g_sanity_violations = 0;
+
+/// Comma-separated substring match. Empty or null never matches.
+inline bool match_csv(const std::string& id, const char* csv) {
+  if (csv == nullptr || *csv == '\0') return false;
+  std::string list(csv);
+  size_t begin = 0;
+  while (begin <= list.size()) {
+    const size_t end = list.find(',', begin);
+    std::string token = list.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+    size_t first = token.find_first_not_of(" \t");
+    size_t last = token.find_last_not_of(" \t");
+    if (first != std::string::npos) {
+      token = token.substr(first, last - first + 1);
+      if (id.find(token) != std::string::npos) return true;
+    }
+    if (end == std::string::npos) break;
+    begin = end + 1;
+  }
+  return false;
+}
+
+/// Apply --only / --skip / --iters to a case table.
+inline void filter_cases(std::vector<Case>* cases, const Options& o) {
+  if (o.only != nullptr && *o.only != '\0') {
+    cases->erase(std::remove_if(cases->begin(), cases->end(),
+                                [&](const Case& c) { return !match_csv(c.id, o.only); }),
+                 cases->end());
+  }
+  if (o.skip != nullptr && *o.skip != '\0') {
+    cases->erase(std::remove_if(cases->begin(), cases->end(),
+                                [&](const Case& c) { return match_csv(c.id, o.skip); }),
+                 cases->end());
+  }
+  if (o.iters > 0) {
+    for (Case& c : *cases) c.iters = o.iters;
+  }
+}
+
 struct DeviceInfo {
   char name[256] = {};
   int major = 0;
@@ -87,6 +139,7 @@ struct DeviceInfo {
   int sms = 0;
   int driver = 0;
   int runtime = 0;
+  int clock_khz = 0;
   int memory_clock_khz = 0;
   int bus_width = 0;
   double peak_gbs = 0.0;
@@ -197,12 +250,42 @@ inline bool query_device(DeviceInfo* out) {
   out->sms = p.multiProcessorCount;
   out->memory_clock_khz = 0;   // attribute query: CUDA 13 removed cudaDeviceProp::memoryClockRate
   cudaDeviceGetAttribute(&out->memory_clock_khz, cudaDevAttrMemoryClockRate, dev);
+  out->clock_khz = 0;
+  cudaDeviceGetAttribute(&out->clock_khz, cudaDevAttrClockRate, dev);
   out->bus_width = p.memoryBusWidth;
   out->driver = [] { int v = 0; cudaDriverGetVersion(&v); return v; }();
   out->runtime = [] { int v = 0; cudaRuntimeGetVersion(&v); return v; }();
   out->peak_gbs = 2.0 * static_cast<double>(out->memory_clock_khz) * 1.0e3 *
                   (static_cast<double>(out->bus_width) / 8.0) / 1.0e9;
   return true;
+}
+
+inline void* g_flush_buffer = nullptr;
+inline void* g_flush_source = nullptr;
+inline size_t g_flush_bytes = 0;
+
+/// Evict L2 before a timed launch. A device-to-device copy reads one 256 MB
+/// buffer and writes another, so both source and destination lines displace the
+/// benchmark working set (a memset of zeros can be compressed and may not).
+inline void flush_l2() {
+  if (g_options.flush_l2_mb <= 0) return;
+  const size_t bytes = static_cast<size_t>(g_options.flush_l2_mb) * 1024u * 1024u;
+  if (bytes > g_flush_bytes) {
+    if (g_flush_buffer != nullptr) cudaFree(g_flush_buffer);
+    if (g_flush_source != nullptr) cudaFree(g_flush_source);
+    g_flush_buffer = nullptr;
+    g_flush_source = nullptr;
+    g_flush_bytes = 0;
+    if (cudaMalloc(&g_flush_buffer, bytes) == cudaSuccess &&
+        cudaMalloc(&g_flush_source, bytes) == cudaSuccess) {
+      cudaMemsetAsync(g_flush_source, 0x5a, bytes, 0);
+      cudaMemsetAsync(g_flush_buffer, 0xa5, bytes, 0);
+      g_flush_bytes = bytes;
+    }
+  }
+  if (g_flush_buffer != nullptr && g_flush_source != nullptr) {
+    cudaMemcpyAsync(g_flush_buffer, g_flush_source, g_flush_bytes, cudaMemcpyDeviceToDevice, 0);
+  }
 }
 
 template <typename Fn>
@@ -216,24 +299,51 @@ inline bool measure(const Case& c, Fn fn, Stats* out) {
     return false;
   }
 
-  // Time a small group of launches between two events. Per-iteration events
-  // cost several microseconds and dominate kernels shorter than ~0.1 ms.
-  constexpr int kInner = 20;
-  const int groups = std::max(1, c.iters / kInner);
+  const int total = std::max(1, c.iters);
+  const int rounds = std::max(1, g_options.rounds);
   std::vector<float> samples;
-  samples.reserve(static_cast<size_t>(groups));
   bool ok = true;
-  for (int i = 0; i < groups; ++i) {
-    cudaEventRecord(start);
-    for (int j = 0; j < kInner; ++j) fn();
-    cudaEventRecord(stop);
-    if (cudaEventSynchronize(stop) != cudaSuccess) {
-      ok = false;
-      break;
+
+  if (g_options.flush_l2_mb > 0) {
+    // Cold-cache mode: one event pair per launch so every sample starts with
+    // an evicted L2. The event overhead is part of this mode; use the default
+    // hot-L2 grouping for kernel-only latency.
+    samples.reserve(static_cast<size_t>(total) * static_cast<size_t>(rounds));
+    for (int r = 0; r < rounds && ok; ++r) {
+      for (int i = 0; i < total; ++i) {
+        flush_l2();
+        cudaEventRecord(start);
+        fn();
+        cudaEventRecord(stop);
+        if (cudaEventSynchronize(stop) != cudaSuccess) {
+          ok = false;
+          break;
+        }
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start, stop);
+        samples.push_back(ms);
+      }
     }
-    float ms = 0.0f;
-    cudaEventElapsedTime(&ms, start, stop);
-    samples.push_back(ms / static_cast<float>(kInner));
+  } else {
+    // Time a small group of launches between two events. Per-iteration events
+    // cost several microseconds and dominate kernels shorter than ~0.1 ms.
+    constexpr int kInner = 20;
+    const int groups = std::max(1, total / kInner);
+    samples.reserve(static_cast<size_t>(groups) * static_cast<size_t>(rounds));
+    for (int r = 0; r < rounds && ok; ++r) {
+      for (int i = 0; i < groups; ++i) {
+        cudaEventRecord(start);
+        for (int j = 0; j < kInner; ++j) fn();
+        cudaEventRecord(stop);
+        if (cudaEventSynchronize(stop) != cudaSuccess) {
+          ok = false;
+          break;
+        }
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start, stop);
+        samples.push_back(ms / static_cast<float>(kInner));
+      }
+    }
   }
   cudaEventDestroy(start);
   cudaEventDestroy(stop);
@@ -304,8 +414,9 @@ inline void write_results(const char* path, const std::vector<Result>& results,
   std::fprintf(f, "},\"device\":{\"name\":");
   json_string(f, dev.name);
   std::fprintf(f, ",\"cc\":\"%d.%d\",\"sms\":%d,\"driver\":%d,\"runtime\":%d,"
-               "\"peak_gbs\":%.1f},\"results\":[",
-               dev.major, dev.minor, dev.sms, dev.driver, dev.runtime, dev.peak_gbs);
+               "\"clock_khz\":%d,\"memory_clock_khz\":%d,\"bus_width\":%d,\"peak_gbs\":%.1f},\"results\":[",
+               dev.major, dev.minor, dev.sms, dev.driver, dev.runtime, dev.clock_khz,
+               dev.memory_clock_khz, dev.bus_width, dev.peak_gbs);
   for (size_t i = 0; i < results.size(); ++i) {
     const Result& r = results[i];
     const Case& c = *r.c;
@@ -315,6 +426,12 @@ inline void write_results(const char* path, const std::vector<Result>& results,
     const double tflops = r.s.median_ms > 0.0
                               ? static_cast<double>(c.flops) / (r.s.median_ms * 1.0e9)
                               : 0.0;
+    const bool over_peak = dev.peak_gbs > 0.0 && gbs > dev.peak_gbs * 1.05;
+    if (over_peak) {
+      ++g_sanity_violations;
+      std::fprintf(stderr, "[bench] sanity: %s reports %.1f GB/s > peak %.1f GB/s (byte count?)\n",
+                   c.id.c_str(), gbs, dev.peak_gbs);
+    }
     if (i != 0) std::fprintf(f, ",");
     std::fprintf(f, "{\"id\":");
     json_string(f, c.id.c_str());
@@ -322,14 +439,19 @@ inline void write_results(const char* path, const std::vector<Result>& results,
     json_string(f, c.op.c_str());
     std::fprintf(f, ",\"dtype\":\"%s\",\"rows\":%lld,\"cols\":%lld,\"bytes\":%lld,"
                  "\"flops\":%lld,\"median_ms\":%.6f,\"p10_ms\":%.6f,\"p90_ms\":%.6f,"
-                 "\"p99_ms\":%.6f,\"min_ms\":%.6f,\"gbs\":%.2f,\"tflops\":%.4f}",
+                 "\"p99_ms\":%.6f,\"min_ms\":%.6f,\"gbs\":%.2f,\"tflops\":%.4f,"
+                 "\"over_peak\":%s}",
                  dtype_label(c.dtype), static_cast<long long>(c.rows),
                  static_cast<long long>(c.cols), static_cast<long long>(c.bytes),
                  static_cast<long long>(c.flops), r.s.median_ms, r.s.p10_ms, r.s.p90_ms,
-                 r.s.p99_ms, r.s.min_ms, gbs, tflops);
+                 r.s.p99_ms, r.s.min_ms, gbs, tflops, over_peak ? "true" : "false");
   }
   std::fprintf(f, "]}\n");
   std::fclose(f);
+  if (g_options.strict && g_sanity_violations > 0) {
+    std::fprintf(stderr, "[bench] %d sanity violation(s) with --strict\n", g_sanity_violations);
+    std::exit(2);
+  }
 }
 
 inline void print_table(const std::vector<Result>& results, const DeviceInfo& dev) {
@@ -345,18 +467,10 @@ inline void print_table(const std::vector<Result>& results, const DeviceInfo& de
     const double tflops = r.s.median_ms > 0.0
                               ? static_cast<double>(c.flops) / (r.s.median_ms * 1.0e9)
                               : 0.0;
-    std::printf("%-42s %10.4f %10.4f %10.1f %9.3f\n", c.id.c_str(), r.s.median_ms, r.s.min_ms,
-                gbs, tflops);
+    std::printf("%-42s %10.4f %10.4f %10.1f %9.3f%s\n", c.id.c_str(), r.s.median_ms, r.s.min_ms,
+                gbs, tflops, (dev.peak_gbs > 0.0 && gbs > dev.peak_gbs * 1.05) ? " !" : "");
   }
 }
-
-struct Options {
-  bool dump_cases = false;
-  bool split_sweep = false;
-  int iters = 0;
-  const char* only = nullptr;
-  const char* json_path = nullptr;
-};
 
 inline Options parse_options(int argc, char** argv) {
   Options o{};
@@ -365,18 +479,28 @@ inline Options parse_options(int argc, char** argv) {
       o.dump_cases = true;
     } else if (std::strcmp(argv[i], "--split-sweep") == 0) {
       o.split_sweep = true;
+    } else if (std::strcmp(argv[i], "--strict") == 0) {
+      o.strict = true;
     } else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) {
       o.iters = std::atoi(argv[++i]);
+    } else if (std::strcmp(argv[i], "--rounds") == 0 && i + 1 < argc) {
+      o.rounds = std::max(1, std::atoi(argv[++i]));
+    } else if (std::strcmp(argv[i], "--flush-l2") == 0 && i + 1 < argc) {
+      o.flush_l2_mb = std::max(0, std::atoi(argv[++i]));
     } else if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) {
       o.only = argv[++i];
+    } else if (std::strcmp(argv[i], "--skip") == 0 && i + 1 < argc) {
+      o.skip = argv[++i];
     } else if (std::strcmp(argv[i], "--json") == 0 && i + 1 < argc) {
       o.json_path = argv[++i];
     } else if (std::strcmp(argv[i], "--help") == 0) {
-      std::printf("usage: %s [--dump-cases] [--only substr] [--iters N] [--split-sweep] "
-                  "[--json out.json]\n",
+      std::printf("usage: %s [--dump-cases] [--only substr[,substr]] [--skip substr[,substr]] "
+                  "[--iters N] [--rounds N] [--flush-l2 MB] [--strict] "
+                  "[--split-sweep] [--json out.json]\n",
                   argv[0]);
     }
   }
+  g_options = o;
   return o;
 }
 
