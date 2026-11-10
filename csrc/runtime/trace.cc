@@ -55,6 +55,10 @@ Status write_environment_record(const char* path) {
   if (cudaGetDeviceProperties(&p, device) != cudaSuccess) {
     return detail::set_error(Status::kCudaError, "write_environment_record: device query failed");
   }
+  // Clock attributes through cudaDeviceGetAttribute: CUDA 13 removed the cudaDeviceProp fields.
+  int clock_khz = 0, memory_clock_khz = 0;
+  cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, device);
+  cudaDeviceGetAttribute(&memory_clock_khz, cudaDevAttrMemoryClockRate, device);
   int driver = 0, runtime = 0;
   cudaDriverGetVersion(&driver);
   cudaRuntimeGetVersion(&runtime);
@@ -69,7 +73,7 @@ Status write_environment_record(const char* path) {
                "\"toolkit\":%d,\"clock_khz\":%d,\"memory_clock_khz\":%d,"
                "\"bus_width\":%d,\"trace_enabled\":%d}\n",
                name, p.major * 100 + p.minor * 10, p.multiProcessorCount, driver, runtime,
-               CUDART_VERSION, p.clockRate, p.memoryClockRate, p.memoryBusWidth,
+               CUDART_VERSION, clock_khz, memory_clock_khz, p.memoryBusWidth,
                g_config.enabled ? 1 : 0);
   std::fclose(f);
   return Status::kSuccess;

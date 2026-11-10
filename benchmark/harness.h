@@ -195,7 +195,8 @@ inline bool query_device(DeviceInfo* out) {
   out->major = p.major;
   out->minor = p.minor;
   out->sms = p.multiProcessorCount;
-  out->memory_clock_khz = p.memoryClockRate;
+  out->memory_clock_khz = 0;   // attribute query: CUDA 13 removed cudaDeviceProp::memoryClockRate
+  cudaDeviceGetAttribute(&out->memory_clock_khz, cudaDevAttrMemoryClockRate, dev);
   out->bus_width = p.memoryBusWidth;
   out->driver = [] { int v = 0; cudaDriverGetVersion(&v); return v; }();
   out->runtime = [] { int v = 0; cudaRuntimeGetVersion(&v); return v; }();

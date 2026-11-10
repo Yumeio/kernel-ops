@@ -3393,10 +3393,17 @@ Status copy_batch_async(const BatchCopyDesc& desc, const LaunchContext& ctx) {
         attr_idxs[static_cast<size_t>(i)] = static_cast<size_t>(i);
       }
       size_t fail_idx = 0;
+#if CUDART_VERSION >= 13000   // CUDA 13 dropped the failIdx out-parameter
+      (void)fail_idx;
+      const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
+                                                   static_cast<size_t>(n), attrs.data(),
+                                                   attr_idxs.data(), static_cast<size_t>(n), stream);
+#else
       const cudaError_t err = cudaMemcpyBatchAsync(dsts.data(), srcs.data(), sizes.data(),
                                                    static_cast<size_t>(n), attrs.data(),
                                                    attr_idxs.data(), static_cast<size_t>(n),
                                                    &fail_idx, stream);
+#endif
       if (err == cudaSuccess) continue;
       if (err != cudaErrorCallRequiresNewerDriver && err != cudaErrorNotSupported) {
         return launch_error("copy_batch_async", err);
