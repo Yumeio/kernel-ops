@@ -12,6 +12,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -165,6 +166,27 @@ void add_b7_cases(std::vector<Case>* cases) {
   }
 }
 
+// ---- B13: SM120a tile cell (gemm_sm120_kernel, csrc/gemm/sm120a_impl.cuh) -------------------------
+// Same problem as the B7 mma cases and the same figure of merit (TFLOP/s), so the two rows are directly
+// comparable; the difference is only the tactic (kSm120WarpSpecialized, tile 64x128), exactly like
+// "mma_bf16_tuned" is a tactic variant of "mma_bf16". The op stays mma_bf16: the math (D = A . B^T in
+// bf16 with an fp32 accumulator) and therefore the PyTorch baseline of the case are the same.
+// Only a KOPS_TARGET_SM120A device has this cell; elsewhere gemm_with_tactic refuses the tactic and the
+// case reports the Status instead of a time.
+void add_b13_cases(std::vector<Case>* cases) {
+  char id[128];
+  // The tile is part of the id: both compiled tiles are measured, at the shape where each one wins
+  // (64x128 on the 2048 square, 128x128 once the operands no longer fit in the 32 MB L2).
+  struct S { int64_t m, n, k; int tm, tn; const char* tag; };
+  const S shapes[] = {{2048, 2048, 2048, 64, 128, "m2048.2048x2048.t64x128"},
+                      {4096, 4096, 4096, 128, 128, "m4096.4096x4096.t128x128"}};
+  for (const S& s : shapes) {
+    const int64_t bytes = (s.m * s.k + s.n * s.k + s.m * s.n) * 2;
+    std::snprintf(id, sizeof(id), "gemm.mma_sm120.bf16.%s", s.tag);
+    cases->push_back({id, "mma_bf16", kops::DType::kBFloat16, s.n, s.k, bytes, 2 * s.m * s.n * s.k, 5, 50});
+  }
+}
+
 // ---- B7 row 3: e4m3 x e4m3 on mma.sync (fp8_gemm_mma_sync_kernel, SM89+) -------------------------------
 // rows = N, cols = K, M = flops / (2 N K). Tensorwise / rowwise / 128x128 blockwise scales; the scale
 // buffers are zero-filled (the product is exact in the epilogue, so the timing is the same).
@@ -302,6 +324,7 @@ std::vector<Case> make_cases() {
       r, c, 3 * r * c);
   add_b5_cases(&cases);
   add_b7_cases(&cases);
+  add_b13_cases(&cases);
   add_b7_fp8_cases(&cases);
   add_b7_lora_cases(&cases);
   add_b7_row2_cases(&cases);
@@ -578,6 +601,25 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     kops::Workspace ws{};
     ws.device_scratch = scratch.p; ws.device_scratch_bytes = 64u << 20;
     return go([&] { return fp8_gemm(args, nullptr, GemmBackend::kNative, ws, ctx); });
+  }
+  // B13 tile cell: same op and operands as the B7 mma cases, selected by the case id.
+  if (c.op.rfind("mma_", 0) == 0 && std::strstr(id, "mma_sm120") != nullptr) {
+    Buf a(m * k * 2), w(n * k * 2), out(m * n * 2);
+    if (!a.p || !w.p || !out.p) return false;
+    ScaledGemmArgs args{};
+    args.recipe = GemmRecipe::kBF16;
+    args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kBFloat16;
+    args.b.data = w.p; args.b.ld = k; args.b.dtype = DType::kBFloat16;
+    args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.m = m; args.n = n; args.k = k;
+    int tm = 64, tn = 128;
+    if (const char* tt = std::strstr(id, ".t"); tt != nullptr) std::sscanf(tt + 2, "%dx%d", &tm, &tn);
+    GemmTactic t{};
+    t.tile_m = static_cast<int16_t>(tm); t.tile_n = static_cast<int16_t>(tn); t.tile_k = 32;
+    t.mainloop = MainloopSchedule::kSm120WarpSpecialized;
+    t.epilogue = EpilogueSchedule::kDirectStore;
+    kops::Workspace ws{};
+    return go([&] { return gemm_with_tactic(args, t, ws, ctx); });
   }
   if (c.op.rfind("mma_", 0) == 0) {
     const bool f16 = c.dtype == DType::kFloat16;

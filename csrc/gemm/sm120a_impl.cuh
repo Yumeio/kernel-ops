@@ -37,7 +37,15 @@
 //     element is the same fp32 sequence whatever the tile shape is; for 16-bit
 //     operands it is bit-identical to the B7 gemm_mma_sync_kernel body, which uses
 //     the same atom and the same k-step order.
-//   * epilogue in registers, fp32, one rounding to the output dtype. Op subset:
+//   * warp layout: 2 warp rows x (TILE_N / 32) warp columns, i.e. 8 warps = 256 threads on a
+//     128-wide tile. The mma.sync pipe of one SM sustains one m16n8k16 every ~8 cycles and a warp
+//     can only issue one every ~29, so four warps per SMSP are needed to keep the pipe busy while
+//     the same warps run ldmatrix + the cp.async issue. The tiles are sized so two CTAs fit both
+//     the 100 KB smem opt-in and the register file, which is what puts 16 warps on an SM (measured:
+//     a 4-warp CTA reaches 39 TF on 2048^3 bf16, 8 warps with two CTAs per SM 47 TF).
+//   * epilogue in registers, fp32, one rounding to the output dtype. The no-op epilogue (alpha only,
+//     no operand scale vector) is a separate path that writes two adjacent columns per store; the
+//     general path below it is element-wise and keeps the documented op order. Op subset:
 //     alpha / row_scale / col_scale / bias / clamp / softcap / act / residual, plus
 //     the per-token (A) and per-channel (B) operand scales of the FP8 recipes, in the
 //     shared order of GemmParams (kEpiGLU, kEpiQuantOut, kEpiAtomicAdd, kEpiScatterRows,
@@ -52,13 +60,15 @@
 //   workspace. GemmTactic::raster is a hint only: the tile order is fixed to M-fastest
 //   and results do not depend on it.
 //
-// TODO(TMA/WS): the roadmap target is a TMA + warp-specialized pipeline selected by
-// MainloopSchedule::kSm120WarpSpecialized / kSm120BlockScaledWS. This pass keeps
-// cp.async and one warp group: same numerics, lower mainloop rate. Both tactic names
-// are accepted by the host so callers can address this cell today; the mainloop body
-// below is still the cp.async one. Replacing it (TMA descriptors from GemmTmaParams,
-// producer warp + mbarrier ring) is a pure mainloop change: the epilogue and the
-// launch contract stay as they are.
+// TODO(TMA/WS): a TMA + mbarrier ring (descriptors from GemmTmaParams, one producer thread or warp)
+// was implemented and measured on this cell: on the SM120a part it was 11-15% *slower* than the
+// cp.async ring at 2048^3 bf16 (0.42 vs 0.36 ms), with the mma removed the TMA ring alone costs
+// 0.27 ms of the 0.36 ms budget, i.e. the strided 64-byte box fetch is close to the L2 bandwidth of
+// the part and does not overlap the mma as well as the cp.async chunks do. The cp.async ring stays
+// until a box shape (128-byte stage rows, 2-D rather than 3-D, multicast within a cluster) or a real
+// producer warp changes that. Both tactic names are accepted by the host so callers can address this
+// cell today; the mainloop body below is the cp.async one. Swapping it is a pure mainloop change: the
+// epilogue and the launch contract stay as they are.
 //
 // Requires: common/macros.cuh, common/status.h, common/dtype.cuh, common/tensor.h,
 //           common/op_types.cuh, common/quant.cuh, common/device.cuh,
@@ -162,7 +172,7 @@ struct AtomOf<f8e4m3_t> {
 /// kernel names out of the header text).
 template <typename Traits>
 struct Threads {
-  static constexpr int value = 32 * 2 * (Traits::tile_n / 64);
+  static constexpr int value = 32 * 2 * (Traits::tile_n / 32);
 };
 
 // -----------------------------------------------------------------------------
@@ -196,6 +206,24 @@ __device__ __forceinline__ float epi_finish(float v, const EpilogueParams& e, in
 /// Thread -> output element map of every tile body is the m16n8k16 fragment layout:
 ///   element (mt, nt, i) sits at row warp_r0 + 16 mt + 8 (i >> 1) + lane/4 and
 ///   column warp_c0 + 8 nt + 2 (lane % 4) + (i & 1).
+
+/// Two adjacent output columns of one lane as one store. The mma fragment map puts elements 2h and 2h + 1
+/// on the same row, at columns 2*gc and 2*gc + 1, so the pair is contiguous; for a 16-bit output dtype it
+/// becomes one 4-byte store as soon as the element index is even (the column always is, the row is not
+/// when ldd is odd -- see the pair_ok test at the call site). An fp32 output keeps two 4-byte stores:
+/// pairing it would need an 8-byte alignment that ldd and the batch stride do not guarantee.
+template <typename Dt>
+__device__ __forceinline__ void store_pair(Dt* p, float a, float b) {
+  if constexpr (sizeof(Dt) == 4) {
+    dev::from_f(p[0], a);
+    dev::from_f(p[1], b);
+  } else {
+    Dt v[2];
+    dev::from_f(v[0], a);
+    dev::from_f(v[1], b);
+    *reinterpret_cast<uint32_t*>(p) = *reinterpret_cast<const uint32_t*>(v);
+  }
+}
 
 /// Finishes and stores one [MT, NT] accumulator tile. `extra_alpha` multiplies the epilogue alpha
 /// (the NVFP4 global-scale product is folded in there).
@@ -234,6 +262,41 @@ __device__ __forceinline__ void epilogue_store(const float (&acc)[MT][NT][4], co
       ws_col = s;   // [N]
     }
   }
+  if (xs_row == nullptr && ws_col == nullptr && e.ops == 0u) {
+    // Plain product (no epilogue op, no operand scale vector): one multiply and one paired store per
+    // two output elements. This is the hot path of a dense inference GEMM -- the per-element flag
+    // checks of the general loop below cost ~4% of a 2048^3 bf16 launch, more than the mma they follow.
+    // A 4-byte pair store needs an even element index of the global address. The column is always even,
+    // so what decides it is the parity of the batch offset, of ldd * row and of row -- three loop
+    // invariants, folded into one per-thread predicate that costs nothing in the loop.
+    const int row_par = (r0 + warp_r0 + gl) & 1;
+    const int bsd_par = static_cast<int>((static_cast<int64_t>(zb) * args.batch_stride_d) & 1);
+    const int ldd_par = static_cast<int>(args.ldd & 1);
+    const bool pair_ok = sizeof(Dt) == 4 || (bsd_par ^ (ldd_par & row_par)) == 0;
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+      for (int nt = 0; nt < NT; ++nt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+          const int64_t row = r0 + warp_r0 + mt * 16 + h * 8 + gl;
+          const int64_t col = n0 + warp_c0 + nt * 8 + 2 * gc;
+          if (row >= M || col >= N) continue;
+          Dt* const p = dbase + row * args.ldd + col;
+          const float v0 = acc[mt][nt][2 * h] * alpha;
+          if (col + 1 >= N) {                              // last column of an odd N
+            dev::from_f(p[0], v0);
+          } else if (pair_ok) {
+            store_pair<Dt>(p, v0, acc[mt][nt][2 * h + 1] * alpha);
+          } else {                                         // odd ldd: two 2-byte stores of the pair
+            dev::from_f(p[0], v0);
+            dev::from_f(p[1], acc[mt][nt][2 * h + 1] * alpha);
+          }
+        }
+      }
+    }
+    return;
+  }
 #pragma unroll
   for (int mt = 0; mt < MT; ++mt) {
 #pragma unroll
@@ -266,7 +329,7 @@ __device__ __forceinline__ void dense_tile(const GemmTmaParams& P) {
   constexpr int TILE_K = 64 / EB;              // K elements of one 64-byte stage row
   constexpr int KS = TILE_K * EB / 32;         // 32-byte k-steps per stage (always 2 here)
   constexpr int WM = 2;                        // warp rows
-  constexpr int WN = TILE_N / 64;              // warp columns
+  constexpr int WN = TILE_N / 32;              // warp columns (8 warps on a 128-wide tile)
   constexpr int kThreads = 32 * WM * WN;
   constexpr int MT = TILE_M / WM / 16;         // m16 tiles per warp
   constexpr int NT = TILE_N / WN / 8;          // n8 tiles per warp
@@ -497,7 +560,7 @@ template <typename Dt, int TILE_M, int TILE_N, int STAGES, int kBlockK>
 __device__ __forceinline__ void fp4_tile(const GemmTmaParams& P) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1200)
   constexpr int WM = 2;                          // warp rows
-  constexpr int WN = TILE_N / 64;                // warp columns
+  constexpr int WN = TILE_N / 32;                // warp columns
   constexpr int kThreads = 32 * WM * WN;
   constexpr int MT = TILE_M / WM / 16;
   constexpr int NT = TILE_N / WN / 8;

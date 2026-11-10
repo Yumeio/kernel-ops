@@ -483,6 +483,36 @@ void test_dense_epilogue(const LaunchContext& ctx) {
                   reference(a.value, b.value, m, n, k, args.epi, eh32, nullptr, nullptr), DType::kFloat32, 0.05, 0.01,
                   "sm120 dense fp32 output");
   }
+  // Plain output (no EpilogueOp at all) takes the epilogue's separate fast path: one multiply, then one
+  // paired store per two columns. It needs its own case because the fp32 run above always carries
+  // kEpiOutFp32, which selects the general element-wise loop. n = 200 / 129 exercise an even and an odd
+  // N (the last column of an odd row of the tile is then stored alone), ldd = n an even and an odd
+  // output stride (which is what decides whether the pair is one 4-byte store or two 2-byte stores).
+  for (int64_t n_plain : {int64_t{200}, int64_t{129}}) {
+    for (DType out_dt : {DType::kFloat32, DType::kBFloat16}) {
+      const Operand a = make_16(m * k, 13u, DType::kBFloat16);
+      const Operand b = make_16(n_plain * k, 14u, DType::kBFloat16);
+      auto da = upload<uint16_t>(a.raw);
+      auto db = upload<uint16_t>(b.raw);
+      const int64_t out_es = out_dt == DType::kFloat32 ? 4 : 2;
+      std::vector<uint8_t> blank(static_cast<size_t>(m * n_plain) * out_es, 0);
+      Dev<uint8_t> dout(blank.size());
+      kops_test::copy_in(dout.p, blank);
+      kg::EpilogueParams plain{};
+      EpiHost none{};
+      kg::ScaledGemmArgs args = make_args(kg::GemmRecipe::kBF16, DType::kBFloat16, out_dt, m, n_plain, k, da.p,
+                                          db.p, dout.p, n_plain);
+      args.epi = plain;
+      KOPS_EXPECT_OK(kg::gemm_with_tactic(args, sm120_tactic(), kops::Workspace{}, ctx), "sm120 plain store");
+      if (cudaDeviceSynchronize() != cudaSuccess) {
+        kops_test::record_failure("sm120 plain store", cudaGetErrorString(cudaGetLastError()), __FILE__, __LINE__);
+        continue;
+      }
+      compare_close(bytes_to_values(kops_test::copy_out(dout.p, blank.size()), static_cast<size_t>(m * n_plain), out_dt),
+                    reference(a.value, b.value, m, n_plain, k, args.epi, none, nullptr, nullptr), out_dt, 0.05, 0.01,
+                    "sm120 plain store");
+    }
+  }
   kops_test::device_free(d_row);
   kops_test::device_free(d_col);
   kops_test::device_free(d_bias);
@@ -702,10 +732,9 @@ void test_contracts(const LaunchContext& ctx) {
   (void)touched;
 }
 
-/// Strided batch: D[b] = A[b] . B[b]^T, batch in blockIdx.z. Compared with the B7 body (bitwise)
+/// One strided-batch case: D[b] = A[b] . B[b]^T over blockIdx.z, compared with the B7 body (bitwise)
 /// and with the fp64 product of the stored operands.
-void test_dense_batch(const LaunchContext& ctx) {
-  const int64_t m = 20, n = 200, k = 128, batch = 3;
+void dense_batch_case(const LaunchContext& ctx, int64_t m, int64_t n, int64_t k, int64_t batch) {
   const Operand a = make_16(batch * m * k, 21u, DType::kBFloat16);
   const Operand b = make_16(batch * n * k, 22u, DType::kBFloat16);
   auto da = upload<uint16_t>(a.raw);
@@ -745,6 +774,15 @@ void test_dense_batch(const LaunchContext& ctx) {
   if (!same_bytes(raw, raw_b7)) {
     kops_test::record_failure("sm120 dense batch", "differs from the B7 mma.sync result", __FILE__, __LINE__);
   }
+}
+
+/// Strided batch: an even n and an odd one.
+void test_dense_batch(const LaunchContext& ctx) {
+  // An even n (ldd even, even D batch stride) and an odd one: with m * n odd the D batch stride is odd
+  // too, so the epilogue's paired 4-byte store is not 4-byte aligned for every batch and has to fall
+  // back to two 2-byte stores. This is the case a plain (no EpilogueOp) launch takes the fast path on.
+  dense_batch_case(ctx, 20, 200, 128, 3);
+  dense_batch_case(ctx, 19, 199, 128, 2);
 }
 
 // -----------------------------------------------------------------------------

@@ -22,6 +22,9 @@
 //     probabilities and -inf logprobs.
 //   * temperature <= 0 or non-finite means greedy: a one-hot row at the
 //     argmax (ties -> lowest id), the same rule SamplingParams documents.
+//   * sample() runs the fused one-launch body for greedy, unfiltered
+//     categorical, top-p-only and min-p rows; top-k keeps the probability path
+//     below because the fused top-k keeps the whole tie group.
 //   * argmax ties resolve to the lowest token id; logprob is log p of the
 //     winner under the row LSE (natural log).
 //   * chosen_rank is 1-based: 1 + number of tokens with a strictly larger
@@ -783,7 +786,10 @@ Status launch_argmax(const Tensor& out_ids, const Tensor& out_logprob, const Ten
   constexpr int VEC = vec_width<in_t>();
   const bool has_logprob = tensor_present(out_logprob);
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
-  argmax_kernel<in_t, VEC><<<batch, kThreads, 0, stream>>>(
+  // A 128k+ row has enough vectors to keep 32 warps busy and 1024-thread blocks
+  // fill the SM when the batch is small; short rows stay at 16 warps.
+  const int threads = vocab >= 65536 ? 1024 : kThreads;
+  argmax_kernel<in_t, VEC><<<batch, threads, 0, stream>>>(
       as_mutable<int32_t>(out_ids), has_logprob ? as_mutable<float>(out_logprob) : nullptr,
       as_const<in_t>(logits), logits.stride[0], batch, vocab);
   const cudaError_t err = cudaGetLastError();
@@ -1448,6 +1454,87 @@ __device__ bool topk_by_candidates(const float* x, int V, int k, int* hist, int*
   return true;
 }
 
+/// Candidate top-k threshold over logits for gumbel_max_sample(). Same 11-bit
+/// histogram scheme as topk_by_candidates(), but reads in_t and orders by logit_key.
+/// Returns false when the boundary bin exceeds the candidate buffer.
+template <typename in_t, int VEC, int T>
+__device__ bool topk_logits_by_candidates(const in_t* x, int V, int k, int* hist, int* csum,
+                                          float* cval, int* cidx, int* sh, uint32_t* out_key,
+                                          int32_t* out_bound) {
+  const int t = threadIdx.x;
+  for (int b = t; b < kTopkBins; b += T) hist[b] = 0;
+  if (t == 0) sh[3] = 0;
+  __syncthreads();
+  int prev = -1, run = 0;
+  const auto count = [&](float v) {
+    const int bin = static_cast<int>(logit_key(v) >> 21);
+    if (bin == prev) {
+      ++run;
+    } else {
+      if (prev >= 0) atomicAdd(&hist[prev], run);
+      prev = bin;
+      run = 1;
+    }
+  };
+  (void)VEC;
+  for (int i = t; i < V; i += T) count(dev::to_f(x[i]));
+  if (prev >= 0) atomicAdd(&hist[prev], run);
+  __syncthreads();
+  if (t < kTopkBins / 32) {
+    int s = 0;
+    for (int j = 0; j < 32; ++j) s += hist[t * 32 + j];
+    csum[t] = s;
+  }
+  __syncthreads();
+  if (t == 0) {
+    int above = 0, c = kTopkBins / 32 - 1;
+    for (; c > 0; --c) {
+      if (above + csum[c] >= k) break;
+      above += csum[c];
+    }
+    int b = c * 32 + 31;
+    for (; b > c * 32; --b) {
+      if (above + hist[b] >= k) break;
+      above += hist[b];
+    }
+    sh[0] = b;
+    sh[1] = above;
+    sh[2] = hist[b];
+  }
+  __syncthreads();
+  const int bin = sh[0], above = sh[1], m = sh[2];
+  if (m > kTopkCand) return false;
+  for (int i = t; i < V; i += T) {
+    const float v = dev::to_f(x[i]);
+    const int d = static_cast<int>(logit_key(v) >> 21);
+    if (d == bin) {
+      const int pos = atomicAdd(&sh[3], 1);
+      cval[pos] = v;
+      cidx[pos] = i;
+    }
+  }
+  __syncthreads();
+  const int need = k - above;
+  for (int c = t; c < m; c += T) {
+    const float v = cval[c];
+    const int id = cidx[c];
+    const uint32_t kv = logit_key(v);
+    int rank = 0;
+    for (int j = 0; j < m; ++j) {
+      rank += (logit_key(cval[j]) > kv) || (logit_key(cval[j]) == kv && cidx[j] < id);
+    }
+    if (rank == need - 1) {
+      sh[0] = static_cast<int>(kv);
+      sh[1] = id;
+    }
+  }
+  __syncthreads();
+  *out_key = static_cast<uint32_t>(sh[0]);
+  *out_bound = sh[1];
+  __syncthreads();
+  return true;
+}
+
 __device__ __forceinline__ float row_max(const float* p, int V, float* red) {
   float m = -INFINITY;
   for (int i = threadIdx.x; i < V; i += blockDim.x) m = fmaxf(m, p[i]);
@@ -1768,6 +1855,12 @@ __global__ void top_k_top_p_sampling_kernel(int32_t* __restrict__ out_ids,
   __shared__ uint64_t rh[256];
   __shared__ uint64_t tgt[2];
   __shared__ float red[8];
+  // Candidate top-k path: one 2048-bin count histogram plus the boundary-bin
+  // candidates, instead of four full-row radix passes.
+  __shared__ int cbins[kTopkBins];
+  __shared__ int csum[kTopkBins / 32];
+  __shared__ float cval[kTopkCand];
+  __shared__ int cidx[kTopkCand];
   (void)VEC_SIZE;
   (void)MAX_ROUNDS;
   const int row = blockIdx.x;
@@ -1783,13 +1876,19 @@ __global__ void top_k_top_p_sampling_kernel(int32_t* __restrict__ out_ids,
     tp = 0.0f;
   }
   const bool use_mp = mp > 0.0f;
-  float maxp = row_max(src, vocab_size, red);
+  float maxp = use_mp ? row_max(src, vocab_size, red) : 0.0f;
   uint32_t kkey = 0;
   int kbound = INT32_MAX;
   int need = 0;
+  bool have_ksum = false;
+  float ksum = 0.0f;
   if (use_k) {
-    select_kth_key<kRowThreads>(src, vocab_size, k, false, hist, sh, &kkey, &need);
-    kbound = boundary_equals<kRowThreads>(src, vocab_size, false, kkey, need, scan, sh);
+    have_ksum = topk_by_candidates<kRowThreads>(src, vocab_size, k, cbins, csum, cval, cidx, sh,
+                                                red, &kkey, &kbound, &ksum);
+    if (!have_ksum) {
+      select_kth_key<kRowThreads>(src, vocab_size, k, false, hist, sh, &kkey, &need);
+      kbound = boundary_equals<kRowThreads>(src, vocab_size, false, kkey, need, scan, sh);
+    }
   } else if (tp == 0.0f) {
     select_kth_key<kRowThreads>(src, vocab_size, 1, false, hist, sh, &kkey, &need);
     kbound = boundary_equals<kRowThreads>(src, vocab_size, false, kkey, need, scan, sh);
@@ -1879,13 +1978,19 @@ __global__ void top_k_top_p_sampling_kernel(int32_t* __restrict__ out_ids,
     pbound = boundary_equals_mass<kRowThreads>(src, vocab_size, pkey, rem, scan, sh);
   }
   const bool use_p = use_tp;
-  float z = 0.0f;
-  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-    const uint32_t key = prob_key(src[i]);
-    const bool ok = base.ok(key, src[i], i) && (!use_p || in_nucleus(key, i, pkey, pbound));
-    if (ok) z += src[i];
+  float mass;
+  if (!use_p && !use_mp && have_ksum) {
+    // topk_by_candidates already summed exactly the top-k set, so the z scan is redundant.
+    mass = ksum;
+  } else {
+    float z = 0.0f;
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+      const uint32_t key = prob_key(src[i]);
+      const bool ok = base.ok(key, src[i], i) && (!use_p || in_nucleus(key, i, pkey, pbound));
+      if (ok) z += src[i];
+    }
+    mass = block_reduce_sum<float, kRowWarps>(z, red);
   }
-  const float mass = block_reduce_sum<float, kRowWarps>(z, red);
   if (mass <= 0.0f) {
     if (threadIdx.x == 0) {
       out_ids[row] = -1;
@@ -1944,6 +2049,10 @@ __global__ void gumbel_max_sampling_kernel(int32_t* __restrict__ out_ids,
   __shared__ float red[8];
   __shared__ float wval[8];
   __shared__ int widx[8];
+  __shared__ int cbins[kTopkBins];
+  __shared__ int csum[kTopkBins / 32];
+  __shared__ float cval[kTopkCand];
+  __shared__ int cidx[kTopkCand];
   (void)VEC_SIZE;
   (void)MAX_TOPK_CANDIDATES;
   const int row = blockIdx.x;
@@ -1954,76 +2063,82 @@ __global__ void gumbel_max_sampling_kernel(int32_t* __restrict__ out_ids,
   const float mp = row_min_p(params, row, params.default_min_p);
   const bool use_k = k > 0 && k < vocab_size;
   const bool greedy = !(t > 0.0f);
-  float mx = -INFINITY;
-  for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-    float v = dev::to_f(src[i]);
-    if (isnan(v)) v = -INFINITY;
-    mx = fmaxf(mx, v);
+  float mx = 0.0f;
+  const bool use_mp = mp > 0.0f;
+  if (use_mp || greedy) {
+    mx = -INFINITY;
+    for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+      float v = dev::to_f(src[i]);
+      if (isnan(v)) v = -INFINITY;
+      mx = fmaxf(mx, v);
+    }
+    mx = block_reduce_max<float, kRowWarps>(mx, red);
   }
-  mx = block_reduce_max<float, kRowWarps>(mx, red);
   uint32_t kkey = 0;
   int kbound = INT32_MAX;
   if (use_k) {
-    // Selection is done on the logits; copy through a float staging view is not
-    // needed because the count-only radix reads the input one element at a time.
-    uint32_t prefix = 0;
-    int rank = k;
-    for (int pass = 0; pass < 4; ++pass) {
-      const int shift = 24 - 8 * pass;
-      for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
-      __syncthreads();
-      for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
-        const uint32_t key = logit_key(dev::to_f(src[i]));
-        if (pass > 0 && (key >> (shift + 8)) != (prefix >> (shift + 8))) continue;
-        atomicAdd(&hist[(key >> shift) & 255], 1);
-      }
-      __syncthreads();
-      if (threadIdx.x == 0) {
-        int run = 0, chosen = 0, rem = rank;
-        for (int b = 255; b >= 0; --b) {
-          if (run + hist[b] >= rank) {
-            chosen = b;
-            rem = rank - run;
-            break;
+    if (!topk_logits_by_candidates<in_t, VEC_SIZE, kRowThreads>(
+            src, vocab_size, k, cbins, csum, cval, cidx, sh, &kkey, &kbound)) {
+        // Fallback: boundary bin larger than the candidate buffer, so use the exact
+        // count-only radix. It reads the input one element at a time, no staging.
+        uint32_t prefix = 0;
+        int rank = k;
+        for (int pass = 0; pass < 4; ++pass) {
+          const int shift = 24 - 8 * pass;
+          for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+          __syncthreads();
+          for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
+            const uint32_t key = logit_key(dev::to_f(src[i]));
+            if (pass > 0 && (key >> (shift + 8)) != (prefix >> (shift + 8))) continue;
+            atomicAdd(&hist[(key >> shift) & 255], 1);
           }
-          run += hist[b];
+          __syncthreads();
+          if (threadIdx.x == 0) {
+            int run = 0, chosen = 0, rem = rank;
+            for (int b = 255; b >= 0; --b) {
+              if (run + hist[b] >= rank) {
+                chosen = b;
+                rem = rank - run;
+                break;
+              }
+              run += hist[b];
+            }
+            sh[0] = chosen;
+            sh[1] = rem;
+          }
+          __syncthreads();
+          prefix |= static_cast<uint32_t>(sh[0]) << shift;
+          rank = sh[1];
+          __syncthreads();
         }
-        sh[0] = chosen;
-        sh[1] = rem;
-      }
-      __syncthreads();
-      prefix |= static_cast<uint32_t>(sh[0]) << shift;
-      rank = sh[1];
-      __syncthreads();
-    }
-    kkey = prefix;
-    // boundary among equal logits
-    if (threadIdx.x == 0) sh[0] = INT32_MAX;
-    __syncthreads();
-    const int chunk = (vocab_size + kRowThreads - 1) / kRowThreads;
-    const int beg = threadIdx.x * chunk;
-    const int end = min(vocab_size, beg + chunk);
-    uint64_t cnt = 0;
-    for (int i = beg; i < end; ++i) {
-      if (logit_key(dev::to_f(src[i])) == kkey) ++cnt;
-    }
-    const uint64_t before = block_exscan_u64<kRowThreads>(cnt, scan);
-    if (before < static_cast<uint64_t>(rank) && static_cast<uint64_t>(rank) <= before + cnt) {
-      uint64_t c = before;
-      for (int i = beg; i < end; ++i) {
-        if (logit_key(dev::to_f(src[i])) != kkey) continue;
-        ++c;
-        if (c == static_cast<uint64_t>(rank)) {
-          sh[0] = i;
-          break;
+        kkey = prefix;
+        // boundary among equal logits
+        if (threadIdx.x == 0) sh[0] = INT32_MAX;
+        __syncthreads();
+        const int chunk = (vocab_size + kRowThreads - 1) / kRowThreads;
+        const int beg = threadIdx.x * chunk;
+        const int end = min(vocab_size, beg + chunk);
+        uint64_t cnt = 0;
+        for (int i = beg; i < end; ++i) {
+          if (logit_key(dev::to_f(src[i])) == kkey) ++cnt;
         }
-      }
+        const uint64_t before = block_exscan_u64<kRowThreads>(cnt, scan);
+        if (before < static_cast<uint64_t>(rank) && static_cast<uint64_t>(rank) <= before + cnt) {
+          uint64_t c = before;
+          for (int i = beg; i < end; ++i) {
+            if (logit_key(dev::to_f(src[i])) != kkey) continue;
+            ++c;
+            if (c == static_cast<uint64_t>(rank)) {
+              sh[0] = i;
+              break;
+            }
+          }
+        }
+        __syncthreads();
+        kbound = sh[0];
     }
-    __syncthreads();
-    kbound = sh[0];
   }
   const float mp_thresh = (mp > 0.0f && mx > -INFINITY) ? mx + t * logf(mp) : -INFINITY;
-  const bool use_mp = mp > 0.0f;
   float best = -INFINITY;
   int bidx = INT32_MAX;
   for (int i = threadIdx.x; i < vocab_size; i += blockDim.x) {
@@ -2256,10 +2371,61 @@ Status sample(const Tensor& out_ids, const Tensor& logits, const SamplingParams&
                              "sample: workspace %zu B, need %zu B", ws.device_scratch_bytes, need);
   }
   auto* base = static_cast<uint8_t*>(ws.device_scratch);
+  cudaStream_t st = stream_of(ctx);
+  // Fast path: the modes whose distribution and tie-breaking agree with
+  // sample_fused() run its one-launch body straight from the logits, so no fp32
+  // probability row is materialized. Top-k stays on the legacy path below
+  // because the fused top-k keeps the whole tie group at the k-th value (the
+  // declared semantic difference), and a per-row temperature tensor is not
+  // equivalent for non-finite entries.
+  const bool k_off = params.top_k == nullptr &&
+                     !(params.default_top_k > 0 && params.default_top_k < vocab);
+  const bool mp_off = params.min_p == nullptr && !(params.default_min_p > 0.0f);
+  const bool all_greedy = !(params.default_temperature > 0.0f);
+  // Top-k disabled: greedy, unfiltered, top-p only and min-p all share the fused
+  // body. Greedy ignores min-p, so it keeps the legacy path when min-p is active
+  // (a min_p > 1 row is empty there, while the greedy kernel would return the
+  // argmax).
+  if (params.temperature == nullptr && k_off && (mp_off || !all_greedy) &&
+      !std::isnan(params.default_top_p) && !std::isnan(params.default_min_p)) {
+    FusedSamplingParams fused{};
+    fused.sampling = params;
+    fused.default_repetition_penalty = 1.0f;
+    SamplingPlan plan{};
+    if (sampling_plan(logits, params, ctx, &plan) == Status::kSuccess) {
+      Workspace fws = ws;
+      WorkspaceRequirements freq{};
+      if (plan.splits > 1 &&
+          sampling_fused_workspace_requirements(batch, vocab, plan, &freq) == Status::kSuccess) {
+        // sample() reserves no barrier region, but the fp32 row it would have
+        // written is larger than the split exchange area in every case that
+        // splits; carve both from that unused region and zero the counters.
+        const size_t align = freq.alignment == 0 ? 256 : freq.alignment;
+        const size_t scratch = (freq.device_scratch_bytes + align - 1) / align * align;
+        if (scratch + freq.device_persistent_bytes <= probs_bytes) {
+          fws.device_scratch = base;
+          fws.device_scratch_bytes = freq.device_scratch_bytes;
+          fws.device_persistent = base + scratch;
+          fws.device_persistent_bytes = freq.device_persistent_bytes;
+          const cudaError_t zero =
+              cudaMemsetAsync(fws.device_persistent, 0, freq.device_persistent_bytes, st);
+          if (zero != cudaSuccess) {
+            return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(zero),
+                                             "sample: %s", cudaGetErrorString(zero));
+          }
+        } else {
+          plan.splits = 1;
+        }
+      } else if (plan.splits > 1) {
+        plan.splits = 1;
+      }
+      const Status fused_status = sample_fused(out_ids, logits, fused, plan, fws, ctx);
+      if (fused_status != Status::kPlanInvalidated) return fused_status;
+    }
+  }
   float* probs_ptr = reinterpret_cast<float*>(base);
   float* temp_ptr = probs_ptr + static_cast<size_t>(batch) * vocab;
   float* state_ptr = temp_ptr + batch;
-  cudaStream_t st = stream_of(ctx);
   const Tensor temperature = [&] {
     if (params.temperature != nullptr) {
       Tensor t{};

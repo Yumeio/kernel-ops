@@ -961,8 +961,10 @@ Status launch_sm120_tile(const GemmTmaParams& p, cudaStream_t s) {
                                      cudaGetErrorString(attr));
   }
   const unsigned tiles = static_cast<unsigned>(p.num_tiles_m) * static_cast<unsigned>(p.num_tiles_n);
-  gemm_sm120_kernel<Tr><<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), static_cast<unsigned>(32 * 2 * (TN / 64)),
-                          kSmem, s>>>(p);
+  // Block size is the body's warp layout (sm120a::Threads), not a copy of it: a tile row is one warp
+  // row per 32 output channels, so a 128-wide tile runs eight warps.
+  gemm_sm120_kernel<Tr><<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)),
+                          static_cast<unsigned>(sm120a::Threads<Tr>::value), kSmem, s>>>(p);
   return launch_error("gemm_sm120_kernel");
 }
 
@@ -980,7 +982,7 @@ Status launch_fp8_sm120_tile(const GemmTmaParams& p, cudaStream_t s, GemmRecipe 
                                      cudaGetErrorString(attr));
   }
   const unsigned tiles = static_cast<unsigned>(p.num_tiles_m) * static_cast<unsigned>(p.num_tiles_n);
-  const unsigned threads = static_cast<unsigned>(32 * 2 * (TN / 64));
+  const unsigned threads = static_cast<unsigned>(sm120a::Threads<Tr>::value);
   if (recipe == GemmRecipe::kFP8Tensorwise) {
     fp8_gemm_sm120_kernel<Tr, GemmRecipe::kFP8Tensorwise>
         <<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), threads, kSmem, s>>>(p);
@@ -1018,7 +1020,7 @@ Status launch_fp4_sm120_tile(const GemmTmaParams& p, cudaStream_t s, GemmRecipe 
                                      cudaGetErrorString(attr));
   }
   const unsigned tiles = static_cast<unsigned>(p.num_tiles_m) * static_cast<unsigned>(p.num_tiles_n);
-  const unsigned threads = static_cast<unsigned>(32 * 2 * (TN / 64));
+  const unsigned threads = static_cast<unsigned>(sm120a::Threads<Tr>::value);
   if (recipe == GemmRecipe::kNVFP4) {
     fp4_gemm_sm120_kernel<Tr, GemmRecipe::kNVFP4>
         <<<dim3(tiles, 1u, static_cast<unsigned>(p.args.batch)), threads, kSmem, s>>>(p);

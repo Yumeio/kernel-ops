@@ -1327,6 +1327,8 @@ __device__ bool topp_three_pass(RowCtx<SPLIT>& rc, const in_t* __restrict__ row,
 /// tokens. The above-boundary tokens race inline; the boundary prefix is refined in shared
 /// memory. 2048 mass bins overlay the 4096 count bins, so this path adds no static shared memory.
 /// A clamped top bin, a zero-mass row or a boundary bin beyond kCand takes the exact fallback.
+/// For p >= 0.95 a pass after the row max builds the exact mass40 histogram instead: the cut
+/// then lands in one bin, so the candidate range needs no slack and stays inside kCand.
 template <typename in_t, int VEC, bool SPLIT>
 __device__ void topp_only_row(RowCtx<SPLIT>& rc, const in_t* __restrict__ row, int vocab,
                               const RowProc& proc, float inv_t, float top_p,
@@ -1336,6 +1338,12 @@ __device__ void topp_only_row(RowCtx<SPLIT>& rc, const in_t* __restrict__ row, i
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const Segment seg = rc.seg();
+  // A high top-p cut keeps almost the whole row above the boundary. The polynomial
+  // mass histogram then needs the two-bin slack, and the three boundary bins can
+  // exceed the candidate buffer. For p >= 0.97 build an exact mass40 histogram
+  // after the row max is known instead: the cut lands in one bin, so the candidate
+  // range is a single bin and the fast path stays available.
+  const bool exact_hist = top_p >= 0.95f;
   uint64_t* hm = reinterpret_cast<uint64_t*>(sm.u.hist);
   for (int b = tid; b < kMassBins; b += kThreads) hm[b] = 0ull;
   __syncthreads();
@@ -1365,13 +1373,15 @@ __device__ void topp_only_row(RowCtx<SPLIT>& rc, const in_t* __restrict__ row, i
         best = y;
         best_token = token;
       }
-      if (y > 64.0f) clamped_hi = true;
-      const int mb = logit_bin(y) >> 1;
-      const float hi = static_cast<float>(mb - (kMassBins / 2 - 1)) * (1.0f / 16.0f);
-      const float t = fminf(y, hi) - hi;
-      const uint64_t mq = t >= -1.0f / 16.0f ? fixed_mass40(exp_small(t)) : 0ull;
-      atomicAdd(reinterpret_cast<unsigned long long*>(&hm[mb]),
-                static_cast<unsigned long long>(mq));
+      if (!exact_hist) {
+        if (y > 64.0f) clamped_hi = true;
+        const int mb = logit_bin(y) >> 1;
+        const float hi = static_cast<float>(mb - (kMassBins / 2 - 1)) * (1.0f / 16.0f);
+        const float t = fminf(y, hi) - hi;
+        const uint64_t mq = t >= -1.0f / 16.0f ? fixed_mass40(exp_small(t)) : 0ull;
+        atomicAdd(reinterpret_cast<unsigned long long*>(&hm[mb]),
+                  static_cast<unsigned long long>(mq));
+      }
     }
   }
   const float m_cta = kops::block_reduce_max<float, kWarps>(mx, sm.sv);
@@ -1423,12 +1433,33 @@ __device__ void topp_only_row(RowCtx<SPLIT>& rc, const in_t* __restrict__ row, i
     return;
   }
 
+  if (exact_hist) {
+    // Exact per-bin mass40, built after m is known. This makes the cut land in
+    // exactly one bin, so the candidate range needs no slack.
+    for (int b = tid; b < kMassBins; b += kThreads) hm[b] = 0ull;
+    __syncthreads();
+    for (int c2 = seg.beg + lane; c2 < seg.end; c2 += 32) {
+      float x[VEC];
+      load_chunk<in_t, VEC>(row, c2, x);
+#pragma unroll
+      for (int i = 0; i < VEC; ++i) {
+        const float v = proc.apply(x[i], c2 * VEC + i);
+        if (v == inf_neg()) continue;
+        const float y = v * inv_t;
+        atomicAdd(reinterpret_cast<unsigned long long*>(&hm[logit_bin(y) >> 1]),
+                  static_cast<unsigned long long>(mass40(y, m)));
+      }
+    }
+    __syncthreads();
+  }
   rc.merge(hm, kMassBins);
   // Bin masses in place: each hm[] slot is dead once scaled by exp(hi_bin - m).
   double* bm = reinterpret_cast<double*>(hm);
   for (int j = tid; j < kMassBins; j += kThreads) {
     const double hi = (static_cast<double>(j) - (kMassBins / 2 - 1)) * (1.0 / 16.0);
-    bm[j] = static_cast<double>(hm[j]) * exp2((hi - static_cast<double>(m)) * 1.4426950408889634);
+    bm[j] = exact_hist
+                ? static_cast<double>(hm[j])
+                : static_cast<double>(hm[j]) * exp2((hi - static_cast<double>(m)) * 1.4426950408889634);
   }
   __syncthreads();
 
@@ -1441,7 +1472,7 @@ __device__ void topp_only_row(RowCtx<SPLIT>& rc, const in_t* __restrict__ row, i
   for (int jj = 0; jj < kPer; ++jj) s += bm[c * kPer + jj];
   const double z = block_all(s, sm.wd, OpSum{});
   const double target = static_cast<double>(top_p) * z;
-  const double eps = 1e-4 * z + 1e-9;
+  const double eps = exact_hist ? 0.0 : 1e-4 * z + 1e-9;
   const double above_chunk = z - (block_incl_scan(s, sm.wd));
   double run = above_chunk + (s - bm[c * kPer]);
   int hi_bin = kMassBins;
@@ -1461,9 +1492,9 @@ __device__ void topp_only_row(RowCtx<SPLIT>& rc, const in_t* __restrict__ row, i
   }
   // Keep one bin of slack on each side of the histogram boundary: the exact mass above the
   // candidate range is then safely below the cut, and a per-bin histogram error can only move the
-  // true boundary inside the collected range.
-  const int hi = min(kMassBins - 1, boundary + 1);
-  const int lo = boundary > 0 ? boundary - 1 : 0;
+  // true boundary inside the collected range. The exact histogram lands in one bin already.
+  const int hi = exact_hist ? boundary : min(kMassBins - 1, boundary + 1);
+  const int lo = exact_hist ? boundary : (boundary > 0 ? boundary - 1 : 0);
   // bm[] is already in fixed-point 2^40 units; the histogram total is accurate enough for the
   // boundary cut, and the exact masses of the collected/raced tokens refine the draw.
   const uint64_t target40 = static_cast<uint64_t>(target + 0.5);
@@ -1478,7 +1509,7 @@ __device__ void topp_only_row(RowCtx<SPLIT>& rc, const in_t* __restrict__ row, i
     if (j > hi) above_hi += bm[j];
   }
   const uint64_t mass_above_hist = static_cast<uint64_t>(block_all(above_hi, sm.wd, OpSum{}) + 0.5);
-  if (mass_above_hist >= target40) {
+  if (!exact_hist && mass_above_hist >= target40) {
     __syncthreads();
     float best = inf_neg();
     int32_t best_token = INT32_MAX;

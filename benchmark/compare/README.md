@@ -32,6 +32,24 @@ python benchmark/compare/torch_baseline.py --cases out/cases-chains.json \
 python benchmark/compare/compare_results.py out/kops-chains.json out/torch-chains.json
 ```
 
+## B14 compressed attention (CSA/HCA)
+
+`bench_sparse` carries the DeepSeek-V4 compressed-attention cases (selected
+compressed entries / HCA dense range + SWA + sink). The PyTorch baseline gathers
+the same key set per row and runs the eager fp32-softmax / bf16 matmul step:
+
+```bash
+build/bench/benchmark/bench_sparse --only compressed_attention --dump-cases > out/cases-cattn.json
+build/bench/benchmark/bench_sparse --only compressed_attention --rounds 3 --json out/kops-cattn.json
+python benchmark/compare/csa_torch.py --cases out/cases-cattn.json \
+    --json out/torch-cattn.json --only compressed_attention --rounds 3
+python benchmark/compare/compare_results.py out/kops-cattn.json out/torch-cattn.json
+```
+
+`csa_torch.py` also implements the `kv_compress` reference math for the same
+case table; this repository has no `kv_compress` benchmark case yet, so those
+rows are reported under `skipped`.
+
 ## B3 quantization comparison
 
 ```bash
@@ -66,6 +84,28 @@ The PyTorch environment pinned by `pyproject.toml` / `requirements.txt` is
 chains `chain_pre_norm_quant` / `chain_glu_quant`. MXFP4/NVFP4 baselines cast to
 FP8 because PyTorch has no portable e2m1 cast; that makes their comparison
 conservative for the native FP4 path.
+
+## Sampling matrix (B1/B6)
+
+`bench_sampling` emits one matrix with three id families that must be reported
+separately: `sampling.fused.*` (the one-launch sampler), `sampling.sample.*`
+(the public `sample()` entry point) and the individual logits ops
+(`softmax`, `argmax`, `bincount`, speculative decoding, ...). The eager
+baseline covers all of them, but the aggregate geomean mixes a 15x legacy
+traffic gap with 200-2000x small-op ratios and is not a sampler number. Use
+`--groups 2` to print the per-family summary, and quote the fused geomean as
+the fused-sampler result:
+
+```bash
+python benchmark/compare/compare_results.py out/kops-sampling.json \
+    out/torch-sampling.json --groups 2 --json out/compare-sampling.json
+```
+
+`sample()` runs the fused body for greedy, unfiltered categorical, top-p-only
+and min-p rows (top-k stays on the legacy probability path for the declared
+tie-group semantics), so those rows are expected to match `sampling.fused.*`
+within noise. A run of the old binary still shows the legacy numbers; record
+the commit next to the table.
 
 ## B4 weight preparation comparison
 

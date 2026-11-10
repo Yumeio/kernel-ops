@@ -123,10 +123,15 @@ remain the ABI and shape authority.
   the graph replay never advances host state. A row with no admissible mass writes `out_ids = -1`.
 - `sample()` materializes the fp32 probability row in `Workspace::device_scratch`
   (`batch * vocab * 4` bytes plus the temperature and split-softmax regions reported by
-  `sampling_workspace_requirements`). `gumbel_max_sample()` deliberately rejects top-p
-  (`kNotImplemented`) because it works from logits; use `sample()` for nucleus truncation.
+  `sampling_workspace_requirements`) for its top-k path. Calls with top-k disabled (greedy,
+  unfiltered categorical, top-p only, min-p) run the `sample_fused()` body in one
+  launch and do not read the row; the workspace requirement is unchanged. `gumbel_max_sample()`
+  deliberately rejects top-p (`kNotImplemented`) because it works from logits; use `sample()`
+  for nucleus truncation.
 - `sample_fused()` samples straight from logits in one launch and never materializes the fp32
-  probability row. Its semantics differ from `sample()` in two declared ways:
+  probability row. Its semantics differ from `sample()` in two declared ways (the greedy,
+  unfiltered and top-p-only rows of `sample()` share this body; its top-k and min-p rows keep the
+  legacy probability path):
   - **top-k keeps the whole tie group** at the k-th largest value (vLLM `apply_top_k` convention:
     every token with `x >= x_(k)` survives), so `top_k == 1` with `T > 0` samples among the tied
     maxima and is not greedy. The comparison uses the processed logits before temperature (the
@@ -144,7 +149,9 @@ remain the ABI and shape authority.
   - **draws are equal in distribution, not token-for-token**: the unfiltered path uses a 64-bit
     uniform for the inverse CDF and the filtered paths a Gumbel race keyed by token id (64-bit
     uniform per kept token), so the same
-    seed does not reproduce `sample()`'s token. `request_id` is the batch row, as in `sample()`:
+    seed does not reproduce the legacy `sample()` top-k/min-p token. For the rows `sample()`
+    routes through this body (greedy, unfiltered, top-p only) the two entry points draw the same
+    token. `request_id` is the batch row, as in `sample()`:
     a row reproduces its token across batch sizes, other rows' contents, split counts and graph
     replays only when it keeps its row index.
   Processors (repetition via `penalty_mask`, frequency/presence via `token_counts`) are applied in
@@ -162,7 +169,9 @@ remain the ABI and shape authority.
   `splits` (1 forces one CTA per row) but not raise it past what fits; non-vectorizable rows with
   `splits > 1` are `kPlanInvalidated`. The workspace holds a per-row exchange area
   (`device_scratch`) and one 8-byte barrier counter per row (`device_persistent`, zero-filled once
-  before the first call, then valid for any split count). A workspace serves one call at a time;
+  before the first call, then valid for any split count). `sample()` carves both from the fp32 row
+  region it would otherwise write when its automatic plan splits, and re-zeroes the counters on
+  every call. A workspace serves one call at a time;
   concurrent streams need their own. The whole call is one kernel node and is graph-capturable.
 
 ## 1d. Tensor-core GEMM and epilogue fusions (B7)

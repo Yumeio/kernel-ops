@@ -27,7 +27,9 @@ Status sampling_workspace_requirements(int32_t max_batch, int32_t max_vocab, int
 /// One-call sampler: (optional processors already applied) -> greedy rows via argmax, others via
 /// top-k/top-p/min-p rejection sampling or Gumbel-max, chosen per capability. Device outputs only.
 /// The workspace holds the fp32 probability row of the call (`num_tokens * vocab * 4` bytes,
-/// plus the optional split-softmax state); sampling_workspace_requirements() reports it. A row
+/// plus the optional split-softmax state); sampling_workspace_requirements() reports it. Calls
+/// with top-k disabled (greedy, unfiltered categorical, top-p only, min-p) run the fused
+/// one-launch body and do not read the row, but the workspace contract is unchanged. A row
 /// with no admissible token writes `out_ids = -1`.
 Status sample(const Tensor& out_ids, const Tensor& logits, const SamplingParams& params,
               const Workspace& ws, const LaunchContext& ctx);
@@ -56,7 +58,9 @@ Status sampling_fused_workspace_requirements(int32_t max_batch, int32_t max_voca
 /// Fused sampler: greedy or unfiltered full-vocab categorical sampling in one
 /// launch, with optional penalty processors folded into the logits load. NaN/-inf
 /// policy and truncation order match sample(); top-k keeps the whole tie group and
-/// draws match sample() in distribution only (CONTRACTS.md §1c). Rows with only
+/// draws match sample()'s top-k/min-p legacy body in distribution only. The greedy,
+/// unfiltered and top-p-only rows of sample() call this body, so those tokens agree
+/// for a given plan and seed (CONTRACTS.md §1c). Rows with only
 /// top-p active use a fixed-point mass histogram to find the boundary bin, then race
 /// the bins above it and refine the boundary candidates; the nucleus is unchanged.
 Status sample_fused(const Tensor& out_ids, const Tensor& logits,

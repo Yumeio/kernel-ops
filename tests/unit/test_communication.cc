@@ -980,7 +980,8 @@ void test_allreduce_fusion(bool host) {
           float amax = 0.0f;
           for (int c = 0; c < H; ++c) {
             const float rv = kops_test::to_float(res[size_t(r) * H + c]);
-            nv[c] = rv * rstd * kops_test::to_float(hw[k][c]);
+            // The fused epilogue and the chain both quantize the rounded T norm output.
+            nv[c] = kops_test::to_float(round_to<T>(rv * rstd * kops_test::to_float(hw[k][c])));
             amax = std::max(amax, std::fabs(nv[c]));
           }
           const float scale_want = std::max(amax / 448.0f, 1.0f / (448.0f * 512.0f));

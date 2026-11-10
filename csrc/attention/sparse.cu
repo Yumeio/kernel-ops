@@ -1794,7 +1794,7 @@ Status lightning_indexer(const IndexerParams& params, DType q_dtype, const Launc
 //     [128w, 128w+128) as 16 n8 mma groups, so the latent output tile needs no
 //     cross-warp reduction. P is repacked from the summed scores as the mma A
 //     fragment.
-//   * K tiles are double-buffered with cp.async (one 16-key tile in flight
+//   * K tiles are double-buffered with cp.async (one key tile in flight
 //     while the previous one is consumed); native bf16/fp16 records take the
 //     cp.async path, the 656/584/528/288 byte codecs are dequantized into the
 //     bf16 tile on load. The 16 keys of the next tile are resolved (page table
@@ -1842,24 +1842,28 @@ struct SpRow {
 };
 
 /// Tensor-core attention over the visible key list `keys`. `smem` must hold
-///   2 * spTile * QK_DIM * sizeof(T)  double-buffered latent tile (Q staging aliases it)
-/// + spRedWords * 4                   QK warp partials
-/// + 2 * spTile * sizeof(SpRow)       per-tile resolved key rows
+///   2 * TILE * QK_DIM * sizeof(T)  double-buffered latent tile (Q staging aliases it)
+/// + (TILE / 8) * 4 * tkWarps * 32 * 4  QK warp partials
+/// + 2 * TILE * sizeof(SpRow)       per-tile resolved key rows
 /// + 8                                small scalars
-/// and blockDim.x must be tkThreads.
-template <int QK_DIM, int VALUE_DIM, typename T, typename DTypeKV, typename DTypeO, typename Keys>
+/// and blockDim.x must be tkThreads. `keys.prepare(base, count, rows)` resolves
+/// up to TILE keys; sparse MLA uses TILE = spTile (16), compressed attention a
+/// wider tile so one shared K/V staging pass feeds all 16 query heads.
+template <int QK_DIM, int VALUE_DIM, int TILE, typename T, typename DTypeKV, typename DTypeO,
+          typename Keys>
 __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& keys, int row,
                                              unsigned char* smem) {
-  constexpr int kNT = spTile / 8;    // n8 score tiles of one key tile
+  constexpr int kNT = TILE / 8;    // n8 score tiles of one key tile
   constexpr int kPairs = kNT * 4;    // score values per lane
-  constexpr int kHalves = spTile / 16;  // 16-key steps of the PV accumulation
+  constexpr int kHalves = TILE / 16;  // 16-key steps of the PV accumulation
   constexpr int kChunks = QK_DIM / 8;  // 16-byte chunks per latent row
-  constexpr int kPerThread = spTile * kChunks / tkThreads;
+  constexpr int kPerThread = TILE * kChunks / tkThreads;
   constexpr int kSteps = QK_DIM / 16;  // mma k steps of one QK tile
   constexpr int kStepsPerWarp = kSteps / tkWarps;
-  constexpr int kTileElems = spTile * QK_DIM;
-  static_assert(spTile % 16 == 0, "two 16-key PV steps");
-  static_assert(spTile * kChunks % tkThreads == 0, "latent tile load");
+  constexpr int kTileElems = TILE * QK_DIM;
+  constexpr int kRedWords = kPairs * tkWarps * 32;
+  static_assert(TILE % 16 == 0, "two 16-key PV steps");
+  static_assert(TILE * kChunks % tkThreads == 0, "latent tile load");
   static_assert(kSteps % tkWarps == 0, "QK k split");
   using L = TkLay<QK_DIM>;
 
@@ -1868,9 +1872,9 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
   const int h0 = static_cast<int>(blockIdx.y) * tkKeys;
   const int H = io.num_heads;
 
-  T* sK = reinterpret_cast<T*>(smem);                             // [2][spTile][QK_DIM]
+  T* sK = reinterpret_cast<T*>(smem);                             // [2][TILE][QK_DIM]
   float* sRed = reinterpret_cast<float*>(sK + 2 * kTileElems);     // [kPairs][tkWarps][32]
-  SpRow* sRow = reinterpret_cast<SpRow*>(sRed + spRedWords);       // [2][spTile]
+  SpRow* sRow = reinterpret_cast<SpRow*>(sRed + kRedWords);       // [2][TILE]
   T* sQ = sK;                                                     // Q staging (aliases buffer 0)
 
   // ---- Q tile of this 16-head block, staged where K buffer 0 will live.
@@ -1920,7 +1924,7 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
   __syncthreads();  // staging area is now free for the first K tile
 
   const int n_flat = keys.count();
-  const int ntiles = (n_flat + spTile - 1) / spTile;
+  const int ntiles = (n_flat + TILE - 1) / TILE;
   const int b_row = (lane & 7) + ((lane >> 4) << 3), b_cs = (lane >> 3) & 1;
   const int v_row = (lane & 7) + (((lane >> 3) & 1) << 3), v_cs = lane >> 4;
   const float score_scale = io.scale * kTkLog2e;
@@ -1963,7 +1967,7 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
   }
 
   if (ntiles > 0) {
-    keys.prepare(0, sRow);
+    keys.prepare(0, TILE, sRow);
     __syncthreads();
     load_tile(sK, sRow);
     tk_cp_commit();
@@ -1972,18 +1976,18 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
   for (int t = 0; t < ntiles; ++t) {
     const int cur = t & 1, nxt = cur ^ 1;
     if (t + 1 < ntiles) {
-      keys.prepare((t + 1) * spTile, sRow + nxt * spTile);
+      keys.prepare((t + 1) * TILE, TILE, sRow + nxt * TILE);
     }
     tk_cp_wait<0>();
     __syncthreads();  // tile t visible to every warp; the next key rows are ready
     if (t + 1 < ntiles) {
-      load_tile(sK + nxt * kTileElems, sRow + nxt * spTile);
+      load_tile(sK + nxt * kTileElems, sRow + nxt * TILE);
       tk_cp_commit();
     }
     T* sKc_p = sK + cur * kTileElems;
     const uint32_t sKc = tk_u32(sKc_p);
 
-    // ---- QK partial of this warp's k steps (16 heads x spTile keys), fp32.
+    // ---- QK partial of this warp's k steps (16 heads x TILE keys), fp32.
     float qk[kNT][4];
 #pragma unroll
     for (int nt = 0; nt < kNT; ++nt) {
@@ -2009,7 +2013,7 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
     __syncthreads();
 
     // ---- Sum the four warp partials once (P-once), scale, mask, softmax.
-    const SpRow* cur_rows = sRow + cur * spTile;
+    const SpRow* cur_rows = sRow + cur * TILE;
     float p[kPairs];
 #pragma unroll
     for (int pair = 0; pair < kPairs; ++pair) {
@@ -2143,12 +2147,12 @@ struct SpMlaKeys {
                     static_cast<int64_t>(code & ~(1 << 30))};
   }
 
-  /// Resolve the keys `[base, base + spTile)`: the page table and record
+  /// Resolve the keys `[base, base + count)`: the page table and record
   /// addressing are evaluated once per key (thread i handles key base + i),
   /// never once per 16-byte chunk.
-  __device__ __forceinline__ void prepare(int base, SpRow* dst) const {
+  __device__ __forceinline__ void prepare(int base, int count, SpRow* dst) const {
     const int i = static_cast<int>(threadIdx.x);
-    if (i >= spTile) return;
+    if (i >= count) return;
     const int flat = base + i;
     int32_t code = -1;
     if (flat < n0) {
@@ -2332,13 +2336,22 @@ __global__ void __launch_bounds__(tkThreads)
   io.q_scale = params.mod.q_scale;
   io.v_dim = v_dim;
   if (qk_dim == 576) {
-    sp_tc_attend<576, 512, DTypeQ, DTypeKV, DTypeO>(io, keys, row, sp_tc_smem);
+    sp_tc_attend<576, 512, spTile, DTypeQ, DTypeKV, DTypeO>(io, keys, row, sp_tc_smem);
   } else {
-    sp_tc_attend<512, 512, DTypeQ, DTypeKV, DTypeO>(io, keys, row, sp_tc_smem);
+    sp_tc_attend<512, 512, spTile, DTypeQ, DTypeKV, DTypeO>(io, keys, row, sp_tc_smem);
   }
 }
 
 namespace {
+
+/// Shared-memory bytes of one sp_tc_attend<QK_DIM, ..., TILE> staging pass.
+template <int QK_DIM, int TILE>
+inline size_t sp_tc_smem_bytes_t() {
+  constexpr int kPairs = (TILE / 8) * 4;
+  return static_cast<size_t>(2 * TILE * QK_DIM) * sizeof(__nv_bfloat16) +
+         static_cast<size_t>(kPairs * tkWarps * 32) * sizeof(float) +
+         static_cast<size_t>(2 * TILE) * sizeof(SpRow) + 8 * sizeof(float);
+}
 
 inline size_t sp_smem_bytes(int qk_dim) {
   return static_cast<size_t>(2 * spTile * qk_dim) * sizeof(__nv_bfloat16) +
@@ -2667,11 +2680,161 @@ inline size_t ca_smem_bytes(int32_t cap, int32_t value_dim) {
          static_cast<size_t>(kCAttnWarps) * 4 * sizeof(float);
 }
 
+/// Tensor-core tiles of the head-grouped compressed-attention body: 16 query
+/// heads x TILE keys per staging pass. Both are multiples of the 16-key
+/// m16n8k16 PV step. The 16-key tile is ~38 KiB (two CTAs per 100 KiB SM), the
+/// 32-key tile ~76 KiB (one CTA) but halves the barrier count, so it wins when
+/// the launch has too few CTAs to fill the SMs and loses when it has enough to
+/// occupy every SM with two resident CTAs.
+constexpr int kCaTcTile = 16;
+constexpr int kCaTcTileWide = 32;
+constexpr int kCaTcDim = 512;
+
+/// Tile for this launch: a grid of at most 16 (row, 16-head group) CTAs cannot
+/// fill the SMs, so it takes the wider tile; a larger grid keeps the two-CTA
+/// tile for throughput. Host launch geometry and the device branch both call
+/// this, so the shared-memory size they choose cannot disagree.
+__host__ __device__ __forceinline__ int ca_tc_tile(const CompressedAttentionParams& p) {
+  const int groups = (p.num_q_heads + 15) / 16;
+  const int64_t ctas = static_cast<int64_t>(p.num_tokens) * groups;
+  return ctas <= 16 ? kCaTcTileWide : kCaTcTile;
+}
+
+/// Shapes and alignments the m16n8k16 body supports. The scalar reader keeps
+/// every other contract (entry_dim < 512, odd value_dim, unaligned q/o, fp32
+/// paths) unchanged; host launch geometry and device routing both call this, so
+/// they cannot disagree about the shared-memory size or block size.
+__host__ __device__ __forceinline__ bool ca_tc_eligible(const CompressedAttentionParams& p) {
+  if (p.entry_dim != kCaTcDim || p.value_dim <= 0 || p.value_dim > kCaTcDim) return false;
+  if ((p.value_dim & 1) != 0) return false;
+  if (p.q_stride_h < p.entry_dim || p.o_stride_h < p.value_dim) return false;
+  if ((p.q_stride_h & 7) != 0 || (p.o_stride_h & 1) != 0) return false;
+  if ((reinterpret_cast<uintptr_t>(p.q) & 15u) != 0) return false;
+  if ((reinterpret_cast<uintptr_t>(p.o) & 3u) != 0) return false;
+  return true;
+}
+
+/// Visible-key list of one compressed-attention query row: the selected (CSA)
+/// or dense (HCA) compressed entries followed by the SWA window. `-1` selected
+/// holes and unmapped pages stay masked keys; the compressed/window bit picks
+/// the cache the record comes from. Address resolution happens once per key
+/// (`prepare`), never once per 16-byte chunk.
+template <typename DTypeKV>
+struct CaKeys {
+  const CompressedAttentionParams* p;
+  int row, req, n_sel, n_win, sel_stride;
+  int64_t win_end;
+
+  __device__ __forceinline__ int count() const { return n_sel + n_win; }
+
+  __device__ __forceinline__ SpKeyRef resolve(int32_t code) const {
+    const bool win = (code & (1 << 30)) != 0;
+    return SpKeyRef{win ? &p->window : &p->compressed,
+                    static_cast<int64_t>(code & ~(1 << 30))};
+  }
+
+  __device__ __forceinline__ void prepare(int base, int n, SpRow* dst) const {
+    const int i = static_cast<int>(threadIdx.x);
+    if (i >= n) return;
+    const int flat = base + i;
+    int32_t code = -1;
+    if (flat < n_sel) {
+      if (p->selected != nullptr) {
+        code = p->selected[static_cast<int64_t>(row) * sel_stride + flat];
+      } else {
+        const int64_t slot = ca_slot(p->compressed, req, flat);
+        if (slot >= 0) code = static_cast<int32_t>(slot);
+      }
+    } else if (flat < n_sel + n_win) {
+      const int64_t pos = win_end - p->window_size + 1 + (flat - n_sel);
+      if (pos >= 0) {
+        const int64_t slot = ca_slot(p->window, req, pos);
+        if (slot >= 0) code = (1 << 30) | static_cast<int32_t>(slot);
+      }
+    }
+    SpRow& r = dst[i];
+    r.code = code;
+    r.kv = nullptr;
+    r.base = nullptr;
+    r.slot = 0;
+    r.native = 0;
+    if (code >= 0) {
+      const SpKeyRef ref = resolve(code);
+      r.kv = ref.kv;
+      r.slot = ref.slot;
+      r.base = sp_row_base<DTypeKV>(*ref.kv, ref.slot);
+      r.native = ref.kv->k_codec == kv::KVCodec::kNative ? 1 : 0;
+    }
+  }
+};
+
+/// One CTA: 16 query heads of one query row over its compressed + window keys,
+/// with the sink folded into the same online softmax.
+template <int ENTRY_DIM, int VALUE_DIM, int TILE, typename DTypeQ, typename DTypeKV, typename DTypeO>
+__device__ __forceinline__ void ca_tc_attend(const CompressedAttentionParams& params,
+                                             unsigned char* smem) {
+  const int row = static_cast<int>(blockIdx.x);
+  const int h0 = static_cast<int>(blockIdx.y) * tkKeys;
+  if (row >= params.num_tokens || h0 >= params.num_q_heads) return;
+  const int topk = params.topk;
+  const int sel_stride = params.selected_stride > 0 ? params.selected_stride : topk;
+  const int req = params.token_to_request != nullptr ? params.token_to_request[row] : row;
+  const int sel_len =
+      params.selected != nullptr
+          ? (params.selected_topk_length != nullptr
+                 ? (params.selected_topk_length[row] < topk ? params.selected_topk_length[row]
+                                                           : topk)
+                 : topk)
+          : (params.num_compressed != nullptr
+                 ? (params.num_compressed[req] < topk ? params.num_compressed[req] : topk)
+                 : 0);
+
+  CaKeys<DTypeKV> keys{};
+  keys.p = &params;
+  keys.row = row;
+  keys.req = req;
+  keys.sel_stride = sel_stride;
+  keys.n_sel = sel_len > 0 ? sel_len : 0;
+  keys.n_win = (params.window_size > 0 && params.positions != nullptr) ? params.window_size : 0;
+  keys.win_end = params.positions != nullptr ? params.positions[row] : 0;
+
+  SpAttnIo io{};
+  io.q = params.q;
+  io.q_stride_n = params.q_stride_n;
+  io.q_stride_h = params.q_stride_h;
+  io.o = params.o;
+  io.o_stride_n = params.o_stride_n;
+  io.o_stride_h = params.o_stride_h;
+  io.lse = params.lse;
+  io.sink = params.mod.sink_logits;
+  io.num_heads = params.num_q_heads;
+  io.scale = params.mod.sm_scale != 0.0f ? params.mod.sm_scale
+                                         : rsqrtf(static_cast<float>(ENTRY_DIM));
+  io.q_scale = 0.0f;
+  io.v_dim = params.value_dim > 0 ? params.value_dim : VALUE_DIM;
+
+  sp_tc_attend<ENTRY_DIM, VALUE_DIM, TILE, DTypeQ, DTypeKV, DTypeO>(io, keys, row, smem);
+}
+
 }  // namespace
 
 template <int HEADS_PER_CTA, int ENTRY_DIM, int VALUE_DIM, typename DTypeQ, typename DTypeKV,
           typename DTypeO, typename ArchTag>
 __global__ void compressed_attention_kernel(const __grid_constant__ CompressedAttentionParams params) {
+  static_assert(HEADS_PER_CTA == tkKeys, "16 query heads per CTA");
+  extern __shared__ __align__(16) unsigned char ca_smem[];
+  // Head-grouped tensor-core body: one CTA stages each K/V tile once for 16
+  // query heads (grid.y = Hq / 16, block = tkThreads). The scalar reader below
+  // keeps the ungrouped geometry (grid.y = Hq, one key per warp) for every
+  // shape the m16n8k16 tiles cannot express.
+  if (ca_tc_eligible(params)) {
+    if (ca_tc_tile(params) == kCaTcTileWide) {
+      ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTileWide, DTypeQ, DTypeKV, DTypeO>(params, ca_smem);
+    } else {
+      ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTile, DTypeQ, DTypeKV, DTypeO>(params, ca_smem);
+    }
+    return;
+  }
   constexpr int kThreads = kCAttnThreads;
   constexpr int kWarps = kCAttnWarps;
   constexpr int kVec = kCAttnVec;
@@ -2687,7 +2850,7 @@ __global__ void compressed_attention_kernel(const __grid_constant__ CompressedAt
   const int topk = params.topk;   // selected count (CSA) or dense-range cap (HCA)
   const int cap = topk + (params.window_size > 0 ? params.window_size : 0);
   if (cap <= 0) return;
-  extern __shared__ float smem[];
+  float* smem = reinterpret_cast<float*>(ca_smem);
   int32_t* sMap = reinterpret_cast<int32_t*>(smem);            // [cap]
   float* sMerge = reinterpret_cast<float*>(sMap + cap);        // [kWarps][vdim]
   float* sState = sMerge + kWarps * vdim;                      // [kWarps][2] max, den
@@ -2886,21 +3049,37 @@ Status compressed_attention(const CompressedAttentionParams& params, const Launc
     return detail::set_error(Status::kInvalidArgument, "compressed_attention: value_dim %d",
                              params.value_dim);
   }
-  const size_t smem = ca_smem_bytes(cap, params.value_dim);
+  const bool tc = ca_tc_eligible(params);
+  const size_t smem = tc ? (ca_tc_tile(params) == kCaTcTileWide
+                                ? sp_tc_smem_bytes_t<kCaTcDim, kCaTcTileWide>()
+                                : sp_tc_smem_bytes_t<kCaTcDim, kCaTcTile>())
+                         : ca_smem_bytes(cap, params.value_dim);
   const dim3 grid(static_cast<unsigned>(params.num_tokens),
-                  static_cast<unsigned>(params.num_q_heads));
-  const dim3 block(kCAttnThreads);
+                  tc ? static_cast<unsigned>((params.num_q_heads + 15) / 16)
+                     : static_cast<unsigned>(params.num_q_heads));
+  const dim3 block(tc ? tkThreads : kCAttnThreads);
   const cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
+  cudaError_t err = cudaSuccess;
+#define KOPS_CA_LAUNCH(QT, KT, OT)                                                              \
+  do {                                                                                          \
+    if (smem > 48u * 1024u) {                                                                   \
+      (void)cudaFuncSetAttribute(                                                               \
+          reinterpret_cast<const void*>(&compressed_attention_kernel<16, 512, 512, QT, KT, OT,   \
+                                                                     Sm80>),                    \
+          cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));                 \
+    }                                                                                           \
+    compressed_attention_kernel<16, 512, 512, QT, KT, OT, Sm80><<<grid, block, smem, stream>>>( \
+        params);                                                                                \
+    err = cudaGetLastError();                                                                   \
+  } while (0)
   if (params.q_dtype == DType::kBFloat16 && params.o_dtype == DType::kBFloat16) {
-    compressed_attention_kernel<16, 512, 512, __nv_bfloat16, __nv_bfloat16, __nv_bfloat16, Sm80>
-        <<<grid, block, smem, stream>>>(params);
+    KOPS_CA_LAUNCH(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
   } else if (params.q_dtype == DType::kFloat16 && params.o_dtype == DType::kFloat16) {
-    compressed_attention_kernel<16, 512, 512, __half, __half, __half, Sm80>
-        <<<grid, block, smem, stream>>>(params);
+    KOPS_CA_LAUNCH(__half, __half, __half);
   } else {
     return detail::set_error(Status::kUnsupportedDtype, "compressed_attention: q/o dtype");
   }
-  const cudaError_t err = cudaGetLastError();
+#undef KOPS_CA_LAUNCH
   if (err != cudaSuccess) return launch_error("compressed_attention launch", err);
   return Status::kSuccess;
 }

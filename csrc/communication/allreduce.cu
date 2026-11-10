@@ -708,7 +708,9 @@ __device__ __forceinline__ void fusion_row(const AllReduceFusionParams& p, int64
       const float wv = w != nullptr ? (to_f32<T>(w[i * VEC + e]) + p.weight_offset) : 1.0f;
       const float y = to_f32<T>(rp[e]) * rstd * wv;
       op[e] = from_f32<T>(y);
-      if (kQuant != 0) amax = fmaxf(amax, fabsf(y));
+      // The chain quantizes the stored (rounded T) norm output, so amax must be taken
+      // over the same rounded value. Using the unrounded y shifts the per-token scale.
+      if (kQuant != 0) amax = fmaxf(amax, fabsf(to_f32<T>(op[e])));
     }
     if (p.norm_out != nullptr) st16(static_cast<T*>(p.norm_out) + (row * hidden + static_cast<int64_t>(i) * VEC), ov);
   }
@@ -724,8 +726,10 @@ __device__ __forceinline__ void fusion_row(const AllReduceFusionParams& p, int64
     uint8_t* q = static_cast<uint8_t*>(p.quant.q) + row * p.quant.q_row_stride;
     for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
       const float wv = w != nullptr ? (to_f32<T>(w[i]) + p.weight_offset) : 1.0f;
-      const float y = to_f32<T>(srow[i]) * rstd * wv;
-      q[i] = static_cast<uint8_t>(__nv_cvt_float_to_fp8(__fdiv_rn(y, applied), __NV_SATFINITE, __NV_E4M3));
+      // The chain quantizes the stored (rounded T) norm output, not the unrounded y.
+      const T nv = from_f32<T>(to_f32<T>(srow[i]) * rstd * wv);
+      q[i] = static_cast<uint8_t>(
+          __nv_cvt_float_to_fp8(__fdiv_rn(to_f32<T>(nv), applied), __NV_SATFINITE, __NV_E4M3));
     }
     __syncthreads();
   }

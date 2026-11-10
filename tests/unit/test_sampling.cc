@@ -2625,6 +2625,282 @@ void test_sampling_distribution() {
   kops_test::device_free(d_ids);
 }
 
+/// gumbel_max_sample() with top-k: the candidate threshold path (small boundary bin) and the
+/// radix fallback (a tie group larger than the buffer) must both draw only from the exact k
+/// tokens ordered by value descending, then id ascending.
+void test_gumbel_topk() {
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  const int64_t batch = 8;
+  constexpr int64_t vocab = 8192;
+  constexpr int k = 50;
+  auto check_row = [&](const std::vector<float>& row, const char* name) {
+    std::vector<int32_t> order(static_cast<size_t>(vocab));
+    for (int64_t v = 0; v < vocab; ++v) order[static_cast<size_t>(v)] = static_cast<int32_t>(v);
+    std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+      return row[static_cast<size_t>(a)] > row[static_cast<size_t>(b)] ||
+             (row[static_cast<size_t>(a)] == row[static_cast<size_t>(b)] && a < b);
+    });
+    std::vector<char> in_top(static_cast<size_t>(vocab), 0);
+    for (int i = 0; i < k; ++i) in_top[static_cast<size_t>(order[static_cast<size_t>(i)])] = 1;
+    std::vector<float> all(static_cast<size_t>(batch * vocab));
+    for (int64_t r = 0; r < batch; ++r) {
+      std::copy(row.begin(), row.end(), all.begin() + static_cast<size_t>(r * vocab));
+    }
+    float* d = kops_test::device_alloc<float>(all.size());
+    int32_t* ids = kops_test::device_alloc<int32_t>(static_cast<size_t>(batch));
+    kops_test::copy_in(d, all);
+    const Tensor t = kops_test::tensor2d(d, DType::kFloat32, batch, vocab);
+    const Tensor ti = tensor1d(ids, DType::kInt32, batch);
+    kops::sample::SamplingParams p{};
+    p.default_temperature = 1.0f;
+    p.default_top_k = k;
+    p.default_top_p = 1.0f;
+    p.default_min_p = 0.0f;
+    int bad = 0;
+    for (uint64_t seed = 0; seed < 16; ++seed) {
+      p.rng.global_seed = 900u + seed;
+      KOPS_EXPECT_OK(kops::sample::gumbel_max_sample(ti, t, p, ctx), "gumbel top-k");
+      const auto got = kops_test::copy_out(ids, static_cast<size_t>(batch));
+      for (int32_t id : got) {
+        if (id < 0 || id >= vocab || in_top[static_cast<size_t>(id)] == 0) ++bad;
+      }
+    }
+    if (bad != 0) std::fprintf(stderr, "%s: %d outside the top-%d set\n", name, bad, k);
+    KOPS_TEST_CHECK(bad == 0);
+    kops_test::device_free(d);
+    kops_test::device_free(ids);
+  };
+  check_row(uniform_row(vocab, -3.0f, 3.0f, 9u), "gumbel topk random");
+  // One tie group of 2048 tokens: the boundary bin overflows kCand and takes the radix fallback.
+  std::vector<float> flat(static_cast<size_t>(vocab), 2.0f);
+  check_row(flat, "gumbel topk flat");
+}
+
+/// The sample() fast path runs greedy, unfiltered and top-p-only rows through the fused body.
+/// Greedy must still resolve ties to the lowest id and write -1 for a row with no admissible
+/// token; a top-p-only run must keep the truncated distribution and reproduce under one seed.
+void test_sample_fast_paths() {
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  const float inf = std::numeric_limits<float>::infinity();
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const int64_t rows = 6;
+  const int64_t vocab = 1001;  // non-vectorized tail
+  std::vector<float> f(static_cast<size_t>(rows * vocab));
+  std::mt19937 gen(17u);
+  std::normal_distribution<float> nd(0.0f, 3.0f);
+  for (float& x : f) x = nd(gen);
+  // Row 1: tie at the maximum (lowest id wins). Row 2: two +inf (lowest id wins).
+  // Row 3: all -inf. Row 4: all NaN (treated as -inf). Row 5: maximum in the last slot.
+  f[1 * vocab + 7] = 40.0f;
+  f[1 * vocab + 300] = 40.0f;
+  f[2 * vocab + 5] = inf;
+  f[2 * vocab + 900] = inf;
+  for (int64_t v = 0; v < vocab; ++v) {
+    f[3 * vocab + v] = -inf;
+    f[4 * vocab + v] = nan;
+  }
+  f[5 * vocab + vocab - 1] = 50.0f;
+
+  float* d_logits = kops_test::device_alloc<float>(f.size());
+  int32_t* d_ids = kops_test::device_alloc<int32_t>(static_cast<size_t>(rows));
+  kops_test::copy_in(d_logits, f);
+  const Tensor t_logits = kops_test::tensor2d(d_logits, DType::kFloat32, rows, vocab);
+  const Tensor t_ids = tensor1d(d_ids, DType::kInt32, rows);
+
+  kops::WorkspaceRequirements req{};
+  KOPS_EXPECT_OK(kops::sample::sampling_workspace_requirements(
+                     static_cast<int32_t>(rows), static_cast<int32_t>(vocab), 0, &req),
+                 "sample fast workspace");
+  void* scratch = nullptr;
+  KOPS_TEST_CHECK(cudaMalloc(&scratch, req.device_scratch_bytes) == cudaSuccess);
+  kops::Workspace ws{};
+  ws.device_scratch = scratch;
+  ws.device_scratch_bytes = req.device_scratch_bytes;
+
+  kops::sample::SamplingParams greedy{};
+  greedy.default_temperature = 0.0f;
+  greedy.default_top_k = 0;
+  greedy.default_top_p = 1.0f;
+  greedy.default_min_p = 0.0f;
+  greedy.rng.global_seed = 9001u;
+  KOPS_EXPECT_OK(kops::sample::sample(t_ids, t_logits, greedy, ws, ctx), "sample greedy");
+  const auto got = kops_test::copy_out(d_ids, static_cast<size_t>(rows));
+  std::vector<int32_t> want(static_cast<size_t>(rows));
+  for (int64_t r = 0; r < rows; ++r) {
+    if (r == 3 || r == 4) {
+      want[static_cast<size_t>(r)] = -1;
+      continue;
+    }
+    std::vector<double> row_d(static_cast<size_t>(vocab));
+    for (int64_t v = 0; v < vocab; ++v) {
+      row_d[static_cast<size_t>(v)] = f[static_cast<size_t>(r * vocab + v)];
+    }
+    want[static_cast<size_t>(r)] = static_cast<int32_t>(argmax_lowest(row_d.data(), vocab));
+  }
+  for (int64_t r = 0; r < rows; ++r) {
+    if (got[static_cast<size_t>(r)] != want[static_cast<size_t>(r)]) {
+      std::fprintf(stderr, "sample greedy row %lld: %d/%d\n", static_cast<long long>(r),
+                   got[static_cast<size_t>(r)], want[static_cast<size_t>(r)]);
+    }
+  }
+  KOPS_TEST_CHECK(got == want);
+  // Greedy ignores the RNG: the same calls with another seed draw the same ids.
+  greedy.rng.global_seed = 123u;
+  KOPS_EXPECT_OK(kops::sample::sample(t_ids, t_logits, greedy, ws, ctx), "sample greedy repeat");
+  KOPS_TEST_CHECK(kops_test::copy_out(d_ids, static_cast<size_t>(rows)) == want);
+  kops_test::device_free(d_logits);
+  kops_test::device_free(d_ids);
+  cudaFree(scratch);
+
+  // Top-p only: the sampled histogram must match the renormalized nucleus, and one seed must
+  // reproduce the same ids (the fused body is counter-RNG based).
+  const int64_t pbatch = 1024;
+  const int64_t pvocab = 32;
+  std::vector<float> plogits(static_cast<size_t>(pvocab));
+  for (int64_t v = 0; v < pvocab; ++v) plogits[static_cast<size_t>(v)] = 0.35f * static_cast<float>(v);
+  std::vector<float> pall(static_cast<size_t>(pbatch * pvocab));
+  for (int64_t r = 0; r < pbatch; ++r) {
+    std::copy(plogits.begin(), plogits.end(), pall.begin() + static_cast<size_t>(r * pvocab));
+  }
+  float* d_plogits = kops_test::device_alloc<float>(pall.size());
+  int32_t* d_pids = kops_test::device_alloc<int32_t>(static_cast<size_t>(pbatch));
+  kops_test::copy_in(d_plogits, pall);
+  const Tensor pt_logits = kops_test::tensor2d(d_plogits, DType::kFloat32, pbatch, pvocab);
+  const Tensor pt_ids = tensor1d(d_pids, DType::kInt32, pbatch);
+  kops::WorkspaceRequirements preq{};
+  KOPS_EXPECT_OK(kops::sample::sampling_workspace_requirements(
+                     static_cast<int32_t>(pbatch), static_cast<int32_t>(pvocab), 0, &preq),
+                 "sample p workspace");
+  kops::Workspace pws{};
+  pws.device_scratch = kops_test::device_alloc<uint8_t>(preq.device_scratch_bytes);
+  pws.device_scratch_bytes = preq.device_scratch_bytes;
+
+  std::vector<double> p_d(static_cast<size_t>(pvocab));
+  double pm = -1e300;
+  for (float x : plogits) pm = std::max(pm, static_cast<double>(x));
+  double pz = 0.0;
+  for (int64_t v = 0; v < pvocab; ++v) {
+    p_d[static_cast<size_t>(v)] = std::exp(static_cast<double>(plogits[static_cast<size_t>(v)]) - pm);
+    pz += p_d[static_cast<size_t>(v)];
+  }
+  for (double& x : p_d) x /= pz;
+  const std::vector<double> p_expect = truncate_kpp(p_d, static_cast<int>(pvocab), 0.6);
+
+  kops::sample::SamplingParams po{};
+  po.default_temperature = 1.0f;
+  po.default_top_k = 0;
+  po.default_top_p = 0.6f;
+  po.default_min_p = 0.0f;
+  const int launches = 256;
+  std::vector<double> hist(static_cast<size_t>(pvocab), 0.0);
+  for (int it = 0; it < launches; ++it) {
+    po.rng.global_seed = 5000u + static_cast<uint64_t>(it);
+    KOPS_EXPECT_OK(kops::sample::sample(pt_ids, pt_logits, po, pws, ctx), "sample top-p only");
+    const auto ids = kops_test::copy_out(d_pids, static_cast<size_t>(pbatch));
+    for (int32_t id : ids) {
+      KOPS_TEST_CHECK(id >= 0 && id < pvocab);
+      if (id >= 0 && id < pvocab) hist[static_cast<size_t>(id)] += 1.0;
+    }
+  }
+  std::vector<double> expect_counts(static_cast<size_t>(pvocab));
+  for (int64_t v = 0; v < pvocab; ++v) {
+    expect_counts[static_cast<size_t>(v)] =
+        p_expect[static_cast<size_t>(v)] * static_cast<double>(pbatch) * launches;
+  }
+  int df = 0;
+  const double chi = chi_square(hist, expect_counts, &df);
+  KOPS_TEST_CHECK(df >= 1);
+  KOPS_TEST_CHECK(chi < 80.0);
+
+  po.rng.global_seed = 777u;
+  KOPS_EXPECT_OK(kops::sample::sample(pt_ids, pt_logits, po, pws, ctx), "sample top-p repeat 1");
+  const auto pids1 = kops_test::copy_out(d_pids, static_cast<size_t>(pbatch));
+  KOPS_EXPECT_OK(kops::sample::sample(pt_ids, pt_logits, po, pws, ctx), "sample top-p repeat 2");
+  KOPS_TEST_CHECK(kops_test::copy_out(d_pids, static_cast<size_t>(pbatch)) == pids1);
+
+  // Min-p only is also routed to the fused filtered body: every returned token must be in
+  // `probs >= min_p * max(probs)`, with the sampled set renormalized.
+  {
+    kops::sample::SamplingParams mp{};
+    mp.default_temperature = 1.0f;
+    mp.default_top_k = 0;
+    mp.default_top_p = 1.0f;
+    mp.default_min_p = 0.25f;
+    const double pmax = *std::max_element(p_d.begin(), p_d.end());
+    std::vector<char> in_set(static_cast<size_t>(pvocab), 0);
+    int kept = 0;
+    for (int64_t v = 0; v < pvocab; ++v) {
+      if (p_d[static_cast<size_t>(v)] >= 0.25 * pmax) {
+        in_set[static_cast<size_t>(v)] = 1;
+        ++kept;
+      }
+    }
+    KOPS_TEST_CHECK(kept > 0);
+    int bad = 0;
+    for (int it = 0; it < 64; ++it) {
+      mp.rng.global_seed = 3000u + static_cast<uint64_t>(it);
+      KOPS_EXPECT_OK(kops::sample::sample(pt_ids, pt_logits, mp, pws, ctx), "sample min-p only");
+      const auto ids = kops_test::copy_out(d_pids, static_cast<size_t>(pbatch));
+      for (int32_t id : ids) {
+        if (id < 0 || id >= pvocab || in_set[static_cast<size_t>(id)] == 0) ++bad;
+      }
+    }
+    KOPS_TEST_CHECK(bad == 0);
+  }
+
+  kops_test::device_free(d_plogits);
+  kops_test::device_free(d_pids);
+  kops_test::device_free(static_cast<uint8_t*>(pws.device_scratch));
+
+  // A vectorizable large vocab makes the auto plan split the row. sample() carves
+  // the fused exchange area and barrier out of the fp32 row it does not write;
+  // two calls must both produce a valid token (the barrier is re-zeroed), and a
+  // greedy call must still take the one-pass fused body.
+  {
+    const int64_t big_rows = 1;
+    const int64_t big_vocab = 151936;
+    std::vector<float> lf(static_cast<size_t>(big_vocab));
+    std::mt19937 big_gen(23u);
+    std::normal_distribution<float> big_nd(0.0f, 3.0f);
+    for (float& x : lf) x = big_nd(big_gen);
+    lf[7777] = 50.0f;
+    float* d_lf = kops_test::device_alloc<float>(lf.size());
+    int32_t* d_id = kops_test::device_alloc<int32_t>(static_cast<size_t>(big_rows));
+    kops_test::copy_in(d_lf, lf);
+    const Tensor bt = kops_test::tensor2d(d_lf, DType::kFloat32, big_rows, big_vocab);
+    const Tensor bid = tensor1d(d_id, DType::kInt32, big_rows);
+    kops::WorkspaceRequirements breq{};
+    KOPS_EXPECT_OK(kops::sample::sampling_workspace_requirements(
+                       static_cast<int32_t>(big_rows), static_cast<int32_t>(big_vocab), 0, &breq),
+                   "sample split workspace");
+    kops::Workspace bws{};
+    bws.device_scratch = kops_test::device_alloc<uint8_t>(breq.device_scratch_bytes);
+    bws.device_scratch_bytes = breq.device_scratch_bytes;
+
+    kops::sample::SamplingParams bp{};
+    bp.default_temperature = 1.0f;
+    bp.default_top_k = 0;
+    bp.default_top_p = 0.9f;
+    bp.default_min_p = 0.0f;
+    for (uint64_t seed : {11u, 12u}) {
+      bp.rng.global_seed = seed;
+      KOPS_EXPECT_OK(kops::sample::sample(bid, bt, bp, bws, ctx), "sample split top-p");
+      const int32_t id = kops_test::copy_out(d_id, 1)[0];
+      KOPS_TEST_CHECK(id >= 0 && id < big_vocab);
+    }
+    bp.default_temperature = 0.0f;
+    bp.default_top_p = 1.0f;
+    KOPS_EXPECT_OK(kops::sample::sample(bid, bt, bp, bws, ctx), "sample split greedy");
+    KOPS_TEST_CHECK(kops_test::copy_out(d_id, 1)[0] == 7777);
+
+    kops_test::device_free(d_lf);
+    kops_test::device_free(d_id);
+    kops_test::device_free(static_cast<uint8_t*>(bws.device_scratch));
+  }
+}
+
 // =============================================================================
 // B10 / Mốc 5: speculative decoding (S03)
 // =============================================================================
@@ -3513,6 +3789,8 @@ int main() {
   test_fused_split_batches();
   test_fused_split_reuse();
   test_sampling_distribution();
+  test_gumbel_topk();
+  test_sample_fast_paths();
   test_spec_chain_greedy();
   test_spec_chain_distribution();
   test_spec_chain_probabilistic();

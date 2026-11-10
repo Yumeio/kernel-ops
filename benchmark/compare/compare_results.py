@@ -30,6 +30,9 @@ def main() -> int:
     ap.add_argument("refs", nargs="+", help="one or more baseline JSON files")
     ap.add_argument("--names", nargs="+", help="display names for refs (default: file stem)")
     ap.add_argument("--only", nargs="+", metavar="PREFIX")
+    ap.add_argument("--groups", nargs="?", type=int, const=2, default=None, metavar="DEPTH",
+                    help="print a per-group summary; groups are the first DEPTH dot fields "
+                         "(default 2, e.g. sampling.fused vs sampling.sample)")
     ap.add_argument("--json", help="write the per-case comparison as JSON")
     args = ap.parse_args()
 
@@ -86,6 +89,31 @@ def main() -> int:
                          "ratio": ratio, "kops_gbs": kgbs, "ref_gbs": rgbs,
                          "ref_note": r.get("note")})
 
+    groups_out = []
+    if args.groups is not None and args.groups > 0:
+        depth = args.groups
+        grouped: dict[str, list[float]] = {}
+        for row in rows_out:
+            if row["ratio"] is None:
+                continue
+            key = ".".join(row["id"].split(".")[:depth])
+            grouped.setdefault(key, []).append(row["ratio"])
+
+        def geomean(values: list[float]) -> float:
+            return math.exp(sum(math.log(max(r, 1e-12)) for r in values) / len(values))
+
+        header = f"{'group':<36} {'cases':>6} {'slower':>7} {'geomean':>9} {'worst':>8}"
+        print(f"\n{header}")
+        print("-" * len(header))
+        for key in sorted(grouped):
+            values = grouped[key]
+            slower = sum(1 for r in values if r < 1.0)
+            gm = geomean(values)
+            line = f"{key:<36} {len(values):6d} {slower:7d} {gm:8.2f}x {min(values):7.2f}x"
+            print(line)
+            groups_out.append({"group": key, "cases": len(values), "slower": slower,
+                               "geomean": gm, "worst": min(values)})
+
     if ratios:
         gm = math.exp(sum(math.log(max(r, 1e-12)) for r in ratios) / len(ratios))
         wins = sum(1 for r in ratios if r < 1.0)
@@ -98,6 +126,7 @@ def main() -> int:
             json.dump({"kops": args.kops, "refs": args.refs, "peak_gbs": peak,
                        "geomean": (math.exp(sum(math.log(max(r, 1e-12)) for r in ratios) /
                                             len(ratios)) if ratios else None),
+                       "groups": groups_out,
                        "cases": rows_out}, f, indent=1)
             f.write("\n")
     return 0
