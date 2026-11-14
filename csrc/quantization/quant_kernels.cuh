@@ -58,7 +58,12 @@ __global__ void quantize_per_token_kernel(
  *   s_{r,g} = max|x| / qmax; if kUE8M0: s rounded UP to a power of two (stored as fp32 or packed UE8M0)
  *   kColMajorScale: scales laid out [cols/GROUP, round_up(rows, 4)] for DeepGEMM / TMA.
  * Masked layout support: when masked_m != null input is [E, max_m, cols] and rows
- *   >= masked_m[e] are skipped (DeepEP low-latency receive buffers).
+ *   >= masked_m[e] are skipped (DeepEP low-latency receive buffers). input_expert_stride is
+ *   input.stride[0], i.e. the padded distance between experts; it may be larger than
+ *   max_m * input_row_stride and is unused (pass 0) in the dense case.
+ * Scalar body: it serves any alignment, row padding and tail, and it is the fallback for the
+ *   vectorized per-group kernel. Every quotient is __fdiv_rn here, so its payload bytes are the
+ *   reference the vector path is compared against.
  * Models : DeepSeek V3/V3.1/V3.2/V4, Kimi K2 FP8, Qwen3 FP8 block, GLM-4.5 FP8, MiniMax-M2 FP8.
  */
 template <typename scalar_t, typename out_t, int GROUP_SIZE, bool kColMajorScale, bool kUE8M0>
@@ -69,6 +74,7 @@ __global__ void quantize_per_group_kernel(
     const int64_t scale_stride,            // row stride (row-major) or padded rows (col-major)
     const scalar_t* __restrict__ input,    // [num_rows, cols] or [E, max_m, cols]
     const int64_t input_row_stride,
+    const int64_t input_expert_stride,     // E stride of a masked input; 0 when masked_m is null
     const int32_t* __restrict__ masked_m,  // [E] or null
     const int max_m,
     const int num_rows, const int cols,

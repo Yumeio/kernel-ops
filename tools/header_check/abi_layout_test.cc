@@ -158,6 +158,14 @@ static_assert(offsetof(kops::LaunchContext, strategy) == offsetof(kops_launch_co
 
 static_assert(KOPS_C_ABI_VERSION == KOPS_ABI_VERSION, "C and C++ ABI versions must match");
 
+// ActQuantOut::math (QuantMath, 1 B) was appended in the tail padding: the struct size and every
+// earlier field offset are unchanged, but the new enumerator is a public contract, so
+// KOPS_ABI_VERSION still has to record it.
+static_assert(sizeof(kops::QuantMath) == 1, "QuantMath is uint8 in the C ABI");
+static_assert(sizeof(kops::ActQuantOut) == 88, "ActQuantOut size");
+static_assert(offsetof(kops::ActQuantOut, math) == 83, "ActQuantOut.math");
+static_assert(offsetof(kops::ActQuantOut, fp8) == 82, "ActQuantOut.fp8");
+
 // C++-only sampler structs (no C mirror): pin the LP64 layout so a field change bumps the ABI.
 static_assert(sizeof(kops::sample::SamplingPlan) == 32, "SamplingPlan size");
 static_assert(offsetof(kops::sample::SamplingPlan, flags) == 16, "SamplingPlan.flags");

@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -399,11 +400,504 @@ void test_per_group(LaunchContext& ctx) {
   KOPS_TEST_CHECK(mqo[static_cast<size_t>((1 * max_m + 2) * cols)] == 0u);
 }
 
+template <typename T>
+std::vector<float> rounded_values(const std::vector<T>& v) {
+  std::vector<float> out(v.size());
+  for (size_t i = 0; i < v.size(); ++i) out[i] = kops_test::to_float(v[i]);
+  return out;
+}
+
 // -----------------------------------------------------------------------------
-// Pack-edge coverage: widths that are not a multiple of the vector, padded input/output rows,
-// tiny rows, fp16/fp32 inputs, asymmetric INT8 and scale_upper_bound. Oracles are the same fp32
-// formulas the kernels document (correctly rounded division, nearest-even, saturating stores).
+// Per-group vector path: shapes, layouts, masked expert strides, arithmetic modes
 // -----------------------------------------------------------------------------
+
+float pg_ue8m0_ceil(float s) {
+  int e = 0;
+  if (s > 0.0f && std::isfinite(s)) {
+    std::frexp(s, &e);
+    e -= 1;
+    if (std::ldexp(1.0f, e) < s) ++e;
+  } else {
+    e = -127;
+  }
+  e = std::max(-127, std::min(127, e));
+  return std::ldexp(1.0f, e);
+}
+
+/// Host oracle of the documented per-group contract: s = max(amax, eps) / 448 (rounded up to a
+/// power of two with `ue8m0`) and one saturating e4m3 byte per element.
+void pg_oracle(const std::vector<float>& vals, int rows, int cols, int group, bool ue8m0,
+               std::vector<float>* scales, std::vector<uint8_t>* codes) {
+  const int groups = cols / group;
+  scales->assign(static_cast<size_t>(rows) * groups, 0.0f);
+  codes->assign(static_cast<size_t>(rows) * cols, 0u);
+  for (int r = 0; r < rows; ++r) {
+    for (int g = 0; g < groups; ++g) {
+      float amax = 0.0f;
+      for (int j = 0; j < group; ++j) {
+        amax = std::fmax(amax, std::fabs(vals[static_cast<size_t>(r) * cols + g * group + j]));
+      }
+      float s = std::fmax(amax, 1e-10f) / 448.0f;
+      if (ue8m0) s = pg_ue8m0_ceil(s);
+      (*scales)[static_cast<size_t>(r) * groups + g] = s;
+      for (int j = 0; j < group; ++j) {
+        const size_t i = static_cast<size_t>(r) * cols + g * group + j;
+        (*codes)[i] = e4m3_byte(vals[i] / s);
+      }
+    }
+  }
+}
+
+template <typename T>
+DType pg_dtype();
+template <>
+DType pg_dtype<__nv_bfloat16>() { return DType::kBFloat16; }
+template <>
+DType pg_dtype<__half>() { return DType::kFloat16; }
+template <>
+DType pg_dtype<float>() { return DType::kFloat32; }
+
+float pg_u32_as_float(uint32_t bits) {
+  float f = 0.0f;
+  std::memcpy(&f, &bits, sizeof(f));
+  return f;
+}
+
+template <typename T>
+T pg_bitcast(uint32_t bits);
+template <>
+__nv_bfloat16 pg_bitcast<__nv_bfloat16>(uint32_t bits) {
+  return __ushort_as_bfloat16(static_cast<unsigned short>(bits));
+}
+template <>
+__half pg_bitcast<__half>(uint32_t bits) {
+  return __ushort_as_half(static_cast<unsigned short>(bits));
+}
+
+struct PgBuffers {
+  std::vector<uint8_t> q;
+  std::vector<float> s;
+};
+
+/// One dense per-group launch. `in_offset` shifts the input pointer by that many elements and
+/// `q_stride` / `s_stride` are the declared row strides, so the caller can force the scalar
+/// fallback (misaligned input or a q row stride that is not 16 B) and padded scale layouts.
+template <typename T>
+bool pg_dense(LaunchContext& ctx, int rows, int cols, int group, ScaleLayout layout, bool ue8m0,
+              bool fast, const std::vector<float>& vals, int in_offset, int64_t q_stride,
+              int64_t s_stride, int64_t s_count, PgBuffers* out) {
+  DevBuf<T> in(static_cast<size_t>(rows) * cols + static_cast<size_t>(in_offset));
+  DevBuf<uint8_t> q(static_cast<size_t>(rows) * static_cast<size_t>(q_stride));
+  DevBuf<float> s(static_cast<size_t>(s_count));
+  if (!in.ok() || !q.ok() || !s.ok()) return false;
+  std::vector<T> staged(static_cast<size_t>(in_offset), T{});
+  const std::vector<T> rounded = cast_from_float<T>(vals);
+  staged.insert(staged.end(), rounded.begin(), rounded.end());
+  kops_test::copy_in(in.p, staged);
+  kops_test::copy_in(q.p, std::vector<uint8_t>(static_cast<size_t>(rows) * q_stride, 0xCDu));
+  kops_test::copy_in(s.p, std::vector<float>(static_cast<size_t>(s_count), -1.0f));
+  ActQuantOut o = make_out(q.p, q_stride, s.p, s_stride, DType::kFloat8E4M3, ActQuantMode::kPerGroup,
+                           layout, group);
+  o.scale_ue8m0 = ue8m0;
+  o.math = fast ? kops::QuantMath::kReciprocal : kops::QuantMath::kExact;
+  const Status st = kops::quant::quantize_activation(
+      o, tensor2d(in.p + in_offset, pg_dtype<T>(), rows, cols), Tensor{}, 0, ctx);
+  if (st != Status::kSuccess) {
+    kops_test::record_failure("per-group dense", kops::last_error_message(), __FILE__, __LINE__);
+    return false;
+  }
+  out->q = kops_test::copy_out(q.p, static_cast<size_t>(rows) * q_stride);
+  out->s = kops_test::copy_out(s.p, static_cast<size_t>(s_count));
+  return true;
+}
+
+/// Adversarial finite values: zeros, the e4m3 saturation and subnormal boundaries, the fp32
+/// extremes and a random magnitude spanning 2^-30 .. 2^30.
+std::vector<float> pg_adversarial(size_t n, unsigned seed) {
+  static const float kFixed[] = {0.0f,  -0.0f, 1.0f,    -1.0f,   448.0f, -448.0f, 464.0f,
+                                 -464.0f, 896.0f, 224.0f, 0x1p-9f, -0x1p-9f, 0x1p-10f,
+                                 0x1p-10f * 1.5f, 0x1p-11f, 3.0e38f, -3.0e38f, 1e-10f,
+                                 1e-30f, 1e30f, 0.1f,   -0.1f,  447.5f, 448.5f, 6.0f, 7.0f};
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+  std::uniform_int_distribution<int> expo(-30, 30);
+  std::vector<float> v(n);
+  for (size_t i = 0; i < n; ++i) {
+    if (i % 5 == 0) {
+      v[i] = kFixed[i % (sizeof(kFixed) / sizeof(kFixed[0]))];
+    } else {
+      v[i] = std::ldexp(unit(rng), expo(rng));
+    }
+  }
+  return v;
+}
+
+/// Shapes 1 x group, one row and a dense grid, every dtype x group x layout. Checks the oracle,
+/// the vectorized body against the scalar fallback (byte for byte) and the two arithmetic modes
+/// against each other.
+template <typename T>
+void pg_shape_cases(LaunchContext& ctx, int group, ScaleLayout layout, int rows, int cols,
+                    bool ue8m0, unsigned seed) {
+  const int groups = cols / group;
+  const int64_t padded_rows = (rows + 3) / 4 * 4;
+  const bool col_major = layout == ScaleLayout::kColMajorTma;
+  const int64_t s_stride = col_major ? padded_rows : groups;
+  const int64_t s_count = col_major ? groups * padded_rows : int64_t(rows) * groups;
+  std::vector<float> vals(static_cast<size_t>(rows) * cols);
+  fill_uniform(vals, seed, -4.0f, 4.0f);
+  const int64_t q_stride = cols;
+  PgBuffers exact, fallback, fast;
+  if (!pg_dense<T>(ctx, rows, cols, group, layout, ue8m0, false, vals, 0, q_stride, s_stride,
+                   s_count, &exact)) {
+    return;
+  }
+  if (!pg_dense<T>(ctx, rows, cols, group, layout, ue8m0, false, vals, 1, q_stride + 3, s_stride,
+                   s_count, &fallback)) {
+    return;
+  }
+  if (!pg_dense<T>(ctx, rows, cols, group, layout, ue8m0, true, vals, 0, q_stride, s_stride,
+                   s_count, &fast)) {
+    return;
+  }
+  std::vector<float> want_s;
+  std::vector<uint8_t> want_q;
+  pg_oracle(rounded_values(cast_from_float<T>(vals)), rows, cols, group, ue8m0, &want_s, &want_q);
+  for (int r = 0; r < rows; ++r) {
+    for (int g = 0; g < groups; ++g) {
+      const size_t off = col_major ? static_cast<size_t>(g) * padded_rows + r
+                                   : static_cast<size_t>(r) * groups + g;
+      KOPS_TEST_CHECK(exact.s[off] == want_s[static_cast<size_t>(r) * groups + g]);
+      KOPS_TEST_CHECK(fallback.s[off] == want_s[static_cast<size_t>(r) * groups + g]);
+      KOPS_TEST_CHECK(fast.s[off] == want_s[static_cast<size_t>(r) * groups + g]);
+    }
+    for (int c = 0; c < cols; ++c) {
+      const uint8_t want = want_q[static_cast<size_t>(r) * cols + c];
+      KOPS_TEST_CHECK(exact.q[static_cast<size_t>(r) * q_stride + c] == want);
+      KOPS_TEST_CHECK(fallback.q[static_cast<size_t>(r) * (q_stride + 3) + c] == want);
+      KOPS_TEST_CHECK(fast.q[static_cast<size_t>(r) * q_stride + c] == want);
+    }
+    for (int c = cols; c < cols + 3; ++c) {
+      KOPS_TEST_CHECK(fallback.q[static_cast<size_t>(r) * (q_stride + 3) + c] == 0xCDu);
+    }
+  }
+}
+
+void test_per_group_vector(LaunchContext& ctx) {
+  struct Shape {
+    int rows;
+    int cols;
+  };
+  const Shape shapes[] = {{1, 0}, {3, 0}, {6, 1024}};  // cols 0 => cols = group
+  unsigned seed = 700;
+  for (int dt = 0; dt < 3; ++dt) {
+    for (int group : {32, 64, 128}) {
+      for (const Shape& sh : shapes) {
+        for (int ui = 0; ui < 2; ++ui) {
+          for (int li = 0; li < 2; ++li) {
+            const int cols = sh.cols == 0 ? group : sh.cols;
+            const ScaleLayout layout =
+                li == 0 ? ScaleLayout::kRowMajor : ScaleLayout::kColMajorTma;
+            if (dt == 0) {
+              pg_shape_cases<__nv_bfloat16>(ctx, group, layout, sh.rows, cols, ui != 0, seed++);
+            } else if (dt == 1) {
+              pg_shape_cases<__half>(ctx, group, layout, sh.rows, cols, ui != 0, seed++);
+            } else {
+              pg_shape_cases<float>(ctx, group, layout, sh.rows, cols, ui != 0, seed++);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Masked (DeepEP) layout with a padded expert stride: input.stride[0] > max_m * stride[1] and
+/// stride[1] > cols. The reference is a dense per-group launch over the compacted live rows.
+template <typename T>
+void pg_masked_cases(LaunchContext& ctx, DType dtype, int group, int row_pad, int expert_pad,
+                     bool ue8m0, bool fast, unsigned seed) {
+  const int experts = 3, max_m = 4, cols = 256;
+  const int groups = cols / group;
+  const int64_t row_stride = cols + row_pad;
+  const int64_t expert_stride = int64_t(max_m) * row_stride + expert_pad;
+  const int64_t in_n = expert_stride * (experts - 1) + int64_t(max_m) * row_stride;
+  std::vector<float> host(static_cast<size_t>(in_n), 0.0f);
+  fill_uniform(host, seed, -3.0f, 5.0f);
+  const std::vector<int32_t> live = {max_m, 2, max_m - 1};
+  std::vector<float> compact;
+  for (int e = 0; e < experts; ++e) {
+    for (int m = 0; m < live[static_cast<size_t>(e)]; ++m) {
+      for (int c = 0; c < cols; ++c) {
+        compact.push_back(host[static_cast<size_t>(e) * expert_stride + m * row_stride + c]);
+      }
+    }
+  }
+  const int compact_rows = static_cast<int>(compact.size()) / cols;
+  PgBuffers want;
+  if (!pg_dense<T>(ctx, compact_rows, cols, group, ScaleLayout::kRowMajor, ue8m0, fast, compact, 0,
+                   cols, groups, int64_t(compact_rows) * groups, &want)) {
+    return;
+  }
+
+  const int64_t q_count = static_cast<int64_t>(experts) * max_m * cols;
+  const int64_t s_count = static_cast<int64_t>(experts) * max_m * groups;
+  DevBuf<T> in(static_cast<size_t>(in_n));
+  DevBuf<uint8_t> q(static_cast<size_t>(q_count));
+  DevBuf<float> s(static_cast<size_t>(s_count));
+  DevBuf<int32_t> mm(experts);
+  if (!in.ok() || !q.ok() || !s.ok() || !mm.ok()) return;
+  kops_test::copy_in(in.p, cast_from_float<T>(host));
+  kops_test::copy_in(q.p, std::vector<uint8_t>(static_cast<size_t>(q_count), 0xCDu));
+  kops_test::copy_in(s.p, std::vector<float>(static_cast<size_t>(s_count), -1.0f));
+  kops_test::copy_in(mm.p, live);
+  Tensor t3{};
+  t3.data = in.p;
+  t3.dtype = dtype;
+  t3.ndim = 3;
+  t3.device = 0;
+  t3.shape[0] = experts;
+  t3.shape[1] = max_m;
+  t3.shape[2] = cols;
+  t3.stride[0] = expert_stride;
+  t3.stride[1] = row_stride;
+  t3.stride[2] = 1;
+  ActQuantOut o = make_out(q.p, cols, s.p, groups, DType::kFloat8E4M3, ActQuantMode::kPerGroup,
+                           ScaleLayout::kRowMajor, group);
+  o.scale_row_stride = groups;
+  o.scale_ue8m0 = ue8m0;
+  o.math = fast ? kops::QuantMath::kReciprocal : kops::QuantMath::kExact;
+  KOPS_EXPECT_OK(kops::quant::quantize_activation(o, t3, tensor1d(mm.p, DType::kInt32, experts),
+                                                   max_m, ctx),
+                 "masked per-group padded expert stride");
+  const std::vector<uint8_t> gq = kops_test::copy_out(q.p, static_cast<size_t>(q_count));
+  const std::vector<float> gs = kops_test::copy_out(s.p, static_cast<size_t>(s_count));
+  int ref_row = 0;
+  for (int e = 0; e < experts; ++e) {
+    for (int m = 0; m < max_m; ++m) {
+      const int64_t out_row = static_cast<int64_t>(e) * max_m + m;
+      if (m < live[static_cast<size_t>(e)]) {
+        for (int g = 0; g < groups; ++g) {
+          KOPS_TEST_CHECK(gs[static_cast<size_t>(out_row) * groups + g] ==
+                          want.s[static_cast<size_t>(ref_row) * groups + g]);
+        }
+        for (int c = 0; c < cols; ++c) {
+          KOPS_TEST_CHECK(gq[static_cast<size_t>(out_row) * cols + c] ==
+                          want.q[static_cast<size_t>(ref_row) * cols + c]);
+        }
+        ++ref_row;
+      } else {
+        // A skipped row is never touched, so its payload and scales keep the sentinel.
+        for (int c = 0; c < cols; ++c) {
+          KOPS_TEST_CHECK(gq[static_cast<size_t>(out_row) * cols + c] == 0xCDu);
+        }
+        for (int g = 0; g < groups; ++g) {
+          KOPS_TEST_CHECK(gs[static_cast<size_t>(out_row) * groups + g] == -1.0f);
+        }
+      }
+    }
+  }
+}
+
+void test_per_group_masked(LaunchContext& ctx) {
+  unsigned seed = 800;
+  for (int dt = 0; dt < 3; ++dt) {
+    for (int group : {32, 64, 128}) {
+      // 8/4-element pads keep every row start and the expert stride 16 B aligned (vector path);
+      // 1/3-element pads force the scalar fallback.
+      for (int pad = 0; pad < 2; ++pad) {
+        const int row_pad = pad == 0 ? 16 / (dt == 2 ? 4 : 2) : 1;
+        const int expert_pad = pad == 0 ? row_pad : 3;
+        for (int fast = 0; fast < 2; ++fast) {
+          if (dt == 0) {
+            pg_masked_cases<__nv_bfloat16>(ctx, DType::kBFloat16, group, row_pad, expert_pad, false,
+                                           fast != 0, seed++);
+          } else if (dt == 1) {
+            pg_masked_cases<__half>(ctx, DType::kFloat16, group, row_pad, expert_pad, false,
+                                    fast != 0, seed++);
+          } else {
+            pg_masked_cases<float>(ctx, DType::kFloat32, group, row_pad, expert_pad, false,
+                                   fast != 0, seed++);
+          }
+        }
+      }
+    }
+  }
+}
+
+/// Exact vs reciprocal over adversarial data: inf/NaN groups (the reciprocal falls back to the
+/// exact body), the saturation and subnormal boundaries, and every 16-bit bit pattern.
+template <typename T>
+void pg_math_compare(LaunchContext& ctx, DType dtype, int group, const std::vector<float>& vals) {
+  const int rows = static_cast<int>(vals.size()) / group;
+  const int groups = 1;
+  PgBuffers exact, fast;
+  if (!pg_dense<T>(ctx, rows, group, group, ScaleLayout::kRowMajor, false, false, vals, 0, group,
+                   groups, rows, &exact)) {
+    return;
+  }
+  if (!pg_dense<T>(ctx, rows, group, group, ScaleLayout::kRowMajor, false, true, vals, 0, group,
+                   groups, rows, &fast)) {
+    return;
+  }
+  size_t mismatch = 0;
+  for (size_t i = 0; i < exact.q.size(); ++i) {
+    if (exact.q[i] != fast.q[i]) ++mismatch;
+  }
+  KOPS_TEST_CHECK(mismatch == 0);
+  for (size_t i = 0; i < exact.s.size(); ++i) KOPS_TEST_CHECK(exact.s[i] == fast.s[i]);
+  (void)dtype;
+}
+
+std::vector<float> pg_sweep_16(DType dtype) {
+  const float anchors[] = {1.0f, 1e-3f, 1e5f, 0.02f};
+  std::vector<float> vals;
+  for (float a : anchors) {
+    vals.push_back(a);
+    for (uint32_t bits = 0; bits < 65536u; ++bits) {
+      vals.push_back(dtype == DType::kBFloat16
+                         ? kops_test::to_float(pg_bitcast<__nv_bfloat16>(bits))
+                         : kops_test::to_float(pg_bitcast<__half>(bits)));
+    }
+  }
+  while (vals.size() % 128 != 0) vals.push_back(0.0f);
+  return vals;
+}
+
+std::vector<float> pg_sweep_fp32(unsigned seed) {
+  std::mt19937 rng(seed);
+  std::vector<float> vals;
+  for (int e : {-40, -20, -6, -1, 0, 1, 6, 20, 40}) {
+    vals.push_back(std::ldexp(1.0f, e));
+    for (int i = 0; i < 65536; ++i) {
+      const uint32_t mantissa = rng() & 0x807FFFFFu;
+      const int exponent = -60 + static_cast<int>(rng() % 121u);
+      vals.push_back(pg_u32_as_float(mantissa | (static_cast<uint32_t>(exponent + 127) << 23)));
+    }
+  }
+  while (vals.size() % 128 != 0) vals.push_back(0.0f);
+  return vals;
+}
+
+void test_per_group_math(LaunchContext& ctx) {
+  unsigned seed = 900;
+  for (int group : {32, 128}) {
+    // Adversarial finite data plus a dedicated inf/NaN group per case.
+    for (int dt = 0; dt < 3; ++dt) {
+      std::vector<float> vals = pg_adversarial(size_t(64) * group, seed++);
+      const float specials[] = {std::numeric_limits<float>::infinity(),
+                                -std::numeric_limits<float>::infinity(),
+                                std::numeric_limits<float>::quiet_NaN()};
+      for (float sp : specials) {
+        for (int j = 0; j < group; ++j) vals.push_back(j == 0 ? sp : 1.0f);
+      }
+      if (dt == 0) {
+        pg_math_compare<__nv_bfloat16>(ctx, DType::kBFloat16, group, vals);
+      } else if (dt == 1) {
+        pg_math_compare<__half>(ctx, DType::kFloat16, group, vals);
+      } else {
+        pg_math_compare<float>(ctx, DType::kFloat32, group, vals);
+      }
+    }
+    pg_math_compare<__nv_bfloat16>(ctx, DType::kBFloat16, group,
+                                   pg_sweep_16(DType::kBFloat16));
+    pg_math_compare<__half>(ctx, DType::kFloat16, group, pg_sweep_16(DType::kFloat16));
+    pg_math_compare<float>(ctx, DType::kFloat32, group, pg_sweep_fp32(seed++));
+  }
+}
+
+
+/// Graph capture/replay of both per-group arithmetic modes: replaying with different data must
+/// reproduce the oracle (and therefore a fresh direct launch) exactly.
+template <typename T>
+void pg_graph_case(LaunchContext& ctx, bool fast, int rows, int cols, int group) {
+  const int groups = cols / group;
+  DevBuf<T> in(static_cast<size_t>(rows) * cols);
+  DevBuf<uint8_t> q(static_cast<size_t>(rows) * cols);
+  DevBuf<float> s(static_cast<size_t>(rows) * groups);
+  if (!in.ok() || !q.ok() || !s.ok()) return;
+  cudaStream_t stream = nullptr;
+  if (cudaStreamCreate(&stream) != cudaSuccess) return;
+  LaunchContext gc = ctx;
+  gc.stream = reinterpret_cast<kops::kops_stream_t>(stream);
+  ActQuantOut o = make_out(q.p, cols, s.p, groups, DType::kFloat8E4M3, ActQuantMode::kPerGroup,
+                           ScaleLayout::kRowMajor, group);
+  o.math = fast ? kops::QuantMath::kReciprocal : kops::QuantMath::kExact;
+  const Tensor tin = tensor2d(in.p, pg_dtype<T>(), rows, cols);
+  std::vector<float> v0(static_cast<size_t>(rows) * cols);
+  fill_uniform(v0, 910, -2.0f, 2.0f);
+  kops_test::copy_in(in.p, cast_from_float<T>(v0));
+  cudaGraph_t graph = nullptr;
+  cudaGraphExec_t exec = nullptr;
+  cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal);
+  KOPS_EXPECT_OK(kops::quant::quantize_activation(o, tin, Tensor{}, 0, gc),
+                 "per-group graph capture");
+  cudaStreamEndCapture(stream, &graph);
+  if (graph != nullptr && cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0) == cudaSuccess) {
+    for (int round = 0; round < 2; ++round) {
+      std::vector<float> v(static_cast<size_t>(rows) * cols);
+      fill_uniform(v, 911 + round, -4.0f * (round + 1), 6.0f * (round + 1));
+      kops_test::copy_in(in.p, cast_from_float<T>(v));
+      cudaGraphLaunch(exec, stream);
+      cudaStreamSynchronize(stream);
+      const std::vector<uint8_t> gq = kops_test::copy_out(q.p, static_cast<size_t>(rows) * cols);
+      const std::vector<float> gs = kops_test::copy_out(s.p, static_cast<size_t>(rows) * groups);
+      std::vector<float> want_s;
+      std::vector<uint8_t> want_q;
+      pg_oracle(rounded_values(cast_from_float<T>(v)), rows, cols, group, false, &want_s, &want_q);
+      for (size_t i = 0; i < gq.size(); ++i) KOPS_TEST_CHECK(gq[i] == want_q[i]);
+      for (size_t i = 0; i < gs.size(); ++i) KOPS_TEST_CHECK(gs[i] == want_s[i]);
+    }
+    cudaGraphExecDestroy(exec);
+  }
+  if (graph != nullptr) cudaGraphDestroy(graph);
+  cudaStreamDestroy(stream);
+}
+
+void test_per_group_graph(LaunchContext& ctx) {
+  for (int fast = 0; fast < 2; ++fast) {
+    for (int group : {32, 128}) {
+      pg_graph_case<__nv_bfloat16>(ctx, fast != 0, 8, 512, group);
+      pg_graph_case<float>(ctx, fast != 0, 1, 256, group);
+    }
+  }
+}
+
+void test_per_group_contracts(LaunchContext& ctx) {
+  const int rows = 2, cols = 256, group = 128, groups = 2;
+  DevBuf<__nv_bfloat16> in(static_cast<size_t>(rows) * cols);
+  DevBuf<uint8_t> q(static_cast<size_t>(rows) * cols);
+  DevBuf<int8_t> qi8(static_cast<size_t>(rows) * cols);
+  DevBuf<float> s(static_cast<size_t>(rows) * (cols / 32));
+  if (!in.ok() || !q.ok() || !qi8.ok() || !s.ok()) return;
+  std::vector<float> host(static_cast<size_t>(rows) * cols, 1.0f);
+  kops_test::copy_in(in.p, cast_from_float<__nv_bfloat16>(host));
+  const Tensor tin = tensor2d(in.p, DType::kBFloat16, rows, cols);
+
+  // Scale layouts the per-group bodies do not implement: an error, never a silent row-major write.
+  for (ScaleLayout layout : {ScaleLayout::kSwizzled128x4, ScaleLayout::kPackedUE8M0x4,
+                             ScaleLayout::kMarlinPermuted, ScaleLayout::kInlineWithData}) {
+    ActQuantOut o = make_out(q.p, cols, s.p, groups, DType::kFloat8E4M3, ActQuantMode::kPerGroup,
+                             layout, group);
+    KOPS_EXPECT_STATUS(kops::quant::quantize_activation(o, tin, Tensor{}, 0, ctx),
+                       Status::kUnsupportedLayout, "per-group unsupported scale layout");
+  }
+  // The opt-in arithmetic is per-group only.
+  ActQuantOut tok = make_out(q.p, cols, s.p, 1, DType::kFloat8E4M3,
+                             ActQuantMode::kDynamicPerToken);
+  tok.scales = s.p;
+  tok.math = kops::QuantMath::kReciprocal;
+  KOPS_EXPECT_STATUS(kops::quant::quantize_activation(tok, tin, Tensor{}, 0, ctx),
+                     Status::kUnsupportedLayout, "reciprocal is per-group only");
+  // INT8 per-group payload is not compiled, group sizes are 32/64/128.
+  ActQuantOut i8 = make_out(qi8.p, cols, s.p, groups, DType::kInt8, ActQuantMode::kPerGroup,
+                            ScaleLayout::kRowMajor, group);
+  KOPS_EXPECT_STATUS(kops::quant::quantize_activation(i8, tin, Tensor{}, 0, ctx),
+                     Status::kUnsupportedDtype, "per-group INT8");
+  ActQuantOut g16 = make_out(q.p, cols, s.p, groups, DType::kFloat8E4M3, ActQuantMode::kPerGroup,
+                             ScaleLayout::kRowMajor, 16);
+  KOPS_EXPECT_STATUS(kops::quant::quantize_activation(g16, tin, Tensor{}, 0, ctx),
+                     Status::kUnsupportedShape, "per-group group size 16");
+}
 
 template <typename T>
 std::vector<T> pad_rows(const std::vector<T>& src, int rows, int cols, int pad) {
@@ -412,13 +906,6 @@ std::vector<T> pad_rows(const std::vector<T>& src, int rows, int cols, int pad) 
     std::copy_n(src.begin() + static_cast<size_t>(r) * cols, cols,
                 out.begin() + static_cast<size_t>(r) * (cols + pad));
   }
-  return out;
-}
-
-template <typename T>
-std::vector<float> rounded_values(const std::vector<T>& v) {
-  std::vector<float> out(v.size());
-  for (size_t i = 0; i < v.size(); ++i) out[i] = kops_test::to_float(v[i]);
   return out;
 }
 
@@ -2030,6 +2517,11 @@ int main() {
   test_per_token_int8_asym(ctx);
   test_quant_pack_edges(ctx);
   test_per_group(ctx);
+  test_per_group_vector(ctx);
+  test_per_group_masked(ctx);
+  test_per_group_math(ctx);
+  test_per_group_graph(ctx);
+  test_per_group_contracts(ctx);
   test_mx(ctx);
   test_nvfp4(ctx);
   test_dequantize(ctx);

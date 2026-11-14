@@ -8,8 +8,11 @@
 // Scales are dequant multipliers (x ~= q * s); every quotient is a correctly
 // rounded fp32 division and every conversion is round-to-nearest-even with
 // saturation, so the bytes are a function of the data alone (not of the fork,
-// grid or vector width).  The kernels are architecture-generic, graph
-// capturable and never allocate or synchronize on the host.
+// grid or vector width). The per-group path can opt into a reciprocal +
+// Markstein quotient (ActQuantOut::math == QuantMath::kReciprocal) that is
+// byte-identical to that division; every other mode stays exact. The kernels are
+// architecture-generic, graph capturable and never allocate or synchronize on
+// the host.
 // =============================================================================
 #include <algorithm>
 #include <cmath>
@@ -99,20 +102,81 @@ __device__ __forceinline__ uint8_t encode_byte<int8_t>(float x) {
   return static_cast<uint8_t>(int8_from_float(x));
 }
 
+// -----------------------------------------------------------------------------
+// Quotient of a quantize loop: exact RN division, or an opt-in reciprocal
+// -----------------------------------------------------------------------------
+//
+// `__fdiv_rn` is a MUFU.RCP + Newton sequence guarded by FCHK whose slow path (a call) is taken
+// for dividends near zero or the exponent limits. A per-group loop that divides sixteen times per
+// thread therefore spends about as much issue and MUFU throughput as the bytes it moves. The
+// opt-in `QuantMath::kReciprocal` mode replaces it with one RN reciprocal per group plus FMUL +
+// 2 FFMA per element (Markstein): with r = RN(1/s), q = RN(x*r) within 1 ulp of x/s and the exact
+// remainder e = x - q*s (an FMA whose result is exact because q*s ~ x), RN(q + e*r) is the
+// correctly rounded quotient. The theorem needs every step normal, so:
+//  * the scale must be in [2^-90, 2^126]: r is then normal and finite, and for every x whose
+//    quotient can round to a non-zero e4m3 code (|x/s| >= 2^-10) the remainder x - q*s is
+//    representable, so the FMA is exact; anything smaller rounds to code 0 either way;
+//  * |q| >= 2^20 keeps q: every payload saturates far below that, so the byte is the same;
+//  * a zero quotient keeps the sign of q (RN(-0 + +0) would be +0);
+//  * scales outside the range (zero, subnormal, huge, inf or NaN - a group whose amax is +inf)
+//    fall back to `__fdiv_rn`; `fast_rcp` returns 0 as the signal and the kernel picks the exact
+//    body at run time.
+// For a power-of-two scale (UE8M0) `x * r` is exactly `x / s`, so kDivPow2 multiplies and never
+// runs the correction.
+//
+// Guarantee: the FP8 payload bytes are identical to the kExact loop for every input. The unit
+// test pins that down by comparing the two modes over all bf16 and fp16 bit patterns under many
+// group scales (and a sampled fp32 sweep), and by comparing the vectorized exact kernel against
+// the scalar one on adversarial data.
+enum QuantDivKind : int {
+  kDivExact = 0,      // __fdiv_rn, the reference
+  kDivMarkstein = 1,  // one reciprocal + Markstein correction
+  kDivPow2 = 2,       // exact multiply; the scale is a power of two (UE8M0)
+};
+
+constexpr float kRcpMinScale = 0x1p-90f;
+constexpr float kRcpMaxScale = 0x1p126f;
+
+/// RN(1/s) when the correction above is valid for this scale, else 0.
+__device__ __forceinline__ float fast_rcp(float s) {
+  return (s >= kRcpMinScale && s <= kRcpMaxScale) ? __frcp_rn(s) : 0.0f;
+}
+
+/// RN(x / s) from r = RN(1/s) (`fast_rcp(s) != 0`).
+__device__ __forceinline__ float div_by_rcp(float x, float s, float r) {
+  const float q = __fmul_rn(x, r);
+  const float e = __fmaf_rn(-q, s, x);
+  const float q2 = copysignf(__fmaf_rn(e, r, q), q);
+  return fabsf(q) < 1048576.0f ? q2 : q;
+}
+
+/// Quotient of the quantize loops. `r` is `fast_rcp(scale)` (0 when unused).
+template <int kMath>
+__device__ __forceinline__ float qdiv(float x, float s, float r) {
+  if constexpr (kMath == kDivMarkstein) {
+    return div_by_rcp(x, s, r);
+  } else if constexpr (kMath == kDivPow2) {
+    return __fmul_rn(x, r);
+  } else {
+    (void)r;
+    return __fdiv_rn(x, s);
+  }
+}
+
 /// One encoded byte. `kAsymmetric` adds the zero point and allows -128, while symmetric INT8 keeps
-/// the historical [-127, 127] clamp. The quotient is the correctly rounded fp32 division in both
-/// cases, so the bytes are a function of the data alone.
-template <typename out_t, bool kAsymmetric>
-__device__ __forceinline__ uint8_t quant_byte(float x, float scale, float zero) {
+/// the historical [-127, 127] clamp. The quotient is the correctly rounded fp32 division in every
+/// mode (`qdiv`), so the bytes are a function of the data alone.
+template <typename out_t, bool kAsymmetric, int kMath = kDivExact>
+__device__ __forceinline__ uint8_t quant_byte(float x, float scale, float zero, float rcp = 0.0f) {
   if constexpr (std::is_same<out_t, __nv_fp8_e4m3>::value) {
     if constexpr (kAsymmetric) {
-      return e4m3_from_float(__fadd_rn(__fdiv_rn(x, scale), zero));
+      return e4m3_from_float(__fadd_rn(qdiv<kMath>(x, scale, rcp), zero));
     } else {
-      return e4m3_from_float(__fdiv_rn(x, scale));
+      return e4m3_from_float(qdiv<kMath>(x, scale, rcp));
     }
   } else {
-    int v = __float2int_rn(kAsymmetric ? __fadd_rn(__fdiv_rn(x, scale), zero)
-                                       : __fdiv_rn(x, scale));
+    int v = __float2int_rn(kAsymmetric ? __fadd_rn(qdiv<kMath>(x, scale, rcp), zero)
+                                       : qdiv<kMath>(x, scale, rcp));
     if constexpr (kAsymmetric) {
       v = v > 127 ? 127 : (v < -128 ? -128 : v);
     } else {
@@ -126,31 +190,31 @@ __device__ __forceinline__ uint8_t quant_byte(float x, float scale, float zero) 
 /// instead of a local byte array: a `uint8_t q[VEC]` reinterpreted as `uint2` made nvcc spill the
 /// pack to local memory (st.local.v2.u8 / ld.local.v2.u32 per pack), which dominated both the
 /// per-tensor and per-token kernels. Words stay in registers.
-template <typename out_t, bool kAsymmetric>
+template <typename out_t, bool kAsymmetric, int kMath = kDivExact>
 __device__ __forceinline__ uint32_t quant_word4(float a, float b, float c, float d, float scale,
-                                                float zero) {
+                                                float zero, float rcp = 0.0f) {
   if constexpr (std::is_same<out_t, __nv_fp8_e4m3>::value) {
     // Two values per `cvt.rn.satfinite.e4m3x2.f32`: half the conversion instructions of the
     // scalar intrinsic, same rounding and saturation.
     if constexpr (kAsymmetric) {
-      a = __fadd_rn(__fdiv_rn(a, scale), zero);
-      b = __fadd_rn(__fdiv_rn(b, scale), zero);
-      c = __fadd_rn(__fdiv_rn(c, scale), zero);
-      d = __fadd_rn(__fdiv_rn(d, scale), zero);
+      a = __fadd_rn(qdiv<kMath>(a, scale, rcp), zero);
+      b = __fadd_rn(qdiv<kMath>(b, scale, rcp), zero);
+      c = __fadd_rn(qdiv<kMath>(c, scale, rcp), zero);
+      d = __fadd_rn(qdiv<kMath>(d, scale, rcp), zero);
     } else {
-      a = __fdiv_rn(a, scale);
-      b = __fdiv_rn(b, scale);
-      c = __fdiv_rn(c, scale);
-      d = __fdiv_rn(d, scale);
+      a = qdiv<kMath>(a, scale, rcp);
+      b = qdiv<kMath>(b, scale, rcp);
+      c = qdiv<kMath>(c, scale, rcp);
+      d = qdiv<kMath>(d, scale, rcp);
     }
     const uint32_t lo = __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
     const uint32_t hi = __nv_cvt_float2_to_fp8x2(make_float2(c, d), __NV_SATFINITE, __NV_E4M3);
     return lo | (hi << 16);
   } else {
-    return static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(a, scale, zero)) |
-           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(b, scale, zero)) << 8) |
-           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(c, scale, zero)) << 16) |
-           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric>(d, scale, zero)) << 24);
+    return static_cast<uint32_t>(quant_byte<out_t, kAsymmetric, kMath>(a, scale, zero, rcp)) |
+           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric, kMath>(b, scale, zero, rcp)) << 8) |
+           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric, kMath>(c, scale, zero, rcp)) << 16) |
+           (static_cast<uint32_t>(quant_byte<out_t, kAsymmetric, kMath>(d, scale, zero, rcp)) << 24);
   }
 }
 
@@ -629,24 +693,20 @@ constexpr size_t kPerTokenStageLimit = 48u * 1024u - 256u;
 /// Full-pack store without alignment or tail handling: the host selected this kernel only when every
 /// row start and the output stride are VEC-byte aligned. Keeping the misaligned/tail fallbacks out
 /// of the hot kernel saves about a third of the registers and a branch per pack.
-template <typename out_t, int VEC, bool kAsymmetric>
+template <typename out_t, int VEC, bool kAsymmetric, int kMath = kDivExact>
 __device__ __forceinline__ void store_quant_pack_aligned(uint8_t* __restrict__ dst,
                                                          const float (&x)[VEC], float scale,
-                                                         float zero) {
+                                                         float zero, float rcp = 0.0f) {
+#define KOPS_W4(i) \
+  quant_word4<out_t, kAsymmetric, kMath>(x[i], x[i + 1], x[i + 2], x[i + 3], scale, zero, rcp)
   if constexpr (VEC == 4) {
-    *reinterpret_cast<uint32_t*>(dst) =
-        quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero);
+    *reinterpret_cast<uint32_t*>(dst) = KOPS_W4(0);
   } else if constexpr (VEC == 8) {
-    *reinterpret_cast<uint2*>(dst) =
-        make_uint2(quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero),
-                   quant_word4<out_t, kAsymmetric>(x[4], x[5], x[6], x[7], scale, zero));
+    *reinterpret_cast<uint2*>(dst) = make_uint2(KOPS_W4(0), KOPS_W4(4));
   } else {
-    *reinterpret_cast<uint4*>(dst) =
-        make_uint4(quant_word4<out_t, kAsymmetric>(x[0], x[1], x[2], x[3], scale, zero),
-                   quant_word4<out_t, kAsymmetric>(x[4], x[5], x[6], x[7], scale, zero),
-                   quant_word4<out_t, kAsymmetric>(x[8], x[9], x[10], x[11], scale, zero),
-                   quant_word4<out_t, kAsymmetric>(x[12], x[13], x[14], x[15], scale, zero));
+    *reinterpret_cast<uint4*>(dst) = make_uint4(KOPS_W4(0), KOPS_W4(4), KOPS_W4(8), KOPS_W4(12));
   }
+#undef KOPS_W4
 }
 
 /// One 16 B word (eight 16-bit values) -> eight floats.
@@ -856,12 +916,18 @@ void launch_per_token(out_t* out, int64_t out_row_stride, float* scales, int32_t
       out, out_row_stride, scales, azp, input, input_row_stride, scale_ub, num_rows, cols);
 }
 
-/// One warp owns one group of 32/64/128 values; lane 0 writes the scale.
+/// One warp owns one group of 32/64/128 values; lane 0 writes the scale. Scalar loads, so this body
+/// serves any alignment, row padding and group size; it is also the reference the vectorized kernel
+/// is compared against (both compute the group amax by an order-independent max and then the same
+/// correctly rounded quotient, so their bytes are identical). Every quotient here is `__fdiv_rn`:
+/// this is the fallback for shapes the vector path cannot take, and exact bytes are always correct
+/// whatever ActQuantOut::math asked for.
 template <typename scalar_t, typename out_t, int GROUP_SIZE, bool kColMajorScale, bool kUE8M0>
 __global__ void quantize_per_group_kernel(out_t* __restrict__ out, const int64_t out_row_stride,
                                           void* __restrict__ scales, const int64_t scale_stride,
                                           const scalar_t* __restrict__ input,
                                           const int64_t input_row_stride,
+                                          const int64_t input_expert_stride,
                                           const int32_t* __restrict__ masked_m,
                                           const int max_m, const int num_rows, const int cols,
                                           const float eps) {
@@ -875,12 +941,19 @@ __global__ void quantize_per_group_kernel(out_t* __restrict__ out, const int64_t
        group += static_cast<int64_t>(gridDim.x) * kWarps) {
     const int64_t row = group / groups;
     const int64_t g = group - row * groups;
+    // Address of the row. A masked input is [E, max_m, cols] and its expert stride may be padded
+    // (input.stride[0] > max_m * input.stride[1]), so the row offset needs both terms.
+    int64_t in_off;
     if (masked_m != nullptr) {
       const int e = static_cast<int>(row / max_m);
       const int m = static_cast<int>(row - static_cast<int64_t>(e) * max_m);
       if (m >= masked_m[e]) continue;
+      in_off = static_cast<int64_t>(e) * input_expert_stride +
+               static_cast<int64_t>(m) * input_row_stride;
+    } else {
+      in_off = row * input_row_stride;
     }
-    const scalar_t* src = input + row * input_row_stride + g * GROUP_SIZE;
+    const scalar_t* src = input + in_off + g * GROUP_SIZE;
     float x[kPerLane];
     float amax = 0.0f;
     #pragma unroll
@@ -908,6 +981,116 @@ __global__ void quantize_per_group_kernel(out_t* __restrict__ out, const int64_t
   }
 }
 
+/// Sixteen consecutive input values as floats with streaming 16 B loads (two for 16-bit types,
+/// four for fp32). `src` is 16 B aligned (host-proved).
+template <typename scalar_t>
+__device__ __forceinline__ void load16_stream(const scalar_t* __restrict__ src, float (&x)[16]) {
+  if constexpr (sizeof(scalar_t) == 2) {
+    const uint4 w0 = __ldcs(reinterpret_cast<const uint4*>(src));
+    const uint4 w1 = __ldcs(reinterpret_cast<const uint4*>(src + 8));
+    unpack8f<scalar_t>(w0, x);
+    unpack8f<scalar_t>(w1, x + 8);
+  } else {
+    #pragma unroll
+    for (int v = 0; v < 4; ++v) {
+      const uint4 w = __ldcs(reinterpret_cast<const uint4*>(src + 4 * v));
+      x[4 * v + 0] = __uint_as_float(w.x);
+      x[4 * v + 1] = __uint_as_float(w.y);
+      x[4 * v + 2] = __uint_as_float(w.z);
+      x[4 * v + 3] = __uint_as_float(w.w);
+    }
+  }
+}
+
+/// Vectorized per-group body: GROUP_SIZE / 16 adjacent threads own one group, each holding sixteen
+/// consecutive values in registers (one pass over the input, no shared memory) and emitting one
+/// 16 B store. The group amax is a width-`kTpg` xor shuffle among those threads (the subgroup never
+/// straddles a warp because kTpg divides 32), so the scale and every payload byte are the ones the
+/// warp-per-group kernel produces: max is order independent and the quotient is the correctly
+/// rounded one in both bodies.
+///
+/// Host-proved: 16 B aligned input/q/expert rows (so two LDG.128 feed the 16 values of a bf16/fp16
+/// group slice and four an fp32 one, and one STG.128 writes the pack) and fewer than 2^32 groups in
+/// total; anything else takes `quantize_per_group_kernel`. The empty subgroup leaves as a unit.
+template <typename scalar_t, typename out_t, int GROUP_SIZE, int kMath>
+__global__ void __launch_bounds__(256) quantize_per_group_vec_kernel(
+    out_t* __restrict__ out, const int64_t out_row_stride, float* __restrict__ scales,
+    const int64_t scale_stride, const int col_major_scale, const scalar_t* __restrict__ input,
+    const int64_t input_row_stride, const int64_t input_expert_stride,
+    const int32_t* __restrict__ masked_m, const int max_m, const int num_rows, const int cols,
+    const float eps, const int ue8m0) {
+  constexpr int kTpg = GROUP_SIZE / 16;
+  constexpr int kGpb = 256 / kTpg;
+  static_assert(kTpg >= 2 && kTpg <= 8, "group of 32/64/128");
+  const uint32_t groups = static_cast<uint32_t>(cols / GROUP_SIZE);
+  const uint32_t total = static_cast<uint32_t>(num_rows) * groups;
+  const uint32_t gid = blockIdx.x * kGpb + threadIdx.x / kTpg;
+  const int sub = threadIdx.x % kTpg;
+  if (gid >= total) return;  // the whole sub-group leaves together
+  const uint32_t row = gid / groups;
+  const uint32_t g = gid - row * groups;
+  int64_t in_off = static_cast<int64_t>(row) * input_row_stride;
+  if (masked_m != nullptr) {
+    const uint32_t e = row / static_cast<uint32_t>(max_m);
+    const int m = static_cast<int>(row - e * static_cast<uint32_t>(max_m));
+    if (m >= masked_m[e]) return;
+    in_off = static_cast<int64_t>(e) * input_expert_stride +
+             static_cast<int64_t>(m) * input_row_stride;
+  }
+  const int64_t col = static_cast<int64_t>(g) * GROUP_SIZE + sub * 16;
+  float x[16];
+  load16_stream<scalar_t>(input + in_off + col, x);
+  float amax = 0.0f;
+  #pragma unroll
+  for (int j = 0; j < 16; ++j) amax = fmaxf(amax, fabsf(x[j]));
+  const int lane = threadIdx.x & 31;
+  const unsigned mask = ((1u << kTpg) - 1u) << (lane & ~(kTpg - 1));
+  #pragma unroll
+  for (int off = kTpg / 2; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(mask, amax, off, kTpg));
+  }
+  const float s = quant_scale_from_amax(amax, eps, kFp8E4M3Max, ue8m0 != 0);
+  if (sub == 0) {
+    const int64_t off = col_major_scale
+                            ? scale_offset(ScaleLayout::kColMajorTma, row, g, num_rows, groups)
+                            : static_cast<int64_t>(row) * scale_stride + g;
+    scales[off] = s;
+  }
+  uint8_t* const q =
+      reinterpret_cast<uint8_t*>(out) + static_cast<int64_t>(row) * out_row_stride + col;
+  if constexpr (kMath == kDivExact) {
+    store_quant_pack_aligned<out_t, 16, false, kDivExact>(q, x, s, 0.0f);
+  } else {
+    // A scale outside the reciprocal's proved range (a group whose amax is +inf, a NaN) keeps the
+    // exact body; `fast_rcp` returns 0 there. The branch is uniform across the subgroup.
+    const float r = fast_rcp(s);
+    if (r != 0.0f) {
+      store_quant_pack_aligned<out_t, 16, false, kMath>(q, x, s, 0.0f, r);
+    } else {
+      store_quant_pack_aligned<out_t, 16, false, kDivExact>(q, x, s, 0.0f);
+    }
+  }
+}
+
+template <typename scalar_t, typename out_t, int GROUP_SIZE, int kMath>
+void launch_group_vec(const ActQuantOut& out, const int32_t* masked_m, int max_m, int64_t rows,
+                      int64_t cols, int64_t input_row_stride, int64_t input_expert_stride,
+                      const scalar_t* in_ptr, int64_t q_stride, int64_t scale_stride,
+                      cudaStream_t stream) {
+  constexpr int kGpb = 256 / (GROUP_SIZE / 16);
+  const int64_t tasks = rows * (cols / GROUP_SIZE);
+  const unsigned grid = static_cast<unsigned>(ceil_div(tasks, kGpb));
+  quantize_per_group_vec_kernel<scalar_t, out_t, GROUP_SIZE, kMath><<<grid, 256, 0, stream>>>(
+      reinterpret_cast<out_t*>(out.q), q_stride, static_cast<float*>(out.scales), scale_stride,
+      out.scale_layout == ScaleLayout::kColMajorTma ? 1 : 0, in_ptr, input_row_stride,
+      input_expert_stride, masked_m, max_m, static_cast<int>(rows), static_cast<int>(cols),
+      1e-10f, out.scale_ue8m0 ? 1 : 0);
+}
+
+/// Per-group dispatch: the vectorized body whenever the host can prove 16 B alignment of every row
+/// start and of the output pack, the scalar warp-per-group body otherwise. The vector body picks
+/// its quotient at compile time from ActQuantOut::math (kDivPow2 instead of kDivMarkstein when the
+/// scales are UE8M0 powers of two); the scalar fallback always divides exactly.
 template <typename scalar_t, typename out_t, int GROUP_SIZE>
 void launch_group_impl(const ActQuantOut& out, const Tensor& input, const int32_t* masked_m,
                        int max_m, int64_t rows, int64_t cols, int64_t input_row_stride,
@@ -920,20 +1103,60 @@ void launch_group_impl(const ActQuantOut& out, const Tensor& input, const int32_
   const int64_t scale_stride =
       out.scale_row_stride > 0 ? out.scale_row_stride : groups;
   const float eps = 1e-10f;
-  if (out.scale_layout == ScaleLayout::kColMajorTma) {
-    quantize_per_group_kernel<scalar_t, out_t, GROUP_SIZE, true, false>
-        <<<grid, kWarps * 32, 0, stream>>>(
-            reinterpret_cast<out_t*>(out.q), q_stride, out.scales, scale_stride,
-            const_ptr<scalar_t>(input), input_row_stride, masked_m, max_m, static_cast<int>(rows),
-            static_cast<int>(cols), eps);
+  const bool col_major = out.scale_layout == ScaleLayout::kColMajorTma;
+  const scalar_t* in_ptr = const_ptr<scalar_t>(input);
+  const int64_t elem_bytes = static_cast<int64_t>(sizeof(scalar_t));
+  // 16 B alignment of every row start: base, row stride, expert stride (masked) and output pack.
+  const bool vec_ok = tasks > 0 && tasks < (int64_t(1) << 32) &&
+                      (reinterpret_cast<uintptr_t>(in_ptr) & 15u) == 0u &&
+                      ((input_row_stride * elem_bytes) & 15) == 0 &&
+                      (masked_m == nullptr || ((input_expert_stride * elem_bytes) & 15) == 0) &&
+                      (reinterpret_cast<uintptr_t>(out.q) & 15u) == 0u && (q_stride & 15) == 0;
+  if (vec_ok) {
+    if (out.math == QuantMath::kReciprocal) {
+      if (out.scale_ue8m0) {
+        launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivPow2>(
+            out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
+            q_stride, scale_stride, stream);
+      } else {
+        launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivMarkstein>(
+            out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
+            q_stride, scale_stride, stream);
+      }
+    } else {
+      launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivExact>(
+          out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
+          q_stride, scale_stride, stream);
+    }
+    return;
+  }
+  if (col_major) {
+    if (out.scale_ue8m0) {
+      quantize_per_group_kernel<scalar_t, out_t, GROUP_SIZE, true, true>
+          <<<grid, kWarps * 32, 0, stream>>>(reinterpret_cast<out_t*>(out.q), q_stride, out.scales,
+                                             scale_stride, in_ptr, input_row_stride,
+                                             input_expert_stride, masked_m, max_m,
+                                             static_cast<int>(rows), static_cast<int>(cols), eps);
+    } else {
+      quantize_per_group_kernel<scalar_t, out_t, GROUP_SIZE, true, false>
+          <<<grid, kWarps * 32, 0, stream>>>(reinterpret_cast<out_t*>(out.q), q_stride, out.scales,
+                                             scale_stride, in_ptr, input_row_stride,
+                                             input_expert_stride, masked_m, max_m,
+                                             static_cast<int>(rows), static_cast<int>(cols), eps);
+    }
+  } else if (out.scale_ue8m0) {
+    quantize_per_group_kernel<scalar_t, out_t, GROUP_SIZE, false, true>
+        <<<grid, kWarps * 32, 0, stream>>>(reinterpret_cast<out_t*>(out.q), q_stride, out.scales,
+                                           scale_stride, in_ptr, input_row_stride,
+                                           input_expert_stride, masked_m, max_m,
+                                           static_cast<int>(rows), static_cast<int>(cols), eps);
   } else {
     quantize_per_group_kernel<scalar_t, out_t, GROUP_SIZE, false, false>
-        <<<grid, kWarps * 32, 0, stream>>>(
-            reinterpret_cast<out_t*>(out.q), q_stride, out.scales, scale_stride,
-            const_ptr<scalar_t>(input), input_row_stride, masked_m, max_m, static_cast<int>(rows),
-            static_cast<int>(cols), eps);
+        <<<grid, kWarps * 32, 0, stream>>>(reinterpret_cast<out_t*>(out.q), q_stride, out.scales,
+                                           scale_stride, in_ptr, input_row_stride,
+                                           input_expert_stride, masked_m, max_m,
+                                           static_cast<int>(rows), static_cast<int>(cols), eps);
   }
-  (void)input_expert_stride;
 }
 
 // =============================================================================
@@ -1337,6 +1560,11 @@ Status quantize_activation(const ActQuantOut& out, const Tensor& input, const Te
                                                     : (is_subbyte_dtype(out.q_dtype) ? cols / 2 : cols);
   const int64_t input_row_stride = masked ? input.stride[1] : input.stride[0];
   const int64_t input_expert_stride = masked ? input.stride[0] : 0;
+  // Opt-in arithmetic is implemented for per-group only; every other mode would ignore the flag.
+  if (out.math != QuantMath::kExact && out.mode != ActQuantMode::kPerGroup) {
+    return detail::set_error(Status::kUnsupportedLayout,
+                             "quantize_activation: math kReciprocal is per-group only");
+  }
   const cudaStream_t stream = stream_of(ctx);
   const int sms = ctx.compute_units > 0 ? ctx.compute_units : 32;
   // 16-bit inputs are quantized in 32 B (two 16 B packs) -> 16 B stores; fp32 keeps one 16 B pack.
@@ -1623,12 +1851,19 @@ Status quantize_activation(const ActQuantOut& out, const Tensor& input, const Te
                                "quantize_activation: cols %lld not divisible by group %d",
                                static_cast<long long>(cols), out.group_size);
     }
-    const int32_t* masked_ptr = masked ? const_ptr<int32_t>(masked_m) : nullptr;
-    if (out.scale_row_stride == 0) {
-      // keep zero: kernels fall back to groups for row-major
+    // Only the two layouts the per-group bodies implement. Anything else used to fall through to
+    // row-major and corrupt the consumer's scale reads, so it is an explicit error now.
+    if (out.scale_layout != ScaleLayout::kRowMajor &&
+        out.scale_layout != ScaleLayout::kColMajorTma) {
+      return detail::set_error(Status::kUnsupportedLayout,
+                               "quantize_activation: per-group scale layout %d",
+                               static_cast<int>(out.scale_layout));
     }
-    const int64_t scale_stride = out.scale_row_stride > 0 ? out.scale_row_stride
-                                                          : cols / out.group_size;
+    if (out.math != QuantMath::kExact && out.math != QuantMath::kReciprocal) {
+      return detail::set_error(Status::kUnsupportedShape, "quantize_activation: math %d",
+                               static_cast<int>(out.math));
+    }
+    const int32_t* masked_ptr = masked ? const_ptr<int32_t>(masked_m) : nullptr;
     #define KOPS_GQ(G, T)                                                                          \
       do {                                                                                         \
         if (out.q_dtype == DType::kFloat8E4M3) {                                                   \
@@ -1658,7 +1893,6 @@ Status quantize_activation(const ActQuantOut& out, const Tensor& input, const Te
     else if (out.group_size == 64) { KOPS_GQ(64, T); }
     else { KOPS_GQ(128, T); }
     #undef KOPS_GQ
-    (void)scale_stride;
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return launch_error("quantize_activation per-group", err);
     return Status::kSuccess;

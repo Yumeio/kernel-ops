@@ -11,6 +11,14 @@ namespace kops::quant {
 Status absmax(const Tensor& amax_out, const Tensor& input, const LaunchContext& ctx);
 /// Quantize `input` according to out.mode (static/dynamic per-tensor, per-token, per-group,
 /// MXFP8/MXFP4/NVFP4). Writes payload + scales described by `out`.
+/// Per-group (`kPerGroup`) supports group 32/64/128, a row-major or kColMajorTma scale layout,
+/// the DeepEP masked layout ([E, max_m, cols] with input.stride[0] as the padded expert stride)
+/// and `scale_ue8m0` (scales rounded up to powers of two, stored as fp32). Other scale layouts
+/// return kUnsupportedLayout.
+/// `out.math` is the quotient arithmetic: kExact (default) divides by the scale with __fdiv_rn;
+/// kReciprocal uses one RN reciprocal plus a Markstein correction, which produces the same
+/// payload bytes but is only implemented for kPerGroup (other modes return kUnsupportedLayout)
+/// and only on the vectorized path (an unaligned/unsupported shape falls back to exact maths).
 Status quantize_activation(const ActQuantOut& out, const Tensor& input,
                            const Tensor& masked_m, int32_t max_m, const LaunchContext& ctx);
 Status dequantize(const Tensor& out, const Tensor& q, const Tensor& scales,

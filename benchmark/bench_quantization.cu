@@ -20,6 +20,23 @@ namespace {
 
 using namespace kops_bench;
 
+/// Group size of a per-group case id ("quant.per_group64.bf16.fp8..." -> 64).
+int group_from_id(const std::string& id) {
+  const std::string key = "per_group";
+  const size_t pos = id.find(key);
+  if (pos == std::string::npos) return 128;
+  size_t i = pos + key.size();
+  int group = 0;
+  while (i < id.size() && id[i] >= '0' && id[i] <= '9') {
+    group = 10 * group + (id[i] - '0');
+    ++i;
+  }
+  return group > 0 ? group : 128;
+}
+
+/// `.fast` suffixes select ActQuantOut::math = kReciprocal (same bytes, opt-in quotient).
+bool fast_from_id(const std::string& id) { return id.find(".fast") != std::string::npos; }
+
 std::vector<Case> make_cases() {
   std::vector<Case> cases;
   auto add = [&](const char* id, const char* op, kops::DType dt, int64_t rows, int64_t cols,
@@ -36,8 +53,19 @@ std::vector<Case> make_cases() {
       3 * r * c, 3 * r * c);
   add("quant.per_token.fp32.int8.4096x4096", "quantize_per_token_int8", kops::DType::kFloat32, r,
       c, 5 * r * c, 3 * r * c);
-  add("quant.per_group128.bf16.fp8.4096x4096", "quantize_per_group", kops::DType::kBFloat16, r, c,
-      3 * r * c, 3 * r * c);
+  // 1 x G activation quantization: 2 B read + 1 B written per element + one fp32 scale per group.
+  auto add_per_group = [&](int64_t group, bool fast) {
+    char id[64];
+    std::snprintf(id, sizeof(id), "quant.per_group%lld.bf16.fp8.4096x4096%s",
+                  static_cast<long long>(group), fast ? ".fast" : "");
+    const int64_t scale_bytes = 4 * (r * c / group);
+    add(id, "quantize_per_group", kops::DType::kBFloat16, r, c, 3 * r * c + scale_bytes,
+        3 * r * c);
+  };
+  for (int64_t group : {128, 64, 32}) {
+    add_per_group(group, false);
+    add_per_group(group, true);
+  }
   add("quant.mxfp8.bf16.4096x4096", "quantize_mxfp8", kops::DType::kBFloat16, r, c, 3 * r * c,
       3 * r * c);
   add("quant.mxfp4.bf16.4096x4096", "quantize_mxfp4", kops::DType::kBFloat16, r, c,
@@ -129,20 +157,30 @@ bool run_typed(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
       (void)kops::quant::quantize_activation(o, tin, kops::Tensor{}, 0, ctx);
     }, st);
   } else if (c.op == "quantize_per_group") {
-    const int64_t groups = c.cols / 128;
+    // The scale buffer is rows * (cols / group) fp32 words, so it has to follow the case's group.
+    const int group = group_from_id(c.id);
+    const int64_t groups = c.cols / group;
+    float* pg = nullptr;
+    if (!cuda_ok(cudaMalloc(reinterpret_cast<void**>(&pg),
+                            static_cast<size_t>(c.rows * groups) * sizeof(float)),
+                 "per-group scales")) {
+      return false;
+    }
     kops::ActQuantOut o{};
     o.q = q;
     o.q_row_stride = c.cols;
-    o.scales = scales;
+    o.scales = pg;
     o.scale_row_stride = groups;
     o.q_dtype = kops::DType::kFloat8E4M3;
     o.mode = kops::ActQuantMode::kPerGroup;
-    o.group_size = 128;
+    o.group_size = group;
+    o.math = fast_from_id(c.id) ? kops::QuantMath::kReciprocal : kops::QuantMath::kExact;
     ok = status_ok(kops::quant::quantize_activation(o, tin, kops::Tensor{}, 0, ctx),
                    c.id.c_str());
     if (ok) ok = measure(c, [&] {
       (void)kops::quant::quantize_activation(o, tin, kops::Tensor{}, 0, ctx);
     }, st);
+    cudaFree(pg);
   } else if (c.op == "quantize_mxfp8" || c.op == "quantize_mxfp4") {
     const int64_t groups = c.cols / 32;
     kops::ActQuantOut o{};

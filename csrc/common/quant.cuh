@@ -107,6 +107,21 @@ enum class ActQuantMode : uint8_t {
   kNVFP4 = 7,              // e2m1 payload + E4M3 per 16 + global fp32
 };
 
+/// Arithmetic used for the quotient x / scale of a per-group activation.
+///   kExact      one correctly rounded fp32 division (`__fdiv_rn`) per element. Default; the
+///               output bytes are a function of the data alone, so they never depend on the
+///               launch shape, vector width or alignment.
+///   kReciprocal one RN reciprocal per group plus a Markstein correction per element. Opt-in;
+///               documented to produce the same payload bytes as kExact (see quantization/quant.cu
+///               for the bound and the fallback). Power-of-two scales (UE8M0/MX/NVFP4) use an
+///               exact multiply instead, so the correction is never applied there.
+/// ABI: appended at the end of ActQuantOut, so the existing field offsets and the struct size are
+/// unchanged; the enumerator itself is a new public contract (bump KOPS_ABI_VERSION).
+enum class QuantMath : uint8_t {
+  kExact = 0,
+  kReciprocal = 1,
+};
+
 /// Output descriptor for a quantized activation written by a fused kernel.
 struct ActQuantOut {
   void* q = nullptr;                    // [rows, cols] payload (packed for fp4)
@@ -126,6 +141,10 @@ struct ActQuantOut {
   bool symmetric = true;
   // Encoding of the payload when q_dtype is an FP8 type (see common/dtype.cuh).
   Fp8Encoding fp8 = Fp8Encoding::kOCP;
+  // Only ActQuantMode::kPerGroup reads this today; every other mode rejects kReciprocal rather
+  // than silently running the exact loop. The per-tensor / per-token / MX / NVFP4 paths keep
+  // kExact arithmetic.
+  QuantMath math = QuantMath::kExact;
 };
 
 /// Physical bytes for a quantized tensor of `rows x cols` incl. scales, zero points,
