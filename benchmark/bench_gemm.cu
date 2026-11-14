@@ -187,6 +187,54 @@ void add_b13_cases(std::vector<Case>* cases) {
   }
 }
 
+// ---- B11: SM90a cell (gemm_wgmma_kernel, csrc/gemm/sm90a_impl.cuh) --------------------------------
+// Same problem and figure of merit as the B7 mma cases (op mma_bf16, TFLOP/s); the tactic names the
+// Hopper mainloop and the tile. Only a KOPS_TARGET_SM90A device has this cell; elsewhere the cases
+// are dropped before the run (see main).
+void add_b11_wgmma_cases(std::vector<Case>* cases) {
+  char id[128];
+  // The id carries the tactic: tile `.t<M>x<N>` and cluster `.c<M>x<N>` (1x2 = A tile multicast, 2x1 = B).
+  struct S { int64_t m, n, k; };
+  struct T { int tm, tn, cm, cn; };
+  const S shapes[] = {{256, 4096, 4096},  {1024, 4096, 4096}, {2048, 2048, 2048}, {4096, 4096, 4096},
+                      {8192, 8192, 8192}, {16384, 7168, 2048} /* DeepSeek-V3 shaped prefill projection */};
+  const T tactics[] = {{64, 128, 1, 1},  {64, 256, 1, 1},  {128, 128, 1, 1}, {128, 256, 1, 1}, {256, 128, 1, 1},
+                       {128, 128, 1, 2}, {128, 128, 2, 1}, {128, 256, 1, 2}, {128, 256, 2, 1}, {256, 128, 1, 2},
+                       {256, 128, 2, 1}};
+  for (const S& s : shapes) {
+    for (const T& t : tactics) {
+      if (s.m >= 8192 && t.tm == 64) continue;       // small tiles on the largest problems add nothing
+      const int64_t bytes = (s.m * s.k + s.n * s.k + s.m * s.n) * 2;
+      std::snprintf(id, sizeof(id), "gemm.wgmma.bf16.m%lld.%lldx%lld.t%dx%d.c%dx%d", static_cast<long long>(s.m),
+                    static_cast<long long>(s.n), static_cast<long long>(s.k), t.tm, t.tn, t.cm, t.cn);
+      cases->push_back({id, "mma_bf16", kops::DType::kBFloat16, s.n, s.k, bytes, 2 * s.m * s.n * s.k, 5, 50});
+    }
+  }
+}
+
+// ---- B11: SM90a FP8 (fp8_gemm_wgmma_kernel) --------------------------------------------------------
+// Same ops and operands as the B7 FP8 cases below (op fp8_mma_<kind>), on the Hopper mainloop. The id
+// names the accumulation (`fast` = Fp8Accum::kFastAccum, `promoted` = kPromoted; blockwise is always
+// promoted) and the tile. The promoted body exists for the 128-wide tiles.
+void add_b11_fp8_cases(std::vector<Case>* cases) {
+  char id[160];
+  const int64_t n = 4096, k = 4096;
+  struct T { int tm, tn; };
+  for (int64_t m : {256, 1024, 4096}) {
+    for (const char* kind : {"tensorwise.fast", "tensorwise.promoted", "rowwise.fast", "blockwise.promoted"}) {
+      const bool promoted = std::strstr(kind, "promoted") != nullptr;
+      const bool row = kind[0] == 'r', block = kind[0] == 'b';
+      const int64_t scales = row ? (m + n) * 4 : block ? ((m + (n + 127) / 128) * (k / 128)) * 4 : 0;
+      for (const T& t : {T{64, 128}, T{128, 128}, T{128, 256}, T{256, 128}}) {
+        if (promoted && t.tn > 128) continue;
+        std::snprintf(id, sizeof(id), "gemm.wgmma.fp8.%s.m%lld.4096x4096.t%dx%d", kind, static_cast<long long>(m), t.tm, t.tn);
+        cases->push_back({id, std::string("fp8_mma_") + (row ? "rowwise" : block ? "blockwise" : "tensorwise"),
+                          kops::DType::kFloat8E4M3, n, k, m * k + n * k + m * n * 2 + scales, 2 * m * n * k, 5, 50});
+      }
+    }
+  }
+}
+
 // ---- B7 row 3: e4m3 x e4m3 on mma.sync (fp8_gemm_mma_sync_kernel, SM89+) -------------------------------
 // rows = N, cols = K, M = flops / (2 N K). Tensorwise / rowwise / 128x128 blockwise scales; the scale
 // buffers are zero-filled (the product is exact in the epilogue, so the timing is the same).
@@ -325,6 +373,8 @@ std::vector<Case> make_cases() {
   add_b5_cases(&cases);
   add_b7_cases(&cases);
   add_b13_cases(&cases);
+  add_b11_wgmma_cases(&cases);
+  add_b11_fp8_cases(&cases);
   add_b7_fp8_cases(&cases);
   add_b7_lora_cases(&cases);
   add_b7_row2_cases(&cases);
@@ -600,7 +650,45 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     }
     kops::Workspace ws{};
     ws.device_scratch = scratch.p; ws.device_scratch_bytes = 64u << 20;
+    if (std::strstr(id, ".wgmma.") != nullptr) {
+      // B11 SM90a cell: tactic (tile) and accumulation mode from the case id.
+      int tm = 128, tn = 128;
+      if (const char* tt = std::strstr(id, ".t"); tt != nullptr) std::sscanf(tt + 2, "%dx%d", &tm, &tn);
+      GemmTactic t{};
+      t.tile_m = static_cast<int16_t>(tm); t.tile_n = static_cast<int16_t>(tn); t.tile_k = 128;
+      t.mainloop = tm <= 64 ? MainloopSchedule::kTmaWarpSpecialized : MainloopSchedule::kTmaWarpSpecializedCooperative;
+      t.epilogue = EpilogueSchedule::kTmaStore;
+      t.persistent = true;
+      args.fp8_accum = std::strstr(id, ".fast.") != nullptr ? Fp8Accum::kFastAccum : Fp8Accum::kPromoted;
+      if (row) {   // the cell takes the rowwise scales as operand scales (same math as the epilogue form)
+        args.epi.ops = kEpiNone;
+        args.a.scale = rs.p; args.a.granularity = kops::ScaleGranularity::kPerToken;
+        args.b.scale = cs.p; args.b.granularity = kops::ScaleGranularity::kPerChannel;
+      }
+      return go([&] { return fp8_gemm(args, &t, GemmBackend::kNative, ws, ctx); });
+    }
     return go([&] { return fp8_gemm(args, nullptr, GemmBackend::kNative, ws, ctx); });
+  }
+  // B11 SM90a cell: same op and operands as the B7 mma cases, selected by the case id.
+  if (c.op.rfind("mma_", 0) == 0 && std::strstr(id, ".wgmma.") != nullptr) {
+    Buf a(m * k * 2), w(n * k * 2), out(m * n * 2);
+    if (!a.p || !w.p || !out.p) return false;
+    ScaledGemmArgs args{};
+    args.recipe = GemmRecipe::kBF16;
+    args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kBFloat16;
+    args.b.data = w.p; args.b.ld = k; args.b.dtype = DType::kBFloat16;
+    args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.m = m; args.n = n; args.k = k;
+    int tm = 128, tn = 128, cm = 1, cn = 1;
+    if (const char* tt = std::strstr(id, ".t"); tt != nullptr) std::sscanf(tt + 2, "%dx%d.c%dx%d", &tm, &tn, &cm, &cn);
+    GemmTactic t{};
+    t.tile_m = static_cast<int16_t>(tm); t.tile_n = static_cast<int16_t>(tn); t.tile_k = 64;
+    t.cluster_m = static_cast<int8_t>(cm); t.cluster_n = static_cast<int8_t>(cn); t.tma_multicast = cm * cn > 1;
+    t.mainloop = tm <= 64 ? MainloopSchedule::kTmaWarpSpecialized : MainloopSchedule::kTmaWarpSpecializedCooperative;
+    t.epilogue = EpilogueSchedule::kTmaStore;
+    t.persistent = true;
+    kops::Workspace ws{};
+    return go([&] { return gemm_with_tactic(args, t, ws, ctx); });
   }
   // B13 tile cell: same op and operands as the B7 mma cases, selected by the case id.
   if (c.op.rfind("mma_", 0) == 0 && std::strstr(id, "mma_sm120") != nullptr) {
@@ -842,6 +930,21 @@ int main(int argc, char** argv) {
   }
   kops::LaunchContext ctx{};
   if (!status_ok(kops::make_launch_context(0, nullptr, &ctx), "make_launch_context")) return 1;
+  // Arch-cell cases only exist on their exact SM: on any other device the launcher refuses the tactic
+  // (kUnsupportedArch), which is a skip of that case, not a failure of the family.
+  cases.erase(std::remove_if(cases.begin(), cases.end(),
+                             [&](const Case& c) {
+                               const bool sm120 = c.id.find("mma_sm120") != std::string::npos;
+                               const bool sm90 = c.id.find(".wgmma.") != std::string::npos;
+                               const bool skip = (sm120 && ctx.arch_id != KOPS_TARGET_SM120A) ||
+                                                 (sm90 && ctx.arch_id != KOPS_TARGET_SM90A);
+                               if (skip) {
+                                 std::fprintf(stderr, "[bench] skip %s: needs %s, found arch %d\n", c.id.c_str(),
+                                              sm120 ? "KOPS_TARGET_SM120A" : "KOPS_TARGET_SM90A", ctx.arch_id);
+                               }
+                               return skip;
+                             }),
+              cases.end());
   std::vector<Result> results;
   results.reserve(cases.size());
   for (const Case& c : cases) {

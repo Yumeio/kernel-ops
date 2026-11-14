@@ -761,6 +761,16 @@ int main(int argc, char** argv) {
       max_bytes = std::max<size_t>(max_bytes, size_t(c.bytes) * 2);
     }
   }
+  {
+    // The host-staged collectives need two physical GPUs. A single-GPU kit (sm90a / sm100a) skips the
+    // family with the CTest skip code instead of reporting a failure; the `multi` kit runs it.
+    int ndev = 0;
+    cudaGetDeviceCount(&ndev);
+    if (ndev < g_world.size) {
+      std::fprintf(stderr, "[bench] SKIP bench_communication: needs %d GPUs, found %d\n", g_world.size, ndev);
+      return 77;
+    }
+  }
   if (!g_world.init(2 * (max_bytes + 4096) * 2)) return 1;
   std::vector<Result> results;
   for (const Case& c : cases) {

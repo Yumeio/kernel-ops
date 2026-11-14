@@ -770,6 +770,23 @@ def make_op(case: dict, device: torch.device):
         h = h / (n ** 0.5)
         return lambda: x @ h.t()
 
+    if op in ("fp8_mma_tensorwise", "fp8_mma_rowwise"):
+        # cuBLASLt anchor (what an FP8 serving path calls on SM90):
+        # torch._scaled_mm with the same operand layout as the kops case.
+        n, k = rows, cols
+        m = int(case["flops"]) // (2 * n * k)
+        e4m3 = torch.float8_e4m3fn
+        x = torch.full((m, k), 1.0, device=device, dtype=torch.bfloat16).to(e4m3)
+        w = torch.full((n, k), 1.0, device=device, dtype=torch.bfloat16).to(e4m3)
+        if op == "fp8_mma_rowwise":
+            scale_a = torch.ones(m, 1, device=device, dtype=torch.float32)
+            scale_b = torch.ones(1, n, device=device, dtype=torch.float32)
+        else:
+            scale_a = torch.tensor(1.0, device=device, dtype=torch.float32)
+            scale_b = torch.tensor(1.0, device=device, dtype=torch.float32)
+        return lambda: torch._scaled_mm(x, w.t(), scale_a=scale_a, scale_b=scale_b,
+                                        out_dtype=torch.bfloat16)
+
     b4 = make_b4_op(case, device)
     if b4 is not None:
         return b4

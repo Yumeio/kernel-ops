@@ -52,7 +52,9 @@
 //     topk_length, fused V4.1 flags) in SparseMLAParams; MLADecodeParams output gate;
 //     IndexerParams and CompressedAttentionParams V4 fields; the DeepSeek-V4 mHC revision of
 //     HCParams plus HCStreamParams. No C mirror carries these structs.
-#define KOPS_ABI_VERSION 7
+// v8: B11 SM90a arch cell. Additive host entry gemm::wgmma_gemm (TMA + wgmma dense GEMM); scaled_gemm /
+//     gemm_with_tactic route the kTmaWarpSpecialized* mainloops to it. No struct layout changed.
+#define KOPS_ABI_VERSION 8
 
 // =============================================================================
 // Backend

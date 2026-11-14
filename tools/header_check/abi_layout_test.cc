@@ -183,6 +183,7 @@ KOPS_FITS_KERNARG(kops::gemm::MmaGemmParams);
 KOPS_FITS_KERNARG(kops::gemm::MarlinParams);
 KOPS_FITS_KERNARG(kops::gemm::GemmTmaParams);
 KOPS_FITS_KERNARG(kops::gemm::GroupedGemmParams);
+KOPS_FITS_KERNARG(kops::gemm::GroupedTmaParams);
 KOPS_FITS_KERNARG(kops::moe::MoELayerParams);
 KOPS_FITS_KERNARG(kops::attn::DecodeParams);
 KOPS_FITS_KERNARG(kops::attn::MLADecodeParams);

@@ -69,7 +69,14 @@ def main() -> int:
 
     results, skipped = [], []
     with open(args.csv, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
+        # The harness prints `device: CUDA0` (and init lines) to stdout before
+        # the CSV header, so start the reader at the real header row.
+        lines = [ln for ln in f if ln.strip()]
+        header = next((i for i, ln in enumerate(lines) if ln.startswith("type,")), None)
+        if header is None:
+            print("llamacpp_csv: no CSV header found", file=sys.stderr)
+            return 2
+        reader = csv.DictReader(lines[header:])
         for row in reader:
             r = row_to_result(row, args.impl)
             if r is None:

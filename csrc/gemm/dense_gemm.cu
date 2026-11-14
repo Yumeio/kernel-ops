@@ -818,6 +818,12 @@ bool sm120_mainloop(MainloopSchedule m) {
   return m == MainloopSchedule::kSm120WarpSpecialized || m == MainloopSchedule::kSm120BlockScaledWS;
 }
 
+/// Mainloops of the SM90a cell (B11, gemm_wgmma.cu): TMA + wgmma.
+bool sm90_mainloop(MainloopSchedule m) {
+  return m == MainloopSchedule::kTmaWarpSpecialized || m == MainloopSchedule::kTmaWarpSpecializedCooperative ||
+         m == MainloopSchedule::kTmaWarpSpecializedPingpong;
+}
+
 /// Shapes instantiated in this build. tile_k is in elements (64 / element size), stages the ring depth.
 struct Sm120Tile {
   int16_t tm, tn, tk;
@@ -1336,6 +1342,8 @@ Status scaled_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBac
   // SM120a / SM121a cells (B13): only an explicit tactic whose mainloop names the SM120a pipeline selects
   // them, and only on the exact target. Everything else keeps the B7 mma.sync path below.
   if (tactic != nullptr && sm120_mainloop(tactic->mainloop)) return launch_gemm_sm120(args, *tactic, ctx);
+  // SM90a cell (B11): same rule, an explicit Hopper mainloop selects TMA + wgmma on the exact target.
+  if (tactic != nullptr && sm90_mainloop(tactic->mainloop)) return wgmma_gemm(args, *tactic, ws, ctx);
   switch (args.recipe) {
     case GemmRecipe::kBF16:
     case GemmRecipe::kFP16:
@@ -1383,6 +1391,9 @@ Status gemm_workspace_requirements(const GemmProblem& problem, const GemmTactic*
   *out = WorkspaceRequirements{};
   if (tactic != nullptr && sm120_mainloop(tactic->mainloop)) {
     return Status::kSuccess;   // the SM120a cell runs one CTA per tile: no split-K / scheduler workspace
+  }
+  if (tactic != nullptr && sm90_mainloop(tactic->mainloop)) {
+    return Status::kSuccess;   // the SM90a cell is persistent with a static tile sequence: no workspace
   }
   const bool dense = problem.recipe == GemmRecipe::kBF16 || problem.recipe == GemmRecipe::kFP16 || problem.recipe == GemmRecipe::kFP32;
   const bool mma16 = problem.recipe == GemmRecipe::kBF16 || problem.recipe == GemmRecipe::kFP16;

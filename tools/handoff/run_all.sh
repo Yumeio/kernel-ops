@@ -263,7 +263,8 @@ if [[ "$DO_BENCH" -eq 1 ]]; then
       bench_rc=${PIPESTATUS[0]}
       set -e
       BENCH_TOTAL=$((BENCH_TOTAL + 1))
-      if [[ "$bench_rc" -ne 0 ]]; then
+      # 77 is the skip code (hardware the kit's machine does not have, e.g. a second GPU).
+      if [[ "$bench_rc" -ne 0 && "$bench_rc" -ne 77 ]]; then
         BENCH_FAIL=$((BENCH_FAIL + 1))
       fi
       printf '%s\t%s\t%s\t%s\n' "$name" "$bench_rc" "$out" "$log" >> "$BENCH_TSV"
@@ -404,6 +405,7 @@ try:
                 "family": name[len("bench_") :] if name.startswith("bench_") else name,
                 "exit_code": rc,
                 "ok": rc == 0,
+                "skipped": rc == 77,
                 "json": Path(json_path).name,
                 "log": Path(log_path).name,
                 "json_valid": False,
@@ -426,7 +428,8 @@ for entry in benchmarks:
     entry["evidence_ok"] = entry["ok"] and entry["json_valid"]
 
 bench_ok = sum(1 for b in benchmarks if b["ok"] and b["json_valid"])
-bench_failed = sum(1 for b in benchmarks if not (b["ok"] and b["json_valid"]))
+bench_skipped = sum(1 for b in benchmarks if b["skipped"])
+bench_failed = sum(1 for b in benchmarks if not b["skipped"] and not (b["ok"] and b["json_valid"]))
 
 result = "PASS"
 if ctest_mode != "disabled" and ctest_rc != 0:
@@ -458,6 +461,7 @@ summary = {
     "benchmarks": {
         "total": len(benchmarks),
         "ok": bench_ok,
+        "skipped": bench_skipped,
         "failed": bench_failed,
         "items": benchmarks,
     },
@@ -492,7 +496,7 @@ else:
 if benchmarks:
     print(
         f"benchmarks:  {bench_ok}/{len(benchmarks)} ok, "
-        f"{bench_failed} failed"
+        f"{bench_skipped} skipped, {bench_failed} failed"
     )
 else:
     print("benchmarks:  none")

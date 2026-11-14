@@ -759,6 +759,12 @@ Status grouped_gemm(const GroupedGemmParams& p, const GemmTactic* tactic, GemmBa
   if (backend != GemmBackend::kNative && backend != GemmBackend::kAuto) {
     return detail::set_error(Status::kUnsupportedBackend, "grouped_gemm: only the native provider exists");
   }
+  // SM90a cell (B11, grouped_gemm_wgmma_kernel in gemm_wgmma.cu): an explicit Hopper mainloop selects it.
+  if (tactic != nullptr && (tactic->mainloop == MainloopSchedule::kTmaWarpSpecialized ||
+                            tactic->mainloop == MainloopSchedule::kTmaWarpSpecializedCooperative ||
+                            tactic->mainloop == MainloopSchedule::kTmaWarpSpecializedPingpong)) {
+    return wgmma_grouped_gemm(p, *tactic, ws, ctx);
+  }
   if (grouped_wants_mma(p, tactic)) {
     if (p.num_groups < 1 || p.n < 1 || p.k < 1) return detail::set_error(Status::kInvalidArgument, "grouped_gemm: empty problem");
     if (p.a == nullptr || p.b == nullptr) return detail::set_error(Status::kInvalidArgument, "grouped_gemm: null operand");

@@ -128,14 +128,38 @@ __global__ void grouped_gemm_task_map_kernel(
 template <typename Traits, GemmRecipe kRecipe, GroupedLayout kLayout>
 __global__ void grouped_gemm_mma_sync_kernel(const __grid_constant__ GroupedGemmParams params);
 
+/// Kernel parameter of grouped_gemm_wgmma_kernel (ABI 8). The Hopper body reads whole arrays through
+/// three tensor maps and derives every group's tiles from the device-resident row counts, so a
+/// captured graph follows the counts without a host update:
+///   A [rows, K]      rows = max_m (kContiguous: capacity of the routed row space) or G * max_m (kMasked)
+///   B [G * N, K]     experts stacked along N (b_group_stride == N * ldb): expert g's row n is g * N + n
+///   D [rows, N]
+/// `args` carries the same arrays as a ScaledGemmArgs (m = rows; b.scale_batch_stride = per-expert scale
+/// stride). A group is rows [group_rows[g], group_rows[g + 1]) (kContiguous) or the first
+/// min(masked_rows[g], max_rows) rows of [g * max_rows, (g + 1) * max_rows) (kMasked). Rows outside
+/// every group are never written.
+struct GroupedTmaParams {
+  KOPS_TMA_DESC tma_a;
+  KOPS_TMA_DESC tma_b;
+  KOPS_TMA_DESC tma_d;
+  ScaledGemmArgs args;
+  int32_t num_tiles_n, num_tiles_k;
+  int32_t num_groups;
+  int32_t max_rows;                  // kMasked: rows reserved per group
+  const int64_t* group_rows;         // kContiguous: [G + 1] (GroupedGemmParams::expert_offsets)
+  const int32_t* masked_rows;        // kMasked: [G]; null selects kContiguous
+};
+
 /**
  * grouped_gemm_wgmma_kernel — Hopper persistent grouped GEMM (TMA + WGMMA, warp-specialized).
  * Recipes: kBF16, kFP8Tensorwise (per-expert alpha), kFP8Rowwise, kFP8Blockwise / kFP8BlockwiseUE8M0
  * (DeepGEMM m-grouped contiguous & masked semantics, Fp8Accum::kPromoted), kINT8Rowwise.
  * Models : DeepSeek-V3/V3.2 & Kimi K2 FP8 experts, Qwen3-MoE FP8, GLM-4.5 FP8, Mixtral/Qwen BF16.
+ * Implemented (B11): kBF16 / kFP16 and kFP8Blockwise / kFP8BlockwiseUE8M0, layouts kContiguous and kMasked
+ * (the layout is resolved at run time from GroupedTmaParams, so kLayout = kContiguous serves both).
  */
 template <typename Traits, GemmRecipe kRecipe, GroupedLayout kLayout, Fp8Accum kAccum>
-__global__ void grouped_gemm_wgmma_kernel(const __grid_constant__ GroupedGemmParams params);
+__global__ void grouped_gemm_wgmma_kernel(const __grid_constant__ GroupedTmaParams params);
 
 /**
  * grouped_gemm_tcgen05_kernel — Blackwell datacenter grouped GEMM. Recipes: kBF16, kFP8Tensorwise,

@@ -756,6 +756,24 @@
    "status": "numerically_validated",
    "predicates": "NVFP4/MXFP4; software e2m1 decode to bf16 + per-block scale promotion; row-major and 128x4 swizzled scales; MXFP4xMXFP8/grouped pending",
    "evidence": "test_sm120"
+  },
+  {
+   "op_id": "G01.gemm_wgmma",
+   "kernel_symbol": "gemm_wgmma_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "numerically_validated",
+   "predicates": "explicit tactic kTmaWarpSpecialized (64-row tiles) / kTmaWarpSpecializedCooperative (128/256-row); bf16/fp16 K-major A,B, out = operand dtype or fp32; tiles 64x128/8, 64x256/4, 128x128/6, 128x256/3, 256x128/3 (+ cluster 1x2 / 2x1 TMA multicast on the 128/256-row tiles, 16-bit out); persistent, TMA load (16 B aligned pointer + row pitch; any K, M, N), TMA store or direct store; dense epilogue subset; batch == 1; no split-K / swap_ab / ping-pong",
+   "evidence": "test_sm90;bench_gemm (H100 SM90a 2026-11-14, reports/sm90a-h100-2026-11-14.md; dirty diagnostic)"
+  },
+  {
+   "op_id": "G03.fp8_gemm_wgmma",
+   "kernel_symbol": "fp8_gemm_wgmma_kernel",
+   "provider": "native",
+   "arch_id": 900,
+   "status": "numerically_validated",
+   "predicates": "explicit SM90a tactic; e4m3 x e4m3 K-major, out bf16/fp16/fp32; kFP8Tensorwise / kFP8Rowwise with Fp8Accum::kFastAccum (5 tiles) or kPromoted (64x128, 128x128, 256x128); kFP8Blockwise / kFP8BlockwiseUE8M0 (1x128 A scales row-major or TMA column-major, 128x128 B scales, fp32 or UE8M0 bytes) kPromoted only, K%128==0; cluster 1x1; batch == 1; measured accumulation error vs fp64 (rms of result): fast 3.1e-3 rms / 3.1e-2 max at K=18432, promoted 1.1e-4 / 4.7e-4",
+   "evidence": "test_sm90;bench_gemm (H100 SM90a 2026-11-14, reports/sm90a-h100-2026-11-14.md; dirty diagnostic)"
   }
  ]
 }

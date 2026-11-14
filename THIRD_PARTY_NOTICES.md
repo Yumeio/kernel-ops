@@ -61,6 +61,21 @@ the upstream format bit for bit.
 GGUF types that are not quantized block formats (`F32`, `F16`, `BF16`, `Q8_1`) return
 `kNotImplemented` from `gguf_dequantize` by design.
 
+## Derived implementations (B11 SM90a GEMM cell, 2026-11-14)
+
+`csrc/gemm/sm90a_impl.cuh` and `csrc/gemm/gemm_wgmma.cu` are independent CUDA / PTX bodies. The
+pipeline structure and its proven configuration were read from the sources below and re-expressed
+without CuTe / CUTLASS types; no upstream text was copied. PTX instruction spellings follow the
+PTX ISA as used by CUTLASS.
+
+| Area | Derived from | License | Commit | What was taken | kernel-ops files |
+|---|---|---|---|---|---|
+| TMA + wgmma warp-specialized pipeline (bf16 / fp16) | DeepGEMM `deep_gemm/include/deep_gemm/impls/sm90_bf16_gemm.cuh` | MIT | `5081f85` | producer / consumer roles, full / empty mbarrier protocol (arrive order, phase parity), `setmaxnreg` split (48 / 224 / 248), stage counts from the 227 KB budget, stmatrix + swizzled TMA-store epilogue, multicast arrival scheme | `gemm/sm90a_impl.cuh`, `gemm/gemm_wgmma.cu` |
+| FP8 promoted accumulation (1x128 x 128x128) | DeepGEMM `deep_gemm/include/deep_gemm/impls/sm90_fp8_gemm_1d2d.cuh` | MIT | `5081f85` | per-128-K block sum in the wgmma registers (`scale_d = 0` on the first atom), promotion with `sA * sB` on CUDA cores, `setmaxnreg` split 40 / 232 | `gemm/sm90a_impl.cuh` |
+| Persistent raster and multicast pairing | DeepGEMM `deep_gemm/include/deep_gemm/scheduler/gemm.cuh` | MIT | `5081f85` | groups of 8 / 16 tiles, odd-tail handling, peer-alive rule | `gemm/sm90a_impl.cuh` (`TileSched`) |
+| wgmma smem descriptor arithmetic | DeepGEMM `deep_gemm/include/deep_gemm/mma/sm90.cuh`; CUTLASS `cute/arch/mma_sm90_desc.hpp` | MIT; BSD-3-Clause | `5081f85`; vendored in `3rd/hpc-ops/3rd/cutlass` | bit layout of the descriptor, K-major 128B-swizzle values (SBO 1024 B, layout 1) | `gemm/sm90a_impl.cuh` |
+| PTX spellings (mbarrier, cp.async.bulk.tensor, wgmma, setmaxnreg, cluster) | CUTLASS `cutlass/arch/{barrier,reg_reconfig}.h`, `cute/arch/{copy_sm90_tma,mma_sm90_gmma,cluster_sm90}.hpp` | BSD-3-Clause | vendored in `3rd/hpc-ops/3rd/cutlass` | instruction text only | `gemm/sm90a_impl.cuh` |
+
 ## Derived implementations (B5 decode GEMV, 2026-11-01)
 
 Independent CUDA-core bodies; formats and semantics were read from the upstream source and

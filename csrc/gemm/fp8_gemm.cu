@@ -260,6 +260,12 @@ Status fp8_gemm(const ScaledGemmArgs& args, const GemmTactic* tactic, GemmBacken
       rc != GemmRecipe::kFP8BlockwiseUE8M0) {
     return detail::set_error(Status::kNotImplemented, "fp8_gemm: recipe %d has no native body yet", static_cast<int>(rc));
   }
+  // SM90a cell (B11, fp8_gemm_wgmma_kernel in gemm_wgmma.cu): an explicit Hopper mainloop selects it.
+  if (tactic != nullptr && (tactic->mainloop == MainloopSchedule::kTmaWarpSpecialized ||
+                            tactic->mainloop == MainloopSchedule::kTmaWarpSpecializedCooperative ||
+                            tactic->mainloop == MainloopSchedule::kTmaWarpSpecializedPingpong)) {
+    return wgmma_gemm(args, *tactic, ws, ctx);
+  }
   // Tensor-core path (B7): M > 16, a batch, or a tactic / cache entry naming mma.sync. e4m3 x e4m3 only; the
   // shared launcher validates the operands before it checks for SM89+.
   if (args.m > 16 || args.batch != 1 || mma_selects(args, tactic, ctx) || rc == GemmRecipe::kFP8BlockwiseUE8M0) {

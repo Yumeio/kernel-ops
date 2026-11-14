@@ -168,6 +168,7 @@ add_library(kops_cuda STATIC
   csrc/gemm/fp4_gemm.cu
   csrc/gemm/dense_gemm.cu
 csrc/gemm/gemm_mma.cu
+  csrc/gemm/gemm_wgmma.cu
   csrc/gemm/gguf_gemm.cu
   csrc/gemm/grouped_gemm.cu
   csrc/moe/fused_moe.cu
@@ -188,7 +189,8 @@ csrc/gemm/gemm_mma.cu
   csrc/state/linear_attention.cu
   csrc/state/delta_rule.cu
   csrc/state/delta_rule_chunk.cu)
-target_link_libraries(kops_cuda PUBLIC kops_host CUDA::cudart)
+# CUDA::cuda_driver: the SM90a cell encodes tensor maps on the host (cuTensorMapEncodeTiled).
+target_link_libraries(kops_cuda PUBLIC kops_host CUDA::cudart CUDA::cuda_driver)
 target_include_directories(kops_cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 foreach(kops_new_source
     csrc/attention/sparse.cu
@@ -320,7 +322,7 @@ if(KOPS_BUILD_TESTS)
       SOURCES tests/unit/test_mega.cc
       LIBS kops_cuda)
   endif()
-  foreach(kops_test_name test_mla test_sparse test_sparse_mla test_indexer test_compressed_attention test_kv_compressor test_hyper_connection test_attn_res test_mla_metadata test_mla_1m test_sm120)
+  foreach(kops_test_name test_mla test_sparse test_sparse_mla test_indexer test_compressed_attention test_kv_compressor test_hyper_connection test_attn_res test_mla_metadata test_mla_1m test_sm120 test_sm90)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/${kops_test_name}.cc")
       set_source_files_properties("tests/unit/${kops_test_name}.cc" PROPERTIES LANGUAGE CUDA)
       kops_add_test("kops_${kops_test_name}"

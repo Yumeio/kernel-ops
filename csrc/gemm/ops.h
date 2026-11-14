@@ -46,6 +46,21 @@ Status mma_workspace(const GemmProblem& problem, const GemmTactic* tactic, const
 Status launch_gemm_mma_sync(const MmaGemmParams& params, const GemmTactic* tactic, const Workspace& ws,
                             const LaunchContext& ctx);
 
+// ---- Hopper mainloop (gemm_wgmma.cu, ABI 8) ---------------------------------------------------
+/// GEMMs of the SM90a arch cell (gemm/sm90a_impl.cuh): TMA + wgmma, warp-specialized, persistent.
+/// scaled_gemm() / gemm_with_tactic() dispatch here when the tactic names kTmaWarpSpecialized
+/// (64-row tiles) or kTmaWarpSpecializedCooperative (128 / 256-row tiles); a call without such a
+/// tactic keeps the mma.sync path. Recipes: kBF16, kFP16 (tiles 64x128, 64x256, 128x128, 128x256,
+/// 256x128; batch == 1). Operands need a 16 B aligned pointer and row pitch (TMA); needs no Workspace.
+/// Any device but KOPS_TARGET_SM90A returns kUnsupportedArch after the argument checks.
+Status wgmma_gemm(const ScaledGemmArgs& args, const GemmTactic& tactic, const Workspace& ws, const LaunchContext& ctx);
+/// Grouped form of the same cell (grouped_gemm_wgmma_kernel); grouped_gemm() dispatches here for an SM90a
+/// tactic. Layouts kContiguous (max_m = rows of A / D) and kMasked; recipes kBF16, kFP16 (tiles 64x128,
+/// 128x128, 128x256) and kFP8Blockwise / kFP8BlockwiseUE8M0 (64x128, 128x128; bf16 output). Experts are
+/// stacked [G, N, K] with b_group_stride == N * ldb. Row counts are read on the device at every launch.
+Status wgmma_grouped_gemm(const GroupedGemmParams& params, const GemmTactic& tactic, const Workspace& ws,
+                          const LaunchContext& ctx);
+
 // ---- G01 dense 16/32-bit -------------------------------------------------------------
 /// Workspace is passed explicitly (not through GemmArgs) so every family has one
 /// convention: query gemm_workspace_requirements(), then pass the same lease here.
