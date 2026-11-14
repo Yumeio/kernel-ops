@@ -342,6 +342,8 @@ void test_mlp(const LaunchContext& base_ctx, const Workspace& gws) {
   p.hidden_size = H;
   p.intermediate_size = I;
 
+  std::printf("[mega/dbg] test dinter=%p dmega=%p p.intermediate=%p\\n", (void*)dinter,
+              (void*)dmega, p.intermediate);
   PlanBuf pb;
   if (!make_plan(MegaKind::kMLP, &p, base_ctx, &pb, "mega_prepare(mlp)")) return;
   std::printf("[mega/mlp] ctas=%d tasks=%d regs=%d smem=%d launches=%d\n", pb.plan.info.ctas,
@@ -357,6 +359,23 @@ void test_mlp(const LaunchContext& base_ctx, const Workspace& gws) {
   kops_test::compare(download(dmega, static_cast<size_t>(M) * H), ref, 5e-2, 5e-2, "mega_mlp ref");
   kops_test::compare(download(dmega, static_cast<size_t>(M) * H), mod_d, 3e-2, 3e-2,
                      "mega_mlp vs modular");
+  {
+    const std::vector<bf16> im = download(dinter, static_cast<size_t>(M) * I);
+    const std::vector<bf16> imr = download(dinter_mod, static_cast<size_t>(M) * I);
+    size_t bad = 0;
+    double worst = 0.0;
+    size_t first = 0;
+    for (size_t i = 0; i < im.size(); ++i) {
+      const double a = kops_test::to_float(im[i]);
+      const double b = kops_test::to_float(imr[i]);
+      if (std::fabs(a - b) > 1e-2 + 1e-2 * std::fabs(b)) {
+        ++bad;
+        if (std::fabs(a - b) > worst) { worst = std::fabs(a - b); first = i; }
+      }
+    }
+    std::printf("[mega/dbg] first inter bad=%zu first=%zu got=%.5f want=%.5f\\n", bad, first,
+                kops_test::to_float(im[first]), kops_test::to_float(imr[first]));
+  }
 
   // Same plan, tiny grids: 1 CTA and 2 CTAs (no deadlock, same result).
   for (int units = 1; units <= 2; ++units) {
@@ -369,6 +388,7 @@ void test_mlp(const LaunchContext& base_ctx, const Workspace& gws) {
     KOPS_TEST_CHECK(ps.plan.info.ctas <= units);
     KOPS_EXPECT_OK(kops::mega::mega_run_mlp(ps.plan, p, small), "mega_run_mlp small grid");
     if (!wait_stream(small.stream, "mega mlp small grid")) return;
+    cudaDeviceSynchronize();
     {
       const std::vector<bf16> im = download(dinter, static_cast<size_t>(M) * I);
       const std::vector<bf16> imr = download(dinter_mod, static_cast<size_t>(M) * I);

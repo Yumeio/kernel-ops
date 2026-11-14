@@ -210,6 +210,17 @@ void add_b11_wgmma_cases(std::vector<Case>* cases) {
       cases->push_back({id, "mma_bf16", kops::DType::kBFloat16, s.n, s.k, bytes, 2 * s.m * s.n * s.k, 5, 50});
     }
   }
+  // The same cell serves kFP16; a smaller sweep keeps the family honest without duplicating the matrix.
+  const S f16_shapes[] = {{4096, 4096, 4096}, {16384, 7168, 2048}};
+  const T f16_tactics[] = {{128, 128, 1, 1}, {128, 256, 1, 1}, {256, 128, 1, 1}, {128, 128, 1, 2}};
+  for (const S& s : f16_shapes) {
+    for (const T& t : f16_tactics) {
+      const int64_t bytes = (s.m * s.k + s.n * s.k + s.m * s.n) * 2;
+      std::snprintf(id, sizeof(id), "gemm.wgmma.fp16.m%lld.%lldx%lld.t%dx%d.c%dx%d", static_cast<long long>(s.m),
+                    static_cast<long long>(s.n), static_cast<long long>(s.k), t.tm, t.tn, t.cm, t.cn);
+      cases->push_back({id, "mma_fp16", kops::DType::kFloat16, s.n, s.k, bytes, 2 * s.m * s.n * s.k, 5, 50});
+    }
+  }
 }
 
 // ---- B11: SM90a FP8 (fp8_gemm_wgmma_kernel) --------------------------------------------------------
@@ -221,15 +232,62 @@ void add_b11_fp8_cases(std::vector<Case>* cases) {
   const int64_t n = 4096, k = 4096;
   struct T { int tm, tn; };
   for (int64_t m : {256, 1024, 4096}) {
-    for (const char* kind : {"tensorwise.fast", "tensorwise.promoted", "rowwise.fast", "blockwise.promoted"}) {
+    for (const char* kind : {"tensorwise.fast", "tensorwise.promoted", "rowwise.fast", "rowwise.promoted",
+                             "blockwise.promoted", "blockwise.ue8m0"}) {
       const bool promoted = std::strstr(kind, "promoted") != nullptr;
+      const bool ue8m0 = std::strstr(kind, "ue8m0") != nullptr;
       const bool row = kind[0] == 'r', block = kind[0] == 'b';
-      const int64_t scales = row ? (m + n) * 4 : block ? ((m + (n + 127) / 128) * (k / 128)) * 4 : 0;
+      const int64_t scales = row ? (m + n) * 4
+                                 : block ? ((m + (n + 127) / 128) * (k / 128)) * (ue8m0 ? 1 : 4)
+                                         : 0;
       for (const T& t : {T{64, 128}, T{128, 128}, T{128, 256}, T{256, 128}}) {
         if (promoted && t.tn > 128) continue;
+        if (block && (t.tm > 128 || t.tn > 128)) continue;   // the FP8 blockwise cell has 64x128 and 128x128 only
         std::snprintf(id, sizeof(id), "gemm.wgmma.fp8.%s.m%lld.4096x4096.t%dx%d", kind, static_cast<long long>(m), t.tm, t.tn);
         cases->push_back({id, std::string("fp8_mma_") + (row ? "rowwise" : block ? "blockwise" : "tensorwise"),
                           kops::DType::kFloat8E4M3, n, k, m * k + n * k + m * n * 2 + scales, 2 * m * n * k, 5, 50});
+      }
+    }
+  }
+}
+
+// ---- B11: SM90a grouped cell (grouped_gemm_wgmma_kernel) ---------------------------------------------
+// Contiguous (expert_offsets) and masked (masked_m) row maps, bf16 / fp16 / FP8 blockwise / FP8 UE8M0.
+// The routed rows are split evenly: rows(g) = R/G + (g < R % G). The id carries G, the routed row
+// count R and the tile so torch_baseline.py can rebuild the same per-expert loop.
+void add_b11_grouped_cases(std::vector<Case>* cases) {
+  char id[192];
+  struct S { int64_t g, r, n, k; const char* tag; };
+  const S shapes[] = {{8, 1024, 4096, 4096, "8x1024.4096x4096"},
+                      {32, 4096, 2048, 2048, "32x4096.2048x2048"},
+                      {128, 100, 1024, 1024, "128x100.1024x1024"}};
+  struct T { int tm, tn; };
+  struct D { const char* tag; const char* op; kops::DType dt; int64_t eb; bool block; bool ue8; };
+  // One tile per entry where the cell restricts the shape (FP8: 64x128 / 128x128; 16-bit also 128x256).
+  const D kinds[] = {
+      {"bf16", "wgmma_grouped_bf16", kops::DType::kBFloat16, 2, false, false},
+      {"fp16", "wgmma_grouped_fp16", kops::DType::kFloat16, 2, false, false},
+      {"fp8", "wgmma_grouped_fp8", kops::DType::kFloat8E4M3, 1, true, false},
+      {"fp8ue8m0", "wgmma_grouped_fp8ue8m0", kops::DType::kFloat8E4M3, 1, true, true},
+  };
+  for (const S& s : shapes) {
+    for (const char* lay : {"contig", "masked"}) {
+      const bool masked = lay[0] == 'm';
+      const int64_t per = (s.r + s.g - 1) / s.g;
+      const int64_t cap = masked ? per * s.g : s.r;
+      for (const D& d : kinds) {
+        const T tiles[] = {{64, 128}, {128, 128}, {128, 256}};
+        for (const T& t : tiles) {
+          if (d.eb == 1 && t.tn > 128) continue;            // FP8 blockwise: 64x128 / 128x128
+          if (std::strcmp(d.tag, "fp16") == 0 && !(t.tm == 128 && t.tn == 128)) continue;  // fp16: 128x128 only
+          const int64_t kb = s.k / 128, nb = (s.n + 127) / 128;
+          const int64_t scale_bytes = d.block ? (cap * kb + s.g * nb * kb) * (d.ue8 ? 1 : 4) : 0;
+          const int64_t bytes = cap * s.k * d.eb + s.g * s.n * s.k * d.eb + cap * s.n * 2 + scale_bytes;
+          std::snprintf(id, sizeof(id), "gemm.wgmma.grouped.%s.%s.g%lld.r%lld.%lldx%lld.t%dx%d", d.tag, lay,
+                        static_cast<long long>(s.g), static_cast<long long>(s.r), static_cast<long long>(s.n),
+                        static_cast<long long>(s.k), t.tm, t.tn);
+          cases->push_back({id, d.op, d.dt, s.n, s.k, bytes, 2 * s.r * s.n * s.k, 5, 50});
+        }
       }
     }
   }
@@ -375,6 +433,7 @@ std::vector<Case> make_cases() {
   add_b13_cases(&cases);
   add_b11_wgmma_cases(&cases);
   add_b11_fp8_cases(&cases);
+  add_b11_grouped_cases(&cases);
   add_b7_fp8_cases(&cases);
   add_b7_lora_cases(&cases);
   add_b7_row2_cases(&cases);
@@ -627,13 +686,16 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
   if (c.op.rfind("fp8_mma_", 0) == 0) {
     const bool row = c.op == "fp8_mma_rowwise";
     const bool block = c.op == "fp8_mma_blockwise";
+    const bool ue8 = std::strstr(id, ".ue8m0.") != nullptr;
     const int64_t kb = k / 128, nb = (n + 127) / 128;
     Buf a(m * k), w(n * k), out(m * n * 2), rs(m * 4), cs(n * 4), sa(m * kb * 4), sb(nb * kb * 4), scratch(64u << 20);
     if (!a.p || !w.p || !out.p || !rs.p || !cs.p || !sa.p || !sb.p || !scratch.p) return false;
     cudaMemset(a.p, 0x38, m * k);   // e4m3 1.0
     cudaMemset(w.p, 0x38, n * k);
     ScaledGemmArgs args{};
-    args.recipe = block ? GemmRecipe::kFP8Blockwise : (row ? GemmRecipe::kFP8Rowwise : GemmRecipe::kFP8Tensorwise);
+    args.recipe = ue8 ? GemmRecipe::kFP8BlockwiseUE8M0
+                      : block ? GemmRecipe::kFP8Blockwise
+                              : (row ? GemmRecipe::kFP8Rowwise : GemmRecipe::kFP8Tensorwise);
     args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kFloat8E4M3;
     args.b.data = w.p; args.b.ld = k; args.b.dtype = DType::kFloat8E4M3;
     args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
@@ -644,7 +706,9 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
       args.epi.col_scale = static_cast<const float*>(cs.p);
     }
     if (block) {
-      args.a.scale = sa.p; args.b.scale = sb.p; args.a.scale_dtype = DType::kFloat32; args.b.scale_dtype = DType::kFloat32;
+      args.a.scale = sa.p; args.b.scale = sb.p;
+      args.a.scale_dtype = ue8 ? DType::kFloat8E8M0 : DType::kFloat32;
+      args.b.scale_dtype = ue8 ? DType::kFloat8E8M0 : DType::kFloat32;
       args.a.granularity = kops::ScaleGranularity::kPerGroup;
       args.b.granularity = kops::ScaleGranularity::kPerBlock2D;
     }
@@ -669,15 +733,81 @@ bool run_b5_case(const Case& c, const kops::LaunchContext& ctx, Stats* st, bool*
     }
     return go([&] { return fp8_gemm(args, nullptr, GemmBackend::kNative, ws, ctx); });
   }
+  // B11 SM90a grouped cell: id `gemm.wgmma.grouped.<dt>.<contig|masked>.g<G>.r<R>.<n>x<k>.t<tm>x<tn>`.
+  if (c.op.rfind("wgmma_grouped_", 0) == 0) {
+    const bool masked = std::strstr(id, ".masked.") != nullptr;
+    const bool ue8 = c.op == "wgmma_grouped_fp8ue8m0";
+    const bool fp8 = c.op == "wgmma_grouped_fp8" || ue8;
+    const bool f16 = c.op == "wgmma_grouped_fp16";
+    int G = 8;
+    // `.g<G>` after the `.grouped.` marker (a bare strstr(id, ".g") would match ".grouped").
+    if (const char* gp = std::strstr(id, ".grouped."); gp != nullptr) {
+      if (const char* gg = std::strstr(gp + 9, ".g"); gg != nullptr) std::sscanf(gg + 2, "%d", &G);
+    }
+    int tm = 128, tn = 128;
+    if (const char* tt = std::strstr(id, ".t"); tt != nullptr) std::sscanf(tt + 2, "%dx%d", &tm, &tn);
+    const int64_t R = m;                       // routed rows = flops / (2 N K)
+    if (G < 1 || R < 1) return false;
+    const int64_t per = (R + G - 1) / G;       // masked capacity per group
+    const int64_t cap = masked ? per * G : R;
+    std::vector<int64_t> rows_g(static_cast<size_t>(G));
+    for (int g = 0; g < G; ++g) rows_g[static_cast<size_t>(g)] = R / G + (g < R % G ? 1 : 0);
+    const int64_t eb = fp8 ? 1 : 2;
+    const int64_t kb = k / 128, nb = (n + 127) / 128;
+    const int64_t sb_bytes = ue8 ? 1 : 4;
+    Buf a(cap * k * eb), b(static_cast<size_t>(G) * n * k * eb), out(cap * n * 2);
+    Buf sa(fp8 ? cap * kb * sb_bytes : 1), sb(fp8 ? static_cast<size_t>(G) * nb * kb * sb_bytes : 1);
+    Buf meta(static_cast<size_t>(G + 1) * 8);
+    if (!a.p || !b.p || !out.p || !meta.p || (fp8 && (!sa.p || !sb.p))) return false;
+    if (masked) {
+      std::vector<int32_t> mm(static_cast<size_t>(G));
+      for (int g = 0; g < G; ++g) mm[static_cast<size_t>(g)] = static_cast<int32_t>(rows_g[static_cast<size_t>(g)]);
+      cudaMemcpy(meta.p, mm.data(), mm.size() * 4, cudaMemcpyHostToDevice);
+    } else {
+      std::vector<int64_t> off(static_cast<size_t>(G + 1));
+      int64_t acc = 0;
+      for (int g = 0; g < G; ++g) { off[static_cast<size_t>(g)] = acc; acc += rows_g[static_cast<size_t>(g)]; }
+      off[static_cast<size_t>(G)] = acc;
+      cudaMemcpy(meta.p, off.data(), off.size() * 8, cudaMemcpyHostToDevice);
+    }
+    GroupedGemmParams p{};
+    p.layout = masked ? GroupedLayout::kMasked : GroupedLayout::kContiguous;
+    p.recipe = ue8 ? GemmRecipe::kFP8BlockwiseUE8M0
+                   : fp8 ? GemmRecipe::kFP8Blockwise : (f16 ? GemmRecipe::kFP16 : GemmRecipe::kBF16);
+    p.num_groups = G;
+    p.a = a.p; p.lda = k;
+    p.b = b.p; p.ldb = k; p.b_group_stride = n * k;
+    p.d = out.p; p.ldd = n;
+    p.n = static_cast<int32_t>(n); p.k = static_cast<int32_t>(k);
+    p.max_m = static_cast<int32_t>(masked ? per : cap);
+    if (masked) p.masked_m = static_cast<const int32_t*>(meta.p);
+    else p.expert_offsets = static_cast<const int64_t*>(meta.p);
+    if (fp8) {
+      p.a_scale = sa.p;
+      p.a_scale_layout = kops::ScaleLayout::kRowMajor;
+      p.b_scale = sb.p;
+      p.b_scale_group_stride = nb * kb;
+    }
+    GemmTactic t{};
+    t.tile_m = static_cast<int16_t>(tm); t.tile_n = static_cast<int16_t>(tn);
+    t.tile_k = static_cast<int16_t>(fp8 ? 128 : 64);
+    t.mainloop = tm <= 64 ? MainloopSchedule::kTmaWarpSpecialized
+                          : MainloopSchedule::kTmaWarpSpecializedCooperative;
+    t.epilogue = EpilogueSchedule::kTmaStore;
+    t.persistent = true;
+    kops::Workspace ws{};
+    return go([&] { return grouped_gemm(p, &t, GemmBackend::kNative, ws, ctx); });
+  }
   // B11 SM90a cell: same op and operands as the B7 mma cases, selected by the case id.
   if (c.op.rfind("mma_", 0) == 0 && std::strstr(id, ".wgmma.") != nullptr) {
+    const bool f16 = c.dtype == DType::kFloat16;
     Buf a(m * k * 2), w(n * k * 2), out(m * n * 2);
     if (!a.p || !w.p || !out.p) return false;
     ScaledGemmArgs args{};
-    args.recipe = GemmRecipe::kBF16;
-    args.a.data = a.p; args.a.ld = k; args.a.dtype = DType::kBFloat16;
-    args.b.data = w.p; args.b.ld = k; args.b.dtype = DType::kBFloat16;
-    args.d = out.p; args.ldd = n; args.d_dtype = DType::kBFloat16;
+    args.recipe = f16 ? GemmRecipe::kFP16 : GemmRecipe::kBF16;
+    args.a.data = a.p; args.a.ld = k; args.a.dtype = c.dtype;
+    args.b.data = w.p; args.b.ld = k; args.b.dtype = c.dtype;
+    args.d = out.p; args.ldd = n; args.d_dtype = c.dtype;
     args.m = m; args.n = n; args.k = k;
     int tm = 128, tn = 128, cm = 1, cn = 1;
     if (const char* tt = std::strstr(id, ".t"); tt != nullptr) std::sscanf(tt + 2, "%dx%d.c%dx%d", &tm, &tn, &cm, &cn);

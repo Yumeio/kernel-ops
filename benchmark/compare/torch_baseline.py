@@ -770,6 +770,62 @@ def make_op(case: dict, device: torch.device):
         h = h / (n ** 0.5)
         return lambda: x @ h.t()
 
+    if op.startswith("wgmma_grouped_"):
+        # Grouped GEMM baseline: one cuBLAS call per expert (the eager per-expert loop a
+        # Python side runs today). FP8 blockwise dequantizes the 1x128 A blocks and the
+        # 128x128 B blocks first because torch._scaled_mm has no block-scale recipe.
+        n, k = rows, cols
+        m = int(case["flops"]) // (2 * n * k)          # routed rows R
+        import re as _re
+        mm = _re.search(r"\.g(\d+)\.r(\d+)\.", case["id"])
+        g = int(mm.group(1)) if mm else 1
+        r = int(mm.group(2)) if mm else m
+        per = [r // g + (1 if i < r % g else 0) for i in range(g)]
+        offsets = [sum(per[:i]) for i in range(g + 1)]
+        fp8 = op in ("wgmma_grouped_fp8", "wgmma_grouped_fp8ue8m0")
+        ue8 = op == "wgmma_grouped_fp8ue8m0"
+        f16 = op == "wgmma_grouped_fp16"
+        dt = torch.float16 if f16 else torch.bfloat16
+        if not fp8:
+            a = torch.randn(r, k, device=device, dtype=dt)
+            b = torch.randn(g, n, k, device=device, dtype=dt)
+
+            def grouped_16():
+                out = []
+                for i in range(g):
+                    if per[i] == 0:
+                        continue
+                    out.append(F.linear(a[offsets[i]:offsets[i] + per[i]], b[i]))
+                return out
+
+            return grouped_16
+        e4m3 = torch.float8_e4m3fn
+        kb, nb = k // 128, (n + 127) // 128
+        a = (torch.randn(r, k, device=device) * 0.25).to(e4m3)
+        b = (torch.randn(g, n, k, device=device) * 0.25).to(e4m3)
+        if ue8:
+            sa = torch.randint(120, 135, (r, kb), device=device, dtype=torch.uint8)
+            sb = torch.randint(120, 135, (g, nb, kb), device=device, dtype=torch.uint8)
+
+            def scale(x):
+                return torch.exp2(x.float() - 127.0)
+        else:
+            sa = torch.rand(r, kb, device=device) + 0.5
+            sb = torch.rand(g, nb, kb, device=device) + 0.5
+            scale = lambda x: x                      # noqa: E731
+
+        def grouped_fp8():
+            ad = (a.float().view(r, kb, 128) * scale(sa)[:, :, None]).reshape(r, k).to(dt)
+            out = []
+            for i in range(g):
+                if per[i] == 0:
+                    continue
+                wd = (b[i].float().view(nb, 128, kb, 128) * scale(sb)[i][:, None, :, None]).reshape(n, k).to(dt)
+                out.append(F.linear(ad[offsets[i]:offsets[i] + per[i]], wd))
+            return out
+
+        return grouped_fp8
+
     if op in ("fp8_mma_tensorwise", "fp8_mma_rowwise"):
         # cuBLASLt anchor (what an FP8 serving path calls on SM90):
         # torch._scaled_mm with the same operand layout as the kops case.

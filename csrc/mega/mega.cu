@@ -148,9 +148,23 @@ struct Layout {
   int32_t num_tasks = 0;
   int32_t num_counters = 0;
   int32_t num_slots = 0;
+  int32_t split = 1;                          // K slices per output tile (E04/E05)
   size_t slot_bytes[4] = {0, 0, 0, 0};
   int32_t dynamic_smem = 0;
 };
+
+/// K-split for one dense projection.  The split is a plan constant (identical on
+/// host and device): every slice owns an equal, BK-aligned K range, so the
+/// partial reduction can sum slice 0..S-1 in fixed order.  Bigger batches stay
+/// at one slice because their partial buffers would defeat the point.
+__host__ __device__ inline int mega_k_split(int m, int k, int k_block, int max_split) {
+  if (m > 64 || k <= 0 || k_block <= 0 || (k % k_block) != 0) return 1;
+  if (max_split <= 1) return 1;
+  const int stages = k / k_block;
+  int s = max_split;
+  while (s > 1 && (stages % s) != 0) s >>= 1;
+  return s;
+}
 
 Status bad(const char* what, const char* detail) {
   return detail::set_error(Status::kInvalidArgument, "mega: %s: %s", what, detail);
@@ -317,15 +331,26 @@ Status layout_for(MegaKind kind, const void* params, const LaunchContext& ctx, L
       const int mt = (p->m + kMlpBM - 1) / kMlpBM;
       const int n1 = (p->intermediate_size + kMlpBN1 - 1) / kMlpBN1;
       const int n2 = (p->hidden_size + kMlpBN2 - 1) / kMlpBN2;
+      const int split = mega_k_split(p->m, p->hidden_size, kMlpBK, 4);
+      const int split_down = mega_k_split(p->m, p->intermediate_size, kMlpBK, 4);
+      // Both stages share one split so a single boxed value describes the plan.
+      L.split = split < split_down ? split : split_down;
       L.m = p->m;
       L.hidden = p->hidden_size;
       L.intermediate = p->intermediate_size;
-      L.num_tasks = mt * (n1 + n2);
-      L.num_counters = mt;
+      L.num_tasks = mt * (n1 + n2) * L.split;
+      // Per-tile arrival counters, then one row counter per 16-row tile.
+      L.num_counters = mt * (n1 + n2) + mt;
       // slot 0: intermediate; slot 1: pre-norm scratch (unused by this kind)
+      // slot 2: gate/up partials [tile][slice][2][BM][BN1]
+      // slot 3: down partials     [tile][slice][BM][BN2]
       L.slot_bytes[0] = align_up(static_cast<size_t>(p->m) * p->intermediate_size * sizeof(Bf16), 256);
       L.slot_bytes[1] = align_up(static_cast<size_t>(p->m) * p->hidden_size * sizeof(Bf16), 256);
-      L.num_slots = 2;
+      L.slot_bytes[2] = align_up(static_cast<size_t>(mt) * n1 * L.split * 2 * kMlpBM * kMlpBN1 *
+                                     sizeof(float), 256);
+      L.slot_bytes[3] = align_up(static_cast<size_t>(mt) * n2 * L.split * kMlpBM * kMlpBN2 *
+                                     sizeof(float), 256);
+      L.num_slots = 4;
       // Gate tasks stage A (BM rows) plus gate and up B tiles; down tasks stage A
       // plus one B tile.  Both bodies share the same dynamic-smem carve.
       int gate_smem = kMlpStages * (kMlpBM * kMlpBK * 2 + 2 * kMlpBN1 * kMlpBK * 2);
@@ -558,32 +583,55 @@ Status prepare_common(MegaKind kind, const void* params, const Workspace& ws,
       const int mt = (p->m + kMlpBM - 1) / kMlpBM;
       const int n1 = (p->intermediate_size + kMlpBN1 - 1) / kMlpBN1;
       const int n2 = (p->hidden_size + kMlpBN2 - 1) / kMlpBN2;
+      const int split = L.split;
+      const int gate_counter_base = 0;
+      const int down_counter_base = mt * n1;
+      const int row_counter_base = mt * (n1 + n2);
+      std::fprintf(stderr,
+                   "[mega/dbg] mlp m=%d H=%d I=%d mt=%d n1=%d n2=%d split=%d counters=%d "
+                   "cat=%p tasks=%p slot2=%p/%zu slot3=%p/%zu\\n",
+                   p->m, p->hidden_size, p->intermediate_size, mt, n1, n2, split,
+                   L.num_counters, (void*)counters, (void*)tasks, hp.slots[2],
+                   L.slot_bytes[2], hp.slots[3], L.slot_bytes[3]);
       host_tasks.reserve(static_cast<size_t>(L.num_tasks));
       for (int mi = 0; mi < mt; ++mi) {
         for (int t = 0; t < n1; ++t) {
-          exec::TileTask k{};
-          k.op_id = 0;
-          k.tile_m = mi;
-          k.tile_n = t;
-          k.wait_counter = -1;
-          k.signal_counter = mi;   // one counter per 16-row tile
-          k.out_slot = 0;
-          host_tasks.push_back(k);
+          for (int s = 0; s < split; ++s) {
+            exec::TileTask k{};
+            k.op_id = 0;
+            k.tile_m = mi;
+            k.tile_n = t;
+            k.group = s;              // K slice
+            if (split > 1) {
+              k.wait_counter = row_counter_base + mi;   // signal this on the last slice
+              k.wait_target = n1;
+              k.signal_counter = gate_counter_base + mi * n1 + t;  // arrival counter
+            } else {
+              k.wait_counter = -1;
+              k.signal_counter = row_counter_base + mi;
+            }
+            k.out_slot = 2;
+            host_tasks.push_back(k);
+          }
         }
         for (int t = 0; t < n2; ++t) {
-          exec::TileTask k{};
-          k.op_id = 1;
-          k.tile_m = mi;
-          k.tile_n = t;
-          k.wait_counter = mi;
-          k.wait_target = n1;
-          k.signal_counter = -1;
-          k.out_slot = 0;
-          host_tasks.push_back(k);
+          for (int s = 0; s < split; ++s) {
+            exec::TileTask k{};
+            k.op_id = 1;
+            k.tile_m = mi;
+            k.tile_n = t;
+            k.group = s;              // K slice
+            k.wait_counter = row_counter_base + mi;
+            k.wait_target = n1;
+            k.signal_counter =
+                split > 1 ? down_counter_base + mi * n2 + t : -1;
+            k.out_slot = 3;
+            host_tasks.push_back(k);
+          }
         }
       }
-      add_stage(StageOp::kGemm, 0, mt * n1);
-      add_stage(StageOp::kGemm, mt * n1, mt * n2);
+      add_stage(StageOp::kGemm, 0, mt * n1 * split);
+      add_stage(StageOp::kGemm, mt * n1 * split, mt * n2 * split);
       break;
     }
     case MegaKind::kAttentionBlock: {
@@ -852,6 +900,7 @@ Status prepare_common(MegaKind kind, const void* params, const Workspace& ws,
       return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(ez),
                                        "mega.prepare: counter reset: %s", cudaGetErrorString(ez));
     }
+    cudaDeviceSynchronize();
   }
 
   const char* id_text = "mega.unknown";
@@ -1095,7 +1144,7 @@ constexpr int kMegaTileThreads = 512;
 constexpr int kMegaKGroups = 4;
 
 template <int BM, int BN, int STAGES, int NB, bool A_RING, typename FillA, typename IssueB>
-__device__ __forceinline__ void bf16_ks_tile(unsigned char* smem, int nk, FillA fill_a,
+__device__ __forceinline__ void bf16_ks_tile(unsigned char* smem, int nk, int kbase0, FillA fill_a,
                                              IssueB issue_b, float (&acc)[NB][2][4]) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   using Bf = __nv_bfloat16;
@@ -1114,10 +1163,10 @@ __device__ __forceinline__ void bf16_ks_tile(unsigned char* smem, int nk, FillA 
   const int kg = warp >> 2;
   const int wg = warp & 3;
 
-  fill_a(0, 0);
+  fill_a(0, kbase0);
 #pragma unroll
   for (int s = 0; s < STAGES - 1; ++s) {
-    if (s < nk) issue_b(s, s * BK);
+    if (s < nk) issue_b(s, kbase0 + s * BK);
     mlp_cp_commit();
   }
   mlp_cp_wait<STAGES - 2>();
@@ -1142,9 +1191,9 @@ __device__ __forceinline__ void bf16_ks_tile(unsigned char* smem, int nk, FillA 
     // Refill the slot consumed in the previous iteration before touching this one;
     // the single barrier at the end of the iteration ordered every warp's reads.
     const int ns = it + STAGES - 1;
-    if (ns < nk) issue_b(ns % STAGES, ns * BK);
+    if (ns < nk) issue_b(ns % STAGES, kbase0 + ns * BK);
     mlp_cp_commit();
-    if (it + 1 < nk) fill_a((it + 1) & 1, (it + 1) * BK);
+    if (it + 1 < nk) fill_a((it + 1) & 1, kbase0 + (it + 1) * BK);
     uint32_t af[4];
     const int as = A_RING ? rs : (it & 1);
     mlp_ldmatrix_x4(af, sA + static_cast<uint32_t>(as * BM * RB) + a_lane + ak);
@@ -1197,11 +1246,83 @@ __device__ __forceinline__ float ks_sum(const float* s_red, int m, int row, int 
   return v;
 }
 
+/// Cross-slice gate/up reduction.  `partial` points at slice 0 of one [BM, BN]
+/// output tile: [slice][2][BM][BN].  Slices are summed in K order, then the
+/// GLU epilogue runs once, exactly like the single-slice body.
+template <int BM, int BN>
+__device__ __forceinline__ void mlp_gate_partial_reduce(const MegaMLPParams& p, int midx, int tidx,
+                                                       const float* partial, int split) {
+  const int I = p.intermediate_size;
+  const int r0 = midx * BM;
+  const int n0 = tidx * BN;
+  Bf16* const inter = static_cast<Bf16*>(p.intermediate);
+  if (threadIdx.x == 0 && midx == 0 && tidx == 0) {
+    printf("[mega/dbg] reduce tile0 split=%d p0=%.6f p1=%.6f\\n", split, partial[0],
+           partial[2 * BM * BN]);
+  }
+  for (int idx = threadIdx.x; idx < BM * BN; idx += blockDim.x) {
+    const int row = idx / BN;
+    const int col = idx - row * BN;
+    float g = 0.0f, u = 0.0f;
+    for (int s = 0; s < split; ++s) {
+      g += partial[s * 2 * BM * BN + idx];
+      u += partial[s * 2 * BM * BN + BM * BN + idx];
+    }
+    if (midx == 0 && tidx == 0 && idx == 158) {
+      printf("[mega/dbg] reduce158 inter=%p g=%.6f u=%.6f row=%d col=%d\\n", (void*)inter, g, u,
+             row, col);
+    }
+    if (r0 + row < p.m && n0 + col < I) {
+      dev::from_f(inter[static_cast<int64_t>(row) * I + col],
+                  glu_runtime(p.act, g, u, p.glu));
+      if (midx == 0 && tidx == 0 && idx == 158) {
+        printf("[mega/dbg] after write inter542=%.6f\\n",
+               to_f(inter[static_cast<int64_t>(row) * I + col]));
+      }
+    }
+  }
+  __threadfence();
+  __syncthreads();
+}
+
+/// Cross-slice down reduction: residual and publish epilogue once.
+template <int BM, int BN>
+__device__ __forceinline__ void mlp_down_partial_reduce(const MegaMLPParams& p, int midx, int tidx,
+                                                       const float* partial, int split,
+                                                       Bf16* publish, int64_t publish_ld) {
+  const int H = p.hidden_size;
+  const int r0 = midx * BM;
+  const int n0 = tidx * BN;
+  const int64_t stride = p.ldo != 0 ? p.ldo : H;
+  const Bf16* const residual =
+      p.residual != nullptr
+          ? static_cast<const Bf16*>(p.residual) + static_cast<int64_t>(r0) * stride + n0
+          : nullptr;
+  Bf16* const out = static_cast<Bf16*>(p.out) + static_cast<int64_t>(r0) * stride + n0;
+  for (int idx = threadIdx.x; idx < BM * BN; idx += blockDim.x) {
+    const int row = idx / BN;
+    const int col = idx - row * BN;
+    float v = 0.0f;
+    for (int s = 0; s < split; ++s) v += partial[s * BM * BN + idx];
+    if (r0 + row < p.m && n0 + col < H) {
+      if (residual != nullptr) v += to_f(residual[static_cast<int64_t>(row) * stride + col]);
+      dev::from_f(out[static_cast<int64_t>(row) * stride + col], v);
+      if (publish != nullptr && publish != static_cast<Bf16*>(p.out)) {
+        dev::from_f(publish[static_cast<int64_t>(r0 + row) * publish_ld + n0 + col], v);
+      }
+    }
+  }
+  __threadfence();
+  __syncthreads();
+}
+
 /// One gate/up tile: [BM, BN] of the GLU output.  Writes the bf16 activated values to
 /// p.intermediate; the down stage consumes them after the counter reaches n1.
 template <int BM, int BN, int STAGES>
 __device__ __forceinline__ void mlp_gate_tile(const MegaMLPParams& p, int midx, int tidx,
-                                              unsigned char* smem) {
+                                              unsigned char* smem, int kbase0 = 0,
+                                              int nk_override = -1,
+                                              float* partial = nullptr, int slice = 0) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   using Bf = __nv_bfloat16;
   constexpr int BK = 64;
@@ -1213,7 +1334,7 @@ __device__ __forceinline__ void mlp_gate_tile(const MegaMLPParams& p, int midx, 
   const int I = p.intermediate_size;
   const int r0 = midx * BM;
   const int n0 = tidx * BN;
-  const int nk = H / BK;
+  const int nk = nk_override > 0 ? nk_override : H / BK;
   const Bf* const w13 = static_cast<const Bf*>(p.w13);
   const Bf* const x = static_cast<const Bf*>(p.x);
   const Bf* const nw = static_cast<const Bf*>(p.pre_norm_weight);
@@ -1282,17 +1403,32 @@ __device__ __forceinline__ void mlp_gate_tile(const MegaMLPParams& p, int midx, 
   };
 
   float acc[2][2][4];
-  bf16_ks_tile<BM, BN, STAGES, 2, false>(smem, nk, fill_a, issue_b, acc);
+  bf16_ks_tile<BM, BN, STAGES, 2, false>(smem, nk, kbase0, fill_a, issue_b, acc);
   float* const s_red = reinterpret_cast<float*>(smem);
   ks_store_partials<BM, BN, 2>(s_red, acc, lane);
   __syncthreads();
-  for (int idx = tid; idx < BM * BN; idx += kMegaTileThreads) {
-    const int row = idx / BN;
-    const int col = idx - row * BN;
-    if (r0 + row < p.m && n0 + col < I) {
-      const float g = ks_sum(s_red, 0, row, col, BN);
-      const float u = ks_sum(s_red, 1, row, col, BN);
-      dev::from_f(inter[static_cast<int64_t>(row) * I + col], glu_runtime(p.act, g, u, p.glu));
+  if (partial != nullptr) {
+    // Split-K: publish this slice's [gate, up] partial.  The K-groups of this
+    // CTA are summed in group order; the slice reduction sums slices in order.
+    for (int idx = tid; idx < BM * BN; idx += kMegaTileThreads) {
+      const int row = idx / BN;
+      const int col = idx - row * BN;
+      partial[idx] = ks_sum(s_red, 0, row, col, BN);
+      partial[BM * BN + idx] = ks_sum(s_red, 1, row, col, BN);
+    }
+    if (threadIdx.x == 0 && midx == 0 && tidx == 0) {
+      printf("[mega/dbg] gate tile0 slice=%d p0=%.6f p1=%.6f\\n", slice, partial[0],
+             partial[BM * BN]);
+    }
+  } else {
+    for (int idx = tid; idx < BM * BN; idx += kMegaTileThreads) {
+      const int row = idx / BN;
+      const int col = idx - row * BN;
+      if (r0 + row < p.m && n0 + col < I) {
+        const float g = ks_sum(s_red, 0, row, col, BN);
+        const float u = ks_sum(s_red, 1, row, col, BN);
+        dev::from_f(inter[static_cast<int64_t>(row) * I + col], glu_runtime(p.act, g, u, p.glu));
+      }
     }
   }
   __syncthreads();
@@ -1306,7 +1442,9 @@ __device__ __forceinline__ void mlp_gate_tile(const MegaMLPParams& p, int midx, 
 template <int BM, int BN, int STAGES>
 __device__ __forceinline__ void mlp_down_tile(const MegaMLPParams& p, int midx, int tidx,
                                               unsigned char* smem, Bf16* publish = nullptr,
-                                              int64_t publish_ld = 0) {
+                                              int64_t publish_ld = 0, int kbase0 = 0,
+                                              int nk_override = -1,
+                                              float* partial = nullptr) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
   using Bf = __nv_bfloat16;
   constexpr int BK = 64;
@@ -1318,7 +1456,7 @@ __device__ __forceinline__ void mlp_down_tile(const MegaMLPParams& p, int midx, 
   const int I = p.intermediate_size;
   const int r0 = midx * BM;
   const int n0 = tidx * BN;
-  const int nk = I / BK;
+  const int nk = nk_override > 0 ? nk_override : I / BK;
   const Bf* const w2 = static_cast<const Bf*>(p.w2);
   const Bf* const src = static_cast<const Bf*>(p.intermediate);
   const int64_t stride = p.ldo != 0 ? p.ldo : H;
@@ -1358,19 +1496,27 @@ __device__ __forceinline__ void mlp_down_tile(const MegaMLPParams& p, int midx, 
   auto no_fill = [](int, int) {};
 
   float acc[1][2][4];
-  bf16_ks_tile<BM, BN, STAGES, 1, true>(smem, nk, no_fill, issue, acc);
+  bf16_ks_tile<BM, BN, STAGES, 1, true>(smem, nk, kbase0, no_fill, issue, acc);
   float* const s_red = reinterpret_cast<float*>(smem);
   ks_store_partials<BM, BN, 1>(s_red, acc, lane);
   __syncthreads();
-  for (int idx = tid; idx < BM * BN; idx += kMegaTileThreads) {
-    const int row = idx / BN;
-    const int col = idx - row * BN;
-    if (r0 + row < p.m && n0 + col < H) {
-      float v = ks_sum(s_red, 0, row, col, BN);
-      if (residual != nullptr) v += to_f(residual[static_cast<int64_t>(row) * stride + col]);
-      dev::from_f(out[static_cast<int64_t>(row) * stride + col], v);
-      if (publish != nullptr && publish != static_cast<Bf*>(p.out)) {
-        dev::from_f(publish[static_cast<int64_t>(r0 + row) * publish_ld + n0 + col], v);
+  if (partial != nullptr) {
+    for (int idx = tid; idx < BM * BN; idx += kMegaTileThreads) {
+      const int row = idx / BN;
+      const int col = idx - row * BN;
+      partial[idx] = ks_sum(s_red, 0, row, col, BN);
+    }
+  } else {
+    for (int idx = tid; idx < BM * BN; idx += kMegaTileThreads) {
+      const int row = idx / BN;
+      const int col = idx - row * BN;
+      if (r0 + row < p.m && n0 + col < H) {
+        float v = ks_sum(s_red, 0, row, col, BN);
+        if (residual != nullptr) v += to_f(residual[static_cast<int64_t>(row) * stride + col]);
+        dev::from_f(out[static_cast<int64_t>(row) * stride + col], v);
+        if (publish != nullptr && publish != static_cast<Bf*>(p.out)) {
+          dev::from_f(publish[static_cast<int64_t>(r0 + row) * publish_ld + n0 + col], v);
+        }
       }
     }
   }
@@ -1594,7 +1740,7 @@ __device__ __forceinline__ void attention_proj_tile(const MegaAttentionBlockPara
   };
 
   float acc[1][2][4];
-  bf16_ks_tile<BM, BN, STAGES, 1, false>(smem, nk, fill_a, issue_b, acc);
+  bf16_ks_tile<BM, BN, STAGES, 1, false>(smem, nk, 0, fill_a, issue_b, acc);
   float* const s_red = reinterpret_cast<float*>(smem);
   ks_store_partials<BM, BN, 1>(s_red, acc, lane);
   __syncthreads();
@@ -1674,7 +1820,7 @@ __device__ __forceinline__ void attention_oproj_tile(const MegaAttentionBlockPar
   auto no_fill = [](int, int) {};
 
   float acc[1][2][4];
-  bf16_ks_tile<BM, BN, STAGES, 1, true>(smem, nk, no_fill, issue, acc);
+  bf16_ks_tile<BM, BN, STAGES, 1, true>(smem, nk, 0, no_fill, issue, acc);
   float* const s_red = reinterpret_cast<float*>(smem);
   ks_store_partials<BM, BN, 1>(s_red, acc, lane);
   __syncthreads();
@@ -1972,6 +2118,31 @@ __device__ __forceinline__ void wait_task(const exec::TaskQueue& q, const exec::
   __syncthreads();
 }
 
+/// Temporary debug variant: a deadlocked wait traps and prints the counter state
+/// instead of hanging the whole test process.
+__device__ __forceinline__ void wait_task_dbg(const exec::TaskQueue& q, const exec::TileTask& t) {
+  if (threadIdx.x == 0) {
+    if (t.wait_counter >= 0 && q.counters != nullptr) {
+      const unsigned long long start = clock64();
+      for (;;) {
+        const uint32_t v = *reinterpret_cast<volatile uint32_t*>(q.counters + t.wait_counter);
+        if (exec::detail::epoch_of(v) == q.epoch &&
+            exec::detail::count_of(v) >= static_cast<uint32_t>(t.wait_target)) {
+          break;
+        }
+        if (clock64() - start > 4000000000ull) {
+          printf("[mega/dbg] wait timeout counter=%d target=%d value=0x%x epoch=%u task=%d\\n",
+                 t.wait_counter, t.wait_target, v, q.epoch, t.tile_m);
+          __trap();
+        }
+        __nanosleep(32);
+      }
+    }
+    __threadfence();
+  }
+  __syncthreads();
+}
+
 __device__ __forceinline__ void signal_task(const exec::TaskQueue& q, const exec::TileTask& t) {
   __syncthreads();
   if (threadIdx.x == 0) exec::task_signal(q, t);
@@ -2013,22 +2184,82 @@ __global__ void mega_mlp_kernel(const __grid_constant__ MegaMLPParams params) {
   const int lane = tid & 31;
   const int warp = tid >> 5;
   const bool mma_ok = (params.hidden_size % kMlpBK == 0) && (params.intermediate_size % kMlpBK == 0);
+  const int split_gate = mma_ok ? mega_k_split(params.m, params.hidden_size, kMlpBK, 4) : 1;
+  const int split_down = mma_ok ? mega_k_split(params.m, params.intermediate_size, kMlpBK, 4) : 1;
+  const int split = split_gate < split_down ? split_gate : split_down;
+  const int n1 = (params.intermediate_size + BN1 - 1) / BN1;
+  const int per_gate = split > 1 ? (params.hidden_size / kMlpBK) / split : 0;
+  const int per_down = split > 1 ? (params.intermediate_size / kMlpBK) / split : 0;
+  float* const gate_partials = static_cast<float*>(params.plan.slots[2]);
+  float* const down_partials = static_cast<float*>(params.plan.slots[3]);
+  __shared__ int s_win;
   const MegaPlanDevice& plan = params.plan;
+  if (threadIdx.x == 0 && blockIdx.x == 0) {
+    printf("[mega/dbg] ptrs inter=%p gate=%p down=%p out=%p\\n", params.intermediate,
+           params.plan.slots[2], params.plan.slots[3], params.out);
+  }
   for (;;) {
     const int idx = next_task(plan.queue);
     if (idx < 0) break;
     const exec::TileTask task = plan.queue.tasks[idx];
+    const int slice = task.group;
     if (task.op_id == 0) {
-      if (mma_ok) {
-        mlp_gate_tile<BM, BN1, STAGES>(params, task.tile_m, task.tile_n, smem_raw);
+      if (mma_ok && split > 1) {
+        const int64_t tile = static_cast<int64_t>(task.tile_m) * n1 + task.tile_n;
+        float* const tile_base = gate_partials + tile * split * 2 * BM * BN1;
+        float* const slice_base = tile_base + slice * 2 * BM * BN1;
+        mlp_gate_tile<BM, BN1, STAGES>(params, task.tile_m, task.tile_n, smem_raw,
+                                       slice * per_gate * kMlpBK, per_gate, slice_base);
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+          s_win = exec::last_cta_arrive(plan.queue.counters + task.signal_counter,
+                                        plan.queue.epoch, static_cast<uint32_t>(split));
+        }
+        __syncthreads();
+        if (tid == 0 && task.tile_m == 0 && task.tile_n == 0) {
+          printf("[mega/dbg] tile0 slice=%d win=%d ctr=%u\\n", slice, s_win,
+                 plan.queue.counters[task.signal_counter]);
+        }
+        if (s_win) {
+          mlp_gate_partial_reduce<BM, BN1>(params, task.tile_m, task.tile_n, tile_base, split);
+          if (tid == 0) {
+            exec::TileTask sig = task;
+            sig.signal_counter = task.wait_counter;
+            exec::task_signal(plan.queue, sig);
+          }
+        }
       } else {
-        mlp_gate_tile_simt<T, W>(params, task.tile_m, task.tile_n,
-                                 reinterpret_cast<T*>(smem_raw), tid, lane, warp);
+        if (mma_ok) {
+          mlp_gate_tile<BM, BN1, STAGES>(params, task.tile_m, task.tile_n, smem_raw);
+        } else {
+          mlp_gate_tile_simt<T, W>(params, task.tile_m, task.tile_n,
+                                   reinterpret_cast<T*>(smem_raw), tid, lane, warp);
+        }
+        signal_task(plan.queue, task);
       }
-      signal_task(plan.queue, task);
     } else {
-      wait_task(plan.queue, task);
-      if (mma_ok) {
+      wait_task_dbg(plan.queue, task);
+      if (mma_ok && split > 1) {
+        const int64_t tile = static_cast<int64_t>(task.tile_m) *
+                                 ((params.hidden_size + BN2 - 1) / BN2) +
+                             task.tile_n;
+        float* const tile_base = down_partials + tile * split * BM * BN2;
+        float* const slice_base = tile_base + slice * BM * BN2;
+        mlp_down_tile<BM, BN2, STAGES>(params, task.tile_m, task.tile_n, smem_raw, nullptr, 0,
+                                       slice * per_down * kMlpBK, per_down, slice_base);
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+          s_win = exec::last_cta_arrive(plan.queue.counters + task.signal_counter,
+                                        plan.queue.epoch, static_cast<uint32_t>(split));
+        }
+        __syncthreads();
+        if (s_win) {
+          mlp_down_partial_reduce<BM, BN2>(params, task.tile_m, task.tile_n, tile_base, split,
+                                           nullptr, 0);
+        }
+      } else if (mma_ok) {
         mlp_down_tile<BM, BN2, STAGES>(params, task.tile_m, task.tile_n, smem_raw);
       } else {
         mlp_down_tile_simt<T, W>(params, task.tile_m, task.tile_n, lane, warp);
@@ -2251,6 +2482,7 @@ Status mega_prepare(MegaKind kind, const void* params, const Workspace& ws,
 }
 
 Status mega_run_mlp(const MegaPlan& plan, const MegaMLPParams& params, const LaunchContext& ctx) {
+  std::fprintf(stderr, "[mega/dbg] run_mlp enter plan=%p\\n", (const void*)&plan);
   Status st = check_arch(ctx);
   if (st != Status::kSuccess) return st;
   st = validate_mlp(&params);
@@ -2264,6 +2496,8 @@ Status mega_run_mlp(const MegaPlan& plan, const MegaMLPParams& params, const Lau
   if (q.ldo == 0) q.ldo = q.hidden_size;
   if (q.intermediate == nullptr) q.intermediate = hp.slots[0];
   if (q.intermediate == nullptr) return bad("run_mlp", "no intermediate buffer");
+  std::fprintf(stderr, "[mega/dbg] run_mlp intermediate=%p out=%p split_cfg=%d\\n",
+               q.intermediate, q.out, mega_k_split(q.m, q.hidden_size, kMlpBK, 4));
   void* args[] = {&q};
   const void* kfn = kernel_for(MegaKind::kMLP);
   return launch_common(hp, ctx, kfn, args);

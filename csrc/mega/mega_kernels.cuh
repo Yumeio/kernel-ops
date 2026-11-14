@@ -143,4 +143,49 @@ __global__ void mega_decoder_layer_kernel(const __grid_constant__ MegaPlanDevice
                                           const __grid_constant__ MegaMLPParams mlp,
                                           const __grid_constant__ MegaMoELocalParams moe);
 
+// ---- B16.2 model-agnostic plan: one kernel per resource class -----------------
+// A plan is a MegaPlanDevice (node DAG, slots, queue, epoch counters) plus a
+// device-side params arena; a node's `params_off` indexes into `arena`. Each
+// kernel below runs one resource class of the same plan, in plan order:
+//   core  -> state -> mma -> comm
+// `mega_run_graph` launches only the classes a prepared plan needs. These
+// declarations are the B16.2 contract; bodies land one class at a time.
+struct MegaCoreParams {
+  MegaPlanDevice plan;
+  const void* arena;               // device params pool
+};
+
+struct MegaStateParams {
+  MegaPlanDevice plan;
+  const void* arena;
+};
+
+struct MegaMMAParams {
+  MegaPlanDevice plan;
+  const void* arena;
+};
+
+struct MegaCommParams {
+  MegaPlanDevice plan;
+  const void* arena;
+  int32_t num_ranks;               // 1 = virtual rank
+  int32_t reserved;
+};
+
+/// B16.2 core class: plan scheduler + norm/act/rope/route/permute/combine/mix.
+template <typename T, typename ArchTag>
+__global__ void mega_core_kernel(const __grid_constant__ MegaCoreParams params);
+
+/// B16.2 state class: conv1d, KDA/GDN/SSM, state commit/snapshot.
+template <typename T, typename ArchTag>
+__global__ void mega_state_kernel(const __grid_constant__ MegaStateParams params);
+
+/// B16.2 mma class: dense/attention/MLA/expert GEMM on the B7/B8 mainloop.
+template <typename T, typename ArchTag>
+__global__ void mega_mma_kernel(const __grid_constant__ MegaMMAParams params);
+
+/// B16.2 comm class: EP dispatch/combine and allreduce overlapped with compute.
+template <typename T, typename ArchTag>
+__global__ void mega_comm_kernel(const __grid_constant__ MegaCommParams params);
+
 }  // namespace kops::mega
