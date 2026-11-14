@@ -33,6 +33,7 @@
 #include "csrc/common/status.h"
 #include "csrc/common/dtype.cuh"
 #include "csrc/common/tensor.h"
+#include "csrc/common/occupancy.h"
 #include "csrc/common/quant.cuh"
 #include "csrc/common/op_types.cuh"
 
@@ -494,6 +495,23 @@ void run_mla_case_t(const MlaCase& c, double atol, double rtol) {
   int32_t* d_indptr = nullptr;
   // Per-request split counts: FlashMLA lets a request with a long KV own more splits.
   std::vector<int> ns_req(static_cast<size_t>(B), c.splits);
+  // splits == 0 is the auto mode of the benchmark: the host helper picks a uniform count from
+  // the context's compute units (occupancy.h). Never reads a device sequence length.
+  if (c.splits == 0) {
+    int32_t max_kv = 0;
+    for (int kv : c.kv) max_kv = std::max(max_kv, kv);
+    kops::attn::MLASplitHint hint{};
+    const Status hs = kops::attn::mla_decode_split_hint(B, ql, H, max_kv, 64, 2, ctx, &hint);
+    if (hs != Status::kSuccess) {
+      kops_test::record_failure(c.name, kops::last_error_message(), __FILE__, __LINE__);
+      return;
+    }
+    if (hint.splits < 1 || hint.splits > 64 || (hint.splits > 1 && hint.total_bytes == 0)) {
+      kops_test::record_failure(c.name, "auto split hint out of range", __FILE__, __LINE__);
+      return;
+    }
+    for (int& n : ns_req) n = hint.splits;
+  }
   if (!c.split_counts.empty()) ns_req = c.split_counts;
   int max_splits = 1;
   std::vector<int> row_splits(static_cast<size_t>(total_q), 1);
@@ -759,6 +777,11 @@ void test_dense_mla(const kops_test::Options& opt) {
       {"dense split16 bf16 h64 kv4103 q2", 1, {4103}, 64, 2, 16, false, false, false, false, 16},
       {"dense split32 bf16 h128 kv4096", 1, {4096}, 128, 1, 16, false, false, false, false, 32},
       {"dense split32 fp8 h128 kv4096", 1, {4096}, 128, 1, 16, true, false, false, false, 32},
+      {"dense auto split bf16 h128 kv8192", 1, {8192}, 128, 1, 16, false, false, false, false, 0},
+      {"dense auto split bf16 h128 kv8192 q4 sink", 1, {8192}, 128, 4, 16, false, false, true,
+       false, 0},
+      {"dense auto split fp8 h64 kv4096", 1, {4096}, 64, 1, 16, true, false, false, false, 0},
+      {"dense auto split ragged b2", 2, {1024, 4096}, 64, 2, 32, false, false, false, false, 0},
       {"dense split4 fp8 h128 kv2048 sink", 1, {2048}, 128, 4, 64, true, false, true, false, 4},
       {"dense split2 fp16 ragged b2", 2, {256, 384}, 64, 2, 32, false, true, false, false, 2},
       {"dense split ragged counts b2", 2, {256, 384}, 64, 1, 16, false, false, false, false, 1,
@@ -772,6 +795,76 @@ void test_dense_mla(const kops_test::Options& opt) {
 // =============================================================================
 // 3. Contract checks
 // =============================================================================
+
+/// mla_decode_split_hint is a pure host function: its arithmetic must be stable across calls and
+/// bounded by the requested cap and by the per-split key floor, and it must never require device
+/// data. The auto-split cases above already prove the produced partials merge to the plain result.
+void test_split_hint() {
+  kops::LaunchContext ctx{};
+  if (!kops_test::make_context(&ctx)) return;
+  const int32_t units = kops::occupancy_compute_units(ctx);
+  KOPS_TEST_CHECK(units >= 1);
+
+  kops::attn::MLASplitHint h{};
+  KOPS_EXPECT_OK(kops::attn::mla_decode_split_hint(1, 1, 128, 64 * 1024, 64, 2, ctx, &h),
+                 "split hint 64k");
+  KOPS_TEST_CHECK(h.splits >= 1 && h.splits <= 64);
+  KOPS_TEST_CHECK(h.total_q == 1);
+  KOPS_TEST_CHECK(h.splits == 1 || h.splits <= (64 * 1024) / 512);
+  if (h.splits > 1) {
+    const size_t want_o = 256u;  // aligned: 1 row * S * 128 heads * 512 floats * 4 B
+    (void)want_o;
+    KOPS_TEST_CHECK(h.o_partial_bytes ==
+                    ((static_cast<size_t>(h.splits) * 128 * 512 * 4 + 255u) & ~size_t{255u}));
+    KOPS_TEST_CHECK(h.lse_partial_bytes ==
+                    ((static_cast<size_t>(h.splits) * 128 * 4 + 255u) & ~size_t{255u}));
+    KOPS_TEST_CHECK(h.merge_indptr_bytes == 256u);
+    KOPS_TEST_CHECK(h.total_bytes ==
+                    h.o_partial_bytes + h.lse_partial_bytes + h.merge_indptr_bytes);
+  }
+
+  // A context that was never probed must still plan more than one CTA for a wide row.
+  kops::LaunchContext unprobed = ctx;
+  unprobed.compute_units = 0;
+  kops::attn::MLASplitHint fallback{};
+  KOPS_EXPECT_OK(
+      kops::attn::mla_decode_split_hint(1, 1, 128, 1 << 20, 64, 2, unprobed, &fallback),
+      "split hint unprobed");
+  KOPS_TEST_CHECK(fallback.splits > 1);
+  KOPS_TEST_CHECK(fallback.splits <= (1 << 20) / 512);
+
+  // Monotone in the visible length and inverse in the head-tile count.
+  kops::attn::MLASplitHint short_kv{};
+  KOPS_EXPECT_OK(kops::attn::mla_decode_split_hint(1, 1, 128, 256, 64, 2, ctx, &short_kv),
+                 "split hint short kv");
+  KOPS_TEST_CHECK(short_kv.splits == 1);  // below the 512-key floor
+  kops::attn::MLASplitHint q8{};
+  KOPS_EXPECT_OK(kops::attn::mla_decode_split_hint(1, 8, 128, 64 * 1024, 64, 2, ctx, &q8),
+                 "split hint q8");
+  KOPS_TEST_CHECK(q8.splits <= h.splits);
+  KOPS_TEST_CHECK(q8.total_q == 8);
+
+  // Contract: the cap, the shape and the required arguments.
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 1, 128, 4096, 1, 2, ctx, &h),
+                     Status::kSuccess, "split hint cap 1");
+  KOPS_TEST_CHECK(h.splits == 1);
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 1, 128, 4096, 64, 2, ctx, nullptr),
+                     Status::kInvalidArgument, "split hint null out");
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(-1, 1, 128, 4096, 64, 2, ctx, &h),
+                     Status::kInvalidArgument, "split hint bad batch");
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 9, 128, 4096, 64, 2, ctx, &h),
+                     Status::kInvalidArgument, "split hint bad q_len");
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 1, 0, 4096, 64, 2, ctx, &h),
+                     Status::kInvalidArgument, "split hint bad heads");
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 1, 128, -1, 64, 2, ctx, &h),
+                     Status::kInvalidArgument, "split hint bad kv_len");
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 1, 128, 4096, 0, 2, ctx, &h),
+                     Status::kInvalidArgument, "split hint bad max_splits");
+  kops::LaunchContext hip = ctx;
+  hip.backend = kops::BackendKind::kHip;
+  KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 1, 128, 4096, 64, 2, hip, &h),
+                     Status::kUnsupportedBackend, "split hint HIP rejected");
+}
 
 void test_contract() {
   kops::LaunchContext ctx{};
@@ -1124,6 +1217,7 @@ int main(int argc, char** argv) {
   }
   test_metadata();
   test_dense_mla(opt);
+  test_split_hint();
   test_contract();
   if (kops_test::tier_enabled(opt, "full")) test_long_split_consistency();
   return kops_test::finish("test_mla");

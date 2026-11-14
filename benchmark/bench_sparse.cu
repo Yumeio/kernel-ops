@@ -7,6 +7,13 @@
 // case table is the shared spec read by benchmark/compare/torch_baseline.py and
 // benchmark/compare/csa_torch.py through --dump-cases.
 //
+// Split heuristics: sparse_topk reserves one scratch slice per row
+// (sparse_topk_rows_workspace_bytes), so the r16/r4 1M cases take the multi-CTA
+// fast path too; sparse_mla and compressed_attention call their *_ws entry when
+// the natural grid (T * ceil(H/16)) is below the partition's compute units and
+// the printed "split S=..." line reports the resolved count. The two
+// ".plain" compressed-attention cases force the pre-split launch for A/B.
+//
 // bytes is the logical volume of the operation (one read of the scores plus the
 // two output rows), which is what the shared case table reports to every
 // implementation: indices int32 and values fp32 are rows * topk each, scores are
@@ -72,6 +79,10 @@ struct CAttnBench {
   bool hca;       // dense compressed range (num_compressed) instead of `selected`
   int warmup;
   int iters;
+  // 0 = auto: the split-KV ws entry when T*ceil(Hq/16) < compute_units (the shape leaves the
+  // partition idle), else the plain one-CTA-per-16-heads launch. 1 = always plain, so a case pair
+  // can A/B the split without changing any other ID.
+  int plain = 0;
 };
 
 const std::vector<IndexerBench>& indexer_benches() {
@@ -123,6 +134,11 @@ const std::vector<CAttnBench>& cattn_benches() {
        512, false, 3, 10},
       {"compressed_attention.bf16.csa.t16.h128.pool64k.topk2048.w512.sink", 16, 128, 65536, 2048,
        512, false, 3, 10},
+      // Same two shapes forced onto the plain launch (no split): the A/B pair for the t1 split.
+      {"compressed_attention.bf16.csa.t1.h128.pool4k.topk512.w512.sink.plain", 1, 128, 4096, 512,
+       512, false, 3, 20, 1},
+      {"compressed_attention.bf16.csa.t1.h128.pool4k.topk2048.w512.sink.plain", 1, 128, 4096, 2048,
+       512, false, 3, 20, 1},
       // HCA: the dense compressed range (64k tokens / m'=128 = 512 entries) + SWA + sink.
       {"compressed_attention.bf16.hca.t1.h128.dense512.w512.sink", 1, 128, 512, 512, 512, true, 3,
        20},
@@ -230,7 +246,9 @@ bool run_sparse_topk(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   int32_t* indices = nullptr;
   int32_t* ends = nullptr;
   void* ws = nullptr;
-  const size_t ws_bytes = kops::attn::sparse_topk_workspace_bytes();
+  // One scratch slice per wide row: the cooperative fast path splits every row across CTAs, so a
+  // 16-row case needs 16 slices instead of the single-row lease.
+  const size_t ws_bytes = kops::attn::sparse_topk_rows_workspace_bytes(static_cast<int32_t>(rows));
   bool ok = cuda_ok(cudaMalloc(reinterpret_cast<void**>(&scores),
                                static_cast<size_t>(rows * max_kv) * sizeof(float)),
                     "scores") &&
@@ -392,9 +410,29 @@ bool run_sparse_mla(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   p.num_heads = heads;
   p.qk_dim = 576;
   p.v_dim = 512;
-  auto call = [&]() { return kops::attn::sparse_mla_run(p, ctx); };
+  // Auto split-KV: one query row of 128 heads is only 8 CTAs, so sparse_mla_run_ws multiplies the
+  // grid by a host-chosen S (sparse_mla_split_count) and merges the fp32 partials. The plain entry
+  // remains the fallback when the shape already fills the partition (or is not a TC shape).
+  const int32_t mla_splits = kops::attn::sparse_mla_split_count(p, ctx);
+  const size_t mla_ws_bytes = kops::attn::sparse_mla_workspace_bytes(p, ctx);
+  void* mla_ws = nullptr;
+  if (mla_ws_bytes > 0) {
+    ok = cuda_ok(cudaMalloc(&mla_ws, mla_ws_bytes), "sparse_mla ws");
+    if (!ok) return false;
+  }
+  const bool mla_split = mla_ws_bytes > 0;
+  const kops::Workspace mla_lease{mla_ws, mla_ws_bytes};
+  if (ok) {
+    std::fprintf(stderr, "[bench] %s: split S=%d, %zu B scratch\n", c.id.c_str(), mla_splits,
+                 mla_ws_bytes);
+  }
+  auto call = [&]() {
+    return mla_split ? kops::attn::sparse_mla_run_ws(p, mla_lease, ctx)
+                     : kops::attn::sparse_mla_run(p, ctx);
+  };
   ok = status_ok(call(), c.id.c_str());
   if (ok) ok = measure(c, [&] { (void)call(); }, st);
+  cudaFree(mla_ws);
   cudaFree(kv);
   cudaFree(q);
   cudaFree(o);
@@ -553,9 +591,36 @@ bool run_compressed_attention(const Case& c, const kops::LaunchContext& ctx, Sta
   p.entry_dim = kDim;
   p.value_dim = kDim;
 
-  auto call = [&]() { return kops::attn::compressed_attention(p, ctx); };
+  // Auto split-KV: a t1 x Hq128 launch is 8 CTAs, so a 132-SM partition runs at 6% occupancy. The
+  // ws entry splits the visible key list (compressed + window, still one softmax) across grid.z
+  // and merges the fp32 partials. The entry point is taken only when the plain grid leaves the
+  // partition more than 4x idle (t1: 8 CTAs); t16 (128 CTAs, ~one per SM) keeps the plain launch
+  // so the existing t16 cases are measured on the body they were tuned on.
+  const int64_t ca_groups = (static_cast<int64_t>(p.num_q_heads) + 15) / 16;
+  const int32_t ca_units = ctx.compute_units > 0 ? ctx.compute_units : 32;
+  const int32_t ca_splits = kops::attn::compressed_attention_split_count(p, ctx);
+  const bool ca_split =
+      b->plain == 0 && 4 * static_cast<int64_t>(p.num_tokens) * ca_groups < ca_units &&
+      ca_splits > 1;
+  const size_t ca_ws_bytes =
+      ca_split ? kops::attn::compressed_attention_workspace_bytes(p, ctx) : 0;
+  void* ca_ws = nullptr;
+  if (ca_ws_bytes > 0) {
+    ok = cuda_ok(cudaMalloc(&ca_ws, ca_ws_bytes), "compressed_attention ws");
+    if (!ok) return false;
+  }
+  const kops::Workspace ca_lease{ca_ws, ca_ws_bytes};
+  if (ok) {
+    std::fprintf(stderr, "[bench] %s: split S=%d, %zu B scratch\n", c.id.c_str(),
+                 ca_split ? ca_splits : 1, ca_ws_bytes);
+  }
+  auto call = [&]() {
+    return ca_split ? kops::attn::compressed_attention_ws(p, ca_lease, ctx)
+                    : kops::attn::compressed_attention(p, ctx);
+  };
   ok = status_ok(call(), c.id.c_str());
   if (ok) ok = measure(c, [&] { (void)call(); }, st);
+  cudaFree(ca_ws);
 
   cudaFree(q);
   cudaFree(comp);

@@ -60,10 +60,17 @@ constexpr uint32_t kPlanFiltered = 1u;
 constexpr uint32_t kPlanToppOnly = 2u;  // p-only rows take the mass-histogram path
 
 // ---- split-row (Path B) layout -------------------------------------------------------------------
-constexpr int kMaxSplits = 16;
+/// Split cap: 32 covers two waves of a 16-SM partition with one row, and the exchange area of a
+/// 32-way split row is ~264 KiB, so a 1-4 row batch still fits a small lease. The count must be a
+/// power of two that divides kBarUnit (the barrier protocol adds kBarUnit / S per arrival).
+constexpr int kMaxSplits = 32;
+/// Budget the barrier counter works in: every arrival adds kBarUnit / S, so the counter stays a
+/// multiple of kBarUnit between launches whatever S is and never needs a reset.
+constexpr int kBarUnit = kMaxSplits;
 constexpr int kExWords = 4;                          // words each CTA contributes per exchange
 constexpr size_t kExArrayBytes = size_t{kBins} * 4;  // per-CTA array slot (u32[4096] / u64[2048])
-constexpr int kMinShard = 4096;                      // tokens per CTA below which a split stops paying
+constexpr int kMinShard = 2048;      // small-batch floor: tokens/CTA below which a split stops paying
+constexpr int kMinShardWide = 4096;  // batch > 4 keeps the previously tuned floor
 
 /// Bytes of one row's exchange area for S CTAs: two alternating sides of S x 4 words and of S
 /// array slots, then the candidate buffer and its count. A function of S only, so the offsets are
@@ -250,14 +257,15 @@ struct RowCtx {
     return reinterpret_cast<unsigned int*>(area + split_words_bytes(S) + split_arrays_bytes(S) +
                                            size_t{kCand} * 8);
   }
-  /// Barrier of the row's CTAs: every arrival adds 16 / S, so the counter stays a multiple of 16
-  /// between launches whatever S is and never needs a reset.
+  /// Barrier of the row's CTAs: every arrival adds kBarUnit / S, so the counter stays a multiple of
+  /// kBarUnit between launches whatever S is and never needs a reset (S is a power of two <= 32).
   __device__ __forceinline__ void barrier() const {
     __threadfence();
     __syncthreads();
     if (threadIdx.x == 0) {
-      const unsigned long long old = atomicAdd(bar, 16ull / static_cast<unsigned long long>(S));
-      const unsigned long long target = (old / 16ull + 1ull) * 16ull;
+      const unsigned long long unit = static_cast<unsigned long long>(kBarUnit);
+      const unsigned long long old = atomicAdd(bar, unit / static_cast<unsigned long long>(S));
+      const unsigned long long target = (old / unit + 1ull) * unit;
       while (*reinterpret_cast<volatile unsigned long long*>(bar) < target) __nanosleep(32);
       __threadfence();
     }
@@ -2029,10 +2037,23 @@ int split_capacity(const void* fn, int smem_bytes) {
   return sms * occ;
 }
 
-/// Largest power-of-two split <= 16 whose grid stays resident and keeps >= kMinShard tokens per CTA.
+/// Largest power-of-two split whose (splits, batch) grid stays co-resident - the row barriers spin
+/// on peer CTAs, so the launch must fit - and keeps >= kMinShard tokens per CTA. `capacity` is the
+/// occupancy-derived number of co-resident CTAs (split_capacity), i.e. several waves of the
+/// partition, so a single row always gets all the CTAs it can use.
+///
+/// Batch 1-4 gets the full kMaxSplits ceiling and the smaller shard floor: one row used to stop at
+/// 16 CTAs (a few percent of a 100+ SM partition). Larger batches keep the previous 16-way ceiling
+/// and the 4096-token floor exactly, because their grids were already tuned against them and a
+/// wider split only adds exchange traffic once the batch itself fills the machine.
 int choose_splits(int batch, int vocab, int capacity) {
+  if (batch <= 0 || vocab <= 0 || capacity <= 0) return 1;
+  const bool small = batch <= 4;
+  const int split_cap = small ? kMaxSplits : kMaxSplits / 2;
+  const int min_shard = small ? kMinShard : kMinShardWide;
   int s = 1;
-  while (s < kMaxSplits && static_cast<int64_t>(batch) * s * 2 <= capacity && vocab / (s * 2) >= kMinShard) {
+  while (s < split_cap && static_cast<int64_t>(batch) * s * 2 <= capacity &&
+         vocab / (s * 2) >= min_shard) {
     s *= 2;
   }
   return s;
@@ -2181,7 +2202,8 @@ Status sample_fused(const Tensor& out_ids, const Tensor& logits,
   }
   if (!valid_splits(plan.splits)) {
     return detail::set_error(Status::kPlanInvalidated,
-                             "sample_fused: splits %d is not a power of two <= 16", plan.splits);
+                             "sample_fused: splits %d is not a power of two <= %d", plan.splits,
+                             kMaxSplits);
   }
   if (plan.capture_generation != ctx.capture_generation) {
     return detail::set_error(Status::kPlanInvalidated,

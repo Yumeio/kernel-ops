@@ -404,6 +404,9 @@ Status dispatch_merge_states(const Tensor& o, const Tensor& lse, const Tensor& o
     case 256:
       return run_merge_states<Out, 256>(o, lse, o_states, lse_states, rows, num_states, heads,
                                         stream);
+    case 512:  // latent (MLA / sparse-MLA) split partials
+      return run_merge_states<Out, 512>(o, lse, o_states, lse_states, rows, num_states, heads,
+                                        stream);
     default:
       return detail::set_error(Status::kUnsupportedShape, "merge_states: head_dim %d", head_dim);
   }

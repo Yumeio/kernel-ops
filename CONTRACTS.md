@@ -80,6 +80,20 @@ remain the ABI and shape authority.
   agree within the FP8 output tolerance.
 - A query row with no valid key writes `o = 0`; LSE is `-inf` without a sink and
   the sink logit with a sink.
+- **Split-KV entries** (`sparse_mla_run_ws`, `compressed_attention_ws`): the
+  visible key list of a row (compressed branch, SWA branch, primary + extra
+  scope) is cut into S contiguous ranges, one CTA group per range; each writes a
+  normalized fp32 `(o, lse)` partial and `merge_states` folds them. The sink is
+  folded into split 0 only, so it is counted exactly once and the merged row
+  matches the unsplit body within the accumulation tolerance (the key-reduction
+  order changes, so it is not bitwise). S is a pure host function of the shape
+  and `LaunchContext` (`*_split_count` / `*_workspace_bytes`), capped at 64 and
+  at one split per 256 visible keys; `S == 1`, a non-tensor-core shape or a
+  padded `o` runs the plain body (a lease below `*_workspace_bytes` is
+  `kWorkspaceTooSmall`). `sparse_topk_ws` takes the same idea for
+  exact selection: wide rows (`max_kv >= 256 Ki`) run one cooperative grid of
+  `rows * splits` CTAs with one scratch slice per row, and the selected set and
+  tie rule are identical to the workspace-free per-row body.
 
 ## 1b3. DeepSeek-V4 mHC and Kimi-K3 AttnRes (B15)
 
@@ -161,10 +175,12 @@ remain the ABI and shape authority.
   `capture_generation`; a workspace serves one in-flight call (concurrent streams need their own).
   Filters that a plan cannot run yet return `kNotImplemented` from `sampling_plan()`. The plan and
   `FusedSamplingParams` are C++ only (no C mirror).
-- **Split rows (`SamplingPlan::splits > 1`)**: `sampling_plan()` splits a row over up to 16 CTAs
-  (a power of two) when the batch leaves the GPU idle, the rows are 16-byte vectorizable and every
-  CTA keeps >= 4096 tokens. The grid (splits, batch) is launched cooperatively, so all CTAs are
-  resident or the launch fails; the CTAs of a row combine integer sums, maxima and histograms in
+- **Split rows (`SamplingPlan::splits > 1`)**: `sampling_plan()` splits a row over up to 32 CTAs
+  (a power of two) for batch 1-4 - the case where one row is a few percent of the partition - and
+  over up to 16 for larger batches, when the batch leaves the GPU idle (the grid fills the
+  co-resident capacity, several waves), the rows are 16-byte vectorizable and every CTA keeps
+  >= 2048 tokens (small batches) / >= 4096 (larger batches). The grid (splits, batch) is
+  launched cooperatively, so all CTAs are resident or the launch fails; the CTAs of a row combine integer sums, maxima and histograms in
   CTA order, so the tokens are bit-identical to `splits == 1` for every filter. Callers may lower
   `splits` (1 forces one CTA per row) but not raise it past what fits; non-vectorizable rows with
   `splits > 1` are `kPlanInvalidated`. The workspace holds a per-row exchange area
@@ -283,7 +299,9 @@ remain the ABI and shape authority.
 - **Split-KV** (`plan.split_kv`): partial rows `merge_indptr[row] + chunk` hold normalized fp32
   `o` and `lse`; `merge_split_kv` combines them in chunk order. Prefill splits when the q tiles fill
   less than one wave (towards two CTAs per SM), decode when the grid is below 4 (CUDA core) or 2
-  (tensor core) CTAs per SM. `merge_split_kv` accepts head dims 64, 80, 96, 128, 192, 256.
+  (tensor core) CTAs per SM. `merge_split_kv` accepts head dims 64, 80, 96, 128, 192, 256, 512 and
+  `merge_states` (the N-state form used by the sparse-MLA / compressed-attention splits) accepts
+  64, 128, 256, 512.
 - **Determinism / batch invariance.** Every sum has a fixed order (per thread in key order, then
   quad lanes, token groups or warps, then splits in index order); no atomics touch values, so
   repeated runs are bit-identical. With `ctx.batch_invariant` the kv chunk is fixed (prefill

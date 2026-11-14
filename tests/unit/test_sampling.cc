@@ -2371,7 +2371,7 @@ void test_fused_split() {
     stale.capture_generation = ctx.capture_generation + 1;
     KOPS_EXPECT_STATUS(kops::sample::sample_fused(ti, t, cp, plan, kops::Workspace{}, stale),
                        kops::Status::kPlanInvalidated, "stale capture generation");
-    plan.splits = 32;
+    plan.splits = 64;
     KOPS_EXPECT_STATUS(kops::sample::sample_fused(ti, t, cp, plan, kops::Workspace{}, ctx),
                        kops::Status::kPlanInvalidated, "split count above the barrier protocol");
     kops_test::device_free(d);
@@ -2410,7 +2410,7 @@ void test_fused_split_batches() {
       fp.sampling.default_top_k = md.k;
       fp.sampling.default_top_p = md.tp;
       const int32_t plan_splits = fused_auto_splits(h, rows, vocab, fp, ctx);
-      KOPS_TEST_CHECK(plan_splits >= 1 && plan_splits <= 16 &&
+      KOPS_TEST_CHECK(plan_splits >= 1 && plan_splits <= 32 &&
                       (plan_splits & (plan_splits - 1)) == 0);
       if (md.k == 0 && md.tp >= 1.0f) {
         // A greedy or unfiltered plan only depends on the row shape; assert the split policy at
@@ -2437,8 +2437,9 @@ void test_fused_split_batches() {
 }
 
 /// One persistent barrier buffer serves S = 8, 2, 16, 4, 2 without being zeroed again: the
-/// counter accumulates 16/S per arrival, so every barrier target stays reachable across split
-/// counts. Each call must still draw Path A's tokens.
+/// counter accumulates kBarUnit/S per arrival, so every barrier target stays reachable across
+/// split counts. Each call must still draw Path A's tokens. Also checks that the raised split cap
+/// reaches more than 16 CTAs for a one-row batch on a machine that can hold them.
 void test_fused_split_reuse() {
   kops::LaunchContext ctx{};
   if (!kops_test::make_context(&ctx)) return;
@@ -2450,6 +2451,20 @@ void test_fused_split_reuse() {
   std::normal_distribution<float> nd(0.0f, 2.0f);
   for (float& x : f) x = nd(gen);
   const auto h = cast_from_float<__nv_bfloat16>(f);
+  {
+    // The split cap must exceed the old 16-way ceiling for the shape that needs it most: one row
+    // whose tokens cannot fill a 100+ SM partition any other way. 32 Ki tokens stop at 16 shards
+    // (2048 tokens each); the benchmark vocabulary reaches the 32-way cap.
+    auto fp1 = fused_params(1.0f, 1u);
+    std::vector<__nv_bfloat16> one(h.begin(), h.begin() + vocab);
+    const int32_t s1 = fused_auto_splits(one, 1, vocab, fp1, ctx);
+    KOPS_TEST_CHECK(s1 >= 1 && s1 <= 32 && (s1 & (s1 - 1)) == 0);
+    if (sms >= 32) KOPS_TEST_CHECK(s1 >= 16);
+    std::vector<__nv_bfloat16> wide(h.begin(), h.begin() + 151936);
+    const int32_t s2 = fused_auto_splits(wide, 1, 151936, fp1, ctx);
+    KOPS_TEST_CHECK(s2 >= 1 && s2 <= 32 && (s2 & (s2 - 1)) == 0);
+    if (sms >= 32) KOPS_TEST_CHECK(s2 > 16);
+  }
   auto* d = kops_test::device_alloc<__nv_bfloat16>(h.size());
   auto* d_ids = kops_test::device_alloc<int32_t>(static_cast<size_t>(rows));
   kops_test::copy_in(d, h);

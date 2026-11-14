@@ -99,10 +99,12 @@ bool fused_supports(const std::string& mode) {
 }
 
 /// Split-row sweep: the same case at a forced split count; an invalid count is refused by the API.
+/// Batch 1 is the shape the raised cap exists for (its auto plan now resolves above the old 16-way
+/// ceiling), so the sweep carries it with the same 1..32 range.
 void add_split_cases(std::vector<Case>* cases) {
-  for (int64_t b : {32, 64}) {
+  for (int64_t b : {1, 32, 64}) {
     for (const char* mode : {"k50", "p0.95"}) {
-      for (int s : {1, 2, 4, 8}) {
+      for (int s : {1, 2, 4, 8, 16, 32}) {
         char id[160];
         std::snprintf(id, sizeof(id), "sampling.fused.%s.bf16.v151936.b%lld.s%d", mode,
                       static_cast<long long>(b), s);

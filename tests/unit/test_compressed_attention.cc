@@ -43,6 +43,7 @@ struct Cfg {
   int dim;         // entry_dim; != 512 takes the scalar fallback
   int vdim;        // value_dim <= dim (shared-KV output slice)
   int sel_len;     // selected_topk_length (0 = topk)
+  int ws = 0;      // 1: run compressed_attention_ws (split + merge); 0: the plain entry
 };
 
 /// Deterministic uniform value in [-1, 1) from a counter (no host RNG cost on
@@ -195,9 +196,46 @@ void run_case(const Cfg& c) {
 
   kops::LaunchContext ctx{};
   if (!kops_test::make_context(&ctx)) return;
-  const auto st = kops::attn::compressed_attention(p, ctx);
-  KOPS_TEST_CHECK(st == kops::Status::kSuccess);
-  if (st != kops::Status::kSuccess) return;
+  // Split-KV entry: the same shapes through compressed_attention_ws must produce the same rows.
+  // The split count is a pure function of the shape and the context, so a shape that already fills
+  // the partition would silently be the plain launch here - require a real split instead.
+  const int32_t splits = kops::attn::compressed_attention_split_count(p, ctx);
+  const size_t ws_bytes =
+      c.ws ? kops::attn::compressed_attention_workspace_bytes(p, ctx) : 0;
+  void* d_ws = nullptr;
+  if (c.ws) {
+    KOPS_TEST_CHECK(splits > 1);
+    KOPS_TEST_CHECK(ws_bytes > 0);
+    d_ws = kops_test::device_alloc<uint8_t>(ws_bytes);
+    if (d_ws == nullptr) return;
+    // A lease one alignment step short must be refused, not silently accepted.
+    kops::Workspace small{d_ws, ws_bytes >= 512 ? ws_bytes - 256 : 0};
+    KOPS_EXPECT_STATUS(kops::attn::compressed_attention_ws(p, small, ctx),
+                       kops::Status::kWorkspaceTooSmall, "compressed_attention_ws short lease");
+  }
+  const kops::Workspace lease{d_ws, ws_bytes};
+  const auto st = c.ws ? kops::attn::compressed_attention_ws(p, lease, ctx)
+                       : kops::attn::compressed_attention(p, ctx);
+  if (st != kops::Status::kSuccess) {
+    kops_test::record_failure(c.ws ? "compressed_attention_ws" : "compressed_attention",
+                              kops::last_error_message(), __FILE__, __LINE__);
+    return;
+  }
+  if (c.ws) {
+    // Same launch twice must be bit-identical: every split writes its own partial and the merge
+    // order is fixed, so the auto split adds no run-to-run variation.
+    const auto o1 = kops_test::copy_out(d_o, static_cast<size_t>(T) * H * vdim);
+    const auto l1 = kops_test::copy_out(d_lse, static_cast<size_t>(T) * H);
+    const auto st2 = kops::attn::compressed_attention_ws(p, lease, ctx);
+    KOPS_TEST_CHECK(st2 == kops::Status::kSuccess);
+    if (st2 != kops::Status::kSuccess) return;
+    const auto o2 = kops_test::copy_out(d_o, static_cast<size_t>(T) * H * vdim);
+    const auto l2 = kops_test::copy_out(d_lse, static_cast<size_t>(T) * H);
+    bool same = o1.size() == o2.size() && l1.size() == l2.size();
+    for (size_t i = 0; same && i < o1.size(); ++i) same = std::memcmp(&o1[i], &o2[i], sizeof(o1[i])) == 0;
+    for (size_t i = 0; same && i < l1.size(); ++i) same = std::memcmp(&l1[i], &l2[i], sizeof(l1[i])) == 0;
+    KOPS_TEST_CHECK(same);
+  }
 
   // Reference: gather this row's visible keys (compressed branch first, then the
   // SWA tail) and clear the custom-mask bits of `-1` holes / the masked row.
@@ -288,6 +326,7 @@ void run_case(const Cfg& c) {
   kops_test::device_free(d_o);
   kops_test::device_free(d_lse);
   kops_test::device_free(d_sink);
+  kops_test::device_free(d_ws);
 }
 
 }  // namespace
@@ -316,5 +355,12 @@ int main() {
   run_case({"csa.t2.h16.value256.topk64.w32.sink", 2, 16, 1024, 64, 32, true, false, -1, 512, 256, 0});
   // selected_topk_length truncates the CSA branch mid-row; the rest stays masked.
   run_case({"csa.t1.h16.pool4k.topk2048.sellen512.w96.sink", 1, 16, 4096, 2048, 96, true, false, -1, 512, 512, 512});
+  // Split-KV entry (compressed_attention_ws), same oracle: one t1 row leaves 1 CTA on a
+  // 100+ SM partition, so the visible key list is split and merged; t2 x 32 heads and the
+  // truncated branch cover 2 head tiles and a split boundary inside the SWA window.
+  run_case({"ws.csa.t1.h16.pool4k.topk2048.w96.sink", 1, 16, 4096, 2048, 96, true, false, -1, 512, 512, 0, 1});
+  run_case({"ws.csa.t2.h32.pool4k.topk2048.w96.sink", 2, 32, 4096, 2048, 96, true, false, -1, 512, 512, 0, 1});
+  run_case({"ws.csa.t1.h16.pool4k.topk2048.sellen512.w96.sink", 1, 16, 4096, 2048, 96, true, false, -1, 512, 512, 512, 1});
+  run_case({"ws.hca.t1.h16.dense512.w96.sink", 1, 16, 512, 512, 96, true, true, -1, 512, 512, 0, 1});
   return kops_test::finish("compressed_attention");
 }

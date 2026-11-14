@@ -93,9 +93,9 @@ kops::kv::PagedKVDesc desc_of(const ScopeData& s, void* kv, int32_t* table, int 
   return d;
 }
 
-void compare_case(int T, int H, bool two_scopes, bool sink) {
+void compare_case(int T, int H, bool two_scopes, bool sink, int topk = 16, bool use_ws = false) {
   constexpr int kHeads = 4;
-  constexpr int kTopk = 16;
+  const int kTopk = topk;
   constexpr int kPage = 16;
   constexpr int kPagesPerRow = 4;
   H = kHeads;
@@ -166,9 +166,44 @@ void compare_case(int T, int H, bool two_scopes, bool sink) {
 
   kops::LaunchContext ctx{};
   if (!kops_test::make_context(&ctx)) return;
-  const auto st = kops::attn::sparse_mla_run(p, ctx);
-  KOPS_TEST_CHECK(st == kops::Status::kSuccess);
-  if (st != kops::Status::kSuccess) return;
+  // Split-KV entry: sparse_mla_run_ws must reproduce the plain rows exactly enough for the same
+  // fp64 oracle. The split count is a pure host function, so a shape that already fills the
+  // partition would silently stay on the plain body - require a real split when asked for the ws.
+  const int32_t splits = kops::attn::sparse_mla_split_count(p, ctx);
+  const size_t ws_bytes = use_ws ? kops::attn::sparse_mla_workspace_bytes(p, ctx) : 0;
+  float* d_ws = nullptr;
+  if (use_ws) {
+    KOPS_TEST_CHECK(splits > 1);
+    KOPS_TEST_CHECK(ws_bytes > 0);
+    d_ws = kops_test::device_alloc<float>(ws_bytes / sizeof(float));
+    if (d_ws == nullptr) return;
+    kops::Workspace small{d_ws, ws_bytes >= 512 ? ws_bytes - 256 : 0};
+    KOPS_EXPECT_STATUS(kops::attn::sparse_mla_run_ws(p, small, ctx),
+                       kops::Status::kWorkspaceTooSmall, "sparse_mla_run_ws short lease");
+  }
+  const kops::Workspace lease{d_ws, ws_bytes};
+  const auto st = use_ws ? kops::attn::sparse_mla_run_ws(p, lease, ctx)
+                         : kops::attn::sparse_mla_run(p, ctx);
+  if (st != kops::Status::kSuccess) {
+    kops_test::record_failure(use_ws ? "sparse_mla_run_ws" : "sparse_mla_run",
+                              kops::last_error_message(), __FILE__, __LINE__);
+    return;
+  }
+  if (use_ws) {
+    // Determinism: the split body writes one partial per CTA and merge_states has a fixed order,
+    // so a second call must reproduce every byte of o and lse.
+    const auto o1 = kops_test::copy_out(d_o, on);
+    const auto l1 = kops_test::copy_out(d_lse, static_cast<int64_t>(T) * H);
+    const auto st2 = kops::attn::sparse_mla_run_ws(p, lease, ctx);
+    KOPS_TEST_CHECK(st2 == kops::Status::kSuccess);
+    if (st2 != kops::Status::kSuccess) return;
+    const auto o2 = kops_test::copy_out(d_o, on);
+    const auto l2 = kops_test::copy_out(d_lse, static_cast<int64_t>(T) * H);
+    bool same = o1.size() == o2.size() && l1.size() == l2.size();
+    for (size_t i = 0; same && i < o1.size(); ++i) same = std::memcmp(&o1[i], &o2[i], sizeof(o1[i])) == 0;
+    for (size_t i = 0; same && i < l1.size(); ++i) same = std::memcmp(&l1[i], &l2[i], sizeof(l1[i])) == 0;
+    KOPS_TEST_CHECK(same);
+  }
 
   // Reference: one request per query row, each with its own concatenated key set.
   std::vector<double> qd(qn), kd, vd, od(static_cast<size_t>(on)), ld(static_cast<size_t>(T) * H);
@@ -243,6 +278,7 @@ void compare_case(int T, int H, bool two_scopes, bool sink) {
   kops_test::device_free(d_o);
   kops_test::device_free(d_lse);
   kops_test::device_free(d_sink);
+  kops_test::device_free(d_ws);
 }
 
 }  // namespace
@@ -251,5 +287,12 @@ int main() {
   compare_case(1, 4, false, false);
   compare_case(2, 4, false, true);
   compare_case(2, 4, true, true);
+  // Split-KV entry (sparse_mla_run_ws): a 2048-key row with one or two scopes leaves 1-2 CTAs on
+  // a 100+ SM partition, so the visible list is split across grid.z. Covers the sink in split 0
+  // only, topk_length truncation (row 1 of a 2-row case) and a split boundary inside the extra
+  // scope.
+  compare_case(1, 4, false, false, 2048, true);
+  compare_case(1, 4, false, true, 2048, true);
+  compare_case(2, 4, true, true, 2048, true);
   return kops_test::finish("sparse_mla");
 }

@@ -2,7 +2,14 @@
 // kernel-ops | benchmark/bench_mla.cu                                Catalog: A12
 // Dense absorbed MLA decode (T1) and the FlashMLA split scheduler metadata.
 //   mla_decode   B=1, H=128, q_len 1/4, latent cache 64k / 256k / 1M tokens,
-//                native bf16 and kMLAFp8DS 656 B, split-KV S=1/8/16/32.
+//                native bf16 and kMLAFp8DS 656 B.
+//                splits = 0 is AUTO: the case calls mla_decode_split_hint (two waves of
+//                ctx.compute_units, >= 512 keys per split) and allocates exactly the partials
+//                it reports, so the case ID is independent of the device it runs on.
+//                splits > 0 forces that count: s8 / s16 / s32 / s64 (s64 only for 64k, the
+//                deep end of the sweep) keep the pre-auto variants for A/B comparison.
+//                Every split case measures the whole op: the split launch plus merge_split_kv
+//                (the fp32 partial merge, and the sink when the case has one).
 //                bytes = latent records read + q/o traffic (the decode roofline);
 //                flops = the nominal 2*(512+576) MACs per (head, visible key),
 //                i.e. the useful math, not the 4x QK redundancy of this variant.
@@ -37,24 +44,24 @@ constexpr int64_t kRow = kNope + kPe;
 
 struct MlaBench {
   const char* id;
-  int batch, heads, kv, q, page, splits;
+  int batch, heads, kv, q, page, splits;  // splits 0 = auto (mla_decode_split_hint)
   bool fp8;
 };
 
 const std::vector<MlaBench>& mla_benches() {
   static const std::vector<MlaBench> b = {
-      {"mla_decode.bf16.kv64k.q1", 1, 128, 1 << 16, 1, 16, 1, false},
-      {"mla_decode.bf16.kv64k.q4", 1, 128, 1 << 16, 4, 16, 1, false},
-      {"mla_decode.fp8.kv64k.q1", 1, 128, 1 << 16, 1, 16, 1, true},
-      {"mla_decode.fp8.kv64k.q4", 1, 128, 1 << 16, 4, 16, 1, true},
-      {"mla_decode.bf16.kv256k.q1", 1, 128, 1 << 18, 1, 16, 1, false},
-      {"mla_decode.bf16.kv256k.q4", 1, 128, 1 << 18, 4, 16, 1, false},
-      {"mla_decode.fp8.kv256k.q1", 1, 128, 1 << 18, 1, 16, 1, true},
-      {"mla_decode.fp8.kv256k.q4", 1, 128, 1 << 18, 4, 16, 1, true},
-      {"mla_decode.bf16.kv1m.q1", 1, 128, 1 << 20, 1, 16, 1, false},
-      {"mla_decode.bf16.kv1m.q4", 1, 128, 1 << 20, 4, 16, 1, false},
-      {"mla_decode.fp8.kv1m.q1", 1, 128, 1 << 20, 1, 16, 1, true},
-      {"mla_decode.fp8.kv1m.q4", 1, 128, 1 << 20, 4, 16, 1, true},
+      {"mla_decode.bf16.kv64k.q1", 1, 128, 1 << 16, 1, 16, 0, false},
+      {"mla_decode.bf16.kv64k.q4", 1, 128, 1 << 16, 4, 16, 0, false},
+      {"mla_decode.fp8.kv64k.q1", 1, 128, 1 << 16, 1, 16, 0, true},
+      {"mla_decode.fp8.kv64k.q4", 1, 128, 1 << 16, 4, 16, 0, true},
+      {"mla_decode.bf16.kv256k.q1", 1, 128, 1 << 18, 1, 16, 0, false},
+      {"mla_decode.bf16.kv256k.q4", 1, 128, 1 << 18, 4, 16, 0, false},
+      {"mla_decode.fp8.kv256k.q1", 1, 128, 1 << 18, 1, 16, 0, true},
+      {"mla_decode.fp8.kv256k.q4", 1, 128, 1 << 18, 4, 16, 0, true},
+      {"mla_decode.bf16.kv1m.q1", 1, 128, 1 << 20, 1, 16, 0, false},
+      {"mla_decode.bf16.kv1m.q4", 1, 128, 1 << 20, 4, 16, 0, false},
+      {"mla_decode.fp8.kv1m.q1", 1, 128, 1 << 20, 1, 16, 0, true},
+      {"mla_decode.fp8.kv1m.q4", 1, 128, 1 << 20, 4, 16, 0, true},
       {"mla_decode.bf16.kv64k.q1.s8", 1, 128, 1 << 16, 1, 16, 8, false},
       {"mla_decode.bf16.kv256k.q1.s8", 1, 128, 1 << 18, 1, 16, 8, false},
       {"mla_decode.bf16.kv1m.q1.s8", 1, 128, 1 << 20, 1, 16, 8, false},
@@ -67,12 +74,14 @@ const std::vector<MlaBench>& mla_benches() {
       // one 16-head tile per SM and shorten the per-CTA key range.
       {"mla_decode.bf16.kv64k.q1.s16", 1, 128, 1 << 16, 1, 16, 16, false},
       {"mla_decode.bf16.kv64k.q1.s32", 1, 128, 1 << 16, 1, 16, 32, false},
+      {"mla_decode.bf16.kv64k.q1.s64", 1, 128, 1 << 16, 1, 16, 64, false},
       {"mla_decode.bf16.kv256k.q1.s16", 1, 128, 1 << 18, 1, 16, 16, false},
       {"mla_decode.bf16.kv256k.q1.s32", 1, 128, 1 << 18, 1, 16, 32, false},
       {"mla_decode.bf16.kv1m.q1.s16", 1, 128, 1 << 20, 1, 16, 16, false},
       {"mla_decode.bf16.kv1m.q1.s32", 1, 128, 1 << 20, 1, 16, 32, false},
       {"mla_decode.fp8.kv64k.q1.s16", 1, 128, 1 << 16, 1, 16, 16, true},
       {"mla_decode.fp8.kv64k.q1.s32", 1, 128, 1 << 16, 1, 16, 32, true},
+      {"mla_decode.fp8.kv64k.q1.s64", 1, 128, 1 << 16, 1, 16, 64, true},
       {"mla_decode.fp8.kv1m.q1.s16", 1, 128, 1 << 20, 1, 16, 16, true},
       {"mla_decode.fp8.kv1m.q1.s32", 1, 128, 1 << 20, 1, 16, 32, true},
   };
@@ -147,11 +156,31 @@ namespace {
 bool run_mla_decode(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   const MlaBench* b = find_mla(c.id);
   if (b == nullptr) return false;
-  const int B = b->batch, H = b->heads, ql = b->q, ps = b->page, S = b->splits;
+  const int B = b->batch, H = b->heads, ql = b->q, ps = b->page;
   const int64_t total_q = static_cast<int64_t>(B) * ql;
   const int64_t rec = b->fp8 ? 656 : kRow * 2;
   const int64_t npages = (static_cast<int64_t>(b->kv) + ps - 1) / ps;
   const int64_t cache_bytes = npages * ps * rec;
+
+  // split count: 0 = auto, resolved on the host from the case shape and ctx (no device read).
+  kops::attn::MLASplitHint hint{};
+  bool ok = true;
+  if (b->splits == 0) {
+    ok = status_ok(kops::attn::mla_decode_split_hint(B, ql, H, b->kv, /*max_splits=*/64,
+                                                    /*waves=*/2, ctx, &hint),
+                   c.id.c_str());
+    if (!ok) return false;
+  }
+  const int S = b->splits == 0 ? hint.splits : b->splits;
+  const size_t o_partial_bytes =
+      b->splits == 0 ? hint.o_partial_bytes
+                     : static_cast<size_t>(total_q) * S * H * kNope * sizeof(float);
+  const size_t lse_partial_bytes =
+      b->splits == 0 ? hint.lse_partial_bytes
+                     : static_cast<size_t>(total_q) * S * H * sizeof(float);
+  const size_t indptr_bytes = b->splits == 0
+                                  ? hint.merge_indptr_bytes
+                                  : (static_cast<size_t>(total_q) + 1) * sizeof(int32_t);
 
   __nv_bfloat16* qn = nullptr;
   __nv_bfloat16* qp = nullptr;
@@ -164,32 +193,26 @@ bool run_mla_decode(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   void* cache = nullptr;
   int32_t* table = nullptr;
   int32_t* seq = nullptr;
-  bool ok = cuda_ok(cudaMalloc(reinterpret_cast<void**>(&qn),
-                               static_cast<size_t>(total_q) * H * kNope * 2),
-                    "q_nope") &&
-            cuda_ok(cudaMalloc(reinterpret_cast<void**>(&qp),
-                               static_cast<size_t>(total_q) * H * kPe * 2),
-                    "q_pe") &&
-            cuda_ok(cudaMalloc(reinterpret_cast<void**>(&o),
-                               static_cast<size_t>(total_q) * H * kNope * 2),
-                    "o") &&
-            cuda_ok(cudaMalloc(reinterpret_cast<void**>(&lse),
-                               static_cast<size_t>(total_q) * H * 4),
-                    "lse") &&
-            cuda_ok(cudaMalloc(&cache, static_cast<size_t>(cache_bytes)), "cache") &&
-            cuda_ok(cudaMalloc(reinterpret_cast<void**>(&table), npages * 4), "block_table") &&
-            cuda_ok(cudaMalloc(reinterpret_cast<void**>(&seq), B * 4), "seq_lens");
+  ok = cuda_ok(cudaMalloc(reinterpret_cast<void**>(&qn),
+                          static_cast<size_t>(total_q) * H * kNope * 2),
+               "q_nope") &&
+       cuda_ok(cudaMalloc(reinterpret_cast<void**>(&qp),
+                          static_cast<size_t>(total_q) * H * kPe * 2),
+               "q_pe") &&
+       cuda_ok(cudaMalloc(reinterpret_cast<void**>(&o),
+                          static_cast<size_t>(total_q) * H * kNope * 2),
+               "o") &&
+       cuda_ok(cudaMalloc(reinterpret_cast<void**>(&lse),
+                          static_cast<size_t>(total_q) * H * 4),
+               "lse") &&
+       cuda_ok(cudaMalloc(&cache, static_cast<size_t>(cache_bytes)), "cache") &&
+       cuda_ok(cudaMalloc(reinterpret_cast<void**>(&table), npages * 4), "block_table") &&
+       cuda_ok(cudaMalloc(reinterpret_cast<void**>(&seq), B * 4), "seq_lens");
   if (!ok) return false;
   if (S > 1) {
-    ok = cuda_ok(cudaMalloc(reinterpret_cast<void**>(&opart),
-                            static_cast<size_t>(total_q) * S * H * kNope * 4),
-                 "o_partial") &&
-         cuda_ok(cudaMalloc(reinterpret_cast<void**>(&lpart),
-                            static_cast<size_t>(total_q) * S * H * 4),
-                 "lse_partial") &&
-         cuda_ok(cudaMalloc(reinterpret_cast<void**>(&indptr),
-                            (static_cast<size_t>(total_q) + 1) * 4),
-                 "merge_indptr") &&
+    ok = cuda_ok(cudaMalloc(reinterpret_cast<void**>(&opart), o_partial_bytes), "o_partial") &&
+         cuda_ok(cudaMalloc(reinterpret_cast<void**>(&lpart), lse_partial_bytes), "lse_partial") &&
+         cuda_ok(cudaMalloc(reinterpret_cast<void**>(&indptr), indptr_bytes), "merge_indptr") &&
          cuda_ok(cudaMalloc(reinterpret_cast<void**>(&splits), (B + 1) * 4), "num_splits");
     if (!ok) return false;
   }
@@ -272,8 +295,46 @@ bool run_mla_decode(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   p.kv_lora_rank = static_cast<int32_t>(kNope);
   p.rope_dim = static_cast<int32_t>(kPe);
 
-  ok = status_ok(kops::attn::mla_decode_run(plan, p, ws, ctx), c.id.c_str());
-  if (ok) ok = measure(c, [&] { (void)kops::attn::mla_decode_run(plan, p, ws, ctx); }, st);
+  // Split cases measure the whole op: the split launch plus merge_split_kv, which folds the fp32
+  // partials (and the sink, absent here) back into o/lse. The merge is a 512-wide fp32 read of
+  // total_q * S * H rows, i.e. negligible next to the latent scan it combines.
+  const kops::Tensor t_o = [&] {
+    kops::Tensor t{};
+    t.data = o;
+    t.dtype = DType::kBFloat16;
+    t.ndim = 3;
+    t.device = ctx.device;
+    t.shape[0] = total_q;
+    t.shape[1] = H;
+    t.shape[2] = kNope;
+    t.stride[0] = static_cast<int64_t>(H) * kNope;
+    t.stride[1] = kNope;
+    t.stride[2] = 1;
+    return t;
+  }();
+  const kops::Tensor t_lse = [&] {
+    kops::Tensor t{};
+    t.data = lse;
+    t.dtype = DType::kFloat32;
+    t.ndim = 2;
+    t.device = ctx.device;
+    t.shape[0] = total_q;
+    t.shape[1] = H;
+    t.stride[0] = H;
+    t.stride[1] = 1;
+    return t;
+  }();
+  const kops::attn::SplitKVBuffers merge_split{p.split.o_partial, p.split.lse_partial,
+                                               p.split.merge_indptr, S};
+  auto call = [&]() {
+    kops::Status st = kops::attn::mla_decode_run(plan, p, ws, ctx);
+    if (st == kops::Status::kSuccess && S > 1) {
+      st = kops::attn::merge_split_kv(t_o, t_lse, merge_split, kops::Tensor{}, ctx);
+    }
+    return st;
+  };
+  ok = status_ok(call(), c.id.c_str());
+  if (ok) ok = measure(c, [&] { (void)call(); }, st);
   for (void* ptr : {static_cast<void*>(qn), static_cast<void*>(qp), static_cast<void*>(o),
                     static_cast<void*>(lse), static_cast<void*>(opart),
                     static_cast<void*>(lpart), static_cast<void*>(indptr),

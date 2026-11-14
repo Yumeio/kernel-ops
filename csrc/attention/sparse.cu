@@ -26,9 +26,9 @@
 //      larger than TOPK falls back to three more column-index passes, so an
 //      all-equal row still selects the lowest indices (lowest TOPK of them).
 //
-// Fast path (rows == 1, max_kv >= 256 Ki, caller-supplied workspace):
-//   One cooperative launch, three chunked passes over the row, so the whole
-//   memory system participates instead of one SM:
+// Fast path (max_kv >= 256 Ki, caller-supplied workspace):
+//   One cooperative launch over (rows * splits) CTAs, three chunked passes over
+//   every row, so the whole memory system participates instead of one SM:
 //     1. every CTA histograms the top 11 key bits of its chunk in shared memory
 //        and merges the non-zero bins into a global 2048-bin histogram;
 //     2. after a grid sync the grid resolves the bucket that holds the K-th
@@ -44,7 +44,10 @@
 //   inside the same launch, so the fast path never changes the result. The
 //   workspace is caller-owned (sparse_topk_workspace_bytes); the path adds no
 //   allocation, no device query and no host synchronization, and stays
-//   CUDA-graph capturable.
+//   CUDA-graph capturable. With several wide rows every row keeps its own
+//   scratch slice (sparse_topk_rows_workspace_bytes) and its own reservation
+//   counters, and the split count shrinks as rows grow so the whole grid stays
+//   co-resident.
 //
 // Rows with fewer than TOPK visible columns write -1 for the unused index slots
 // (and -inf into `values` when it is present); such a row is copied in one pass
@@ -61,9 +64,9 @@
 // workspace-free and CUDA-graph capturable. The host validates every shape,
 // dtype, stride, alignment and page-table argument before the single launch.
 // sparse_topk_ws takes the same arguments plus a caller-owned workspace and only
-// differs where the fast path applies (rows == 1 and max_kv >= 256 Ki): a
-// missing, too small or misaligned workspace is not an error, it selects the
-// workspace-free path above.
+// differs where the fast path applies (max_kv >= 256 Ki): a missing, too small
+// or misaligned workspace is not an error, it selects the workspace-free path
+// above.
 // =============================================================================
 #include <algorithm>
 #include <cmath>
@@ -83,6 +86,7 @@
 #include "csrc/common/dtype.cuh"
 #include "csrc/common/op_types.cuh"
 #include "csrc/common/tensor.h"
+#include "csrc/common/occupancy.h"
 #include "csrc/common/device.cuh"
 #include "csrc/common/device_impl.cuh"
 #include "csrc/kvcache/kv_layout.cuh"
@@ -272,10 +276,11 @@ constexpr int kTopkFastThreads = 512;
 /// Rows at least this wide switch to the chunked path when a workspace exists:
 /// one CTA only reaches a single SM's slice of the memory system.
 constexpr int64_t kTopkFastMinKv = 262144;
-/// CTAs the fast path asks for per SM, capped by cooperative-launch residency.
-constexpr int kTopkFastCtasPerSm = 2;
 /// Visible columns per CTA below which extra CTAs stop paying for their syncs.
 constexpr int64_t kTopkFastMinChunk = 4096;
+/// CTAs to aim for, in waves of the partition, and the split cap (a 1M row uses 256 of them).
+constexpr int32_t kTopkFastWaves = 2;
+constexpr int32_t kTopkFastMaxSplits = 256;
 
 /// Workspace layout of a 256-byte aligned device_scratch:
 ///   [0, 8192)        hist1  uint32[2048]  top-11-bit key digits
@@ -292,20 +297,6 @@ static_assert(kTopkFastWorkspaceBytes == 51200, "fast-path workspace layout chan
 /// ctrl[] words.
 constexpr int kTopkFastCtrlCand = 0;   // candidates buffered (may exceed kTopkFastCand)
 constexpr int kTopkFastCtrlAbove = 1;  // output slots emitted by the pass flushes
-
-/// Chunk of [start, end) owned by this CTA. Every CTA of the launch reads the same
-/// row data, so the partition is uniform and no CTA skips a grid sync.
-__device__ __forceinline__ void topk_fast_chunk(int64_t start, int64_t end, int64_t* lo,
-                                               int64_t* hi) {
-  const int64_t blocks = static_cast<int64_t>(gridDim.x);
-  const int64_t chunk = (end - start + blocks - 1) / blocks;
-  int64_t l = start + static_cast<int64_t>(blockIdx.x) * chunk;
-  if (l > end) l = end;
-  int64_t h = l + chunk;
-  if (h > end) h = end;
-  *lo = l;
-  *hi = h;
-}
 
 }  // namespace
 
@@ -511,20 +502,25 @@ __global__ void sparse_topk_kernel(int32_t* __restrict__ indices, float* __restr
 }
 
 // -----------------------------------------------------------------------------
-// sparse_topk_fast_kernel — the multi-CTA fast path of rows == 1 and a wide row.
+// sparse_topk_fast_kernel — the multi-CTA fast path of one or more wide rows.
 //
-// One cooperative launch, three chunked passes over the single visible row:
-//   pass 1  hist1[top 11 key bits], merged from every CTA's shared histogram;
+// One cooperative launch, three chunked passes over every visible row:
+//   pass 1  hist1[top 11 key bits], merged from each CTA's shared histogram;
 //   pass 2  emit the entries above hist1's bucket (the K-th score is inside it)
 //           and fill hist2[next 11 key bits] from the entries inside the bucket;
 //   pass 3  emit the entries above hist2's bucket and buffer the rest (the
 //           candidates: entries of the 22-bit bucket that holds the K-th score);
-//   stage 4 (CTA 0) turns the candidates into the exact 32-bit threshold, applies
-//           the (value desc, column asc) tie rule and pads the row.
-// Every CTA reads the same row_starts / row_ends, so the early return and the
-// chunk partition are uniform: a grid sync is never skipped by part of the grid.
-// A candidate overflow (constant / tie-heavy row) reselects the row with the
-// exact single-CTA body inside stage 4, which rewrites every output slot.
+//   stage 4 (split 0 of each row) turns the candidates into the exact 32-bit threshold,
+//           applies the (value desc, column asc) tie rule and pads the row.
+// The grid is (num_rows * splits): CTA blockIdx.x owns split blockIdx.x % splits of row
+// blockIdx.x / splits, so a short batch of very wide rows still fills the machine. Per-row
+// scratch lives at ws + row * kTopkFastWorkspaceBytes and every row's counters are private, so
+// rows never reserve slots in each other's output. A candidate overflow (constant / tie-heavy
+// row) reselects that row with the exact single-CTA body inside stage 4, which rewrites every
+// output slot of the row.
+//
+// Every CTA executes the same sequence of grid syncs, including the CTAs of a row with no
+// visible columns (they only write that row's -1 / -inf padding), so no CTA can skip a barrier.
 // -----------------------------------------------------------------------------
 namespace {
 
@@ -536,140 +532,181 @@ __device__ __forceinline__ int32_t topk_fast_reserve(uint32_t* __restrict__ ctrl
                      : 0;
 }
 
+/// Chunk of [start, end) owned by (split, splits). Uniform across the row's CTAs, so the pass
+/// partitions cover the range exactly and no CTA skips a grid sync.
+__device__ __forceinline__ void topk_fast_split(int64_t start, int64_t end, int splits, int split,
+                                                int64_t* lo, int64_t* hi) {
+  const int64_t chunk = (end - start + splits - 1) / splits;
+  int64_t l = start + static_cast<int64_t>(split) * chunk;
+  if (l > end) l = end;
+  int64_t h = l + chunk;
+  if (h > end) h = end;
+  *lo = l;
+  *hi = h;
+}
+
 template <int TOPK>
 __global__ void sparse_topk_fast_kernel(
-    int32_t* __restrict__ out, float* __restrict__ val, const float* __restrict__ srow,
-    const int32_t* __restrict__ row_starts, const int32_t* __restrict__ row_ends,
-    const int32_t* __restrict__ block_table, const int32_t* __restrict__ token_to_request,
-    const int block_table_stride, const int page_size, const bool absolute_indices,
-    const bool to_page_slots, void* __restrict__ ws) {
+    int32_t* __restrict__ out, float* __restrict__ val, const float* __restrict__ scores,
+    const int64_t scores_stride, const int32_t* __restrict__ row_starts,
+    const int32_t* __restrict__ row_ends, const int32_t* __restrict__ block_table,
+    const int32_t* __restrict__ token_to_request, const int block_table_stride,
+    const int page_size, const bool absolute_indices, const bool to_page_slots, const int num_rows,
+    const int splits, void* __restrict__ ws) {
   __shared__ uint32_t lhist[kHistBins];
   __shared__ int32_t emit_idx[TOPK];
   __shared__ float emit_val[TOPK];
   __shared__ int32_t s_emit, s_base, s_bin, s_above, s_gt, s_tie, s_write;
+  // Row-level bucket state shared by the three passes and stage 4 (identical in every CTA of
+  // the row because they all read the same merged histograms).
+  __shared__ int32_t s_b0, s_b1, s_above0, s_above1;
   cooperative_groups::grid_group grid = cooperative_groups::this_grid();
 
-  int64_t start = (row_starts != nullptr) ? static_cast<int64_t>(row_starts[0]) : 0;
-  int64_t end = static_cast<int64_t>(row_ends[0]);
+  const int row = static_cast<int>(blockIdx.x) / splits;
+  const int split = static_cast<int>(blockIdx.x) - row * splits;
+  const float* const srow = scores + static_cast<int64_t>(row) * scores_stride;
+  int32_t* const out_row = out + static_cast<int64_t>(row) * TOPK;
+  float* const val_row = val != nullptr ? val + static_cast<int64_t>(row) * TOPK : nullptr;
+
+  int64_t start = (row_starts != nullptr) ? static_cast<int64_t>(row_starts[row]) : 0;
+  int64_t end = static_cast<int64_t>(row_ends[row]);
   if (start < 0) start = 0;
   if (end < start) end = start;
   const int64_t visible = end - start;
   const int m = static_cast<int>(visible < TOPK ? visible : static_cast<int64_t>(TOPK));
   const int block = static_cast<int>(blockDim.x);
   const int tid = static_cast<int>(threadIdx.x);
+  const bool active = m > 0;
 
-  uint32_t* const hist1 = static_cast<uint32_t*>(ws);
+  char* const row_ws =
+      static_cast<char*>(ws) + static_cast<size_t>(row) * kTopkFastWorkspaceBytes;
+  uint32_t* const hist1 = reinterpret_cast<uint32_t*>(row_ws);
   uint32_t* const hist2 = hist1 + kHistBins;
-  uint32_t* const ctrl = reinterpret_cast<uint32_t*>(static_cast<char*>(ws) + kTopkFastCtrlOffset);
-  TopkFastCand* const cand =
-      reinterpret_cast<TopkFastCand*>(static_cast<char*>(ws) + kTopkFastCandOffset);
+  uint32_t* const ctrl = reinterpret_cast<uint32_t*>(row_ws + kTopkFastCtrlOffset);
+  TopkFastCand* const cand = reinterpret_cast<TopkFastCand*>(row_ws + kTopkFastCandOffset);
 
-  if (m == 0) {
-    for (int i = tid; i < TOPK; i += block) {
-      out[i] = -1;
-      if (val != nullptr) val[i] = topk_neg_inf();
+  // ---- 0. clear this row's workspace (its own CTAs, no memset launch) --------
+  if (active) {
+    for (int i = split * block + tid; i < kHistBins; i += splits * block) {
+      hist1[i] = 0u;
+      hist2[i] = 0u;
     }
-    return;
+    if (split == 0 && tid < 2) ctrl[tid] = 0u;
   }
-
-  // ---- 0. clear the workspace (one cooperative sweep, no memset launch) ------
-  const int gtid = static_cast<int>(blockIdx.x) * block + tid;
-  const int gstep = static_cast<int>(gridDim.x) * block;
-  for (int i = gtid; i < kHistBins; i += gstep) {
-    hist1[i] = 0u;
-    hist2[i] = 0u;
-  }
-  if (gtid < 2) ctrl[gtid] = 0u;
   grid.sync();
 
   int64_t lo = 0, hi = 0;
-  topk_fast_chunk(start, end, &lo, &hi);
+  topk_fast_split(start, end, splits, split, &lo, &hi);
 
   // ---- 1. chunked top-11-bit histogram --------------------------------------
-  for (int i = tid; i < kHistBins; i += block) lhist[i] = 0u;
-  __syncthreads();
-  topk_hist_pass(srow, lo, hi, 0u, 0u, kRadixShift[0], kRadixWidth[0], lhist);
-  __syncthreads();
-  for (int i = tid; i < kHistBins; i += block) {
-    const uint32_t c = lhist[i];
-    if (c != 0u) atomicAdd(&hist1[i], c);
+  if (active) {
+    for (int i = tid; i < kHistBins; i += block) lhist[i] = 0u;
+    __syncthreads();
+    topk_hist_pass(srow, lo, hi, 0u, 0u, kRadixShift[0], kRadixWidth[0], lhist);
+    __syncthreads();
+    for (int i = tid; i < kHistBins; i += block) {
+      const uint32_t c = lhist[i];
+      if (c != 0u) atomicAdd(&hist1[i], c);
+    }
   }
   grid.sync();
 
   // ---- 2. resolve the bucket holding the K-th score, emit what is above it ---
-  topk_pick_desc(hist1, kHistBins, m, &s_bin, &s_above);
-  const int32_t b0 = s_bin;
-  const int32_t above0 = s_above;
-  if (tid == 0) s_emit = 0;
-  __syncthreads();
-  topk_each(srow, lo, hi, [&](int64_t col, float v) {
-    const uint32_t key = topk_key(v);
-    const uint32_t d1 = key >> kRadixShift[0];
-    if (d1 > static_cast<uint32_t>(b0)) {
-      const int32_t slot = atomicAdd(&s_emit, 1);
-      if (slot < TOPK) {  // provably < above0 < m, guarded for safety
-        emit_idx[slot] = topk_map_column(0, col, block_table, token_to_request, block_table_stride,
-                                        page_size, absolute_indices, to_page_slots, start);
-        if (val != nullptr) emit_val[slot] = v;
-      }
-    } else if (d1 == static_cast<uint32_t>(b0)) {
-      atomicAdd(&hist2[(key >> kRadixShift[1]) & (kHistBins - 1)], 1u);
+  if (active) {
+    topk_pick_desc(hist1, kHistBins, m, &s_bin, &s_above);
+    const int32_t b0 = s_bin;
+    if (tid == 0) {
+      s_b0 = s_bin;
+      s_above0 = s_above;
+      s_emit = 0;
     }
-  });
-  __syncthreads();
-  if (tid == 0) s_base = topk_fast_reserve(ctrl, s_emit);
-  __syncthreads();
-  for (int i = tid; i < s_emit; i += block) {
-    out[s_base + i] = emit_idx[i];
-    if (val != nullptr) val[s_base + i] = emit_val[i];
+    __syncthreads();
+    topk_each(srow, lo, hi, [&](int64_t col, float v) {
+      const uint32_t key = topk_key(v);
+      const uint32_t d1 = key >> kRadixShift[0];
+      if (d1 > static_cast<uint32_t>(b0)) {
+        const int32_t slot = atomicAdd(&s_emit, 1);
+        if (slot < TOPK) {  // provably < above0 < m, guarded for safety
+          emit_idx[slot] =
+              topk_map_column(row, col, block_table, token_to_request, block_table_stride,
+                              page_size, absolute_indices, to_page_slots, start);
+          if (val_row != nullptr) emit_val[slot] = v;
+        }
+      } else if (d1 == static_cast<uint32_t>(b0)) {
+        atomicAdd(&hist2[(key >> kRadixShift[1]) & (kHistBins - 1)], 1u);
+      }
+    });
+    __syncthreads();
+    if (tid == 0) s_base = topk_fast_reserve(ctrl, s_emit);
+    __syncthreads();
+    for (int i = tid; i < s_emit; i += block) {
+      out_row[s_base + i] = emit_idx[i];
+      if (val_row != nullptr) val_row[s_base + i] = emit_val[i];
+    }
   }
   grid.sync();
 
   // ---- 3. emit above the 22-bit bucket, buffer the bucket itself ------------
-  topk_pick_desc(hist2, kHistBins, m - above0, &s_bin, &s_above);
-  const int32_t b1 = s_bin;
-  const int32_t above1 = s_above;
-  if (tid == 0) s_emit = 0;
-  __syncthreads();
-  topk_each(srow, lo, hi, [&](int64_t col, float v) {
-    const uint32_t key = topk_key(v);
-    if ((key >> kRadixShift[0]) != static_cast<uint32_t>(b0)) return;
-    const uint32_t d2 = (key >> kRadixShift[1]) & (kHistBins - 1);
-    if (d2 > static_cast<uint32_t>(b1)) {
-      const int32_t slot = atomicAdd(&s_emit, 1);
-      if (slot < TOPK) {
-        emit_idx[slot] = topk_map_column(0, col, block_table, token_to_request, block_table_stride,
-                                        page_size, absolute_indices, to_page_slots, start);
-        if (val != nullptr) emit_val[slot] = v;
-      }
-    } else if (d2 == static_cast<uint32_t>(b1)) {
-      const int32_t slot = static_cast<int32_t>(atomicAdd(&ctrl[kTopkFastCtrlCand], 1u));
-      if (slot < kTopkFastCand) {
-        cand[slot].value = v;
-        cand[slot].col = static_cast<int32_t>(col);
-      }
+  if (active) {
+    topk_pick_desc(hist2, kHistBins, m - s_above0, &s_bin, &s_above);
+    const int32_t b1 = s_bin;
+    if (tid == 0) {
+      s_b1 = s_bin;
+      s_above1 = s_above;
+      s_emit = 0;
     }
-  });
-  __syncthreads();
-  // The reservation counter already carries the slots pass 2 emitted, so the run
-  // continues right after them: above0 must not be added a second time.
-  if (tid == 0) s_base = topk_fast_reserve(ctrl, s_emit);
-  __syncthreads();
-  for (int i = tid; i < s_emit; i += block) {
-    out[s_base + i] = emit_idx[i];
-    if (val != nullptr) val[s_base + i] = emit_val[i];
+    __syncthreads();
+    topk_each(srow, lo, hi, [&](int64_t col, float v) {
+      const uint32_t key = topk_key(v);
+      const uint32_t d1 = key >> kRadixShift[0];
+      const uint32_t d2 = (key >> kRadixShift[1]) & (kHistBins - 1);
+      if (d1 != static_cast<uint32_t>(s_b0)) return;  // only this row's bucket contributes
+      if (d2 > static_cast<uint32_t>(b1)) {
+        const int32_t slot = atomicAdd(&s_emit, 1);
+        if (slot < TOPK) {
+          emit_idx[slot] =
+              topk_map_column(row, col, block_table, token_to_request, block_table_stride,
+                              page_size, absolute_indices, to_page_slots, start);
+          if (val_row != nullptr) emit_val[slot] = v;
+        }
+      } else if (d2 == static_cast<uint32_t>(b1)) {
+        const int32_t slot = static_cast<int32_t>(atomicAdd(&ctrl[kTopkFastCtrlCand], 1u));
+        if (slot < kTopkFastCand) {
+          cand[slot].value = v;
+          cand[slot].col = static_cast<int32_t>(col);
+        }
+      }
+    });
+    __syncthreads();
+    // The reservation counter already carries the slots pass 2 emitted, so the run
+    // continues right after them: above0 must not be added a second time.
+    if (tid == 0) s_base = topk_fast_reserve(ctrl, s_emit);
+    __syncthreads();
+    for (int i = tid; i < s_emit; i += block) {
+      out_row[s_base + i] = emit_idx[i];
+      if (val_row != nullptr) val_row[s_base + i] = emit_val[i];
+    }
   }
   grid.sync();
 
-  // ---- 4. exact threshold and tie rule over the candidates (one CTA) --------
-  if (blockIdx.x != 0) return;
+  // ---- 4. exact threshold and tie rule over the candidates (one CTA per row) --
+  if (split != 0) return;
+  if (!active) {
+    for (int i = tid; i < TOPK; i += block) {
+      out_row[i] = -1;
+      if (val_row != nullptr) val_row[i] = topk_neg_inf();
+    }
+    return;
+  }
+  const int32_t above0 = s_above0;
+  const int32_t above1 = s_above1;
   const int32_t above = above0 + above1;
   const int32_t need = m - above;
   const int32_t n_cand = static_cast<int32_t>(ctrl[kTopkFastCtrlCand]);
   if (need <= 0 || need > n_cand || n_cand > kTopkFastCand) {
     // Tie-heavy or degenerate row: the single-CTA body reselects it exactly.
-    sparse_topk_row_body<TOPK>(out, val, srow, start, end, block_table, token_to_request,
-                               block_table_stride, page_size, absolute_indices, to_page_slots, 0,
+    sparse_topk_row_body<TOPK>(out_row, val_row, srow, start, end, block_table, token_to_request,
+                               block_table_stride, page_size, absolute_indices, to_page_slots, row,
                                lhist, emit_idx);
     return;
   }
@@ -678,16 +715,17 @@ __global__ void sparse_topk_fast_kernel(
     // Every candidate is selected; the output order is unspecified.
     for (int i = tid; i < n_cand; i += block) {
       const TopkFastCand c = cand[i];
-      out[above + i] = topk_map_column(0, c.col, block_table, token_to_request, block_table_stride,
-                                      page_size, absolute_indices, to_page_slots, start);
-      if (val != nullptr) val[above + i] = c.value;
+      out_row[above + i] =
+          topk_map_column(row, c.col, block_table, token_to_request, block_table_stride, page_size,
+                          absolute_indices, to_page_slots, start);
+      if (val_row != nullptr) val_row[above + i] = c.value;
     }
   } else {
     // Candidates all share the 22-bit prefix (b0, b1): the low 10 key bits pick
     // the exact threshold, then equal keys fall back to the column tie rule.
     constexpr int kLowBins = 1 << kRadixWidth[2];
-    const uint32_t prefix = (static_cast<uint32_t>(b0) << kRadixShift[0]) |
-                            (static_cast<uint32_t>(b1) << kRadixShift[1]);
+    const uint32_t prefix = (static_cast<uint32_t>(s_b0) << kRadixShift[0]) |
+                            (static_cast<uint32_t>(s_b1) << kRadixShift[1]);
     const uint32_t low_mask = static_cast<uint32_t>(kLowBins - 1);
     for (int i = tid; i < kLowBins; i += block) lhist[i] = 0u;
     __syncthreads();
@@ -708,9 +746,10 @@ __global__ void sparse_topk_fast_kernel(
       if (topk_key(c.value) <= threshold) continue;
       const int32_t slot = above + atomicAdd(&s_gt, 1);
       if (slot < TOPK) {
-        out[slot] = topk_map_column(0, c.col, block_table, token_to_request, block_table_stride,
-                                    page_size, absolute_indices, to_page_slots, start);
-        if (val != nullptr) val[slot] = c.value;
+        out_row[slot] =
+            topk_map_column(row, c.col, block_table, token_to_request, block_table_stride,
+                            page_size, absolute_indices, to_page_slots, start);
+        if (val_row != nullptr) val_row[slot] = c.value;
       }
     }
 
@@ -754,16 +793,17 @@ __global__ void sparse_topk_fast_kernel(
       if (c.col > cutoff) continue;
       const int32_t slot = above + above2 + atomicAdd(&s_write, 1);
       if (slot < TOPK) {
-        out[slot] = topk_map_column(0, c.col, block_table, token_to_request, block_table_stride,
-                                    page_size, absolute_indices, to_page_slots, start);
-        if (val != nullptr) val[slot] = c.value;
+        out_row[slot] =
+            topk_map_column(row, c.col, block_table, token_to_request, block_table_stride,
+                            page_size, absolute_indices, to_page_slots, start);
+        if (val_row != nullptr) val_row[slot] = c.value;
       }
     }
   }
 
   for (int i = m + tid; i < TOPK; i += block) {
-    out[i] = -1;
-    if (val != nullptr) val[i] = topk_neg_inf();
+    out_row[i] = -1;
+    if (val_row != nullptr) val_row[i] = topk_neg_inf();
   }
 }
 
@@ -974,36 +1014,45 @@ Status sparse_topk_impl(const Tensor& indices, const Tensor& values, const Tenso
   const int32_t* ends_ptr = const_ptr<int32_t>(row_ends);
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
 
-  // ---- multi-CTA fast path: one long row, caller-supplied workspace ----------
-  // A single CTA reaches ~1/36 of this memory system, so a 1M-column row is
-  // chunked across a cooperative grid. The workspace is optional: a missing,
-  // small or misaligned lease silently keeps the workspace-free path below.
-  const bool ws_ready =
-      ws_opt != nullptr && ws_opt->device_scratch != nullptr &&
-      ws_opt->device_scratch_bytes >= kTopkFastWorkspaceBytes &&
-      (reinterpret_cast<uintptr_t>(ws_opt->device_scratch) & 255u) == 0u;
-  if (ws_ready && rows == 1 && scores.shape[1] >= kTopkFastMinKv &&
-      scores.shape[1] <= INT32_MAX) {
+  // ---- multi-CTA fast path: one or more wide rows, caller-supplied workspace --
+  // A single CTA reaches a small slice of the memory system, so a 1M-column row is chunked across
+  // a cooperative grid; with several such rows the grid is (rows * splits) and every row keeps its
+  // own scratch and reservation counters. The workspace is optional: a missing, small or
+  // misaligned lease silently keeps the workspace-free path below.
+  const bool ws_ready = ws_opt != nullptr && ws_opt->device_scratch != nullptr &&
+                        (reinterpret_cast<uintptr_t>(ws_opt->device_scratch) & 255u) == 0u;
+  if (ws_ready && scores.shape[1] >= kTopkFastMinKv && scores.shape[1] <= INT32_MAX) {
+    int nrows = static_cast<int>(rows);
     void* ws_ptr = ws_opt->device_scratch;
+    const size_t ws_needed = static_cast<size_t>(nrows) * kTopkFastWorkspaceBytes;
     int table_stride_arg = table_stride;
+    int splits_arg = 1;
+    int64_t scores_stride_arg = scores_stride;
+    bool absolute_arg = absolute_indices;
+    bool slots_arg = to_page_slots;
     const int sms = ctx.compute_units > 0 ? ctx.compute_units : 1;
-    int64_t by_work = (scores.shape[1] + kTopkFastMinChunk - 1) / kTopkFastMinChunk;
-    if (by_work < 1) by_work = 1;
-    void* args[] = {&indices_ptr, &values_ptr, &scores_ptr, &starts_ptr, &ends_ptr,
-                    &table_ptr,   &request_ptr, &table_stride_arg, &page_size, &absolute_indices,
-                    &to_page_slots, &ws_ptr};
-    int desired = sms * kTopkFastCtasPerSm;
-    if (by_work < desired) desired = static_cast<int>(by_work);
-    if (desired < 1) desired = 1;
+    void* args[] = {&indices_ptr, &values_ptr,   &scores_ptr,      &scores_stride_arg,
+                    &starts_ptr,  &ends_ptr,     &table_ptr,       &request_ptr,
+                    &table_stride_arg, &page_size, &absolute_arg,  &slots_arg,
+                    &nrows,       &splits_arg,   &ws_ptr};
 #define KOPS_LAUNCH_SPARSE_TOPK_FAST(TOPKV)                                                        \
   do {                                                                                             \
     const int cap = topk_fast_ctas_per_sm<TOPKV>() * sms;                                           \
-    const int blocks = desired < cap ? desired : cap;                                               \
-    const cudaError_t ferr = cudaLaunchCooperativeKernel(                                           \
-        reinterpret_cast<void*>(&sparse_topk_fast_kernel<TOPKV>), dim3(blocks),                     \
-        dim3(kTopkFastThreads), args, 0, stream);                                                   \
-    if (ferr == cudaSuccess) return Status::kSuccess;                                               \
-    (void)cudaGetLastError(); /* fall through to the workspace-free path */                          \
+    if (nrows <= cap && ws_opt->device_scratch_bytes >= ws_needed) {                                \
+      int splits = occupancy_split_count(nrows, scores.shape[1], kTopkFastMinChunk,                 \
+                                         kTopkFastWaves, kTopkFastMaxSplits, ctx);                  \
+      const int by_cap = cap / nrows;                                                               \
+      if (splits > by_cap) splits = by_cap;                                                         \
+      if (splits < 1) splits = 1;                                                                    \
+      if (static_cast<int64_t>(nrows) * splits <= cap) {                                            \
+        splits_arg = splits;                                                                        \
+        const cudaError_t ferr = cudaLaunchCooperativeKernel(                                       \
+            reinterpret_cast<void*>(&sparse_topk_fast_kernel<TOPKV>),                               \
+            dim3(static_cast<unsigned>(nrows * splits)), dim3(kTopkFastThreads), args, 0, stream);  \
+        if (ferr == cudaSuccess) return Status::kSuccess;                                           \
+        (void)cudaGetLastError(); /* fall through to the workspace-free path */                     \
+      }                                                                                             \
+    }                                                                                               \
   } while (0)
     switch (topk) {
       case 512:
@@ -1060,6 +1109,11 @@ Status sparse_topk_ws(const Tensor& indices, const Tensor& values, const Tensor&
 }
 
 size_t sparse_topk_workspace_bytes() noexcept { return kTopkFastWorkspaceBytes; }
+
+size_t sparse_topk_rows_workspace_bytes(int32_t rows) noexcept {
+  const size_t n = rows > 0 ? static_cast<size_t>(rows) : 1u;
+  return kTopkFastWorkspaceBytes * n;
+}
 
 // -----------------------------------------------------------------------------
 // Shared mma.sync m16n8k16 helpers for the DSA/V4 sparse-attention bodies below.
@@ -1831,6 +1885,17 @@ struct SpKeyRef {
   int64_t slot;
 };
 
+/// Split-KV role of one CTA inside sp_tc_attend. `count == 1` is the plain single-CTA body that
+/// writes io.o / io.lse directly; `count > 1` writes a normalized fp32 partial for merge_states
+/// and folds the sink into split 0 only (a merge then counts it exactly once).
+struct SpSplit {
+  float* o_partial = nullptr;    // [rows, count, H, v_dim] fp32
+  float* lse_partial = nullptr;  // [rows, count, H] fp32, natural log
+  int32_t index = 0;
+  int32_t count = 1;
+};
+
+
 /// One visible key resolved to its latent record: the page table and record
 /// addressing are evaluated once per key, not once per 16-byte chunk.
 struct SpRow {
@@ -1839,6 +1904,20 @@ struct SpRow {
   int64_t slot;               // physical token slot (codec scale pages)
   int32_t code;               // encoded key, < 0 when masked
   int32_t native;             // record is a plain dtype array
+};
+/// Contiguous [lo, hi) sub-range of a visible-key list. A split CTA resolves only the keys it
+/// owns, so the page-table walk and the per-tile staging shrink with the split count. The tail of
+/// the last tile is masked by `limit`, never borrowed from the next split.
+template <typename Keys>
+struct SpKeyRange {
+  const Keys* keys;
+  int lo, hi;
+
+  __device__ __forceinline__ int count() const { return hi > lo ? hi - lo : 0; }
+
+  __device__ __forceinline__ void prepare(int base, int n, SpRow* dst) const {
+    keys->prepare(lo + base, n, dst, hi);
+  }
 };
 
 /// Tensor-core attention over the visible key list `keys`. `smem` must hold
@@ -1852,7 +1931,7 @@ struct SpRow {
 template <int QK_DIM, int VALUE_DIM, int TILE, typename T, typename DTypeKV, typename DTypeO,
           typename Keys>
 __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& keys, int row,
-                                             unsigned char* smem) {
+                                             unsigned char* smem, const SpSplit& split) {
   constexpr int kNT = TILE / 8;    // n8 score tiles of one key tile
   constexpr int kPairs = kNT * 4;    // score values per lane
   constexpr int kHalves = TILE / 16;  // 16-key steps of the PV accumulation
@@ -2088,10 +2167,33 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
     l_run[r] += __shfl_xor_sync(0xffffffffu, l_run[r], 1);
     l_run[r] += __shfl_xor_sync(0xffffffffu, l_run[r], 2);
   }
+  const bool split_mode = split.count > 1;
+  // Global partial-row index of this CTA: the merge reads o_states as [row, split, head, dim].
+  const int64_t partial_row = static_cast<int64_t>(row) * split.count + split.index;
+  const int v_dim = io.v_dim;
   float oscale[2], lse[2];
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
     const int h = h0 + (lane >> 2) + 8 * r;
+    if (split_mode) {
+      if (split.index == 0) {
+        // The sink belongs to exactly one state: split 0, which the merge then treats like any
+        // other disjoint key range.
+        const bool has_sink = io.sink != nullptr && h < H;
+        const float sk = has_sink ? io.sink[h] * kTkLog2e : tk_ninf();
+        const float mn = fmaxf(m_run[r], sk);
+        const float al = mn == tk_ninf() ? 0.0f : exp2f(m_run[r] - mn);
+        const float den = mn == tk_ninf()
+                              ? 0.0f
+                              : l_run[r] * al + (sk == tk_ninf() ? 0.0f : exp2f(sk - mn));
+        oscale[r] = den > 0.0f ? al / den : 0.0f;
+        lse[r] = den > 0.0f ? (mn + log2f(den)) * kTkLn2 : tk_ninf();
+      } else {
+        oscale[r] = l_run[r] > 0.0f ? 1.0f / l_run[r] : 0.0f;
+        lse[r] = l_run[r] > 0.0f ? (m_run[r] + log2f(l_run[r])) * kTkLn2 : tk_ninf();
+      }
+      continue;
+    }
     const bool has_sink = io.sink != nullptr && h < H;
     const float sk = has_sink ? io.sink[h] * kTkLog2e : tk_ninf();
     const float mn = fmaxf(m_run[r], sk);
@@ -2102,7 +2204,6 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
     oscale[r] = den > 0.0f ? al / den : 0.0f;
     lse[r] = den > 0.0f ? (mn + log2f(den)) * kTkLn2 : tk_ninf();
   }
-  const int v_dim = io.v_dim;
 #pragma unroll
   for (int i = 0; i < 16; ++i) {
     const int d = 128 * warp + 8 * i + 2 * (lane & 3);
@@ -2113,6 +2214,12 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
       if (h >= H) continue;
       const float v0 = acc[i][2 * r] * oscale[r];
       const float v1 = acc[i][2 * r + 1] * oscale[r];
+      if (split_mode) {
+        float* dst = split.o_partial + (partial_row * H + h) * v_dim + d;
+        dst[0] = v0;
+        dst[1] = v1;
+        continue;
+      }
       DTypeO* dst = reinterpret_cast<DTypeO*>(io.o) + static_cast<int64_t>(row) * io.o_stride_n +
                     static_cast<int64_t>(h) * io.o_stride_h + d;
       if constexpr (std::is_same_v<DTypeO, float>) {
@@ -2123,11 +2230,16 @@ __device__ __forceinline__ void sp_tc_attend(const SpAttnIo& io, const Keys& key
       }
     }
   }
-  if ((lane & 3) == 0 && io.lse != nullptr) {
+  if ((lane & 3) == 0) {
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
       const int h = h0 + (lane >> 2) + 8 * r;
-      if (h < H) io.lse[static_cast<int64_t>(row) * H + h] = lse[r];
+      if (h >= H) continue;
+      if (split_mode) {
+        split.lse_partial[partial_row * H + h] = lse[r];
+      } else if (io.lse != nullptr) {
+        io.lse[static_cast<int64_t>(row) * H + h] = lse[r];
+      }
     }
   }
 }
@@ -2149,17 +2261,21 @@ struct SpMlaKeys {
 
   /// Resolve the keys `[base, base + count)`: the page table and record
   /// addressing are evaluated once per key (thread i handles key base + i),
-  /// never once per 16-byte chunk.
-  __device__ __forceinline__ void prepare(int base, int count, SpRow* dst) const {
+  /// never once per 16-byte chunk. Keys at a flat index >= `limit` stay masked,
+  /// which is how a split CTA's last tile never borrows the next split's keys.
+  __device__ __forceinline__ void prepare(int base, int count, SpRow* dst,
+                                          int limit = 0x7fffffff) const {
     const int i = static_cast<int>(threadIdx.x);
     if (i >= count) return;
     const int flat = base + i;
     int32_t code = -1;
-    if (flat < n0) {
-      code = p->primary.indices[static_cast<int64_t>(row) * topk0 + flat];
-    } else if (flat < n0 + n1) {
-      const int32_t x = p->extra.indices[static_cast<int64_t>(row) * topk1 + (flat - n0)];
-      code = x < 0 ? -1 : ((1 << 30) | x);
+    if (flat < limit) {
+      if (flat < n0) {
+        code = p->primary.indices[static_cast<int64_t>(row) * topk0 + flat];
+      } else if (flat < n0 + n1) {
+        const int32_t x = p->extra.indices[static_cast<int64_t>(row) * topk1 + (flat - n0)];
+        code = x < 0 ? -1 : ((1 << 30) | x);
+      }
     }
     SpRow& r = dst[i];
     r.code = code;
@@ -2286,6 +2402,59 @@ __device__ void sp_mla_scalar(const SparseMLAParams& params, float* smem) {
 
 }  // namespace
 
+/// Tensor-core body shared by sparse_mla_kernel (split.count == 1) and sparse_mla_split_kernel:
+/// resolves the visible key list of one (row, 16-head tile), narrows it to this CTA's split range
+/// and runs the P-once softmax.
+template <typename DTypeQ, typename DTypeKV, typename DTypeO>
+__device__ __forceinline__ void sp_mla_attend(const SparseMLAParams& params, int row,
+                                              unsigned char* smem, const SpSplit& split) {
+  const int qk_dim = params.qk_dim > 0 ? params.qk_dim : 576;
+  const int v_dim = params.v_dim > 0 ? params.v_dim : 512;
+  const int topk0 = params.primary.topk;
+  const int topk1 = params.extra.indices != nullptr ? params.extra.topk : 0;
+  SpMlaKeys<DTypeKV> keys{};
+  keys.p = &params;
+  keys.row = row;
+  keys.topk0 = topk0;
+  keys.topk1 = topk1;
+  keys.n0 = params.primary.indices != nullptr
+                ? (params.primary.topk_length != nullptr
+                       ? min(max(params.primary.topk_length[row], 0), topk0)
+                       : topk0)
+                : 0;
+  keys.n1 = params.extra.indices != nullptr
+                ? (params.extra.topk_length != nullptr
+                       ? min(max(params.extra.topk_length[row], 0), topk1)
+                       : topk1)
+                : 0;
+  const int total = keys.n0 + keys.n1;
+  const int splits = split.count > 0 ? split.count : 1;
+  const int per = (total + splits - 1) / splits;
+  const int lo = split.index > 0 ? min(total, split.index * per) : 0;
+  const int hi = split.count > 1 ? min(total, lo + per) : total;
+  SpKeyRange<SpMlaKeys<DTypeKV>> range{&keys, lo, hi};
+
+  SpAttnIo io{};
+  io.q = params.q;
+  io.q_stride_n = params.q_stride_n;
+  io.q_stride_h = params.q_stride_h;
+  io.o = params.o;
+  io.o_stride_n = params.o_stride_n;
+  io.o_stride_h = params.o_stride_h;
+  io.lse = params.lse;
+  io.sink = params.mod.sink_logits;
+  io.num_heads = params.num_heads;
+  io.scale = params.mod.sm_scale != 0.0f ? params.mod.sm_scale
+                                        : rsqrtf(static_cast<float>(qk_dim));
+  io.q_scale = params.mod.q_scale;
+  io.v_dim = v_dim;
+  if (qk_dim == 576) {
+    sp_tc_attend<576, 512, spTile, DTypeQ, DTypeKV, DTypeO>(io, range, row, smem, split);
+  } else {
+    sp_tc_attend<512, 512, spTile, DTypeQ, DTypeKV, DTypeO>(io, range, row, smem, split);
+  }
+}
+
 template <int HEADS_PER_CTA, int TOPK_TILE, typename DTypeQ, typename DTypeKV, typename DTypeO,
           typename ArchTag>
 __global__ void __launch_bounds__(tkThreads)
@@ -2304,42 +2473,40 @@ __global__ void __launch_bounds__(tkThreads)
     sp_mla_scalar<DTypeQ, DTypeKV, DTypeO>(params, reinterpret_cast<float*>(sp_tc_smem));
     return;
   }
-  const int topk0 = params.primary.topk;
-  const int topk1 = params.extra.indices != nullptr ? params.extra.topk : 0;
-  SpMlaKeys<DTypeKV> keys{};
-  keys.p = &params;
-  keys.row = row;
-  keys.topk0 = topk0;
-  keys.topk1 = topk1;
-  keys.n0 = params.primary.indices != nullptr
-                ? (params.primary.topk_length != nullptr
-                       ? min(max(params.primary.topk_length[row], 0), topk0)
-                       : topk0)
-                : 0;
-  keys.n1 = params.extra.indices != nullptr
-                ? (params.extra.topk_length != nullptr
-                       ? min(max(params.extra.topk_length[row], 0), topk1)
-                       : topk1)
-                : 0;
-  SpAttnIo io{};
-  io.q = params.q;
-  io.q_stride_n = params.q_stride_n;
-  io.q_stride_h = params.q_stride_h;
-  io.o = params.o;
-  io.o_stride_n = params.o_stride_n;
-  io.o_stride_h = params.o_stride_h;
-  io.lse = params.lse;
-  io.sink = params.mod.sink_logits;
-  io.num_heads = params.num_heads;
-  io.scale = params.mod.sm_scale != 0.0f ? params.mod.sm_scale
-                                         : rsqrtf(static_cast<float>(qk_dim));
-  io.q_scale = params.mod.q_scale;
-  io.v_dim = v_dim;
-  if (qk_dim == 576) {
-    sp_tc_attend<576, 512, spTile, DTypeQ, DTypeKV, DTypeO>(io, keys, row, sp_tc_smem);
-  } else {
-    sp_tc_attend<512, 512, spTile, DTypeQ, DTypeKV, DTypeO>(io, keys, row, sp_tc_smem);
+  sp_mla_attend<DTypeQ, DTypeKV, DTypeO>(params, row, sp_tc_smem, SpSplit{});
+}
+
+/// Split-KV variant: grid.z = S, one normalized fp32 partial per (row, head tile, split).
+template <int HEADS_PER_CTA, int TOPK_TILE, typename DTypeQ, typename DTypeKV, typename DTypeO,
+          typename ArchTag>
+__global__ void __launch_bounds__(tkThreads)
+    sparse_mla_split_kernel(const __grid_constant__ SparseMLAParams params,
+                            float* __restrict__ o_partial, float* __restrict__ lse_partial) {
+  static_assert(HEADS_PER_CTA == tkKeys, "16 query heads per CTA");
+  (void)sizeof(ArchTag);
+  (void)sizeof(TOPK_TILE);
+  // The host only selects this body for the tensor-core shapes below (fp32 q/o and odd entry
+  // dims stay on sparse_mla_kernel, which has a per-head scalar fallback).
+  constexpr bool kTcDtype = std::is_same_v<DTypeQ, __nv_bfloat16> || std::is_same_v<DTypeQ, __half>;
+  if constexpr (!kTcDtype) {
+    (void)o_partial;
+    (void)lse_partial;
+    if (threadIdx.x == 0) __trap();
+    return;
   }
+  const int row = static_cast<int>(blockIdx.x);
+  const int h0 = static_cast<int>(blockIdx.y) * tkKeys;
+  if (row >= params.num_tokens || h0 >= params.num_heads) return;
+  const int qk_dim = params.qk_dim > 0 ? params.qk_dim : 576;
+  const int v_dim = params.v_dim > 0 ? params.v_dim : 512;
+  if (v_dim > 512 || (qk_dim != 576 && qk_dim != 512)) return;
+  extern __shared__ __align__(16) unsigned char sp_tc_smem[];
+  SpSplit split{};
+  split.o_partial = o_partial;
+  split.lse_partial = lse_partial;
+  split.index = static_cast<int32_t>(blockIdx.z);
+  split.count = static_cast<int32_t>(gridDim.z);
+  sp_mla_attend<DTypeQ, DTypeKV, DTypeO>(params, row, sp_tc_smem, split);
 }
 
 namespace {
@@ -2405,10 +2572,10 @@ Status sparse_mla_dispatch(const SparseMLAParams& params, const LaunchContext& c
 
 }  // namespace
 
-Status sparse_mla_run(const SparseMLAParams& params, const LaunchContext& ctx) {
-  if (ctx.backend != BackendKind::kCuda) {
-    return detail::set_error(Status::kUnsupportedBackend, "sparse_mla: CUDA backend only");
-  }
+namespace {
+
+/// Argument contract shared by sparse_mla_run and sparse_mla_run_ws.
+Status sparse_mla_validate(const SparseMLAParams& params) {
   if (params.q == nullptr || params.o == nullptr || params.num_tokens < 0 || params.num_heads <= 0 ||
       params.qk_dim <= 0 || params.v_dim <= 0) {
     return detail::set_error(Status::kInvalidArgument, "sparse_mla: bad argument");
@@ -2458,7 +2625,156 @@ Status sparse_mla_run(const SparseMLAParams& params, const LaunchContext& ctx) {
   if (topk <= 0 || topk > 8192) {
     return detail::set_error(Status::kUnsupportedShape, "sparse_mla: topk %d", topk);
   }
+  return Status::kSuccess;
+}
+
+/// Tensor-core shapes of the split body (mirrors the device test in sparse_mla_split_kernel).
+bool sparse_mla_tc_shape(const SparseMLAParams& params) {
+  const bool tc_dtype =
+      params.q_dtype == DType::kBFloat16 || params.q_dtype == DType::kFloat16;
+  const int qk_dim = params.qk_dim > 0 ? params.qk_dim : 576;
+  const int v_dim = params.v_dim > 0 ? params.v_dim : 512;
+  return tc_dtype && params.o_dtype == params.q_dtype && v_dim <= 512 &&
+         (qk_dim == 576 || qk_dim == 512);
+}
+
+Status sparse_mla_split_dispatch(const SparseMLAParams& params, float* o_partial,
+                                 float* lse_partial, int32_t splits, const LaunchContext& ctx) {
+  const int qk_dim = params.qk_dim > 0 ? params.qk_dim : 576;
+  const size_t smem = sp_smem_bytes(qk_dim);
+  const dim3 grid(static_cast<unsigned>(params.num_tokens),
+                  static_cast<unsigned>((params.num_heads + tkKeys - 1) / tkKeys),
+                  static_cast<unsigned>(splits));
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
+  cudaError_t err = cudaSuccess;
+#define KOPS_SPARSE_MLA_SPLIT(QT, KT, OT)                                                       \
+  do {                                                                                          \
+    if (smem > 48u * 1024u) {                                                                   \
+      (void)cudaFuncSetAttribute(                                                               \
+          reinterpret_cast<const void*>(&sparse_mla_split_kernel<16, 64, QT, KT, OT, Sm80>),    \
+          cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));                 \
+    }                                                                                           \
+    sparse_mla_split_kernel<16, 64, QT, KT, OT, Sm80>                                           \
+        <<<grid, tkThreads, smem, stream>>>(params, o_partial, lse_partial);                    \
+    err = cudaGetLastError();                                                                   \
+  } while (0)
+  if (params.q_dtype == DType::kBFloat16) {
+    KOPS_SPARSE_MLA_SPLIT(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
+  } else {
+    KOPS_SPARSE_MLA_SPLIT(__half, __half, __half);
+  }
+#undef KOPS_SPARSE_MLA_SPLIT
+  if (err != cudaSuccess) return launch_error("sparse_mla_split launch", err);
+  return Status::kSuccess;
+}
+
+Status sparse_mla_launch_plain(const SparseMLAParams& params, const LaunchContext& ctx) {
   return sparse_mla_dispatch(params, ctx);
+}
+
+/// One packed fp32/row view handed to merge_states.
+Tensor sp_mla_tensor(void* data, DType dt, int32_t ndim, const int64_t* shape, int32_t device) {
+  Tensor t{};
+  t.data = data;
+  t.dtype = dt;
+  t.ndim = ndim;
+  t.device = device;
+  int64_t stride = 1;
+  for (int32_t d = ndim - 1; d >= 0; --d) {
+    t.shape[d] = shape[d];
+    t.stride[d] = stride;
+    stride *= shape[d];
+  }
+  return t;
+}
+
+/// Keys per split below which the extra CTA + merge costs more than it saves.
+constexpr int64_t kSpMlaSplitMinKeys = 256;
+constexpr int32_t kSpMlaSplitMax = 64;
+constexpr int32_t kSpMlaSplitWaves = 2;
+
+int32_t sp_mla_split_count_impl(const SparseMLAParams& params, const LaunchContext& ctx) {
+  if (params.num_tokens <= 0 || params.num_heads <= 0 || !sparse_mla_tc_shape(params)) return 1;
+  const int64_t topk = static_cast<int64_t>(params.primary.topk) +
+                       (params.extra.indices != nullptr ? params.extra.topk : 0);
+  if (params.primary.indices == nullptr && params.extra.indices == nullptr) return 1;
+  const int32_t tiles = (params.num_heads + tkKeys - 1) / tkKeys;
+  const int64_t base64 = static_cast<int64_t>(params.num_tokens) * tiles;
+  if (base64 <= 0 || base64 > INT32_MAX) return 1;
+  return occupancy_split_count(static_cast<int32_t>(base64), topk, kSpMlaSplitMinKeys,
+                               kSpMlaSplitWaves, kSpMlaSplitMax, ctx);
+}
+
+size_t sp_mla_split_bytes_impl(const SparseMLAParams& params, int32_t splits) {
+  if (splits <= 1) return 0;
+  const int64_t v_dim = params.v_dim > 0 ? params.v_dim : 512;
+  const int64_t rows = static_cast<int64_t>(params.num_tokens) * splits;
+  const auto align256 = [](size_t n) { return (n + 255u) & ~static_cast<size_t>(255u); };
+  return align256(static_cast<size_t>(rows) * params.num_heads * v_dim * sizeof(float)) +
+         align256(static_cast<size_t>(rows) * params.num_heads * sizeof(float));
+}
+
+}  // namespace
+
+Status sparse_mla_run(const SparseMLAParams& params, const LaunchContext& ctx) {
+  if (ctx.backend != BackendKind::kCuda) {
+    return detail::set_error(Status::kUnsupportedBackend, "sparse_mla: CUDA backend only");
+  }
+  Status s = sparse_mla_validate(params);
+  if (s != Status::kSuccess) return s;
+  return sparse_mla_launch_plain(params, ctx);
+}
+
+int32_t sparse_mla_split_count(const SparseMLAParams& params, const LaunchContext& ctx) {
+  return sp_mla_split_count_impl(params, ctx);
+}
+
+size_t sparse_mla_workspace_bytes(const SparseMLAParams& params, const LaunchContext& ctx) {
+  return sp_mla_split_bytes_impl(params, sp_mla_split_count_impl(params, ctx));
+}
+
+Status sparse_mla_run_ws(const SparseMLAParams& params, const Workspace& ws,
+                         const LaunchContext& ctx) {
+  if (ctx.backend != BackendKind::kCuda) {
+    return detail::set_error(Status::kUnsupportedBackend, "sparse_mla: CUDA backend only");
+  }
+  Status s = sparse_mla_validate(params);
+  if (s != Status::kSuccess) return s;
+  const int32_t splits = sp_mla_split_count_impl(params, ctx);
+  if (splits <= 1 || params.num_tokens == 0) return sparse_mla_launch_plain(params, ctx);
+  const size_t bytes = sp_mla_split_bytes_impl(params, splits);
+  if (ws.device_scratch == nullptr || ws.device_scratch_bytes < bytes ||
+      (reinterpret_cast<uintptr_t>(ws.device_scratch) & 255u) != 0u) {
+    return detail::set_error(Status::kWorkspaceTooSmall,
+                             "sparse_mla_run_ws: needs %zu B of 256-byte aligned scratch", bytes);
+  }
+  const int64_t v_dim = params.v_dim > 0 ? params.v_dim : 512;
+  if (params.o_stride_h != v_dim ||
+      params.o_stride_n != static_cast<int64_t>(params.num_heads) * v_dim) {
+    // merge_states writes a packed view; a padded output keeps the plain body, so the result
+    // never depends on a layout the workspace path cannot express.
+    return sparse_mla_launch_plain(params, ctx);
+  }
+  auto* o_partial = static_cast<float*>(ws.device_scratch);
+  const int64_t o_elems =
+      static_cast<int64_t>(params.num_tokens) * splits * params.num_heads * v_dim;
+  auto* lse_partial = reinterpret_cast<float*>(
+      static_cast<char*>(ws.device_scratch) +
+      ((static_cast<size_t>(o_elems) * sizeof(float) + 255u) & ~static_cast<size_t>(255u)));
+  s = sparse_mla_split_dispatch(params, o_partial, lse_partial, splits, ctx);
+  if (s != Status::kSuccess) return s;
+  const int64_t o_shape[4] = {params.num_tokens, splits, params.num_heads, v_dim};
+  const int64_t lse_shape[3] = {params.num_tokens, splits, params.num_heads};
+  const int64_t o_out_shape[3] = {params.num_tokens, params.num_heads, v_dim};
+  const int64_t lse_out_shape[2] = {params.num_tokens, params.num_heads};
+  Tensor o_out = sp_mla_tensor(params.o, params.o_dtype, 3, o_out_shape, ctx.device);
+  Tensor lse_out{};
+  if (params.lse != nullptr) {
+    lse_out = sp_mla_tensor(params.lse, DType::kFloat32, 2, lse_out_shape, ctx.device);
+  }
+  Tensor o_states = sp_mla_tensor(o_partial, DType::kFloat32, 4, o_shape, ctx.device);
+  Tensor lse_states = sp_mla_tensor(lse_partial, DType::kFloat32, 3, lse_shape, ctx.device);
+  return merge_states(o_out, lse_out, o_states, lse_states, ctx);
 }
 
 // -----------------------------------------------------------------------------
@@ -2733,23 +3049,26 @@ struct CaKeys {
                     static_cast<int64_t>(code & ~(1 << 30))};
   }
 
-  __device__ __forceinline__ void prepare(int base, int n, SpRow* dst) const {
+  __device__ __forceinline__ void prepare(int base, int n, SpRow* dst,
+                                          int limit = 0x7fffffff) const {
     const int i = static_cast<int>(threadIdx.x);
     if (i >= n) return;
     const int flat = base + i;
     int32_t code = -1;
-    if (flat < n_sel) {
-      if (p->selected != nullptr) {
-        code = p->selected[static_cast<int64_t>(row) * sel_stride + flat];
-      } else {
-        const int64_t slot = ca_slot(p->compressed, req, flat);
-        if (slot >= 0) code = static_cast<int32_t>(slot);
-      }
-    } else if (flat < n_sel + n_win) {
-      const int64_t pos = win_end - p->window_size + 1 + (flat - n_sel);
-      if (pos >= 0) {
-        const int64_t slot = ca_slot(p->window, req, pos);
-        if (slot >= 0) code = (1 << 30) | static_cast<int32_t>(slot);
+    if (flat < limit) {
+      if (flat < n_sel) {
+        if (p->selected != nullptr) {
+          code = p->selected[static_cast<int64_t>(row) * sel_stride + flat];
+        } else {
+          const int64_t slot = ca_slot(p->compressed, req, flat);
+          if (slot >= 0) code = static_cast<int32_t>(slot);
+        }
+      } else if (flat < n_sel + n_win) {
+        const int64_t pos = win_end - p->window_size + 1 + (flat - n_sel);
+        if (pos >= 0) {
+          const int64_t slot = ca_slot(p->window, req, pos);
+          if (slot >= 0) code = (1 << 30) | static_cast<int32_t>(slot);
+        }
       }
     }
     SpRow& r = dst[i];
@@ -2769,10 +3088,11 @@ struct CaKeys {
 };
 
 /// One CTA: 16 query heads of one query row over its compressed + window keys,
-/// with the sink folded into the same online softmax.
+/// with the sink folded into the same online softmax. `split.count > 1` narrows the visible list
+/// to this CTA's range and writes an fp32 partial instead of the final row.
 template <int ENTRY_DIM, int VALUE_DIM, int TILE, typename DTypeQ, typename DTypeKV, typename DTypeO>
 __device__ __forceinline__ void ca_tc_attend(const CompressedAttentionParams& params,
-                                             unsigned char* smem) {
+                                             unsigned char* smem, const SpSplit& split) {
   const int row = static_cast<int>(blockIdx.x);
   const int h0 = static_cast<int>(blockIdx.y) * tkKeys;
   if (row >= params.num_tokens || h0 >= params.num_q_heads) return;
@@ -2798,6 +3118,13 @@ __device__ __forceinline__ void ca_tc_attend(const CompressedAttentionParams& pa
   keys.n_win = (params.window_size > 0 && params.positions != nullptr) ? params.window_size : 0;
   keys.win_end = params.positions != nullptr ? params.positions[row] : 0;
 
+  const int total = keys.count();
+  const int splits = split.count > 0 ? split.count : 1;
+  const int per = (total + splits - 1) / splits;
+  const int lo = split.index > 0 ? min(total, split.index * per) : 0;
+  const int hi = split.count > 1 ? min(total, lo + per) : total;
+  SpKeyRange<CaKeys<DTypeKV>> range{&keys, lo, hi};
+
   SpAttnIo io{};
   io.q = params.q;
   io.q_stride_n = params.q_stride_n;
@@ -2813,7 +3140,7 @@ __device__ __forceinline__ void ca_tc_attend(const CompressedAttentionParams& pa
   io.q_scale = 0.0f;
   io.v_dim = params.value_dim > 0 ? params.value_dim : VALUE_DIM;
 
-  sp_tc_attend<ENTRY_DIM, VALUE_DIM, TILE, DTypeQ, DTypeKV, DTypeO>(io, keys, row, smem);
+  sp_tc_attend<ENTRY_DIM, VALUE_DIM, TILE, DTypeQ, DTypeKV, DTypeO>(io, range, row, smem, split);
 }
 
 }  // namespace
@@ -2829,9 +3156,11 @@ __global__ void compressed_attention_kernel(const __grid_constant__ CompressedAt
   // shape the m16n8k16 tiles cannot express.
   if (ca_tc_eligible(params)) {
     if (ca_tc_tile(params) == kCaTcTileWide) {
-      ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTileWide, DTypeQ, DTypeKV, DTypeO>(params, ca_smem);
+      ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTileWide, DTypeQ, DTypeKV, DTypeO>(params, ca_smem,
+                                                                                 SpSplit{});
     } else {
-      ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTile, DTypeQ, DTypeKV, DTypeO>(params, ca_smem);
+      ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTile, DTypeQ, DTypeKV, DTypeO>(params, ca_smem,
+                                                                            SpSplit{});
     }
     return;
   }
@@ -3020,10 +3349,33 @@ __global__ void compressed_attention_kernel(const __grid_constant__ CompressedAt
   }
 }
 
-Status compressed_attention(const CompressedAttentionParams& params, const LaunchContext& ctx) {
-  if (ctx.backend != BackendKind::kCuda) {
-    return detail::set_error(Status::kUnsupportedBackend, "compressed_attention: CUDA only");
+/// Split-KV variant of the tensor-core body: grid.z = S, one normalized fp32 partial per
+/// (row, 16-head tile, split); merge_states folds the S states and the sink lands in split 0.
+template <int HEADS_PER_CTA, int ENTRY_DIM, int VALUE_DIM, typename DTypeQ, typename DTypeKV,
+          typename DTypeO, typename ArchTag>
+__global__ void compressed_attention_split_kernel(
+    const __grid_constant__ CompressedAttentionParams params, float* __restrict__ o_partial,
+    float* __restrict__ lse_partial) {
+  static_assert(HEADS_PER_CTA == tkKeys, "16 query heads per CTA");
+  if (!ca_tc_eligible(params)) return;  // host keeps scalar shapes on compressed_attention
+  extern __shared__ __align__(16) unsigned char ca_smem[];
+  SpSplit split{};
+  split.o_partial = o_partial;
+  split.lse_partial = lse_partial;
+  split.index = static_cast<int32_t>(blockIdx.z);
+  split.count = static_cast<int32_t>(gridDim.z);
+  if (ca_tc_tile(params) == kCaTcTileWide) {
+    ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTileWide, DTypeQ, DTypeKV, DTypeO>(params, ca_smem,
+                                                                                split);
+  } else {
+    ca_tc_attend<ENTRY_DIM, VALUE_DIM, kCaTcTile, DTypeQ, DTypeKV, DTypeO>(params, ca_smem, split);
   }
+}
+
+namespace {
+
+/// Shape / dtype / alignment contract shared by compressed_attention and compressed_attention_ws.
+Status ca_validate(const CompressedAttentionParams& params) {
   if (params.q == nullptr || params.o == nullptr || params.num_tokens < 0 || params.num_q_heads <= 0 ||
       params.entry_dim <= 0 || params.value_dim <= 0) {
     return detail::set_error(Status::kInvalidArgument, "compressed_attention: bad argument");
@@ -3049,6 +3401,16 @@ Status compressed_attention(const CompressedAttentionParams& params, const Launc
     return detail::set_error(Status::kInvalidArgument, "compressed_attention: value_dim %d",
                              params.value_dim);
   }
+  const bool dt_ok = (params.q_dtype == DType::kBFloat16 && params.o_dtype == DType::kBFloat16) ||
+                     (params.q_dtype == DType::kFloat16 && params.o_dtype == DType::kFloat16);
+  if (!dt_ok) {
+    return detail::set_error(Status::kUnsupportedDtype, "compressed_attention: q/o dtype");
+  }
+  return Status::kSuccess;
+}
+
+Status ca_launch_plain(const CompressedAttentionParams& params, const LaunchContext& ctx) {
+  const int cap = params.topk + (params.window_size > 0 ? params.window_size : 0);
   const bool tc = ca_tc_eligible(params);
   const size_t smem = tc ? (ca_tc_tile(params) == kCaTcTileWide
                                 ? sp_tc_smem_bytes_t<kCaTcDim, kCaTcTileWide>()
@@ -3072,16 +3434,155 @@ Status compressed_attention(const CompressedAttentionParams& params, const Launc
         params);                                                                                \
     err = cudaGetLastError();                                                                   \
   } while (0)
-  if (params.q_dtype == DType::kBFloat16 && params.o_dtype == DType::kBFloat16) {
+  if (params.q_dtype == DType::kBFloat16) {
     KOPS_CA_LAUNCH(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
-  } else if (params.q_dtype == DType::kFloat16 && params.o_dtype == DType::kFloat16) {
-    KOPS_CA_LAUNCH(__half, __half, __half);
   } else {
-    return detail::set_error(Status::kUnsupportedDtype, "compressed_attention: q/o dtype");
+    KOPS_CA_LAUNCH(__half, __half, __half);
   }
 #undef KOPS_CA_LAUNCH
   if (err != cudaSuccess) return launch_error("compressed_attention launch", err);
   return Status::kSuccess;
+}
+
+Status ca_launch_split(const CompressedAttentionParams& params, float* o_partial,
+                       float* lse_partial, int32_t splits, const LaunchContext& ctx) {
+  const size_t smem = ca_tc_tile(params) == kCaTcTileWide
+                          ? sp_tc_smem_bytes_t<kCaTcDim, kCaTcTileWide>()
+                          : sp_tc_smem_bytes_t<kCaTcDim, kCaTcTile>();
+  const dim3 grid(static_cast<unsigned>(params.num_tokens),
+                  static_cast<unsigned>((params.num_q_heads + 15) / 16),
+                  static_cast<unsigned>(splits));
+  const cudaStream_t stream = reinterpret_cast<cudaStream_t>(ctx.stream);
+  cudaError_t err = cudaSuccess;
+#define KOPS_CA_SPLIT_LAUNCH(QT, KT, OT)                                                        \
+  do {                                                                                          \
+    if (smem > 48u * 1024u) {                                                                   \
+      (void)cudaFuncSetAttribute(                                                               \
+          reinterpret_cast<const void*>(&compressed_attention_split_kernel<16, 512, 512, QT, KT, \
+                                                                           OT, Sm80>),          \
+          cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem));                 \
+    }                                                                                           \
+    compressed_attention_split_kernel<16, 512, 512, QT, KT, OT, Sm80>                           \
+        <<<grid, tkThreads, smem, stream>>>(params, o_partial, lse_partial);                    \
+    err = cudaGetLastError();                                                                   \
+  } while (0)
+  if (params.q_dtype == DType::kBFloat16) {
+    KOPS_CA_SPLIT_LAUNCH(__nv_bfloat16, __nv_bfloat16, __nv_bfloat16);
+  } else {
+    KOPS_CA_SPLIT_LAUNCH(__half, __half, __half);
+  }
+#undef KOPS_CA_SPLIT_LAUNCH
+  if (err != cudaSuccess) return launch_error("compressed_attention_ws launch", err);
+  return Status::kSuccess;
+}
+
+/// Packed fp32 (o_states / lse_states) or row view used to hand the split buffers to merge_states.
+Tensor ca_tensor(void* data, DType dt, int32_t ndim, const int64_t* shape, const int32_t device) {
+  Tensor t{};
+  t.data = data;
+  t.dtype = dt;
+  t.ndim = ndim;
+  t.device = device;
+  int64_t stride = 1;
+  for (int32_t d = ndim - 1; d >= 0; --d) {
+    t.shape[d] = shape[d];
+    t.stride[d] = stride;
+    stride *= shape[d];
+  }
+  return t;
+}
+
+/// Split count of the tensor-core body: the natural grid is T * ceil(Hq/16) CTAs. Below two
+/// waves of the partition one CTA per (row, 16 heads) is under-parallel, so the key list is
+/// split; 256 visible keys per CTA is the floor where the extra CTA and the merge still pay.
+constexpr int32_t kCaSplitMinKeys = 256;
+constexpr int32_t kCaSplitMax = 64;
+constexpr int32_t kCaSplitWaves = 2;
+
+int32_t ca_split_count_impl(const CompressedAttentionParams& params, const LaunchContext& ctx) {
+  if (params.num_tokens <= 0 || params.num_q_heads <= 0 || !ca_tc_eligible(params)) return 1;
+  const int64_t cap = static_cast<int64_t>(params.topk) +
+                      (params.window_size > 0 ? params.window_size : 0);
+  const int32_t tiles = (params.num_q_heads + 15) / 16;
+  const int64_t base64 = static_cast<int64_t>(params.num_tokens) * tiles;
+  if (base64 <= 0 || base64 > INT32_MAX) return 1;
+  return occupancy_split_count(static_cast<int32_t>(base64), cap, kCaSplitMinKeys, kCaSplitWaves,
+                               kCaSplitMax, ctx);
+}
+
+size_t ca_split_bytes_impl(const CompressedAttentionParams& params, int32_t splits) {
+  if (splits <= 1) return 0;
+  const int64_t rows = static_cast<int64_t>(params.num_tokens) * splits;
+  const auto align256 = [](size_t n) { return (n + 255u) & ~static_cast<size_t>(255u); };
+  return align256(static_cast<size_t>(rows) * params.num_q_heads * params.value_dim *
+                  sizeof(float)) +
+         align256(static_cast<size_t>(rows) * params.num_q_heads * sizeof(float));
+}
+
+}  // namespace
+
+Status compressed_attention(const CompressedAttentionParams& params, const LaunchContext& ctx) {
+  if (ctx.backend != BackendKind::kCuda) {
+    return detail::set_error(Status::kUnsupportedBackend, "compressed_attention: CUDA only");
+  }
+  Status s = ca_validate(params);
+  if (s != Status::kSuccess) return s;
+  return ca_launch_plain(params, ctx);
+}
+
+int32_t compressed_attention_split_count(const CompressedAttentionParams& params,
+                                         const LaunchContext& ctx) {
+  return ca_split_count_impl(params, ctx);
+}
+
+size_t compressed_attention_workspace_bytes(const CompressedAttentionParams& params,
+                                            const LaunchContext& ctx) {
+  return ca_split_bytes_impl(params, ca_split_count_impl(params, ctx));
+}
+
+Status compressed_attention_ws(const CompressedAttentionParams& params, const Workspace& ws,
+                               const LaunchContext& ctx) {
+  if (ctx.backend != BackendKind::kCuda) {
+    return detail::set_error(Status::kUnsupportedBackend, "compressed_attention_ws: CUDA only");
+  }
+  Status s = ca_validate(params);
+  if (s != Status::kSuccess) return s;
+  const int32_t splits = ca_split_count_impl(params, ctx);
+  if (splits <= 1 || params.num_tokens == 0) return ca_launch_plain(params, ctx);
+  const size_t bytes = ca_split_bytes_impl(params, splits);
+  if (ws.device_scratch == nullptr || ws.device_scratch_bytes < bytes ||
+      (reinterpret_cast<uintptr_t>(ws.device_scratch) & 255u) != 0u) {
+    return detail::set_error(Status::kWorkspaceTooSmall,
+                             "compressed_attention_ws: needs %zu B of 256-byte aligned scratch",
+                             bytes);
+  }
+  // merge_states folds packed views; a padded output keeps the plain body, so the result never
+  // depends on a layout the workspace path cannot express.
+  const int64_t v_dim = params.value_dim;
+  if (params.o_stride_h != v_dim ||
+      params.o_stride_n != static_cast<int64_t>(params.num_q_heads) * v_dim) {
+    return ca_launch_plain(params, ctx);
+  }
+  auto* o_partial = static_cast<float*>(ws.device_scratch);
+  const int64_t o_elems =
+      static_cast<int64_t>(params.num_tokens) * splits * params.num_q_heads * v_dim;
+  auto* lse_partial = reinterpret_cast<float*>(static_cast<char*>(ws.device_scratch) +
+                                               ((static_cast<size_t>(o_elems) * sizeof(float) + 255u) &
+                                                ~static_cast<size_t>(255u)));
+  s = ca_launch_split(params, o_partial, lse_partial, splits, ctx);
+  if (s != Status::kSuccess) return s;
+  const int64_t o_shape[4] = {params.num_tokens, splits, params.num_q_heads, v_dim};
+  const int64_t lse_shape[3] = {params.num_tokens, splits, params.num_q_heads};
+  const int64_t o_out_shape[3] = {params.num_tokens, params.num_q_heads, v_dim};
+  const int64_t lse_out_shape[2] = {params.num_tokens, params.num_q_heads};
+  Tensor o_out = ca_tensor(params.o, params.o_dtype, 3, o_out_shape, ctx.device);
+  Tensor lse_out{};
+  if (params.lse != nullptr) {
+    lse_out = ca_tensor(params.lse, DType::kFloat32, 2, lse_out_shape, ctx.device);
+  }
+  Tensor o_states = ca_tensor(o_partial, DType::kFloat32, 4, o_shape, ctx.device);
+  Tensor lse_states = ca_tensor(lse_partial, DType::kFloat32, 3, lse_shape, ctx.device);
+  return merge_states(o_out, lse_out, o_states, lse_states, ctx);
 }
 
 }  // namespace kops::attn

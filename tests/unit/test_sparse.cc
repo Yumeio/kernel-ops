@@ -137,9 +137,10 @@ struct TopkCase {
   bool slots = false;
   bool with_values = true;
   int buffer_rows = 0;            // > rows: sentinel index rows past num_rows
-  /// 0: workspace-free entry (sparse_topk); 1: sparse_topk_ws with the recommended
-  /// lease (rows == 1 and max_kv >= 256 Ki then take the multi-CTA fast path);
-  /// 2: sparse_topk_ws with a 1 KiB lease, which must fall back and stay exact.
+  /// 0: workspace-free entry (sparse_topk); 1: sparse_topk_ws with the single-row
+  /// lease (max_kv >= 256 Ki then takes the multi-CTA fast path); 2: sparse_topk_ws
+  /// with a 1 KiB lease, which must fall back and stay exact; 3: sparse_topk_ws
+  /// with sparse_topk_rows_workspace_bytes(rows), one scratch slice per wide row.
   int workspace = 0;
 };
 
@@ -265,8 +266,13 @@ void run_topk_case(const TopkCase& c, const char* what) {
   DevArray<int32_t> d_starts(c.starts.empty() ? 0 : c.starts.size());
   DevArray<int32_t> d_table(c.table.empty() ? 0 : c.table.size());
   DevArray<int32_t> d_request(c.request.empty() ? 0 : c.request.size());
-  const size_t ws_bytes =
-      c.workspace == 1 ? kops::attn::sparse_topk_workspace_bytes() : (c.workspace == 2 ? 1024 : 0);
+  const size_t ws_bytes = c.workspace == 1
+                              ? kops::attn::sparse_topk_workspace_bytes()
+                              : (c.workspace == 2 ? 1024
+                                                  : (c.workspace == 3
+                                                         ? kops::attn::sparse_topk_rows_workspace_bytes(
+                                                               c.rows)
+                                                         : 0));
   DevArray<char> d_ws(ws_bytes);
   if (d_scores.p == nullptr || d_values.p == nullptr || d_idx.p == nullptr ||
       d_ends.p == nullptr) {
@@ -591,6 +597,82 @@ void test_fast_path() {
     c.ends = {c.max_kv};
     c.workspace = 2;
     run_topk_case(c, "sparse_topk fast path short workspace");
+  }
+  {
+    // Several wide rows in one cooperative launch: every row owns a scratch slice
+    // and a split share of its own columns, and the grid shrank the split count so
+    // all CTAs stay resident.
+    TopkCase c;
+    c.rows = 16;
+    c.max_kv = 262144;
+    c.topk = 2048;
+    c.scores = uniform_scores(c.rows, c.max_kv, 81u);
+    c.ends.assign(static_cast<size_t>(c.rows), c.max_kv);
+    c.workspace = 3;
+    run_topk_case(c, "sparse_topk fast path 16 rows x 256k");
+  }
+  {
+    // Ragged window plus a 1M row: chunks follow each row's own [start, end) with
+    // relative indices, and a row shorter than K pads instead of reading past it.
+    TopkCase c;
+    c.rows = 4;
+    c.max_kv = 1 << 20;
+    c.topk = 512;
+    c.scores = uniform_scores(c.rows, c.max_kv, 82u);
+    c.starts = {1000, 0, 4096, 65536};
+    c.ends = {c.max_kv, 300, 700000, 131072};
+    c.absolute = false;
+    c.workspace = 3;
+    run_topk_case(c, "sparse_topk fast path 4 ragged 1M rows");
+  }
+  {
+    // An empty row and a one-column row share the grid with a full row: they take
+    // the -1 / -inf padding branch, and the full row must still be exact (no CTA
+    // may skip a grid sync because its row has no visible columns).
+    TopkCase c;
+    c.rows = 3;
+    c.max_kv = 262144;
+    c.topk = 1024;
+    c.scores = uniform_scores(c.rows, c.max_kv, 83u);
+    c.ends = {0, 1, c.max_kv};
+    c.workspace = 3;
+    run_topk_case(c, "sparse_topk fast path empty and short rows");
+  }
+  {
+    // A tie-heavy row forces its own candidate overflow and exact single-CTA
+    // reselection inside the shared launch; its neighbour must be unaffected.
+    TopkCase c;
+    c.rows = 3;
+    c.max_kv = 262144;
+    c.topk = 2048;
+    c.scores = uniform_scores(c.rows, c.max_kv, 84u);
+    for (int64_t i = 0; i < c.max_kv; ++i) c.scores[static_cast<size_t>(c.max_kv + i)] = 0.5f;
+    c.ends.assign(static_cast<size_t>(c.rows), c.max_kv);
+    c.workspace = 3;
+    run_topk_case(c, "sparse_topk fast path multi-row tie fallback");
+  }
+  {
+    // Per-row page-slot mapping through the multi-row fast path.
+    TopkCase c;
+    c.rows = 4;
+    c.max_kv = 262144;
+    c.topk = 512;
+    c.scores = uniform_scores(c.rows, c.max_kv, 85u);
+    c.ends.assign(static_cast<size_t>(c.rows), c.max_kv);
+    c.page_size = 64;
+    c.table_stride = c.max_kv / c.page_size;
+    c.table.assign(static_cast<size_t>(c.rows) * c.table_stride, 0);
+    for (int r = 0; r < c.rows; ++r) {
+      for (int i = 0; i < c.table_stride; ++i) {
+        c.table[static_cast<size_t>(r) * c.table_stride + i] = c.table_stride - 1 - i;
+      }
+      c.table[static_cast<size_t>(r) * c.table_stride + 3] = -1;  // page 3 unmapped for every row
+    }
+    c.request = {0, 1, 2, 3};
+    c.slots = true;
+    c.absolute = true;
+    c.workspace = 3;
+    run_topk_case(c, "sparse_topk fast path 4 rows page slots");
   }
 }
 

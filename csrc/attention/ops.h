@@ -79,6 +79,31 @@ Status mla_decode_plan(const AttentionSpec& spec, int32_t max_batch, int32_t q_l
                        const LaunchContext& ctx, const Workspace& ws, AttentionPlan* plan);
 Status mla_decode_run(const AttentionPlan& plan, const MLADecodeParams& params,
                       const Workspace& ws, const LaunchContext& ctx);
+
+/// Host-only split-KV plan for one dense MLA decode shape: a uniform split count over every
+/// request plus the sizes of the three partial buffers mla_decode_run() then consumes.
+///
+/// The count scales the natural grid — q_len * ceil(H / 16) CTAs per request, one per 16-head
+/// tile — to `waves` full waves of ctx (occupancy.h), capped by max_splits and by at least 512
+/// visible keys per split. `kv_len` is a host-known length bound (a capacity, the benchmark's
+/// fixed context length, a max over the batch the caller already computed); the function never
+/// reads seq_lens, num_splits or any other device array, so it stays valid across CUDA-graph
+/// capture and replay. splits == 1 means the plan needs no partial buffers at all.
+///
+/// The caller owns the buffers and fills num_splits[b] = b * splits and
+/// merge_indptr[row] = row * splits (FlashMLA cumulative convention) before mla_decode_run;
+/// merge_split_kv then folds them (and the sink, exactly once) into o/lse.
+struct MLASplitHint {
+  int32_t splits = 1;             // uniform split count (1 = no split)
+  int64_t total_q = 0;            // batch_size * q_len partial rows
+  size_t o_partial_bytes = 0;     // [total_q * splits, H, kv_lora_rank] fp32
+  size_t lse_partial_bytes = 0;   // [total_q * splits, H] fp32
+  size_t merge_indptr_bytes = 0;  // [total_q + 1] int32
+  size_t total_bytes = 0;         // 256-aligned sum of the three buffers
+};
+Status mla_decode_split_hint(int32_t batch_size, int32_t q_len, int32_t num_heads,
+                             int32_t kv_len, int32_t max_splits, int32_t waves,
+                             const LaunchContext& ctx, MLASplitHint* out);
 /// Device-side split planner (FlashMLA get_decoding_sched_meta semantics). seq_lens is [B];
 /// tile_scheduler_metadata is [num_sm_parts, 8], num_splits is [B + 1]. Graph-capturable.
 Status mla_get_metadata(const Tensor& tile_scheduler_metadata, const Tensor& num_splits,
@@ -89,6 +114,22 @@ Status mla_context_gather(const Tensor& c_kv_out, const Tensor& k_pe_out,
                           const kv::PagedKVDesc& cache, const Tensor& ctx_token_indptr,
                           const Tensor& ctx_start, const LaunchContext& ctx);
 Status sparse_mla_run(const SparseMLAParams& params, const LaunchContext& ctx);
+/// Split-KV body of the same op for one short, wide query row: grid.z splits the visible key list
+/// (primary + extra scope, `topk_length`-truncated) across CTAs, each writes an fp32 partial to
+/// ws.device_scratch and merge_states folds them (and the sink, exactly once) into params.o/lse.
+///
+/// The count scales `num_tokens * ceil(num_heads / 16)` to two waves of ctx's compute units
+/// (occupancy.h), capped at 64 and at one split per 256 visible keys; a shape that already fills
+/// the machine, a shape outside the tensor-core body, a padded params.o or `splits == 1` runs the
+/// plain sparse_mla_run body and needs no workspace. An explicit lease smaller than
+/// sparse_mla_workspace_bytes() is kWorkspaceTooSmall. All three functions are pure w.r.t. device
+/// state, so a plan can size the lease before capture and replay it, provided the same shard runs
+/// on the same device.
+int32_t sparse_mla_split_count(const SparseMLAParams& params, const LaunchContext& ctx);
+/// Device scratch bytes sparse_mla_run_ws uses for these params (0 = the plain path).
+size_t sparse_mla_workspace_bytes(const SparseMLAParams& params, const LaunchContext& ctx);
+Status sparse_mla_run_ws(const SparseMLAParams& params, const Workspace& ws,
+                         const LaunchContext& ctx);
 Status concat_mla_q(const Tensor& q_out, const Tensor& ql_nope, const Tensor& q_pe,
                     const LaunchContext& ctx);
 
@@ -98,26 +139,45 @@ Status sparse_topk(const Tensor& indices, const Tensor& values, const Tensor& sc
                    const Tensor& row_starts, const Tensor& row_ends, int32_t topk,
                    const Tensor& block_table, const Tensor& token_to_request, int32_t page_size,
                    bool absolute_indices, bool to_page_slots, const LaunchContext& ctx);
-/// Same selection with a caller-owned device scratch lease. rows == 1 with max_kv >= 256 Ki
-/// switches to a cooperative multi-CTA path (three chunked passes over the row instead of one CTA
-/// scanning it); every other shape - and a lease that is absent, smaller than
-/// sparse_topk_workspace_bytes() or not 256-byte aligned - runs the workspace-free path unchanged,
-/// so the result never depends on the workspace. No allocation, no device query, no host
-/// synchronization: safe under CUDA-graph capture and replay.
+/// Same selection with a caller-owned device scratch lease. Wide rows (max_kv >= 256 Ki) switch to
+/// a cooperative multi-CTA path that chunks every row across (rows * splits) CTAs (three passes
+/// over each row instead of one CTA scanning it); every other shape - and a lease that is absent,
+/// smaller than sparse_topk_rows_workspace_bytes(rows) or not 256-byte aligned - runs the
+/// workspace-free path unchanged, so the result never depends on the workspace. No allocation, no
+/// device query, no host synchronization: safe under CUDA-graph capture and replay.
 Status sparse_topk_ws(const Tensor& indices, const Tensor& values, const Tensor& scores,
                       const Tensor& row_starts, const Tensor& row_ends, int32_t topk,
                       const Tensor& block_table, const Tensor& token_to_request,
                       int32_t page_size, bool absolute_indices, bool to_page_slots,
                       const Workspace& ws, const LaunchContext& ctx);
-/// Device scratch bytes sparse_topk_ws uses for the fast path; reserving it unconditionally
-/// covers every shape (the other shapes ignore it).
+/// Device scratch bytes one fast-path row uses; sparse_topk_rows_workspace_bytes(rows) covers a
+/// batch of `rows` wide rows. Reserving it unconditionally covers every shape (the other shapes
+/// ignore it).
 size_t sparse_topk_workspace_bytes() noexcept;
+size_t sparse_topk_rows_workspace_bytes(int32_t rows) noexcept;
 Status block_select(const Tensor& block_row_indptr, const Tensor& block_col_indices,
                     const Tensor& q, const Tensor& summaries, const Tensor& qo_indptr,
                     const Tensor& kv_lens, int32_t q_block, int32_t kv_block, int32_t topk_blocks,
                     int32_t num_sink_blocks, int32_t num_local_blocks, const LaunchContext& ctx);
 Status kv_compress(const KVCompressorParams& params, DType in_dtype, const LaunchContext& ctx);
 Status compressed_attention(const CompressedAttentionParams& params, const LaunchContext& ctx);
+/// Split-KV body for small grids: while `num_tokens * ceil(Hq / 16)` stays below two waves of
+/// ctx's compute units the one-CTA-per-16-heads launch leaves most of the partition idle and every
+/// CTA pays the full compressed + window scan. grid.z then splits the visible key list (compressed
+/// entries and the SWA branch together, one softmax) and each CTA writes an fp32 partial that
+/// merge_states folds back, with the sink counted exactly once (split 0). The split count caps at
+/// 64 and at one split per 256 visible keys of `topk + window_size`.
+///
+/// Same contract as the sparse_mla pair: the count is a pure host function of the shape and the
+/// context; splits == 1, a shape outside the tensor-core body or a padded params.o falls back to
+/// the plain launch; a lease smaller than compressed_attention_workspace_bytes() is
+/// kWorkspaceTooSmall; the workspace is only read during run.
+int32_t compressed_attention_split_count(const CompressedAttentionParams& params,
+                                         const LaunchContext& ctx);
+size_t compressed_attention_workspace_bytes(const CompressedAttentionParams& params,
+                                            const LaunchContext& ctx);
+Status compressed_attention_ws(const CompressedAttentionParams& params, const Workspace& ws,
+                               const LaunchContext& ctx);
 
 }  // namespace kops::attn
 

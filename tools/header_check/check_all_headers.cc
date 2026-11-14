@@ -13,6 +13,7 @@
 #include "csrc/common/status.h"
 #include "csrc/common/dtype.cuh"
 #include "csrc/common/tensor.h"
+#include "csrc/common/occupancy.h"
 #include "csrc/common/quant.cuh"
 #include "csrc/common/op_types.cuh"
 #include "csrc/common/vec.cuh"

@@ -57,11 +57,12 @@ __global__ void lightning_indexer_kernel(const __grid_constant__ IndexerParams p
  * data: the caller guarantees 0 <= start <= end <= max_kv and 0 <= token_to_request[row] <
  * block_table rows.
  *
- * Host side, `sparse_topk_ws` may instead select an internal cooperative kernel for one very wide
- * row (rows == 1, max_kv >= 256 Ki, caller workspace): it runs the same exact selection body
- * across a grid of CTAs (chunked radix passes) and falls back to this per-row launch when the row
- * is tie-heavy. That body is file-local to attention/sparse.cu on purpose - it is not part of the
- * family device ABI and carries no declaration here, so the launcher contract above is unchanged.
+ * Host side, `sparse_topk_ws` may instead select an internal cooperative kernel for wide rows
+ * (max_kv >= 256 Ki, caller workspace): it runs the same exact selection body across
+ * (rows * splits) CTAs (chunked radix passes, one scratch slice per row) and falls back to this
+ * per-row launch when a row is tie-heavy. That body is file-local to attention/sparse.cu on
+ * purpose - it is not part of the family device ABI and carries no declaration here, so the
+ * launcher contract above is unchanged.
  */
 template <int TOPK>
 __global__ void sparse_topk_kernel(
@@ -162,6 +163,20 @@ template <int HEADS_PER_CTA, int TOPK_TILE, typename DTypeQ, typename DTypeKV, t
           typename ArchTag>
 __global__ void sparse_mla_kernel(const __grid_constant__ SparseMLAParams params);
 
+/**
+ * sparse_mla_split_kernel — split-KV body of sparse_mla_run_ws. Identical selection, mask,
+ * topk_length and softmax math as sparse_mla_kernel, but grid = (T, ceil(H/16), S): each CTA owns
+ * the key sub-range [c*n/S, (c+1)*n/S) of its row's visible list and writes a normalized fp32
+ * partial o_partial[(row*S + c)*H + h][v_dim] and lse_partial[(row*S + c)*H + h] (natural log).
+ * The sink is folded into split c == 0 only, so merge_states counts it exactly once. fp32 q/o and
+ * entry dims outside 576/512 are not launched here (the host keeps them on sparse_mla_kernel).
+ */
+template <int HEADS_PER_CTA, int TOPK_TILE, typename DTypeQ, typename DTypeKV, typename DTypeO,
+          typename ArchTag>
+__global__ void sparse_mla_split_kernel(const __grid_constant__ SparseMLAParams params,
+                                        float* __restrict__ o_partial,
+                                        float* __restrict__ lse_partial);
+
 // -----------------------------------------------------------------------------
 // DeepSeek-V4 CSA / HCA
 // -----------------------------------------------------------------------------
@@ -245,5 +260,18 @@ struct CompressedAttentionParams {
 template <int HEADS_PER_CTA, int ENTRY_DIM, int VALUE_DIM, typename DTypeQ, typename DTypeKV,
           typename DTypeO, typename ArchTag>
 __global__ void compressed_attention_kernel(const __grid_constant__ CompressedAttentionParams params);
+
+/**
+ * compressed_attention_split_kernel — split-KV body of compressed_attention_ws. Same compressed
+ * (CSA selected / HCA dense) + sliding-window + sink softmax in one pass, but grid =
+ * (T, ceil(Hq/16), S): each CTA scans the key sub-range [c*n/S, (c+1)*n/S) of its row (the
+ * selected entries followed by the window, so a split can contain both) and writes a normalized
+ * fp32 partial for merge_states. Sink in split 0 only. Tensor-core shapes only.
+ */
+template <int HEADS_PER_CTA, int ENTRY_DIM, int VALUE_DIM, typename DTypeQ, typename DTypeKV,
+          typename DTypeO, typename ArchTag>
+__global__ void compressed_attention_split_kernel(
+    const __grid_constant__ CompressedAttentionParams params, float* __restrict__ o_partial,
+    float* __restrict__ lse_partial);
 
 }  // namespace kops::attn

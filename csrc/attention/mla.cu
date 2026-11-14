@@ -26,6 +26,7 @@
 #include "csrc/common/dtype.cuh"
 #include "csrc/common/op_types.cuh"
 #include "csrc/common/tensor.h"
+#include "csrc/common/occupancy.h"
 #include "csrc/common/device.cuh"
 #include "csrc/common/device_impl.cuh"
 #include "csrc/kvcache/kv_layout.cuh"
@@ -1530,6 +1531,77 @@ Status mla_decode_run(const AttentionPlan& plan, const MLADecodeParams& params,
     return launch_mla_decode_dt<__half>(params, fp8, grid, stream);
   }
   return launch_mla_decode_dt<__nv_bfloat16>(params, fp8, grid, stream);
+}
+
+// -----------------------------------------------------------------------------
+// mla_decode_split_hint — host-only, uniform split-KV sizing (occupancy.h).
+//
+// The natural grid is q_len * ceil(H/16) CTAs per request: every CTA owns 16 query heads and
+// scans the request's whole visible key range, so one request leaves the machine idle as soon as
+// the context is long. Splitting the key range S ways multiplies the grid by S and divides each
+// CTA's scan by S; the partials are merged by merge_split_kv (sink folded exactly once there).
+//
+// 512 keys per split is the floor: below it a CTA spends more time on its Q tile (16 x 576) and
+// the fp32 partial row (16 x 512) than on the keys it adds, and the merge traffic (S * H * 512
+// fp32 per query row) dominates. `kv_len` is host data; no device array is read.
+// -----------------------------------------------------------------------------
+namespace {
+
+constexpr int64_t kMlaSplitMinKeys = 512;
+
+}  // namespace
+
+Status mla_decode_split_hint(int32_t batch_size, int32_t q_len, int32_t num_heads, int32_t kv_len,
+                             int32_t max_splits, int32_t waves, const LaunchContext& ctx,
+                             MLASplitHint* out) {
+  if (out == nullptr) {
+    return detail::set_error(Status::kInvalidArgument, "mla_decode_split_hint: null out");
+  }
+  *out = MLASplitHint{};
+  Status s = backend_ok(ctx);
+  if (s != Status::kSuccess) return s;
+  if (batch_size < 0) {
+    return detail::set_error(Status::kInvalidArgument, "mla_decode_split_hint: batch %d",
+                             batch_size);
+  }
+  if (q_len < 1 || q_len > 8) {
+    return detail::set_error(Status::kInvalidArgument, "mla_decode_split_hint: q_len %d", q_len);
+  }
+  if (num_heads <= 0) {
+    return detail::set_error(Status::kInvalidArgument, "mla_decode_split_hint: num_heads %d",
+                             num_heads);
+  }
+  if (kv_len < 0 || max_splits < 1 || waves < 0) {
+    return detail::set_error(Status::kInvalidArgument,
+                             "mla_decode_split_hint: kv_len %d, max_splits %d, waves %d", kv_len,
+                             max_splits, waves);
+  }
+  const int64_t total_q = static_cast<int64_t>(batch_size) * q_len;
+  if (total_q > INT32_MAX / (max_splits > 0 ? max_splits : 1)) {
+    return detail::set_error(Status::kCapacityExceeded,
+                             "mla_decode_split_hint: %lld query rows x %d splits exceeds int32",
+                             static_cast<long long>(total_q), max_splits);
+  }
+  out->total_q = total_q;
+  if (batch_size == 0) return Status::kSuccess;  // nothing to size
+
+  const int32_t head_tiles = (num_heads + kMlaDecodeHeads - 1) / kMlaDecodeHeads;
+  const int32_t base_ctas = head_tiles * q_len;
+  out->splits = occupancy_split_count(base_ctas, kv_len, kMlaSplitMinKeys, waves, max_splits, ctx);
+  if (out->splits <= 1) {
+    out->splits = 1;
+    return Status::kSuccess;
+  }
+  const int64_t partial_rows = total_q * out->splits;
+  out->o_partial_bytes = static_cast<size_t>(partial_rows) * num_heads * kMlaNope * sizeof(float);
+  out->lse_partial_bytes = static_cast<size_t>(partial_rows) * num_heads * sizeof(float);
+  out->merge_indptr_bytes = static_cast<size_t>(total_q + 1) * sizeof(int32_t);
+  const auto align256 = [](size_t n) { return (n + 255u) & ~static_cast<size_t>(255u); };
+  out->o_partial_bytes = align256(out->o_partial_bytes);
+  out->lse_partial_bytes = align256(out->lse_partial_bytes);
+  out->merge_indptr_bytes = align256(out->merge_indptr_bytes);
+  out->total_bytes = out->o_partial_bytes + out->lse_partial_bytes + out->merge_indptr_bytes;
+  return Status::kSuccess;
 }
 
 }  // namespace kops::attn
