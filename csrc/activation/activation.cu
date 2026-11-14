@@ -83,68 +83,30 @@ __device__ __forceinline__ float glu(float gate, float up, const GluParams& p, f
   return row_w * actf<kAct>(gate, p) * up;
 }
 
-// ---- flat tiled elementwise access -------------------------------------------
-// grid = (tiles, rows), block = 256, kPacks 16 B packs per thread. Every pack of a
-// thread is loaded before the first store, so a 4e6-element flat activation keeps
-// 64 B per thread in flight and runs ~SM*4 CTAs on an H100. The input is read
-// through ld.global.cs / written with st.global.cs: elementwise output is not
-// reused, so streaming keeps L2 for the tensors that are.
-constexpr int kActThreads = 256;
-constexpr int kActPacks = 4;
-constexpr int kActTile = kActThreads * kActPacks;  // packs per CTA
-
-template <typename T, int N>
-__device__ __forceinline__ Pack<T, N> ldcs16(const T* __restrict__ p) {
-  static_assert(sizeof(Pack<T, N>) == 16, "a pack is one 16-byte access");
-  const uint4 u = __ldcs(reinterpret_cast<const uint4*>(p));
-  Pack<T, N> r;
-  __builtin_memcpy(&r, &u, sizeof(r));
-  return r;
-}
-
-template <typename T, int N>
-__device__ __forceinline__ void stcs16(T* __restrict__ p, const Pack<T, N>& v) {
-  static_assert(sizeof(Pack<T, N>) == 16, "a pack is one 16-byte access");
-  uint4 u;
-  __builtin_memcpy(&u, &v, sizeof(u));
-  __stcs(reinterpret_cast<uint4*>(p), u);
-}
-
 }  // namespace
 
 template <typename scalar_t, ActFn kAct, int VEC_SIZE>
 __global__ void act_kernel(scalar_t* __restrict__ out, const int64_t out_stride,
                            const scalar_t* __restrict__ input, const int64_t input_stride,
                            const GluParams params, const int num_tokens, const int d) {
-  for (int64_t row = blockIdx.y; row < num_tokens; row += gridDim.y) {
+  const int64_t row = blockIdx.x;
+  if (row >= num_tokens) return;
   const scalar_t* x = input + row * input_stride;
   scalar_t* y = out + row * out_stride;
-  const int nvec = d / VEC_SIZE;  // whole packs; the tail is handled by tile 0
-  const int base = blockIdx.x * kActTile + static_cast<int>(threadIdx.x);
-  Pack<scalar_t, VEC_SIZE> p[kActPacks];
-  bool own[kActPacks];
-  int idx[kActPacks];
-#pragma unroll
-  for (int k = 0; k < kActPacks; ++k) {
-    idx[k] = (base + k * kActThreads) * VEC_SIZE;
-    own[k] = (base + k * kActThreads) < nvec;
-    if (own[k]) p[k] = ldcs16<scalar_t, VEC_SIZE>(x + idx[k]);
-  }
-#pragma unroll
-  for (int k = 0; k < kActPacks; ++k) {
-    if (!own[k]) continue;
+  const int nvec = d / VEC_SIZE;
+  const int i = blockIdx.y * blockDim.x + threadIdx.x;
+  if (i < nvec) {
+    const int idx = i * VEC_SIZE;
+    Pack<scalar_t, VEC_SIZE> p;
+    p = *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(x + idx);
     Pack<scalar_t, VEC_SIZE> q;
-#pragma unroll
-    for (int j = 0; j < VEC_SIZE; ++j) {
-      from_f<scalar_t>(q.x[j], actf<kAct>(to_f<scalar_t>(p[k].x[j]), params));
-    }
-    stcs16<scalar_t, VEC_SIZE>(y + idx[k], q);
+    for (int k = 0; k < VEC_SIZE; ++k) from_f<scalar_t>(q.x[k], actf<kAct>(to_f<scalar_t>(p.x[k]), params));
+    *reinterpret_cast<Pack<scalar_t, VEC_SIZE>*>(y + idx) = q;
   }
-  if (blockIdx.x == 0) {
-    for (int e = nvec * VEC_SIZE + static_cast<int>(threadIdx.x); e < d; e += blockDim.x) {
-      from_f<scalar_t>(y[e], actf<kAct>(to_f<scalar_t>(x[e]), params));
+  if (blockIdx.y == 0) {
+    for (int i = nvec * VEC_SIZE + threadIdx.x; i < d; i += blockDim.x) {
+      from_f<scalar_t>(y[i], actf<kAct>(to_f<scalar_t>(x[i]), params));
     }
-  }
   }
 }
 
@@ -153,68 +115,44 @@ __global__ void act_and_mul_kernel(scalar_t* __restrict__ out, const int64_t out
                                    const scalar_t* __restrict__ input, const int64_t input_stride,
                                    const float* __restrict__ row_weight, const GluParams params,
                                    const int num_tokens, const int d) {
-  for (int64_t row = blockIdx.y; row < num_tokens; row += gridDim.y) {
+  const int64_t row = blockIdx.x;
+  if (row >= num_tokens) return;
   const scalar_t* x = input + row * input_stride;
   scalar_t* y = out + row * out_stride;
   const float rw = (row_weight != nullptr) ? row_weight[row] : 1.0f;
-  const int tid = static_cast<int>(threadIdx.x);
-  const int base = blockIdx.x * kActTile + tid;
-  if constexpr (kLayout == GateLayout::kInterleaved) {
-    // One output element per pair; no 16 B pack holds a whole pair boundary.
-    for (int k = 0; k < kActPacks; ++k) {
-      const int i = base + k * kActThreads;
-      if (i >= d) continue;
+  if (kLayout == GateLayout::kInterleaved) {
+    const int i = blockIdx.y * blockDim.x + threadIdx.x;
+    if (i < d) {
       const float gate = to_f<scalar_t>(x[2 * i]);
       const float up = to_f<scalar_t>(x[2 * i + 1]);
       from_f<scalar_t>(y[i], glu<kAct>(gate, up, params, rw));
     }
-    if (blockIdx.x == 0) {
-      for (int e = (d / VEC_SIZE) * VEC_SIZE + tid; e < d; e += blockDim.x) {
-        from_f<scalar_t>(y[e], glu<kAct>(to_f<scalar_t>(x[2 * e]), to_f<scalar_t>(x[2 * e + 1]),
-                                         params, rw));
-      }
-    }
-    continue;
+    return;
   }
   const int nvec = d / VEC_SIZE;
-  Pack<scalar_t, VEC_SIZE> g[kActPacks];
-  Pack<scalar_t, VEC_SIZE> u[kActPacks];
-  bool own[kActPacks];
-  int idx[kActPacks];
-  // Gate and up of every pack are issued before the SiLU chain runs.
-#pragma unroll
-  for (int k = 0; k < kActPacks; ++k) {
-    const int i = base + k * kActThreads;
-    idx[k] = i * VEC_SIZE;
-    own[k] = i < nvec;
-    if (own[k]) {
-      const int gi = (kLayout == GateLayout::kGateUp) ? idx[k] : idx[k] + d;
-      const int ui = (kLayout == GateLayout::kGateUp) ? idx[k] + d : idx[k];
-      g[k] = ldcs16<scalar_t, VEC_SIZE>(x + gi);
-      u[k] = ldcs16<scalar_t, VEC_SIZE>(x + ui);
-    }
-  }
-#pragma unroll
-  for (int k = 0; k < kActPacks; ++k) {
-    if (!own[k]) continue;
+  const int i = blockIdx.y * blockDim.x + threadIdx.x;
+  if (i < nvec) {
+    const int idx = i * VEC_SIZE;
+    Pack<scalar_t, VEC_SIZE> g;
+    Pack<scalar_t, VEC_SIZE> u;
+    g = *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(x + idx);
+    u = *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(x + idx + d);
     Pack<scalar_t, VEC_SIZE> q;
-#pragma unroll
-    for (int j = 0; j < VEC_SIZE; ++j) {
-      // g[k] already holds the gate half and u[k] the up half for both layouts.
-      from_f<scalar_t>(q.x[j], glu<kAct>(to_f<scalar_t>(g[k].x[j]), to_f<scalar_t>(u[k].x[j]),
-                                         params, rw));
+    for (int k = 0; k < VEC_SIZE; ++k) {
+      const float gv = (kLayout == GateLayout::kGateUp) ? to_f<scalar_t>(g.x[k]) : to_f<scalar_t>(u.x[k]);
+      const float uv = (kLayout == GateLayout::kGateUp) ? to_f<scalar_t>(u.x[k]) : to_f<scalar_t>(g.x[k]);
+      from_f<scalar_t>(q.x[k], glu<kAct>(gv, uv, params, rw));
     }
-    stcs16<scalar_t, VEC_SIZE>(y + idx[k], q);
+    *reinterpret_cast<Pack<scalar_t, VEC_SIZE>*>(y + idx) = q;
   }
-  if (blockIdx.x == 0) {
-    for (int e = nvec * VEC_SIZE + tid; e < d; e += blockDim.x) {
-      const float a = to_f<scalar_t>(x[e]);
-      const float b = to_f<scalar_t>(x[e + d]);
+  if (blockIdx.y == 0) {
+    for (int i = nvec * VEC_SIZE + threadIdx.x; i < d; i += blockDim.x) {
+      const float a = to_f<scalar_t>(x[i]);
+      const float b = to_f<scalar_t>(x[i + d]);
       const float gate = (kLayout == GateLayout::kGateUp) ? a : b;
       const float up = (kLayout == GateLayout::kGateUp) ? b : a;
-      from_f<scalar_t>(y[e], glu<kAct>(gate, up, params, rw));
+      from_f<scalar_t>(y[i], glu<kAct>(gate, up, params, rw));
     }
-  }
   }
 }
 
@@ -225,93 +163,43 @@ __global__ void gate_mul_kernel(scalar_t* __restrict__ out, const int64_t out_st
                                 const scalar_t* __restrict__ accumulate_into,
                                 const int64_t accumulate_stride, const int num_tokens, const int d,
                                 const int gate_width) {
-  for (int64_t row = blockIdx.y; row < num_tokens; row += gridDim.y) {
+  const int64_t row = blockIdx.x;
+  if (row >= num_tokens) return;
   scalar_t* dst = out + row * out_stride;
   const scalar_t* src = x + row * x_stride;
   const scalar_t* g = gate + row * gate_stride;
   const scalar_t* acc = accumulate_into ? (accumulate_into + row * accumulate_stride) : nullptr;
   const int group = d / gate_width;
   const int nvec = d / VEC_SIZE;
-  const int tid = static_cast<int>(threadIdx.x);
-  const int base = blockIdx.x * kActTile + tid;
-  // One gate per token: the whole row shares it, so it is loaded once.
-  if (gate_width == 1) {
-    const float gv = actf<kAct>(to_f<scalar_t>(g[0]), GluParams{});
-    for (int k = 0; k < kActPacks; ++k) {
-      const int i = base + k * kActThreads;
-      if (i >= nvec) continue;
-      const int idx = i * VEC_SIZE;
-      Pack<scalar_t, VEC_SIZE> px;
-      Pack<scalar_t, VEC_SIZE> py;
-      px = ldcs16<scalar_t, VEC_SIZE>(src + idx);
-      if (acc != nullptr) py = ldcs16<scalar_t, VEC_SIZE>(acc + idx);
+  const int col = blockIdx.y * blockDim.x + threadIdx.x;
+  if (col < nvec) {
+    const int idx = col * VEC_SIZE;
+    Pack<scalar_t, VEC_SIZE> px;
+    Pack<scalar_t, VEC_SIZE> py;
+    px = *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(src + idx);
+    if (acc != nullptr) py = *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(acc + idx);
+    Pack<scalar_t, VEC_SIZE> pg;
+    if (gate_width == d) pg = *reinterpret_cast<const Pack<scalar_t, VEC_SIZE>*>(g + idx);
 #pragma unroll
-      for (int j = 0; j < VEC_SIZE; ++j) {
-        float v = to_f<scalar_t>(px.x[j]) * gv;
-        if (acc != nullptr) v += to_f<scalar_t>(py.x[j]);
-        from_f<scalar_t>(py.x[j], v);
-      }
-      stcs16<scalar_t, VEC_SIZE>(dst + idx, py);
+    for (int j = 0; j < VEC_SIZE; ++j) {
+      const int e = idx + j;
+      const float gv = (gate_width == d) ? to_f<scalar_t>(pg.x[j])
+                                          : to_f<scalar_t>(g[e / group]);
+      float v = to_f<scalar_t>(px.x[j]) * actf<kAct>(gv, GluParams{});
+      if (acc != nullptr) v += to_f<scalar_t>(py.x[j]);
+      from_f<scalar_t>(py.x[j], v);
     }
-  } else if (gate_width == d) {
-    for (int k = 0; k < kActPacks; ++k) {
-      const int i = base + k * kActThreads;
-      if (i >= nvec) continue;
-      const int idx = i * VEC_SIZE;
-      const Pack<scalar_t, VEC_SIZE> px = ldcs16<scalar_t, VEC_SIZE>(src + idx);
-      const Pack<scalar_t, VEC_SIZE> pg = ldcs16<scalar_t, VEC_SIZE>(g + idx);
-      Pack<scalar_t, VEC_SIZE> py;
-      if (acc != nullptr) py = ldcs16<scalar_t, VEC_SIZE>(acc + idx);
-#pragma unroll
-      for (int j = 0; j < VEC_SIZE; ++j) {
-        float v = to_f<scalar_t>(px.x[j]) * actf<kAct>(to_f<scalar_t>(pg.x[j]), GluParams{});
-        if (acc != nullptr) v += to_f<scalar_t>(py.x[j]);
-        from_f<scalar_t>(py.x[j], v);
-      }
-      stcs16<scalar_t, VEC_SIZE>(dst + idx, py);
-    }
-  } else {
-    // gate_width heads: one gate value per `group` columns. A pack that stays
-    // inside one group hoists the gate (shift when `group` is a power of two).
-    const bool per_pack = (group % VEC_SIZE) == 0;
-    const int gshift = __ffs(group) - 1;  // == log2(group) when group is a power of two
-    for (int k = 0; k < kActPacks; ++k) {
-      const int i = base + k * kActThreads;
-      if (i >= nvec) continue;
-      const int idx = i * VEC_SIZE;
-      const Pack<scalar_t, VEC_SIZE> px = ldcs16<scalar_t, VEC_SIZE>(src + idx);
-      Pack<scalar_t, VEC_SIZE> py;
-      if (acc != nullptr) py = ldcs16<scalar_t, VEC_SIZE>(acc + idx);
-      if (per_pack) {
-        const int gi = (group == (1 << gshift)) ? (idx >> gshift) : (idx / group);
-        const float gv = actf<kAct>(to_f<scalar_t>(g[gi]), GluParams{});
-#pragma unroll
-        for (int j = 0; j < VEC_SIZE; ++j) {
-          float v = to_f<scalar_t>(px.x[j]) * gv;
-          if (acc != nullptr) v += to_f<scalar_t>(py.x[j]);
-          from_f<scalar_t>(py.x[j], v);
-        }
-      } else {
-#pragma unroll
-        for (int j = 0; j < VEC_SIZE; ++j) {
-          const float gv = actf<kAct>(to_f<scalar_t>(g[(idx + j) / group]), GluParams{});
-          float v = to_f<scalar_t>(px.x[j]) * gv;
-          if (acc != nullptr) v += to_f<scalar_t>(py.x[j]);
-          from_f<scalar_t>(py.x[j], v);
-        }
-      }
-      stcs16<scalar_t, VEC_SIZE>(dst + idx, py);
-    }
+    *reinterpret_cast<Pack<scalar_t, VEC_SIZE>*>(dst + idx) = py;
+    return;
   }
-  // Scalar tail; only the first tile performs it.
-  if (blockIdx.x == 0) {
-    for (int e = nvec * VEC_SIZE + tid; e < d; e += blockDim.x) {
-      const float gv = actf<kAct>(to_f<scalar_t>(g[gate_width == 1 ? 0 : e / group]), GluParams{});
-      float v = to_f<scalar_t>(src[e]) * gv;
+  // Scalar tail; only the first y tile performs it.
+  if (blockIdx.y == 0) {
+    for (int e = nvec * VEC_SIZE + threadIdx.x; e < d; e += blockDim.x) {
+      const float gv = to_f<scalar_t>(g[e / group]);
+      float v = to_f<scalar_t>(src[e]) * actf<kAct>(gv, GluParams{});
       if (acc != nullptr) v += to_f<scalar_t>(acc[e]);
       from_f<scalar_t>(dst[e], v);
     }
-  }
   }
 }
 
@@ -321,32 +209,20 @@ __global__ void gate_mul_kernel(scalar_t* __restrict__ out, const int64_t out_st
 namespace {
 
 template <typename T>
-constexpr int vec_width() {
-  return 8;
-}
+constexpr int vec_width() { return 8; }
 template <>
-constexpr int vec_width<float>() {
-  return 4;
-}
-
-/// CTAs along a row: one flat tile of kActTile packs, at least one for the tail.
-inline int act_tiles(int nvec) {
-  return nvec > 0 ? (nvec + kActTile - 1) / kActTile : 1;
-}
-
-/// Rows on grid.y (hardware limit 65535); the kernels stride rows by gridDim.y.
-inline unsigned grid_rows(int tokens) {
-  return static_cast<unsigned>(tokens > 65535 ? 65535 : (tokens > 0 ? tokens : 1));
-}
+constexpr int vec_width<float>() { return 4; }
 
 template <typename T, ActFn A>
 Status run_act(const Tensor& out, const Tensor& input, const GluParams& p, int tokens, int d,
                cudaStream_t stream) {
   const int vec = vec_width<T>();
+  const int nvec = (d + vec - 1) / vec;
+  const int block = nvec < 128 ? ((nvec + 31) / 32) * 32 : 128;
+  const int ny = (nvec + block - 1) / block;
   const T* x = reinterpret_cast<const T*>(static_cast<const char*>(input.data) + input.byte_offset);
   T* y = reinterpret_cast<T*>(static_cast<char*>(out.data) + out.byte_offset);
-  const dim3 grid(static_cast<unsigned>(act_tiles(d / vec)), grid_rows(tokens));
-  act_kernel<T, A, vec><<<grid, kActThreads, 0, stream>>>(
+  act_kernel<T, A, vec_width<T>()><<<dim3(tokens, ny), block, 0, stream>>>(
       y, out.stride[0], x, input.stride[0], p, tokens, d);
   const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -360,12 +236,13 @@ template <typename T, ActFn A, GateLayout L>
 Status run_glu(const Tensor& out, const Tensor& input, const Tensor& row_weight, const GluParams& p,
                int tokens, int d, cudaStream_t stream) {
   const int vec = vec_width<T>();
+  const int nvec = (d + vec - 1) / vec;
+  const int block = nvec < 128 ? ((nvec + 31) / 32) * 32 : 128;
+  const int ny = (nvec + block - 1) / block;
   const T* x = reinterpret_cast<const T*>(static_cast<const char*>(input.data) + input.byte_offset);
   T* y = reinterpret_cast<T*>(static_cast<char*>(out.data) + out.byte_offset);
   const float* rw = tensor_present(row_weight) ? static_cast<const float*>(row_weight.data) : nullptr;
-  const int tiles = L == GateLayout::kInterleaved ? act_tiles(d) : act_tiles(d / vec);
-  const dim3 grid(static_cast<unsigned>(tiles), grid_rows(tokens));
-  act_and_mul_kernel<T, A, L, vec><<<grid, kActThreads, 0, stream>>>(
+  act_and_mul_kernel<T, A, L, vec_width<T>()><<<dim3(tokens, ny), block, 0, stream>>>(
       y, out.stride[0], x, input.stride[0], rw, p, tokens, d);
   const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
@@ -417,6 +294,9 @@ template <typename T, ActFn A>
 Status run_gate_mul(const Tensor& out, const Tensor& x, const Tensor& gate, const Tensor& accumulate,
                     int tokens, int d, int gate_width, cudaStream_t stream) {
   const int vec = vec_width<T>();
+  const int nvec = (d + vec - 1) / vec;
+  const int block = nvec < 128 ? ((nvec + 31) / 32) * 32 : 128;
+  const int ny = (nvec + block - 1) / block;
   const T* xp = reinterpret_cast<const T*>(static_cast<const char*>(x.data) + x.byte_offset);
   const T* gp = reinterpret_cast<const T*>(static_cast<const char*>(gate.data) + gate.byte_offset);
   const T* ap = tensor_present(accumulate)
@@ -424,8 +304,7 @@ Status run_gate_mul(const Tensor& out, const Tensor& x, const Tensor& gate, cons
                                                  accumulate.byte_offset)
                     : nullptr;
   T* op = reinterpret_cast<T*>(static_cast<char*>(out.data) + out.byte_offset);
-  const dim3 grid(static_cast<unsigned>(act_tiles(d / vec)), grid_rows(tokens));
-  gate_mul_kernel<T, A, vec><<<grid, kActThreads, 0, stream>>>(
+  gate_mul_kernel<T, A, vec_width<T>()><<<dim3(tokens, ny), block, 0, stream>>>(
       op, out.stride[0], xp, x.stride[0], gp, gate.stride[0], ap,
       tensor_present(accumulate) ? accumulate.stride[0] : 0, tokens, d, gate_width);
   const cudaError_t err = cudaGetLastError();
@@ -659,30 +538,27 @@ __device__ __forceinline__ float aq_ue8m0_to_float(uint8_t e) {
 
 }  // namespace
 
-template <typename scalar_t, ActFn kAct, GateLayout kLayout, ActQuantMode kMode, int VEC_SIZE,
-          int kRows>
+template <typename scalar_t, ActFn kAct, GateLayout kLayout, ActQuantMode kMode, int VEC_SIZE>
 __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantParams params) {
-  const int64_t rows = params.masked_m != nullptr
-                           ? static_cast<int64_t>(params.num_experts) * params.max_m
-                           : params.num_rows;
-  const int lanes = static_cast<int>(blockDim.x);
-  const int ry = static_cast<int>(threadIdx.y);
-  const int64_t row = static_cast<int64_t>(blockIdx.x) * kRows + ry;
-  const int64_t d = params.d;
-  // A dead row is masked, not returned: the CTA still reaches every barrier for
-  // the live row of its pair.
-  bool valid = row < rows;
-  if (valid && params.masked_m != nullptr) {
+  __shared__ float smem[32];
+  (void)smem;
+  const bool masked = params.masked_m != nullptr;
+  const int64_t rows = masked ? static_cast<int64_t>(params.num_experts) * params.max_m
+                              : params.num_rows;
+  const int64_t row = blockIdx.x;
+  if (row >= rows) return;
+  if (masked) {
     const int e = static_cast<int>(row / params.max_m);
     const int m = static_cast<int>(row - static_cast<int64_t>(e) * params.max_m);
-    valid = m < params.masked_m[e];
+    if (m >= params.masked_m[e]) return;
   }
-  if (valid && params.expert_offsets != nullptr && params.num_experts > 0 &&
+  if (params.expert_offsets != nullptr && params.num_experts > 0 &&
       row >= params.expert_offsets[params.num_experts]) {
-    valid = false;
+    return;
   }
+  const int64_t d = params.d;
   const scalar_t* src = static_cast<const scalar_t*>(params.input) + row * params.input_stride;
-  const float rw = (params.row_weight != nullptr && valid) ? params.row_weight[row] : 1.0f;
+  const float rw = params.row_weight != nullptr ? params.row_weight[row] : 1.0f;
   ActQuantOut q = params.quant;
   const int64_t q_stride = q.q_row_stride > 0 ? q.q_row_stride : d;
   const float qmax = q.q_dtype == DType::kInt8 ? kInt8Max : kFp8E4M3Max;
@@ -704,9 +580,8 @@ __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantPara
   };
 
   if constexpr (kMode == ActQuantMode::kStaticPerTensor) {
-    if (!valid) return;
     const float s = *q.static_scale;
-    for (int64_t c = threadIdx.x; c < d; c += lanes) {
+    for (int64_t c = threadIdx.x; c < d; c += blockDim.x) {
       const float y = gated(c);
       if (q.q_dtype == DType::kInt8) {
         int qv = __float2int_rn(y / s);
@@ -720,28 +595,20 @@ __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantPara
   }
 
   if constexpr (kMode == ActQuantMode::kDynamicPerToken) {
-    // Two rows per CTA, 256 lanes each. One row of up to 16 floats per lane stays
-    // in registers, so the block no longer needs the 16 KB row_cache.
-    constexpr int kReg = 16;
+    __shared__ __align__(16) float row_cache[4096];
+    const bool cache_ok = d <= 4096;
     const bool asym = !q.symmetric && q.q_dtype == DType::kInt8;
+    float amax = 0.0f, amin = __int_as_float(0x7f800000);
     const int64_t nv = d / 4;
-    const bool vector_ok = !asym && d % 4 == 0 && q_stride % 4 == 0;
-    const bool reg_ok = vector_ok && nv * 4 <= static_cast<int64_t>(lanes) * kReg;
-    const int warps = lanes >> 5;
-    __shared__ float smax[kRows][8];
-    __shared__ float smin[kRows][8];
-    float yreg[kReg];
-    float amax = 0.0f;
-    float amin = __int_as_float(0x7f800000);
-    if (valid && reg_ok) {
-      int slot = 0;
-      for (int64_t v = threadIdx.x; v < nv; v += lanes, ++slot) {
+    if (cache_ok && d % 4 == 0 && (q_stride % 4 == 0) && !asym) {
+      for (int64_t v = threadIdx.x; v < nv; v += blockDim.x) {
         float y4[4];
         if constexpr (kLayout == GateLayout::kInterleaved) {
-          const Pack<scalar_t, 8> pk = *reinterpret_cast<const Pack<scalar_t, 8>*>(src + 2 * (v * 4));
-#pragma unroll
+          const Pack<scalar_t, 8> p =
+              *reinterpret_cast<const Pack<scalar_t, 8>*>(src + 2 * (v * 4));
+          #pragma unroll
           for (int j = 0; j < 4; ++j) {
-            y4[j] = glu<kAct>(to_f<scalar_t>(pk.x[2 * j]), to_f<scalar_t>(pk.x[2 * j + 1]),
+            y4[j] = glu<kAct>(to_f<scalar_t>(p.x[2 * j]), to_f<scalar_t>(p.x[2 * j + 1]),
                               params.glu, rw);
           }
         } else {
@@ -749,75 +616,42 @@ __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantPara
           const scalar_t* up = src + v * 4 + (kLayout == GateLayout::kUpGate ? 0 : d);
           const Pack<scalar_t, 4> pg = *reinterpret_cast<const Pack<scalar_t, 4>*>(gp);
           const Pack<scalar_t, 4> pu = *reinterpret_cast<const Pack<scalar_t, 4>*>(up);
-#pragma unroll
+          #pragma unroll
           for (int j = 0; j < 4; ++j) {
             y4[j] = glu<kAct>(to_f<scalar_t>(pg.x[j]), to_f<scalar_t>(pu.x[j]), params.glu, rw);
           }
         }
-        yreg[slot * 4 + 0] = y4[0];
-        yreg[slot * 4 + 1] = y4[1];
-        yreg[slot * 4 + 2] = y4[2];
-        yreg[slot * 4 + 3] = y4[3];
-#pragma unroll
+        *reinterpret_cast<float4*>(&row_cache[v * 4]) =
+            make_float4(y4[0], y4[1], y4[2], y4[3]);
+        #pragma unroll
         for (int j = 0; j < 4; ++j) {
           amax = fmaxf(amax, fabsf(y4[j]));
           amin = fminf(amin, y4[j]);
         }
       }
-    } else if (valid) {
-      for (int64_t c = threadIdx.x; c < d; c += lanes) {
-        const float y = gated(c);
-        amax = fmaxf(amax, fabsf(y));
-        amin = fminf(amin, y);
+      amax = aq_block_max(amax, smem);
+      __syncthreads();
+      amin = aq_block_sum(amin, smem);
+      float s;
+      if (threadIdx.x == 0) {
+        s = fmaxf(amax, 1e-10f) / qmax;
+        if (q.scale_upper_bound != nullptr) s = fminf(s, q.scale_upper_bound[0]);
+        static_cast<float*>(q.scales)[row] = s;
       }
-    }
-    // Per-row reduction: 32-lane butterfly, one shared slot per warp of the row.
-    const int lane = static_cast<int>(threadIdx.x) & 31;
-    const int warp = static_cast<int>(threadIdx.x) >> 5;
-    amax = aq_warp_max(amax);
-    const float neadmin = aq_warp_max(-amin);
-    if (lane == 0) {
-      smax[ry][warp] = amax;
-      smin[ry][warp] = -neadmin;
-    }
-    __syncthreads();
-    amax = smax[ry][0];
-    amin = smin[ry][0];
-    for (int w = 1; w < warps; ++w) {
-      amax = fmaxf(amax, smax[ry][w]);
-      amin = fminf(amin, smin[ry][w]);
-    }
-    // Every thread derives the same scale from the reduced amax, so no second
-    // barrier and no shared broadcast is needed.
-    float s = 0.0f;
-    float zero = -128.0f;
-    int zpoint = 0;
-    if (asym) {
-      s = __fdiv_rn(fmaxf(amax, 1e-10f) - amin, 255.0f);
-      zpoint = __float2int_rn(-128.0f - __fdiv_rn(amin, s));
-      zero = static_cast<float>(zpoint);
-    } else {
-      s = fmaxf(amax, 1e-10f) / qmax;
-      if (q.scale_upper_bound != nullptr) s = fminf(s, q.scale_upper_bound[0]);
-    }
-    if (valid && threadIdx.x == 0) {
-      static_cast<float*>(q.scales)[row] = s;
-      if (asym) q.zero_points[row] = zpoint;
-    }
-    if (!valid) return;
-    if (reg_ok) {
-      int slot = 0;
-      for (int64_t v = threadIdx.x; v < nv; v += lanes, ++slot) {
+      __syncthreads();
+      s = static_cast<float*>(q.scales)[row];
+      for (int64_t v = threadIdx.x; v < nv; v += blockDim.x) {
+        const float4 y4 = *reinterpret_cast<const float4*>(&row_cache[v * 4]);
         uint8_t codes[4];
-#pragma unroll
+        const float yy[4] = {y4.x, y4.y, y4.z, y4.w};
+        #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          const float y = yreg[slot * 4 + j];
           if (q.q_dtype == DType::kInt8) {
-            int qv = __float2int_rn(y / s);
+            int qv = __float2int_rn(yy[j] / s);
             qv = qv > 127 ? 127 : (qv < -127 ? -127 : qv);
             codes[j] = static_cast<uint8_t>(static_cast<int8_t>(qv));
           } else {
-            codes[j] = aq_e4m3(__fdiv_rn(y, s));
+            codes[j] = aq_e4m3(__fdiv_rn(yy[j], s));
           }
         }
         *reinterpret_cast<uint32_t*>(qptr + row * q_stride + v * 4) =
@@ -826,8 +660,35 @@ __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantPara
       }
       return;
     }
-    for (int64_t c = threadIdx.x; c < d; c += lanes) {
+    for (int64_t c = threadIdx.x; c < d; c += blockDim.x) {
       const float y = gated(c);
+      if (cache_ok) row_cache[c] = y;
+      amax = fmaxf(amax, fabsf(y));
+      amin = fminf(amin, y);
+    }
+    amax = aq_block_max(amax, smem);
+    __syncthreads();
+    amin = aq_block_sum(amin, smem);
+    __syncthreads();
+    float s = 0.0f, zero = -128.0f;
+    if (asym) {
+      s = __fdiv_rn(fmaxf(amax, 1e-10f) - amin, 255.0f);
+    } else {
+      s = fmaxf(amax, 1e-10f) / qmax;
+      if (q.scale_upper_bound != nullptr) s = fminf(s, q.scale_upper_bound[0]);
+    }
+    if (threadIdx.x == 0) {
+      static_cast<float*>(q.scales)[row] = s;
+      if (asym) {
+        const int z = __float2int_rn(-128.0f - __fdiv_rn(amin, s));
+        q.zero_points[row] = z;
+      }
+    }
+    __syncthreads();
+    s = static_cast<float*>(q.scales)[row];
+    if (asym) zero = static_cast<float>(q.zero_points[row]);
+    for (int64_t c = threadIdx.x; c < d; c += blockDim.x) {
+      const float y = cache_ok ? row_cache[c] : gated(c);
       if (asym) {
         int v = __float2int_rn(y / s + zero);
         v = v > 127 ? 127 : (v < -128 ? -128 : v);
@@ -842,7 +703,6 @@ __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantPara
     return;
   }
 
-  if (!valid) return;
   const int group = kMode == ActQuantMode::kNVFP4
                         ? kNvFp4Block
                         : (kMode == ActQuantMode::kMXFP8 || kMode == ActQuantMode::kMXFP4
@@ -920,20 +780,15 @@ Status launch_act_quant(const ActMulQuantParams& p, cudaStream_t stream) {
                            ? static_cast<int64_t>(p.num_experts) * p.max_m
                            : p.num_rows;
   if (rows <= 0) return Status::kSuccess;
-  // The dynamic per-token mode pairs two rows per CTA (one 256-lane half each);
-  // the other modes keep one row so their block-wide warp map stays simple.
-  constexpr int kRows = (kMode == ActQuantMode::kDynamicPerToken) ? 2 : 1;
-  const unsigned gx = static_cast<unsigned>((rows + kRows - 1) / kRows);
-  const dim3 block(kActThreads, kRows);
   if (p.d % 8 == 0) {
-    act_and_mul_quant_kernel<scalar_t, kAct, kLayout, kMode, 8, kRows>
-        <<<gx, block, 0, stream>>>(p);
+    act_and_mul_quant_kernel<scalar_t, kAct, kLayout, kMode, 8>
+        <<<static_cast<unsigned>(rows), 256, 0, stream>>>(p);
   } else if (p.d % 4 == 0) {
-    act_and_mul_quant_kernel<scalar_t, kAct, kLayout, kMode, 4, kRows>
-        <<<gx, block, 0, stream>>>(p);
+    act_and_mul_quant_kernel<scalar_t, kAct, kLayout, kMode, 4>
+        <<<static_cast<unsigned>(rows), 256, 0, stream>>>(p);
   } else {
-    act_and_mul_quant_kernel<scalar_t, kAct, kLayout, kMode, 1, kRows>
-        <<<gx, block, 0, stream>>>(p);
+    act_and_mul_quant_kernel<scalar_t, kAct, kLayout, kMode, 1>
+        <<<static_cast<unsigned>(rows), 256, 0, stream>>>(p);
   }
   const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {

@@ -41,9 +41,8 @@ struct Conv1dFwdParams {
  * causal_conv1d_fwd_kernel — y[t, c] = act(bias[c] + sum_{j<W} w[c, j] * x[t - W + 1 + j, c]),
  * using the slot's conv_states for t < 0 and replacing them with the last W-1 inputs (raw bits).
  * Taps accumulate in fp32 as bias, w[0] x[t-W+1], ..., w[W-1] x[t] (fused multiply-adds), rounded once.
- * Launch : grid = (ceil(dim / (128 * kVec)), ceil(max_seqlen / kTok), B), block = 128, with kTok = 64
- * tokens walked with a rolling register window. Chunk 0 of a sequence owns its slot (reads the history,
- * writes snapshots and the final state).
+ * Launch : grid = (ceil(dim / (128 * kVec)), ceil(max_seqlen / 64), B), block = 128. Chunk 0 of a
+ * sequence owns its slot (reads the history, writes snapshots and the final state).
  */
 template <typename input_t, typename weight_t, int kWidth, int kVec>
 __global__ void causal_conv1d_fwd_kernel(const __grid_constant__ Conv1dFwdParams params);

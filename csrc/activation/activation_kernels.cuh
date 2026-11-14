@@ -4,11 +4,7 @@
 // Plain activations, gated (GLU) activations, gate-multiply and fused
 // activation + quantization (incl. masked MoE layout).
 // Requires: common/macros.cuh, common/dtype.cuh, common/op_types.cuh, common/quant.cuh.
-// Launch: grid = (ceil(d / (VEC_SIZE * 1024)), num_tokens), block = 256, 4 packs per
-// thread; the input is read with ld.global.cs and the output written with
-// st.global.cs (elementwise results are never re-read). act_and_mul_quant uses
-// grid = ceil(rows / kRows) with a (256, kRows) block, kRows = 2 for the dynamic
-// per-token mode.
+// Launch: grid = (num_tokens, ceil(d / (VEC_SIZE * blockDim.x))), block = 128..1024.
 // =============================================================================
 
 namespace kops::act {
@@ -73,8 +69,7 @@ struct ActMulQuantParams {
  *          Kimi-K3 MXFP8 activations, GPT-OSS / Qwen3 NVFP4/MXFP4 MoE, Llama-4 FP8.
  * Skips padded / masked rows (no NaN from garbage), matching HPC-Ops masked act_mul_and_quant.
  */
-template <typename scalar_t, ActFn kAct, GateLayout kLayout, ActQuantMode kMode, int VEC_SIZE,
-          int kRows = 1>
+template <typename scalar_t, ActFn kAct, GateLayout kLayout, ActQuantMode kMode, int VEC_SIZE>
 __global__ void act_and_mul_quant_kernel(const __grid_constant__ ActMulQuantParams params);
 
 /**
