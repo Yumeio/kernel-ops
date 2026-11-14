@@ -55,10 +55,13 @@ struct RaggedPrefillParams {
  * in fp32 (base-2 exp internally), PV accumulation, optional LSE / split partials.
  * Supports Dqk != Dvo (MLA prefill: q/k 192 = 128 nope + 64 rope, v 128), GQA/MQA via head mapping.
  * Models : every model's prompt phase without prefix cache; vision/audio encoders (kNone mask).
- * ABI 6: the mask mode is the runtime field params.mask (it was a template parameter); Variant
- * flags compile a modifier in, its runtime value in params.mod switches it on (CONTRACTS §1e).
+ * kMask names the compile-time mask specialization; the sentinel kMaskRuntime (prefill.cu) reads the
+ * runtime field params.mask instead.  Variant flags compile a modifier in, its runtime value in
+ * params.mod switches it on (CONTRACTS §1e).
+ * Tile: Traits::cta_tile_q rows per CTA (128 on the narrow head dims, 64 on 192/256), one warp per
+ * 16 rows, two K/V stages of Traits::cta_tile_kv keys.
  */
-template <typename Traits, typename Variant>
+template <typename Traits, typename Variant, MaskMode kMask>
 __global__ void ragged_prefill_kernel(const __grid_constant__ RaggedPrefillParams params);
 
 /// Arguments of paged prefill (chunked prefill, prefix reuse, verification).
@@ -87,10 +90,10 @@ struct PagedPrefillParams {
  * MTP / EAGLE / DSpark-style drafts), A08 FP8 KV dequant on load (kFp8Kv) or FP8 tensor-core
  * compute (separate Traits with DTypeQ = f8e4m3_t).
  * Page tables: CSR or block table (PagedKVDesc::table_format), NHD or HND.
- * ABI 6: mask mode is params.mask; kLayout = kNHD names the token-major strided loader, which also
- * reads HND pages (the strides carry the difference).
+ * kLayout = kNHD names the token-major strided loader, which also reads HND pages (the strides
+ * carry the difference); kMask is the mask specialization (see ragged_prefill_kernel).
  */
-template <typename Traits, typename Variant, kv::KVLayout kLayout>
+template <typename Traits, typename Variant, kv::KVLayout kLayout, MaskMode kMask>
 __global__ void paged_prefill_kernel(const __grid_constant__ PagedPrefillParams params);
 
 /// Block-sparse mask in BSR form over (R x C) blocks of the [qo_len, kv_len] score matrix.

@@ -261,10 +261,12 @@ remain the ABI and shape authority.
   and no sink gives `o = 0`, `lse = -inf`. Decode is causal among its `q_len` rows; custom masks
   and `q_pos_offset` go through `paged_prefill_run`.
 - **Mask mode and modifiers are runtime values** (ABI 6): `RaggedPrefillParams::mask` /
-  `PagedPrefillParams::mask` (set by `*_run` from the plan) replace the `kMask` template parameter,
-  and the B8 kernels are instantiated with every `AttentionVariant` flag on; the runtime value
-  switches a modifier on, and `*_run` neutralizes the ones the `AttentionSpec` did not enable. The
-  per-flag instantiation matrix does not fit the 90 s TU budget (ptxas ~2 s per FA2 kernel).
+  `PagedPrefillParams::mask` are the contract (`*_run` sets them from the plan and neutralizes the
+  modifiers the `AttentionSpec` did not enable). The kernels additionally carry a compile-time
+  `kMask` specialization: (causal | none, no modifier) on d64/d128/d256 has its own body, and every
+  other combination uses the generic instantiation with every `AttentionVariant` flag on, which
+  reads `params.mask` at runtime (sentinel `kMaskRuntime`). The full per-flag instantiation matrix
+  does not fit the 90 s TU budget (ptxas ~2 s per FA2 kernel); the 54-cell matrix above does.
 - **Compiled cells.** Prefill (`prefill.cu`): (Dqk, Dvo) in {64, 80, 96, 128, 256, 192/128} x
   {bf16, fp16} x {ragged, paged}; FP8 e4m3 / e5m2 paged K/V for 64, 128, 256. Decode (`decode.cu`):
   CUDA-core D in {64, 80, 96, 128, 192, 256}, tensor-core and dynamic D in {64, 128, 256}, each
@@ -626,7 +628,9 @@ weights) on this repo's block-sorted MoE path.
   remain unchanged. Version 6 adds `kEpiRowSumSq` / `kEpiKvAppend` with their `EpilogueParams`
   fields and the runtime tactic fields of `ScaledGemmArgs`, and (B8) the runtime `mask` field of
   `RaggedPrefillParams` / `PagedPrefillParams` (the `kMask` template parameter of the two prefill
-  kernels is gone) plus the kv-length / capacity arguments of `prefill_plan_kernel` and
+  kernels became a runtime field; a later perf pass re-added it as a compile-time specialization
+  parameter together with the 128-row / two-stage tile, still inside the unreleased ABI 6) plus the
+  kv-length / capacity arguments of `prefill_plan_kernel` and
   `assign_decode_tasks_kernel` (§1e), and (B9) the state parameter structs and kernel template
   lists of `conv1d_kernels.cuh`, `ssm_kernels.cuh`, `linear_attention_kernels.cuh`,
   `delta_rule_kernels.cuh` (head strides, slot counts, snapshot / intermediate tables,

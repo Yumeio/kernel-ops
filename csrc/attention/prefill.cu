@@ -8,12 +8,21 @@
 //
 // Contract: csrc/attention/{attention_params,prefill_kernels}.cuh, ops.h, CONTRACTS.md §1e.
 //
-// Geometry.  One CTA = 4 warps = 64 packed query rows of ONE kv head: packed row r maps to query
-// token r / G and q head hk * G + r % G (GQA packing, G = Hq / Hkv), so K/V tiles are read once for
-// the G heads that share them.  Each warp owns 16 rows.  Q stays in registers when Dqk <= 128 (else
-// it is re-read from smem with ldmatrix); K/V tiles of 64 (32 when a head dim exceeds 128) tokens go
-// through cp.async into padded or XOR-swizzled smem.  QK^T and PV are mma.sync.m16n8k16 with fp32
-// accumulators; the S accumulator is re-packed in registers as the A operand of PV (FA2).
+// Geometry.  One CTA = 8 warps = 128 packed query rows of ONE kv head (4 warps / 64 rows when a head
+// dim exceeds 128, see PrefillTile): packed row r maps to query token r / G and q head hk * G + r % G
+// (GQA packing, G = Hq / Hkv), so K/V tiles are read once for the G heads that share them.  Each
+// warp owns 16 rows.  Q stays in registers when Dqk <= 128 (else it is re-read from smem with
+// ldmatrix); K/V tiles of 64 (32 for the wide dims) keys go through cp.async into padded or
+// XOR-swizzled smem, double buffered so the next stage streams under the current one's mma.
+// QK^T and PV are mma.sync.m16n8k16 with fp32 accumulators; the S accumulator is re-packed in
+// registers as the A operand of PV (FA2).
+//
+// Specialization.  The body is templated on the params type, the mask mode and the modifier variant,
+// so a wrapper reads its __grid_constant__ arguments directly (no argument struct on the stack) and
+// the hot (causal | full, no-modifier) cells of d64 / d128 / d256 compile without mask or modifier
+// branches.  Every other combination uses the all-mods runtime-mask instantiation.  ABI note: the
+// kernel template parameter lists and the cta_tile_q values of PrefillTraits changed with this;
+// KOPS_ABI_VERSION is intentionally NOT bumped here (unreleased ABI 6), see ROADMAP B8.
 //
 // Numerics.  Scores are formed in fp32, s = sm_scale * k_scale * q.k, then softcap
 // (cap * tanh(s / cap)), then ALiBi (slope * (k_pos - q_pos)), then the mask; the online softmax
@@ -170,77 +179,54 @@ struct Lay {
   }
 };
 
-// ---- runtime arguments ---------------------------------------------------------------------------
-/// What the shared body reads.  Each kernel wrapper fills it from its own params struct, with the
-/// modifiers its Variant does not compile already neutral, so one body serves every mask mode,
-/// modifier set and K/V source (ragged, CSR pages, block table) of a (head dims, dtype, FP8) cell.
-struct FwdArgs {
-  const char* q;
-  int64_t q_sn, q_sh;  // elements
-  const int32_t* qo_indptr;
-  const int32_t* q_pos_offset;
-  int mask;  // MaskMode
-  const uint8_t* custom_mask;
-  const int64_t* mask_indptr;
-  float sm_scale, softcap;
-  int window_left, window_right, chunk, num_sink;
-  const float* alibi;
-  const float* sinks;
-  float k_scale, v_scale;  // FP8 per-tensor fallback when the descriptor has no device scale
-  const float* k_scale_ptr;
-  const float* v_scale_ptr;
-  int scale_head_stride;
-  int kv_format;  // 0 ragged, 1 CSR pages, 2 block table
-  bool e5m2;
-  const char* k;
-  const char* v;
-  int64_t k_sp, k_st, k_sh, v_sp, v_st, v_sh;  // bytes
-  const int32_t* kv_indptr;                    // ragged: token indptr; CSR: page indptr
-  const int32_t* page_ids;                     // CSR page indices | block table
-  const int32_t* last_page_len;
-  const int32_t* seq_lens;
-  int64_t bt_stride;
-  int page_size;
-  void* o;
-  int64_t o_sn, o_sh;
-  float* lse;
-  SplitKVBuffers split;
-  WorkPlan plan;
-  int Hq, Hkv;
+// ---- FA2 tile ------------------------------------------------------------------------------------
+/// Row stride of a smem stage (mirrors Lay<D>::kRow for a runtime head dim).
+KOPS_HOST_DEVICE constexpr int row_stride(int d) { return (d & 63) == 0 ? d : d + 8; }
+
+/// K/V double buffer: stage i + 1 is copied while stage i is consumed.
+constexpr int kStages = 2;
+
+/// Wide head dims keep 64 rows and 32-key tiles: Q alone is 32-64 KiB, and Q plus two K/V stages
+/// must still fit the dynamic shared memory of every supported SM (99 KiB on SM86).  The narrow dims
+/// pack 128 rows per CTA (8 warps, one per 16 rows, 64-key tiles): K/V traffic and the mask work per
+/// key are then shared by twice as many query rows, which is what the memory-bound chunked /
+/// cold-cache shapes need.
+KOPS_HOST_DEVICE constexpr bool wide_dims(int dqk, int dvo) { return dqk > 128 || dvo > 128; }
+KOPS_HOST_DEVICE constexpr int bq_of(int dqk, int dvo) { return wide_dims(dqk, dvo) ? 64 : 128; }
+KOPS_HOST_DEVICE constexpr int bkv_of(int dqk, int dvo) { return wide_dims(dqk, dvo) ? 32 : 64; }
+
+KOPS_HOST_DEVICE constexpr int fwd_smem_bytes(int bq, int rq, int rqk, int rv, int bkv) {
+  return (bq * rq + kStages * bkv * (rqk + rv)) * 2;
+}
+KOPS_HOST_DEVICE constexpr int smem_for(int dqk, int dvo) {
+  return fwd_smem_bytes(bq_of(dqk, dvo), row_stride(dqk), row_stride(dqk), row_stride(dvo),
+                        bkv_of(dqk, dvo));
+}
+template <int DQK, int DVO>
+constexpr int smem_bytes() {
+  return smem_for(DQK, DVO);
+}
+
+/// Per-(head dims) CTA tile: packed query rows, one warp per 16 rows, keys per K/V stage.
+template <int DQK, int DVO>
+struct PrefillTile {
+  static constexpr int BQ = bq_of(DQK, DVO);
+  static constexpr int WARPS = BQ / 16;
+  static constexpr int THREADS = WARPS * 32;
+  static constexpr int BKV = bkv_of(DQK, DVO);
+  static_assert(smem_for(DQK, DVO) <= 99 * 1024, "one CTA must fit the smallest supported SM");
 };
 
-template <typename Variant, typename P>
-__device__ __forceinline__ void fill_common(FwdArgs& a, const P& p) {
-  a.q = static_cast<const char*>(p.q);
-  a.q_sn = p.q_stride_n;
-  a.q_sh = p.q_stride_h;
-  a.qo_indptr = p.qo_indptr;
-  a.q_pos_offset = p.q_pos_offset;
-  a.mask = static_cast<int>(p.mask);
-  a.custom_mask = p.custom_mask;
-  a.mask_indptr = p.mask_indptr;
-  const AttentionModifiers& m = p.mod;
-  a.sm_scale = m.sm_scale;
-  a.softcap = Variant::use_softcap ? m.logits_softcap : 0.0f;
-  a.window_left = Variant::use_sliding_window ? m.window_left : -1;
-  a.window_right = Variant::use_sliding_window ? m.window_right : -1;
-  a.num_sink = Variant::use_sliding_window ? m.num_sink_tokens : 0;
-  a.chunk = Variant::use_chunked ? m.chunk_size : 0;
-  a.alibi = Variant::use_alibi ? m.alibi_slopes : nullptr;
-  a.sinks = Variant::use_sinks ? m.sink_logits : nullptr;
-  a.k_scale = m.k_scale;
-  a.v_scale = m.v_scale;
-  a.k_scale_ptr = a.v_scale_ptr = nullptr;
-  a.scale_head_stride = 0;
-  a.o = p.o;
-  a.o_sn = p.o_stride_n;
-  a.o_sh = p.o_stride_h;
-  a.lse = p.lse;
-  a.split = p.split;
-  a.plan = p.plan;
-  a.Hq = p.num_qo_heads;
-  a.Hkv = p.num_kv_heads;
+template <typename Traits>
+KOPS_HOST_DEVICE constexpr bool tile_matches() {
+  using Tile = PrefillTile<Traits::head_dim_qk, Traits::head_dim_vo>;
+  return Traits::cta_tile_q == Tile::BQ && Traits::num_warps_q == Tile::WARPS &&
+         Traits::cta_tile_kv == Tile::BKV && Traits::num_stages == kStages;
 }
+
+/// Compile-time mask mode of the body.  kMaskRuntime reads params.mask instead: the fallback used
+/// for every (mask, modifier) combination that has no specialization.
+inline constexpr MaskMode kMaskRuntime = static_cast<MaskMode>(0xFF);
 
 __device__ __forceinline__ float tanh_fast(float x) {
   const float e = __expf(2.0f * fabsf(x));
@@ -252,16 +238,16 @@ __device__ __forceinline__ float tanh_fast(float x) {
 /// FP8 K/V is dequantized on load.  The eight global reads of a thread are issued as one group
 /// before the first convert/store: a dependent load -> convert -> store chain per 8-byte chunk costs
 /// one full memory round trip per chunk, which dominated the FP8 prefill path.
-template <int D, int BKV, typename T, bool FP8>
+template <int D, int BKV, typename T, bool FP8, int THREADS = 128>
 __device__ __forceinline__ void load_kv(T* s, const char* base, int64_t sp, int64_t st,
                                         const int32_t* pages, int ps, int t0, int hi, bool e5m2) {
-  constexpr int CH = D / 8, N = BKV * CH, IT = (N + 127) / 128;
+  constexpr int CH = D / 8, N = BKV * CH, IT = (N + THREADS - 1) / THREADS;
   const int tid = static_cast<int>(threadIdx.x);
   if constexpr (!FP8) {
 #pragma unroll
     for (int it = 0; it < IT; ++it) {
-      const int idx = it * 128 + tid;
-      if (N % 128 != 0 && idx >= N) break;
+      const int idx = it * THREADS + tid;
+      if (N % THREADS != 0 && idx >= N) break;
       const int r = idx / CH, c = idx % CH;
       const int pos = t0 + r;
       const bool ok = pos < hi;
@@ -284,7 +270,7 @@ __device__ __forceinline__ void load_kv(T* s, const char* base, int64_t sp, int6
       for (int j = 0; j < GRP; ++j) {
         const int it = g + j;
         const bool live = it < IT;
-        const int idx = (live ? it : 0) * 128 + tid;
+        const int idx = (live ? it : 0) * THREADS + tid;
         rr[j] = idx / CH;
         cc[j] = idx % CH;
         const int pos = t0 + rr[j];
@@ -317,51 +303,31 @@ __device__ __forceinline__ void load_kv(T* s, const char* base, int64_t sp, int6
 }
 
 // ---- FA2 body ------------------------------------------------------------------------------------
-constexpr int kBQ = 64;      // packed query rows per CTA
-constexpr int kWarps = 4;    // one warp per 16 rows
-constexpr int kThreads = 128;
-
-/// Row stride of a smem stage (mirrors Lay<D>::kRow for a runtime head dim).
-KOPS_HOST_DEVICE constexpr int row_stride(int d) { return (d % 64) == 0 ? d : d + 8; }
-
-KOPS_HOST_DEVICE constexpr int fwd_smem_bytes(int rq, int rqk, int rv, int bkv) {
-  return (kBQ * rq + bkv * rqk + bkv * rv) * 2;
-}
-
-/// K/V tile width: the widest one whose Q + K + V single buffers still leave two CTAs resident in
-/// the 100 KiB of shared memory one SM has (2 x 50 KiB).  Two CTAs interleave their softmax / mma /
-/// load phases, which is what the balanced cases reach ~70% of the mma.sync peak with.  D = 256
-/// cannot get there (Q alone is 32 KiB), and 16-key tiles make it slower rather than faster, so the
-/// wide dims keep 32 keys and one CTA.
-KOPS_HOST_DEVICE constexpr int bkv_of(int dqk, int dvo) {
-  const int rq = row_stride(dqk), rv = row_stride(dvo);
-  return fwd_smem_bytes(rq, rq, rv, 64) <= 50 * 1024 ? 64 : 32;
-}
-
-template <int DQK, int DVO>
-constexpr int smem_bytes() {
-  return fwd_smem_bytes(Lay<DQK>::kRow, Lay<DQK>::kRow, Lay<DVO>::kRow, bkv_of(DQK, DVO));
-}
-
-/// The shared body.  __noinline__: compiled once per (head dims, dtype, FP8) and called by every
-/// mask / variant / source wrapper, which keeps the translation unit inside its compile budget.
-template <int DQK, int DVO, typename T, bool FP8>
-__device__ __noinline__ void fwd_body(const FwdArgs& a) {
-  constexpr int BQ = kBQ, BKV = bkv_of(DQK, DVO);
-  static_assert(DQK % 16 == 0 && DVO % 16 == 0, "mma.sync k16 tiles");
-  constexpr bool kQRegs = DQK <= 128;
+/// The forward body, compiled per (head dims, dtype, FP8, mask mode, modifier variant) and templated
+/// on the params type, so it reads the __grid_constant__ arguments directly: no wrapper builds a
+/// stack copy of an argument struct, and the mask / modifier branches are resolved at compile time.
+/// kMaskRuntime is the dynamic fallback (params.mask, runtime modifier values) for the combinations
+/// that have no specialization.
+template <int DQK, int DVO, typename T, bool FP8, MaskMode kMask, typename Variant, typename P>
+__device__ __forceinline__ void fwd_body(const P& pa) {
+  using Tile = PrefillTile<DQK, DVO>;
+  constexpr int BQ = Tile::BQ, BKV = Tile::BKV, NTHREADS = Tile::THREADS;
   constexpr int KQ = DQK / 16, NS = BKV / 8, KP = BKV / 16, NO = DVO / 8;
+  constexpr bool kQRegs = DQK <= 128;
+  constexpr bool kPaged = std::is_same_v<P, PagedPrefillParams>;
+  static_assert(DQK % 16 == 0 && DVO % 16 == 0, "mma.sync k16 tiles");
+  static_assert(!FP8 || kPaged, "FP8 K/V is a paged cache");
   using LQ = Lay<DQK>;
   using LV = Lay<DVO>;
 
   extern __shared__ __align__(16) unsigned char smem_raw[];
-  T* sQ = reinterpret_cast<T*>(smem_raw);
-  T* sK = sQ + BQ * LQ::kRow;
-  T* sV = sK + BKV * LQ::kRow;
+  T* const sQ = reinterpret_cast<T*>(smem_raw);
+  T* const sK = sQ + BQ * LQ::kRow;  // kStages tiles of BKV rows
+  T* const sV = sK + kStages * BKV * LQ::kRow;
 
-  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-  const int hk = blockIdx.y;
-  const WorkPlan& wp = a.plan;
+  const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, lane = tid & 31;
+  const int hk = static_cast<int>(blockIdx.y);
+  const WorkPlan& wp = pa.plan;
   // Heaviest item first.  The plan lists (request, q tile, kv chunk) in order and the visible key
   // range grows with the q tile, so the causal triangle's CTAs are ordered by increasing work;
   // launching them in reverse is the longest-processing-time schedule and removes the long tail.
@@ -374,50 +340,82 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
   int chunk_sz = wp.kv_chunk_size != nullptr ? *wp.kv_chunk_size : INT_MAX;
   if (chunk_sz <= 0) chunk_sz = INT_MAX;
 
-  const int G = a.Hq / a.Hkv;
-  const int qo_start = a.qo_indptr[b];
-  const int qo_len = a.qo_indptr[b + 1] - qo_start;
+  const int Hq = pa.num_qo_heads;
+  const int G = Hq / pa.num_kv_heads;
+  const int qo_start = pa.qo_indptr[b];
+  const int qo_len = pa.qo_indptr[b + 1] - qo_start;
   const int rows_total = qo_len * G;
   const int row0 = qtile * BQ;
   if (row0 >= rows_total) return;
 
-  // ---- K/V of (request b, kv head hk)
-  const char* kb = a.k + hk * a.k_sh;
-  const char* vb = a.v + hk * a.v_sh;
+  // ---- K/V of (request b, kv head hk): the descriptor is read once, into scalars ---------------
+  const char* kb;
+  const char* vb;
+  int64_t k_sp = 0, k_st, v_sp = 0, v_st;
   const int32_t* pages = nullptr;
+  int ps = 1;
+  bool e5m2 = false;
   int kv_len;
-  if (a.kv_format == 0) {
-    const int k0 = a.kv_indptr[b];
-    kb += k0 * a.k_st;
-    vb += k0 * a.v_st;
-    kv_len = a.kv_indptr[b + 1] - k0;
-  } else if (a.kv_format == 1) {
-    const int p0 = a.kv_indptr[b], np = a.kv_indptr[b + 1] - p0;
-    pages = a.page_ids + p0;
-    kv_len = np > 0 ? (np - 1) * a.page_size + a.last_page_len[b] : 0;
+  if constexpr (kPaged) {
+    const kv::PagedKVDesc& d = pa.kv;
+    const int64_t eb = d.stride_unit == StrideUnit::kByte ? 1 : (FP8 ? 1 : 2);
+    kb = static_cast<const char*>(d.k_data) + static_cast<int64_t>(hk) * d.k_stride_head * eb;
+    vb = static_cast<const char*>(d.v_data) + static_cast<int64_t>(hk) * d.v_stride_head * eb;
+    k_sp = d.k_stride_page * eb;
+    k_st = d.k_stride_token * eb;
+    v_sp = d.v_stride_page * eb;
+    v_st = d.v_stride_token * eb;
+    ps = d.page_size;
+    e5m2 = d.k_dtype == DType::kFloat8E5M2;
+    if (d.table_format == kv::PageTableFormat::kBlockTable) {
+      pages = d.block_table + static_cast<int64_t>(b) * d.block_table_stride;
+      kv_len = d.seq_lens[b];
+    } else {
+      const int p0 = d.kv_indptr[b], np = d.kv_indptr[b + 1] - p0;
+      pages = d.kv_page_indices + p0;
+      kv_len = np > 0 ? (np - 1) * ps + d.kv_last_page_len[b] : 0;
+    }
   } else {
-    pages = a.page_ids + b * a.bt_stride;
-    kv_len = a.seq_lens[b];
+    const kv::RaggedKVDesc& d = pa.kv;
+    const int k0 = d.kv_indptr[b];
+    k_st = d.k_stride_n * 2;
+    v_st = d.v_stride_n * 2;
+    kb = static_cast<const char*>(d.k) + static_cast<int64_t>(hk) * d.k_stride_h * 2 +
+         static_cast<int64_t>(k0) * k_st;
+    vb = static_cast<const char*>(d.v) + static_cast<int64_t>(hk) * d.v_stride_h * 2 +
+         static_cast<int64_t>(k0) * v_st;
+    kv_len = d.kv_indptr[b + 1] - k0;
   }
-  const int ps = a.page_size;
   float k_scale = 1.0f;
   [[maybe_unused]] float v_scale = 1.0f;
   if constexpr (FP8) {
-    const int sh = a.scale_head_stride != 0 ? hk : 0;
-    k_scale = a.k_scale_ptr != nullptr ? a.k_scale_ptr[sh] : a.k_scale;
-    v_scale = a.v_scale_ptr != nullptr ? a.v_scale_ptr[sh] : a.v_scale;
-    if (!a.e5m2) {  // e4m3 codes are converted as value * 2^-8 (fp8x4_to)
+    const kv::PagedKVDesc& d = pa.kv;
+    const int sh = d.scale_head_stride != 0 ? hk : 0;
+    k_scale = d.k_scale != nullptr ? d.k_scale[sh] : pa.mod.k_scale;
+    v_scale = d.v_scale != nullptr ? d.v_scale[sh] : pa.mod.v_scale;
+    if (!e5m2) {  // e4m3 codes are converted as value * 2^-8 (fp8x4_to)
       k_scale *= 256.0f;
       v_scale *= 256.0f;
     }
   }
-  const int pos0 = a.q_pos_offset != nullptr ? a.q_pos_offset[b] : kv_len - qo_len;
-  const float sm = a.sm_scale != 0.0f ? a.sm_scale : rsqrtf(static_cast<float>(DQK));
-  const float scale_nat = sm * k_scale, scale2 = scale_nat * kLog2e;
-  const float cap = a.softcap, inv_cap = cap > 0.0f ? 1.0f / cap : 0.0f;
-  const bool causal = a.mask == static_cast<int>(MaskMode::kCausal);
-  const bool custom = a.mask == static_cast<int>(MaskMode::kCustom);
-  const int wl = a.window_left, wr = a.window_right, ck = a.chunk, nsink = a.num_sink;
+  const int pos0 = pa.q_pos_offset != nullptr ? pa.q_pos_offset[b] : kv_len - qo_len;
+  const float sm_scale =
+      pa.mod.sm_scale != 0.0f ? pa.mod.sm_scale : rsqrtf(static_cast<float>(DQK));
+  const float scale_nat = sm_scale * k_scale, scale2 = scale_nat * kLog2e;
+  const float cap = Variant::use_softcap ? pa.mod.logits_softcap : 0.0f;
+  const float inv_cap = cap > 0.0f ? 1.0f / cap : 0.0f;
+  const int wl = Variant::use_sliding_window ? pa.mod.window_left : -1;
+  const int wr = Variant::use_sliding_window ? pa.mod.window_right : -1;
+  const int nsink = Variant::use_sliding_window ? pa.mod.num_sink_tokens : 0;
+  const int ck = Variant::use_chunked ? pa.mod.chunk_size : 0;
+  const float* const alibi = Variant::use_alibi ? pa.mod.alibi_slopes : nullptr;
+  const float* const sinks = Variant::use_sinks ? pa.mod.sink_logits : nullptr;
+  const uint8_t* const cmask = pa.custom_mask;
+  const int64_t* const mindptr = pa.mask_indptr;
+  // kMask == kMaskRuntime folds to `false`, so `mode` is a constant in a specialization.
+  const MaskMode mode = kMask == kMaskRuntime ? pa.mask : kMask;
+  const bool causal = mode == MaskMode::kCausal;
+  const bool custom = mode == MaskMode::kCustom;
 
   // ---- key range of this item, tightened by the mask over the CTA's query positions
   const int qmin = pos0 + row0 / G;
@@ -461,29 +459,34 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
     rlo[r] = static_cast<int>(l64);
     rhi[r] = static_cast<int>(max(h64, static_cast<int64_t>(-1)));
     rwlo[r] = wl >= 0 ? static_cast<int>(max(static_cast<int64_t>(qpos[r]) - wl, static_cast<int64_t>(INT_MIN))) : INT_MIN;
-    if (a.alibi != nullptr) slope2[r] = a.alibi[head[r]] * kLog2e;
-    if (custom) mbase[r] = a.mask_indptr[b] + static_cast<int64_t>(qi_r[r]) * kv_len;
+    if (alibi != nullptr) slope2[r] = alibi[head[r]] * kLog2e;
+    if (custom) mbase[r] = mindptr[b] + static_cast<int64_t>(qi_r[r]) * kv_len;
   }
 
-  // ---- prologue: Q tile + first K tile
+  // ---- prologue: Q tile + the first K/V stage (one cp.async group) -----------------------------
   {
-    constexpr int CH = DQK / 8, N = BQ * CH, IT = (N + 127) / 128;
+    constexpr int CH = DQK / 8, N = BQ * CH, IT = (N + NTHREADS - 1) / NTHREADS;
 #pragma unroll
     for (int it = 0; it < IT; ++it) {
-      const int idx = it * 128 + tid;
-      if (N % 128 != 0 && idx >= N) break;
+      const int idx = it * NTHREADS + tid;
+      if (N % NTHREADS != 0 && idx >= N) break;
       const int r = idx / CH, c = idx % CH;
       const int pr = row0 + r;
       const bool ok = pr < rows_total;
       const int qi = ok ? pr / G : 0;
       const int h = hk * G + (ok ? pr - qi * G : 0);
-      const char* src = a.q + ((static_cast<int64_t>(qo_start) + qi) * a.q_sn + static_cast<int64_t>(h) * a.q_sh) * 2 + c * 16;
-      cp_async16(smem_u32(sQ + LQ::off(r, c)), ok ? src : a.q, ok);
+      const char* src = static_cast<const char*>(pa.q) +
+                        ((static_cast<int64_t>(qo_start) + qi) * pa.q_stride_n +
+                         static_cast<int64_t>(h) * pa.q_stride_h) * 2 + c * 16;
+      cp_async16(smem_u32(sQ + LQ::off(r, c)), ok ? src : pa.q, ok);
     }
   }
   int t0 = lo;
   if (has_gap && t0 >= nsink && t0 + BKV <= gap_hi) t0 = gap_hi;
-  if (t0 < hi) load_kv<DQK, BKV, T, FP8>(sK, kb, a.k_sp, a.k_st, pages, ps, t0, hi, a.e5m2);
+  if (t0 < hi) {
+    load_kv<DQK, BKV, T, FP8, NTHREADS>(sK, kb, k_sp, k_st, pages, ps, t0, hi, e5m2);
+    load_kv<DVO, BKV, T, FP8, NTHREADS>(sV, vb, v_sp, v_st, pages, ps, t0, hi, e5m2);
+  }
   cp_async_commit();
 
   float m[2] = {ninf(), ninf()}, l[2] = {0.0f, 0.0f};
@@ -492,10 +495,15 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
   for (int i = 0; i < NO; ++i) o[i][0] = o[i][1] = o[i][2] = o[i][3] = 0.0f;
   [[maybe_unused]] uint32_t qf[kQRegs ? KQ : 1][4];
 
-  const uint32_t sQ_u = smem_u32(sQ), sK_u = smem_u32(sK), sV_u = smem_u32(sV);
+  const uint32_t sQ_u = smem_u32(sQ);
   const int a_row = warp * 16 + (lane & 15), a_cs = lane >> 4;
   const int b_row = (lane & 7) + ((lane >> 4) << 3), b_cs = (lane >> 3) & 1;
   const int v_row = (lane & 7) + (((lane >> 3) & 1) << 3), v_cs = lane >> 4;
+  // Ping-pong stage pointers: `cur` is consumed by this iteration, `next` is copied into it.
+  T* kcur = sK;
+  T* vcur = sV;
+  T* knext = sK + BKV * LQ::kRow;
+  T* vnext = sV + BKV * LV::kRow;
 
   bool first = true;
   while (t0 < hi) {
@@ -508,8 +516,17 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
       }
     }
     first = false;
-    load_kv<DVO, BKV, T, FP8>(sV, vb, a.v_sp, a.v_st, pages, ps, t0, hi, a.e5m2);
+    // Start the next stage before touching this one: the copy overlaps QK, the softmax and PV, and
+    // the barrier above (every warp past the previous iteration) makes `next` safe to overwrite.
+    int tn = t0 + BKV;
+    if (has_gap && tn >= nsink && tn + BKV <= gap_hi) tn = gap_hi;
+    const bool more = tn < hi;
+    if (more) {
+      load_kv<DQK, BKV, T, FP8, NTHREADS>(knext, kb, k_sp, k_st, pages, ps, tn, hi, e5m2);
+      load_kv<DVO, BKV, T, FP8, NTHREADS>(vnext, vb, v_sp, v_st, pages, ps, tn, hi, e5m2);
+    }
     cp_async_commit();
+    const uint32_t sK_u = smem_u32(kcur), sV_u = smem_u32(vcur);
 
     // S = Q K^T
     float s[NS][4];
@@ -546,7 +563,7 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
         for (int e = 0; e < 4; ++e) s[nt][e] *= scale2;
     }
     const int jb = t0 + 2 * (lane & 3);
-    if (a.alibi != nullptr) {
+    if (alibi != nullptr) {
 #pragma unroll
       for (int nt = 0; nt < NS; ++nt)
 #pragma unroll
@@ -567,7 +584,7 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
           bool vis = j >= rlo[r] && j <= rhi[r] && (j >= rwlo[r] || j < nsink);
           if (custom && vis) {
             const int64_t bit = mbase[r] + j;
-            vis = ((a.custom_mask[bit >> 3] >> (bit & 7)) & 1) != 0;
+            vis = ((cmask[bit >> 3] >> (bit & 7)) & 1) != 0;
           }
           if (!vis) s[nt][e] = ninf();
         }
@@ -613,13 +630,6 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
       }
     }
 
-    cp_async_wait_all();
-    __syncthreads();  // V(t0) landed; every warp is done with sK
-    int tn = t0 + BKV;
-    if (has_gap && tn >= nsink && tn + BKV <= gap_hi) tn = gap_hi;
-    if (tn < hi) load_kv<DQK, BKV, T, FP8>(sK, kb, a.k_sp, a.k_st, pages, ps, tn, hi, a.e5m2);
-    cp_async_commit();
-
     // O += P V
 #pragma unroll
     for (int kk = 0; kk < KP; ++kk) {
@@ -637,19 +647,25 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
       }
     }
     t0 = tn;
+    T* ptr = kcur;
+    kcur = knext;
+    knext = ptr;
+    ptr = vcur;
+    vcur = vnext;
+    vnext = ptr;
   }
   cp_async_wait_all();
 
   // ---- finalize
-  const bool split = wp.split_kv && a.split.o_partial != nullptr;
+  const bool split = wp.split_kv && pa.split.o_partial != nullptr;
   float scale[2], lse_n[2];
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
     l[r] += __shfl_xor_sync(0xffffffffu, l[r], 1);
     l[r] += __shfl_xor_sync(0xffffffffu, l[r], 2);
     float mf = m[r], lf = l[r], num = 1.0f;
-    if (!split && a.sinks != nullptr) {
-      const float sk = a.sinks[head[r]] * kLog2e;
+    if (!split && sinks != nullptr) {
+      const float sk = sinks[head[r]] * kLog2e;
       const float mn = fmaxf(mf, sk);
       num = exp2f(mf - mn);
       lf = lf * num + exp2f(sk - mn);
@@ -659,26 +675,25 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
     lse_n[r] = lf > 0.0f ? (mf + log2f(lf)) * kLn2 : ninf();
     if constexpr (FP8) scale[r] *= v_scale;
   }
-  const int Hq = a.Hq;
 #pragma unroll
   for (int r = 0; r < 2; ++r) {
     if (!rvalid[r]) continue;
     const int64_t tok = static_cast<int64_t>(qo_start) + qi_r[r];
     if (split) {
-      const int64_t prow = static_cast<int64_t>(a.split.merge_indptr[tok]) + kvc;
-      float* dst = a.split.o_partial + (prow * Hq + head[r]) * DVO + 2 * (lane & 3);
+      const int64_t prow = static_cast<int64_t>(pa.split.merge_indptr[tok]) + kvc;
+      float* dst = pa.split.o_partial + (prow * Hq + head[r]) * DVO + 2 * (lane & 3);
 #pragma unroll
       for (int i = 0; i < NO; ++i) {
         *reinterpret_cast<float2*>(dst + i * 8) = make_float2(o[i][2 * r] * scale[r], o[i][2 * r + 1] * scale[r]);
       }
-      if ((lane & 3) == 0) a.split.lse_partial[prow * Hq + head[r]] = lse_n[r];
+      if ((lane & 3) == 0) pa.split.lse_partial[prow * Hq + head[r]] = lse_n[r];
     } else {
-      T* dst = static_cast<T*>(a.o) + tok * a.o_sn + static_cast<int64_t>(head[r]) * a.o_sh + 2 * (lane & 3);
+      T* dst = static_cast<T*>(pa.o) + tok * pa.o_stride_n + static_cast<int64_t>(head[r]) * pa.o_stride_h + 2 * (lane & 3);
 #pragma unroll
       for (int i = 0; i < NO; ++i) {
         *reinterpret_cast<uint32_t*>(dst + i * 8) = pack2<T>(o[i][2 * r] * scale[r], o[i][2 * r + 1] * scale[r]);
       }
-      if (a.lse != nullptr && (lane & 3) == 0) a.lse[tok * Hq + head[r]] = lse_n[r];
+      if (pa.lse != nullptr && (lane & 3) == 0) pa.lse[tok * Hq + head[r]] = lse_n[r];
     }
   }
 }
@@ -686,75 +701,35 @@ __device__ __noinline__ void fwd_body(const FwdArgs& a) {
 }  // namespace
 
 // ---- kernels (contract: prefill_kernels.cuh) -----------------------------------------------------
-// Thin wrappers around fwd_body.  Variant flags compile a modifier in (the runtime value in
-// params.mod switches it on); the mask mode is params.mask.  kLayout kNHD names the token-major
-// strided loader, which reads NHD and HND pages alike.
-template <typename Traits, typename Variant>
-__global__ void __launch_bounds__(kThreads)
+// Thin wrappers around fwd_body: they only pick the params type and pass the compile-time mask
+// specialization through.  Variant flags compile a modifier in (the runtime value in params.mod
+// switches it on); kMask is the mask mode, or kMaskRuntime to read params.mask.  kLayout kNHD names
+// the token-major strided loader, which reads NHD and HND pages alike.
+template <typename Traits, typename Variant, MaskMode kMask>
+__global__ void __launch_bounds__(PrefillTile<Traits::head_dim_qk, Traits::head_dim_vo>::THREADS)
     ragged_prefill_kernel(const __grid_constant__ RaggedPrefillParams params) {
   static_assert(!Variant::fp8_kv && sizeof(typename Traits::kv_type) == 2, "ragged K/V is 16-bit");
-  static_assert(Traits::cta_tile_q == kBQ && Traits::num_warps_q == kWarps &&
-                    Traits::cta_tile_kv == bkv_of(Traits::head_dim_qk, Traits::head_dim_vo),
-                "fwd_body tile");
+  static_assert(tile_matches<Traits>(), "fwd_body tile");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-  FwdArgs a;
-  fill_common<Variant>(a, params);
-  const kv::RaggedKVDesc& d = params.kv;
-  a.kv_format = 0;
-  a.e5m2 = false;
-  a.k = static_cast<const char*>(d.k);
-  a.v = static_cast<const char*>(d.v);
-  a.k_sp = a.v_sp = 0;
-  a.k_st = d.k_stride_n * 2;
-  a.k_sh = d.k_stride_h * 2;
-  a.v_st = d.v_stride_n * 2;
-  a.v_sh = d.v_stride_h * 2;
-  a.kv_indptr = d.kv_indptr;
-  a.page_ids = a.last_page_len = a.seq_lens = nullptr;
-  a.bt_stride = 0;
-  a.page_size = 1;
-  fwd_body<Traits::head_dim_qk, Traits::head_dim_vo, typename Traits::q_type, false>(a);
+  fwd_body<Traits::head_dim_qk, Traits::head_dim_vo, typename Traits::q_type, false, kMask, Variant>(
+      params);
 #else
   (void)params;
   if (threadIdx.x == 0) __trap();  // host refuses sm < 80 (attention_supports / decode_plan)
 #endif
 }
 
-template <typename Traits, typename Variant, kv::KVLayout kLayout>
-__global__ void __launch_bounds__(kThreads)
+template <typename Traits, typename Variant, kv::KVLayout kLayout, MaskMode kMask>
+__global__ void __launch_bounds__(PrefillTile<Traits::head_dim_qk, Traits::head_dim_vo>::THREADS)
     paged_prefill_kernel(const __grid_constant__ PagedPrefillParams params) {
   static_assert(kLayout == kv::KVLayout::kNHD || kLayout == kv::KVLayout::kHND,
                 "token-major pages (strides carry NHD vs HND)");
   constexpr bool kFp8 = Variant::fp8_kv;
   static_assert(kFp8 == (sizeof(typename Traits::kv_type) == 1), "Variant::fp8_kv matches kv_type");
-  static_assert(Traits::cta_tile_q == kBQ && Traits::num_warps_q == kWarps &&
-                    Traits::cta_tile_kv == bkv_of(Traits::head_dim_qk, Traits::head_dim_vo),
-                "fwd_body tile");
+  static_assert(tile_matches<Traits>(), "fwd_body tile");
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
-  FwdArgs a;
-  fill_common<Variant>(a, params);
-  const kv::PagedKVDesc& d = params.kv;
-  const int64_t eb = d.stride_unit == StrideUnit::kByte ? 1 : (kFp8 ? 1 : 2);
-  a.kv_format = d.table_format == kv::PageTableFormat::kBlockTable ? 2 : 1;
-  a.e5m2 = d.k_dtype == DType::kFloat8E5M2;
-  a.k = static_cast<const char*>(d.k_data);
-  a.v = static_cast<const char*>(d.v_data);
-  a.k_sp = d.k_stride_page * eb;
-  a.k_st = d.k_stride_token * eb;
-  a.k_sh = d.k_stride_head * eb;
-  a.v_sp = d.v_stride_page * eb;
-  a.v_st = d.v_stride_token * eb;
-  a.v_sh = d.v_stride_head * eb;
-  a.kv_indptr = d.kv_indptr;
-  a.page_ids = a.kv_format == 2 ? d.block_table : d.kv_page_indices;
-  a.last_page_len = d.kv_last_page_len;
-  a.seq_lens = d.seq_lens;
-  a.bt_stride = d.block_table_stride;
-  a.page_size = d.page_size;
-  a.k_scale_ptr = d.k_scale;
-  a.v_scale_ptr = d.v_scale;
-  a.scale_head_stride = d.scale_head_stride;
-  fwd_body<Traits::head_dim_qk, Traits::head_dim_vo, typename Traits::q_type, kFp8>(a);
+  fwd_body<Traits::head_dim_qk, Traits::head_dim_vo, typename Traits::q_type, kFp8, kMask, Variant>(
+      params);
 #else
   (void)params;
   if (threadIdx.x == 0) __trap();  // host refuses sm < 80 (attention_supports / decode_plan)
@@ -983,38 +958,60 @@ Status launch_error(const char* what, cudaError_t err) {
 }
 
 // ---- dispatch ------------------------------------------------------------------------------------
-template <typename Traits, bool PAGED, typename P>
+/// Instantiate one (traits, variant, mask specialization) kernel and launch it.  The template
+/// arguments are the whole dispatch: run() re-derives this cell from plan.kernel_id, so the plan
+/// format did not change with the specializations.
+template <typename Traits, typename Variant, MaskMode kMask, bool PAGED, typename P>
 Status launch_one(const P& params, dim3 grid, cudaStream_t stream) {
-  using V = AttentionVariant<true, true, true, true, true, sizeof(typename Traits::kv_type) == 1>;
   constexpr int smem = smem_bytes<Traits::head_dim_qk, Traits::head_dim_vo>();
+  constexpr int threads = PrefillTile<Traits::head_dim_qk, Traits::head_dim_vo>::THREADS;
   if constexpr (PAGED) {
-    auto* fn = paged_prefill_kernel<Traits, V, kv::KVLayout::kNHD>;
+    auto* fn = paged_prefill_kernel<Traits, Variant, kv::KVLayout::kNHD, kMask>;
     static const cudaError_t attr =
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     if (attr != cudaSuccess) return (cudaGetLastError(), launch_error("paged_prefill smem attribute", attr));
-    fn<<<grid, kThreads, smem, stream>>>(params);
+    fn<<<grid, threads, smem, stream>>>(params);
   } else {
-    auto* fn = ragged_prefill_kernel<Traits, V>;
+    auto* fn = ragged_prefill_kernel<Traits, Variant, kMask>;
     static const cudaError_t attr =
         cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     if (attr != cudaSuccess) return (cudaGetLastError(), launch_error("ragged_prefill smem attribute", attr));
-    fn<<<grid, kThreads, smem, stream>>>(params);
+    fn<<<grid, threads, smem, stream>>>(params);
   }
   const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) return launch_error(PAGED ? "paged_prefill launch" : "ragged_prefill launch", err);
   return Status::kSuccess;
 }
 
+/// Head dims that carry the two hot mask specializations (causal and full, no modifiers).
+KOPS_HOST_DEVICE constexpr bool hot_dims(int dqk, int dvo) {
+  return dqk == dvo && (dqk == 64 || dqk == 128 || dqk == 256);
+}
+
 template <int DQK, int DVO, typename T, bool PAGED, typename P>
 Status launch_dtype_kv(const Key& k, const P& params, dim3 grid, cudaStream_t st) {
-  constexpr int BKV = bkv_of(DQK, DVO);
+  using Tile = PrefillTile<DQK, DVO>;
   if (!k.fp8) {
-    using Tr = PrefillTraits<DQK, DVO, kBQ, BKV, kWarps, 1, 1, T, T, T, Sm80>;
-    return launch_one<Tr, PAGED>(params, grid, st);
+    using Tr = PrefillTraits<DQK, DVO, Tile::BQ, Tile::BKV, Tile::WARPS, 1, kStages, T, T, T, Sm80>;
+    // No modifier and a causal / full mask: the mask and every modifier branch fold away.  Every
+    // other (mask, modifier) combination shares the all-mods runtime-mask kernel below.
+    if constexpr (hot_dims(DQK, DVO)) {
+      using V0 = AttentionVariant<false, false, false, false, false, false>;
+      if (k.mods == 0 && k.mask == static_cast<int>(MaskMode::kCausal)) {
+        return launch_one<Tr, V0, MaskMode::kCausal, PAGED>(params, grid, st);
+      }
+      if (k.mods == 0 && k.mask == static_cast<int>(MaskMode::kNone)) {
+        return launch_one<Tr, V0, MaskMode::kNone, PAGED>(params, grid, st);
+      }
+    }
+    using VG = AttentionVariant<true, true, true, true, true, false>;
+    return launch_one<Tr, VG, kMaskRuntime, PAGED>(params, grid, st);
   }
   if constexpr (PAGED && fp8_compiled<DQK, DVO>()) {
-    using Tr = PrefillTraits<DQK, DVO, kBQ, BKV, kWarps, 1, 1, T, __nv_fp8_e4m3, T, Sm80>;
-    return launch_one<Tr, true>(params, grid, st);
+    using Tr8 = PrefillTraits<DQK, DVO, Tile::BQ, Tile::BKV, Tile::WARPS, 1, kStages, T,
+                              __nv_fp8_e4m3, T, Sm80>;
+    using VG = AttentionVariant<true, true, true, true, true, true>;
+    return launch_one<Tr8, VG, kMaskRuntime, true>(params, grid, st);
   } else {
     return detail::set_error(Status::kUnsupportedDtype, "prefill: FP8 K/V not compiled for %d/%d (paged only)",
                              DQK, DVO);
@@ -1185,6 +1182,7 @@ Status prefill_plan(const AttentionSpec& spec, const Tensor& qo_indptr_host,
                              kPlanMaxBatch);
   }
   const int G = spec.num_q_heads / spec.num_kv_heads;
+  const int bq = bq_of(spec.head_dim_qk, spec.head_dim_vo);  // query rows per CTA (PrefillTile)
   int64_t base_ctas = 0;
   int max_kv = 0;
   for (int64_t b = 0; b < B; ++b) {
@@ -1193,7 +1191,7 @@ Status prefill_plan(const AttentionSpec& spec, const Tensor& qo_indptr_host,
       return detail::set_error(Status::kInvalidArgument, "prefill_plan: negative length at request %lld",
                                static_cast<long long>(b));
     }
-    base_ctas += (qn * G + kBQ - 1) / kBQ;
+    base_ctas += (qn * G + bq - 1) / bq;
     max_kv = std::max(max_kv, kvl[b]);
   }
   const int64_t total_q = qo[B];
@@ -1229,14 +1227,14 @@ Status prefill_plan(const AttentionSpec& spec, const Tensor& qo_indptr_host,
   int64_t items = 0, prow = 0;
   if (dev_plan) {
     const int64_t mc = chunks_of(max_kv);
-    items = ((total_q * G + kBQ - 1) / kBQ + B_cap) * mc;
+    items = ((total_q * G + bq - 1) / bq + B_cap) * mc;
     prow = split ? total_q * mc : 0;
   } else {
     merge.assign(static_cast<size_t>(total_q + 1), 0);
     oind.assign(static_cast<size_t>(B + 1), 0);
     for (int64_t b = 0; b < B; ++b) {
       const int64_t qn = static_cast<int64_t>(qo[b + 1]) - qo[b];
-      const int64_t tiles = (qn * G + kBQ - 1) / kBQ;
+      const int64_t tiles = (qn * G + bq - 1) / bq;
       const int64_t nc = chunks_of(kvl[b]);
       for (int64_t t = 0; t < tiles; ++t) {
         for (int64_t c = 0; c < nc; ++c) {
@@ -1447,7 +1445,8 @@ Status prefill_run_impl(const AttentionPlan& plan, const P& params, const Worksp
         reinterpret_cast<int32_t*>(base + cv.kvtile), reinterpret_cast<int32_t*>(base + cv.merge),
         reinterpret_cast<int32_t*>(base + cv.oind), reinterpret_cast<uint8_t*>(base + cv.valid),
         reinterpret_cast<int32_t*>(base + cv.nitems), reinterpret_cast<int32_t*>(base + cv.overflow),
-        params.qo_indptr, kv_lens, params.batch_size, kBQ, reinterpret_cast<const int32_t*>(base + cv.chunk),
+        params.qo_indptr, kv_lens, params.batch_size, bq_of(k.dqk, k.dvo),
+        reinterpret_cast<const int32_t*>(base + cv.chunk),
         params.num_qo_heads / params.num_kv_heads, dp.padded_num_items, kv_indptr, last, ps,
         static_cast<int>(prow_cap), reinterpret_cast<uint32_t*>(base + cv.total_rows));
     const cudaError_t err = cudaGetLastError();
