@@ -54,7 +54,7 @@
 //     HCParams plus HCStreamParams. No C mirror carries these structs.
 // v8: B11 SM90a arch cell. Additive host entry gemm::wgmma_gemm (TMA + wgmma dense GEMM); scaled_gemm /
 //     gemm_with_tactic route the kTmaWarpSpecialized* mainloops to it. No struct layout changed.
-#define KOPS_ABI_VERSION 8
+#define KOPS_ABI_VERSION 9
 
 // =============================================================================
 // Backend
