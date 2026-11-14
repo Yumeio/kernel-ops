@@ -78,6 +78,12 @@ PyTorch package here and the node has two GPUs. The kops JSON may be measured in
 graph mode while the PyTorch baseline is eager; run the C++ benchmark with
 `--mode eager` for a launch-model-matched comparison, and report both.
 
+`deepep_baseline.py` covers the EP rows (`ep_layout`, normal and low-latency
+`ep_dispatch_combine`) through DeepEP v1.2.1. It needs an NVLink host with at
+least `--world-size` GPUs, and NVSHMEM for the low-latency row; otherwise it
+prints why and exits 77. Build steps, the API mapping and the 1x3050 status are
+in `reports/deepep-baseline.md`.
+
 The PyTorch environment pinned by `pyproject.toml` / `requirements.txt` is
 `torch==2.14.1+cu126`. `torch_baseline.py` maps every B3 op (including
 `quantize_per_token_int8`, `norm_quant`, `act_and_mul_quant`) and the two fused
@@ -213,6 +219,14 @@ bash tools/dev/bench_thirdparty.sh --all --rounds 3 --flush-l2 256 \
     --report out/thirdparty/report.md
 ```
 
+SGLang has two local options on this machine:
+
+- `~/venv-3rd` has a **partial** `sgl_kernel` 0.4.5 build (norm/activation/
+  rotary) that matches the adapter's norm/activation/position paths;
+- `~/venv-sgl` has the **full** official 0.4.5 wheel with torch 2.11.0. Select
+  it with `PY=~/venv-sgl/bin/python` when you need SGLang GEMM/MoE/KV ops.
+  See `reports/sglang-sgl-kernel-wsl.md`.
+
 Useful variants:
 
 ```bash
@@ -256,9 +270,14 @@ logs/
 
 The report includes a coverage table (`wired`, `not_wired`, `needs_hardware`,
 `reference_only`), the per-case best third-party ratio, and the known
-references that are not wired yet (DeepEP, FLA, mamba_ssm, FlashMLA, DeepGEMM,
-TensorRT-LLM, DeepGEMM Mega MoE). The third-party numbers are comparisons, not
-registry evidence.
+references. Optional adapters now exist for:
+`fla`/`mamba_ssm`/`causal_conv1d` (B9 state), `deepgemm` (SM90/SM100 FP8/FP4
+GEMM), `flashmla` (SM90/SM100 MLA/sparse) and `trtllm` (TensorRT-LLM/FlashInfer
+trtllm-*). They load only when the package and the module are present; missing
+packages/architectures are reported as skip reasons. `DeepEP` has a separate
+multi-GPU harness (`deepep_baseline.py`). DeepGEMM Mega MoE, TensorRT-LLM
+containers and full FlashMLA sparse still need their own hardware/package
+setup. The third-party numbers are comparisons, not registry evidence.
 
 ## Clone the pinned 3rd-party trees
 

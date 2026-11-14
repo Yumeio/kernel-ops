@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import importlib
+import os
 import re
 import sys
 
@@ -409,13 +411,22 @@ def sglang_adapter(case: dict, device: torch.device):
     rows, cols = int(case["rows"]), int(case["cols"])
     dt = dtype_of(case)
 
+    def need(name: str) -> bool:
+        return hasattr(sgl_kernel, name)
+
     if op == "rms_norm":
+        if not need("rmsnorm"):
+            return None, "sgl_kernel build has no rmsnorm"
+        if dt == torch.float32:
+            return None, "sgl_kernel rmsnorm supports fp16/bf16 only"
         x = torch.randn(rows, cols, device=device, dtype=dt)
         w = torch.ones(cols, device=device, dtype=dt)
         out = torch.empty_like(x)
         return lambda: sgl_kernel.rmsnorm(x, w, EPS, out=out), "sgl_kernel rmsnorm"
 
     if op == "fused_add_rms_norm":
+        if not need("fused_add_rmsnorm"):
+            return None, "sgl_kernel build has no fused_add_rmsnorm"
         x = torch.randn(rows, cols, device=device, dtype=dt) * 0.1
         res = torch.randn(rows, cols, device=device, dtype=dt) * 0.1
         w = torch.ones(cols, device=device, dtype=dt)
@@ -423,21 +434,27 @@ def sglang_adapter(case: dict, device: torch.device):
                 "sgl_kernel fused_add_rmsnorm")
 
     if op == "act_and_mul":
+        if not need("silu_and_mul"):
+            return None, "sgl_kernel build has no silu_and_mul"
         x = torch.randn(rows, 2 * cols, device=device, dtype=dt)
         out = torch.empty(rows, cols, device=device, dtype=dt)
         return lambda: sgl_kernel.silu_and_mul(x, out=out), "sgl_kernel silu_and_mul"
 
     if op == "apply_rotary":
+        if not need("rotary_embedding"):
+            return None, "sgl_kernel build has no rotary_embedding"
         hq, hkv = _pair(cid, "h", (32, 8))
         tokens, d = rows, cols
         q = torch.randn(tokens, hq * d, device=device, dtype=dt)
         k = torch.randn(tokens, hkv * d, device=device, dtype=dt)
         pos = (torch.arange(tokens, device=device) % 4096).to(torch.int64)
-        cache = torch.randn(4096, d, device=device, dtype=torch.float32)
+        cache = torch.randn(4096, d, device=device, dtype=dt)
         return (lambda: sgl_kernel.rotary_embedding(pos, q, k, d, cache, True),
                 "sgl_kernel rotary_embedding")
 
     if op == "moe_route":
+        if not need("topk_softmax"):
+            return None, "sgl_kernel build has no topk_softmax"
         experts, k = cols, 8
         gating = torch.randn(rows, experts, device=device, dtype=torch.float32)
         w = torch.empty(rows, k, device=device, dtype=torch.float32)
@@ -446,6 +463,8 @@ def sglang_adapter(case: dict, device: torch.device):
                 "sgl_kernel topk_softmax")
 
     if op == "moe_align":
+        if not need("moe_align_block_size"):
+            return None, "sgl_kernel build has no moe_align_block_size"
         block = 128
         experts = 256
         tokens = max(1, rows)
@@ -471,6 +490,40 @@ IMPLS = {
     "fa2": fa2_adapter,
     "sglang": sglang_adapter,
 }
+
+
+def _load_optional_impls() -> None:
+    """Merge the optional adapter modules without making them hard dependencies.
+
+    Each module exports `IMPLS = {name: adapter}` with the same
+    `(case, device) -> (fn, note) | (None, reason)` contract. Import failures
+    (missing package, unsupported arch) are reported once on stderr and the
+    base adapters keep working.
+    """
+    for module_name in (
+        "thirdparty_state",
+        "thirdparty_deepgemm",
+        "thirdparty_flashmla",
+        "thirdparty_trtllm",
+    ):
+        module_path = os.path.join(os.path.dirname(__file__), module_name + ".py")
+        if not os.path.exists(module_path):
+            continue
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # noqa: BLE001 - optional adapter module
+            print(f"thirdparty: optional adapter {module_name} not loaded: "
+                  f"{type(exc).__name__}: {exc}", file=sys.stderr)
+            continue
+        extra = getattr(module, "IMPLS", None)
+        if not isinstance(extra, dict):
+            print(f"thirdparty: optional adapter {module_name} has no IMPLS dict",
+                  file=sys.stderr)
+            continue
+        IMPLS.update(extra)
+
+
+_load_optional_impls()
 
 
 # ---------------------------------------------------------------------------

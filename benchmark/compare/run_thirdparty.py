@@ -162,6 +162,20 @@ def python_impls() -> dict[str, dict]:
         sgl_reason = "sgl_kernel not installed (3rd/sglang cloned)"
     out["sglang"] = {"available": spec("sgl_kernel"), "reason": sgl_reason}
     out["bnb"] = {"available": spec("bitsandbytes"), "reason": "bitsandbytes"}
+    out["fla"] = {"available": spec("fla") and (COMPARE_DIR / "thirdparty_state.py").exists(),
+                  "reason": "fla (flash-linear-attention)"}
+    out["mamba_ssm"] = {"available": spec("mamba_ssm") and (COMPARE_DIR / "thirdparty_state.py").exists(),
+                        "reason": "mamba_ssm"}
+    out["causal_conv1d"] = {"available": spec("causal_conv1d") and (COMPARE_DIR / "thirdparty_state.py").exists(),
+                            "reason": "causal_conv1d"}
+    out["deepgemm"] = {"available": spec("deep_gemm") and (COMPARE_DIR / "thirdparty_deepgemm.py").exists(),
+                       "reason": "deep_gemm (SM90/SM100)"}
+    out["flashmla"] = {"available": spec("flash_mla") and (COMPARE_DIR / "thirdparty_flashmla.py").exists(),
+                       "reason": "flash_mla (SM90/SM100)"}
+    trt_reason = "tensorrt_llm or flashinfer trtllm_*"
+    trt_ok = (spec("tensorrt_llm") or spec("flashinfer")) and \
+             (COMPARE_DIR / "thirdparty_trtllm.py").exists()
+    out["trtllm"] = {"available": trt_ok, "reason": trt_reason}
     return out
 
 
@@ -273,7 +287,8 @@ def is_large_case(case: dict) -> bool:
     return False
 
 
-def filter_cases(raw_cases: dict, args, vram_gb: float) -> tuple[list[dict], int, int]:
+def filter_cases(raw_cases: dict, args, vram_gb: float,
+                 family: str = "") -> tuple[list[dict], int, int]:
     cases = raw_cases.get("cases", [])
     skip_large = args.skip_large
     if skip_large is None:
@@ -289,6 +304,11 @@ def filter_cases(raw_cases: dict, args, vram_gb: float) -> tuple[list[dict], int
         if args.skip and matches(cid, args.skip):
             continue
         if skip_large and (is_large_case(c) or (max_bytes and int(c.get("bytes", 0)) > max_bytes)):
+            dropped += 1
+            continue
+        if skip_large and family == "state" and ("T4096" in cid or "T8192" in cid):
+            # 4 GB cards OOM in FLA's chunked delta-rule prefill; the
+            # decode cases stay and the report records the skip.
             dropped += 1
             continue
         selected.append(c)
@@ -446,6 +466,33 @@ def run_comm_torch(state: RunState, family: str, cases_path: Path, args, env: di
                 state.logs / f"comm-torch-{family}.log", args.timeout, args.dry_run, env)
     if r.returncode != 0:
         state.skipped.append({"family": family, "impl": "communication_torch",
+                              "reason": r.error or f"rc={r.returncode}"})
+        return None
+    return out
+
+
+def run_deepep(state: RunState, family: str, cases_path: Path, args, env: dict) -> Path | None:
+    """DeepEP EP baseline (multi-GPU). The script exits 77 when unavailable."""
+    script = COMPARE_DIR / "deepep_baseline.py"
+    out = state.external / "deepep" / f"{family}.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if args.resume and out.exists() and load_json(out) is not None:
+        return out
+    if not script.exists():
+        state.skipped.append({"family": family, "impl": "deepep",
+                              "reason": "deepep_baseline.py not present"})
+        return None
+    if args.world_size < 2 or gpu_count() < args.world_size:
+        state.skipped.append({"family": family, "impl": "deepep",
+                              "reason": f"requires >={args.world_size} GPUs (found {gpu_count()})"})
+        return None
+    cmd = [sys.executable, str(script), "--cases", str(cases_path),
+           "--json", str(out), "--world-size", str(args.world_size),
+           "--calls", str(args.comm_calls), "--groups", str(args.comm_groups)]
+    r = run_cmd(state, f"deepep/{family}", cmd,
+                state.logs / f"deepep-{family}.log", args.timeout, args.dry_run, env)
+    if r.returncode != 0 or not out.exists():
+        state.skipped.append({"family": family, "impl": "deepep",
                               "reason": r.error or f"rc={r.returncode}"})
         return None
     return out
@@ -816,6 +863,8 @@ def main() -> int:
     ap.add_argument("--max-case-bytes", type=int, default=None)
     ap.add_argument("--comm-calls", type=int, default=8)
     ap.add_argument("--comm-groups", type=int, default=8)
+    ap.add_argument("--world-size", type=int, default=2,
+                    help="DeepEP/NCCL world size (default 2)")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
@@ -977,7 +1026,7 @@ def main() -> int:
             state.skipped.append({"family": family, "impl": "cases",
                                   "reason": "could not dump cases"})
             continue
-        selected_cases, dropped, total = filter_cases(raw, args, gpu["vram_gb"])
+        selected_cases, dropped, total = filter_cases(raw, args, gpu["vram_gb"], family)
         cases_per_family[family] = len(selected_cases)
         case_ids = {c["id"] for c in selected_cases}
         raw_ids = {c.get("id", "") for c in raw.get("cases", [])}
@@ -1024,8 +1073,11 @@ def main() -> int:
         for name in meta["external"]:
             if name not in requested_external or not ext[name]["available"]:
                 continue
-            p = run_external(state, family, name, Path(ext[name]["path"]),
-                             cases_path, args, env, case_ids)
+            if name == "deepep":
+                p = run_deepep(state, family, cases_path, args, env)
+            else:
+                p = run_external(state, family, name, Path(ext[name]["path"]),
+                                 cases_path, args, env, case_ids)
             if p is not None:
                 refs.append((f"external:{name}", p))
 

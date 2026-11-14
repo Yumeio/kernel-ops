@@ -87,12 +87,12 @@ FAMILIES: dict[str, dict] = {
     },
     "state": {
         "target": "bench_state",
-        "impls": [],
+        "impls": ["fla", "mamba_ssm", "causal_conv1d"],
         "external": [],
         "special": None,
-        "status": "not_wired",
+        "status": "wired",
         "references": "FLA, mamba_ssm, causal-conv1d, vLLM selective_scan, SGLang causal_conv1d",
-        "note": "B9 gate needs FLA/mamba_ssm; Linux + Triton/CUDA extensions",
+        "note": "adapters landed; packages required; fused_delta_decode/delta_gating unsupported",
     },
     "quantization": {
         "target": "bench_quantization",
@@ -105,20 +105,20 @@ FAMILIES: dict[str, dict] = {
     },
     "gemm": {
         "target": "bench_gemm",
-        "impls": ["vllm", "sglang", "bnb"],
+        "impls": ["vllm", "sglang", "bnb", "deepgemm", "trtllm"],
         "external": ["llamacpp"],
         "special": None,
         "status": "wired",
-        "references": "vLLM Marlin/Machete, SGLang fp8, bitsandbytes NF4, llama.cpp mmvq",
+        "references": "vLLM Marlin/Machete, SGLang fp8, bitsandbytes NF4, llama.cpp mmvq, DeepGEMM, TRT-LLM",
         "note": "llama.cpp harness is hot-L2; compare with --flush-l2 0",
     },
     "moe": {
         "target": "bench_moe",
-        "impls": ["vllm", "sglang"],
+        "impls": ["vllm", "sglang", "trtllm"],
         "external": ["attention_rs_w2"],
         "special": None,
         "status": "wired",
-        "references": "vLLM topk/align, SGLang moe_fused_gate, attention.rs W2",
+        "references": "vLLM topk/align, SGLang moe_fused_gate, attention.rs W2, TRT-LLM",
         "note": "attention.rs W2 is B17 experimental",
     },
     "merge": {
@@ -132,21 +132,21 @@ FAMILIES: dict[str, dict] = {
     },
     "mla": {
         "target": "bench_mla",
-        "impls": [],
+        "impls": ["flashmla"],
         "external": [],
         "special": None,
-        "status": "reference_only",
+        "status": "wired",
         "references": "FlashMLA (dense/sparse), attn-rs mla_paged_attention",
-        "note": "FlashMLA package/harness not wired; needs SM90/SM100",
+        "note": "flashmla adapter landed; package + SM90/SM100 required",
     },
     "sparse": {
         "target": "bench_sparse",
-        "impls": [],
+        "impls": ["flashmla"],
         "external": [],
         "special": "csa",
-        "status": "reference_only",
+        "status": "wired",
         "references": "PyTorch CSA/HCA (csa_torch.py); FlashMLA sparse, DeepGEMM indexer",
-        "note": "csa_torch covers kv_compress/compressed_attention; FlashMLA sparse not wired",
+        "note": "csa_torch covers kv_compress/compressed_attention; flashmla adapter needs SM90/SM100",
     },
     "hyper_connection": {
         "target": "bench_hyper_connection",
@@ -169,11 +169,11 @@ FAMILIES: dict[str, dict] = {
     "communication": {
         "target": "bench_communication",
         "impls": [],
-        "external": ["nccl"],
+        "external": ["nccl", "deepep"],
         "special": "comm",
         "status": "wired",
         "references": "NCCL collectives; DeepEP EP dispatch/combine; vLLM/SGLang custom allreduce; hpc-ops fused allreduce",
-        "note": "DeepEP is the B12 EP gate comparison; needs multi-GPU NVLink and is not wired yet",
+        "note": "DeepEP is the B12 EP gate comparison; needs multi-GPU NVLink",
     },
 }
 
@@ -181,28 +181,32 @@ FAMILIES: dict[str, dict] = {
 # (family, name, status, hardware, note)
 KNOWN_REFERENCES = [
     ("embedding", "PyTorch F.embedding", "torch_only", "any", "no standalone third-party kernel"),
-    ("state", "FLA (GDN/KDA)", "not_wired", "Linux + Triton, SM80/SM90", "B9 gate"),
-    ("state", "mamba_ssm", "not_wired", "Linux + CUDA extension", "B9 gate"),
-    ("state", "causal-conv1d", "not_wired", "Linux + CUDA extension", "B9"),
+    ("state", "FLA (GDN/KDA)", "wired", "Linux + Triton, SM80/SM90", "ran on SM86 (3 state cases)"),
+    ("state", "mamba_ssm", "wired", "Linux + CUDA extension", "adapter landed; package not installed"),
+    ("state", "causal-conv1d", "wired", "Linux + CUDA extension", "adapter landed; package not installed"),
     ("state", "vLLM selective_scan", "reference_only", "SM80", "source reference"),
     ("model_ops", "DeepGEMM mhc_reference", "reference_only", "Python, any", "official mHC reference"),
     ("model_ops", "DeepGEMM sm100_mega_mhc", "needs_hardware", "SM100/B200", ""),
     ("model_ops", "vLLM attn_res_kernel", "needs_hardware", "SM100, H=7168", "Kimi K3"),
     ("hyper_connection", "hpc-ops iHC", "reference_only", "SM90", "similar, not identical to mHC"),
     ("mega", "DeepGEMM Mega MoE", "needs_hardware", "SM100/B200", "no generic callable op"),
-    ("communication", "DeepEP", "needs_hardware", "multi-GPU NVLink + NVSHMEM", "B12 EP gate"),
+    ("communication", "DeepEP", "needs_hardware", "multi-GPU NVLink + NVSHMEM", "harness landed; needs >=2 GPUs"),
     ("communication", "NCCL", "wired", "multi-GPU", "collectives"),
     ("communication", "vLLM custom allreduce", "reference_only", "multi-GPU", ""),
     ("communication", "SGLang custom allreduce", "reference_only", "multi-GPU", ""),
     ("communication", "hpc-ops fused allreduce+RMSNorm", "reference_only", "SM90, multi-GPU", ""),
     ("communication", "TensorRT-LLM Lamport allreduce", "reference_only", "multi-GPU", ""),
-    ("mla", "FlashMLA", "needs_hardware", "SM90/SM100", "package/harness not wired"),
-    ("sparse", "FlashMLA sparse / DeepGEMM indexer", "needs_hardware", "SM90/SM100", ""),
-    ("gemm", "DeepGEMM", "needs_hardware", "SM90/SM100", "FP8/FP4 grouped; package not wired"),
-    ("gemm", "TensorRT-LLM / trtllm-gen", "needs_hardware", "SM100 via FlashInfer", "container/heavy"),
+    ("mla", "FlashMLA", "needs_hardware", "SM90/SM100", "adapter landed; package/arch required"),
+    ("sparse", "FlashMLA sparse / DeepGEMM indexer", "needs_hardware", "SM90/SM100", "adapter landed; package/arch required"),
+    ("gemm", "DeepGEMM", "needs_hardware", "SM90/SM100", "adapter landed; package/arch required"),
+    ("gemm", "TensorRT-LLM / trtllm-gen", "needs_hardware", "SM100 via FlashInfer", "adapter landed; package/container required"),
 ]
 
-PY_IMPLS = ["vllm", "flashinfer", "sglang", "sdpa", "fa2", "bnb"]
+PY_IMPLS = [
+    "vllm", "flashinfer", "sglang", "sdpa", "fa2", "bnb",
+    "fla", "mamba_ssm", "causal_conv1d",
+    "deepgemm", "flashmla", "trtllm",
+]
 EXTERNALS = {
     "llamacpp": {
         "family": "gemm",
@@ -233,5 +237,10 @@ EXTERNALS = {
         "family": "communication",
         "paths": ["out/b12/nccl_baseline"],
         "build": "bash tools/dev/build_comm_baselines.sh",
+    },
+    "deepep": {
+        "family": "communication",
+        "paths": ["benchmark/compare/deepep_baseline.py"],
+        "build": "see reports/deepep-baseline.md (DeepEP v1.2.1 + NVSHMEM + multi-GPU)",
     },
 }
