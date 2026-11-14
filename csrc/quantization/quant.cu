@@ -8,9 +8,11 @@
 // Scales are dequant multipliers (x ~= q * s); every quotient is a correctly
 // rounded fp32 division and every conversion is round-to-nearest-even with
 // saturation, so the bytes are a function of the data alone (not of the fork,
-// grid or vector width). The per-group path can opt into a reciprocal +
-// Markstein quotient (ActQuantOut::math == QuantMath::kReciprocal) that is
-// byte-identical to that division; every other mode stays exact. The kernels are
+// grid or vector width). The per-group path reaches that quotient with one RN
+// reciprocal plus a Markstein correction for 16-bit inputs (byte-identical to
+// the division) and can opt into a raw reciprocal multiply
+// (ActQuantOut::math == QuantMath::kReciprocal) that is at most one payload
+// code away; every other mode divides exactly. The kernels are
 // architecture-generic, graph capturable and never allocate or synchronize on
 // the host.
 // =============================================================================
@@ -103,46 +105,52 @@ __device__ __forceinline__ uint8_t encode_byte<int8_t>(float x) {
 }
 
 // -----------------------------------------------------------------------------
-// Quotient of a quantize loop: exact RN division, or an opt-in reciprocal
+// Quotient of a quantize loop: exact bytes, or the opt-in approximate reciprocal
 // -----------------------------------------------------------------------------
 //
 // `__fdiv_rn` is a MUFU.RCP + Newton sequence guarded by FCHK whose slow path (a call) is taken
-// for dividends near zero or the exponent limits. A per-group loop that divides sixteen times per
-// thread therefore spends about as much issue and MUFU throughput as the bytes it moves. The
-// opt-in `QuantMath::kReciprocal` mode replaces it with one RN reciprocal per group plus FMUL +
-// 2 FFMA per element (Markstein): with r = RN(1/s), q = RN(x*r) within 1 ulp of x/s and the exact
-// remainder e = x - q*s (an FMA whose result is exact because q*s ~ x), RN(q + e*r) is the
-// correctly rounded quotient. The theorem needs every step normal, so:
-//  * the scale must be in [2^-90, 2^126]: r is then normal and finite, and for every x whose
-//    quotient can round to a non-zero e4m3 code (|x/s| >= 2^-10) the remainder x - q*s is
-//    representable, so the FMA is exact; anything smaller rounds to code 0 either way;
-//  * |q| >= 2^20 keeps q: every payload saturates far below that, so the byte is the same;
-//  * a zero quotient keeps the sign of q (RN(-0 + +0) would be +0);
-//  * scales outside the range (zero, subnormal, huge, inf or NaN - a group whose amax is +inf)
-//    fall back to `__fdiv_rn`; `fast_rcp` returns 0 as the signal and the kernel picks the exact
-//    body at run time.
-// For a power-of-two scale (UE8M0) `x * r` is exactly `x / s`, so kDivPow2 multiplies and never
-// runs the correction.
+// for dividends near zero or the exponent limits; a per-group loop that divides sixteen times per
+// thread spends more issue and MUFU throughput than the bytes it moves. Two cheaper quotients
+// reach the same or a neighbouring payload byte:
 //
-// Guarantee: the FP8 payload bytes are identical to the kExact loop for every input. The unit
-// test pins that down by comparing the two modes over all bf16 and fp16 bit patterns under many
-// group scales (and a sampled fp32 sweep), and by comparing the vectorized exact kernel against
-// the scalar one on adversarial data.
+//  * kDivMarkstein (used by QuantMath::kExact for bf16/fp16): one RN reciprocal per group plus
+//    FMUL + 2 FFMA per element. With r = RN(1/s), q = RN(x*r) within 1 ulp of x/s and the exact
+//    remainder e = x - q*s (an FMA whose result is exact because q*s ~ x), RN(q + e*r) is the
+//    correctly rounded quotient. The theorem needs every step normal, so
+//      - the scale must be in [2^-90, 2^126]: r is then normal and finite, and for every x whose
+//        quotient can round to a non-zero e4m3 code (|x/s| >= 2^-10) the remainder x - q*s is
+//        representable, so the FMA is exact; anything smaller rounds to code 0 either way;
+//      - |q| >= 2^20 keeps q: every payload saturates far below that, so the byte is the same;
+//      - a zero quotient keeps the sign of q (RN(-0 + +0) would be +0).
+//    Its payload bytes are identical to kDivExact, which is the kExact contract. The unit test
+//    sweeps every bf16 and fp16 bit pattern (thousands of group scales) and compares against the
+//    scalar `__fdiv_rn` body, byte for byte.
+//  * kDivRaw (QuantMath::kReciprocal): the same reciprocal with a raw multiply and no correction,
+//    one FMUL per element. RN(1/s) carries up to 2^-24 relative error and the multiply another,
+//    so the quotient is within ~2^-23 relative of x/s; e4m3 codes are 2^-3 relative apart, hence
+//    the payload is either the exact code or its neighbour: at most one code (about one ulp of
+//    the quotient, also across the 448 saturation edge and the 2^-9 subnormal grid).
+//
+// Both fall back to `__fdiv_rn` when `fast_rcp` returns 0: a scale outside the proved range
+// (zero, subnormal, huge, inf or NaN - e.g. a group whose amax is +inf) has no usable reciprocal.
+// For a power-of-two scale (UE8M0) `x * r` is exactly `x / s`, so kDivPow2 multiplies and never
+// runs either correction, in both modes.
 enum QuantDivKind : int {
-  kDivExact = 0,      // __fdiv_rn, the reference
-  kDivMarkstein = 1,  // one reciprocal + Markstein correction
-  kDivPow2 = 2,       // exact multiply; the scale is a power of two (UE8M0)
+  kDivExact = 0,      // __fdiv_rn
+  kDivMarkstein = 1,  // one RN reciprocal + Markstein correction; same bytes as kDivExact
+  kDivRaw = 2,        // one RN reciprocal, raw multiply; at most one payload code away
+  kDivPow2 = 3,       // exact multiply; the scale is a power of two (UE8M0)
 };
 
 constexpr float kRcpMinScale = 0x1p-90f;
 constexpr float kRcpMaxScale = 0x1p126f;
 
-/// RN(1/s) when the correction above is valid for this scale, else 0.
+/// RN(1/s) when the quotients above are valid for this scale, else 0.
 __device__ __forceinline__ float fast_rcp(float s) {
   return (s >= kRcpMinScale && s <= kRcpMaxScale) ? __frcp_rn(s) : 0.0f;
 }
 
-/// RN(x / s) from r = RN(1/s) (`fast_rcp(s) != 0`).
+/// RN(x / s) from r = RN(1/s) (`fast_rcp(s) != 0`), with the Markstein correction.
 __device__ __forceinline__ float div_by_rcp(float x, float s, float r) {
   const float q = __fmul_rn(x, r);
   const float e = __fmaf_rn(-q, s, x);
@@ -155,7 +163,7 @@ template <int kMath>
 __device__ __forceinline__ float qdiv(float x, float s, float r) {
   if constexpr (kMath == kDivMarkstein) {
     return div_by_rcp(x, s, r);
-  } else if constexpr (kMath == kDivPow2) {
+  } else if constexpr (kMath == kDivRaw || kMath == kDivPow2) {
     return __fmul_rn(x, r);
   } else {
     (void)r;
@@ -1005,9 +1013,9 @@ __device__ __forceinline__ void load16_stream(const scalar_t* __restrict__ src, 
 /// Vectorized per-group body: GROUP_SIZE / 16 adjacent threads own one group, each holding sixteen
 /// consecutive values in registers (one pass over the input, no shared memory) and emitting one
 /// 16 B store. The group amax is a width-`kTpg` xor shuffle among those threads (the subgroup never
-/// straddles a warp because kTpg divides 32), so the scale and every payload byte are the ones the
-/// warp-per-group kernel produces: max is order independent and the quotient is the correctly
-/// rounded one in both bodies.
+/// straddles a warp because kTpg divides 32), and the scale is computed by the same helper as the
+/// warp-per-group kernel (max is order independent), so the scale words are identical in both
+/// bodies. `kMath` decides how closely the payload follows the exact quotient; see QuantDivKind.
 ///
 /// Host-proved: 16 B aligned input/q/expert rows (so two LDG.128 feed the 16 values of a bf16/fp16
 /// group slice and four an fp32 one, and one STG.128 writes the pack) and fewer than 2^32 groups in
@@ -1061,8 +1069,8 @@ __global__ void __launch_bounds__(256) quantize_per_group_vec_kernel(
   if constexpr (kMath == kDivExact) {
     store_quant_pack_aligned<out_t, 16, false, kDivExact>(q, x, s, 0.0f);
   } else {
-    // A scale outside the reciprocal's proved range (a group whose amax is +inf, a NaN) keeps the
-    // exact body; `fast_rcp` returns 0 there. The branch is uniform across the subgroup.
+    // A scale outside the proved range of the reciprocal (a group whose amax is +inf, a NaN)
+    // keeps the exact body; `fast_rcp` returns 0 there. The branch is uniform across the subgroup.
     const float r = fast_rcp(s);
     if (r != 0.0f) {
       store_quant_pack_aligned<out_t, 16, false, kMath>(q, x, s, 0.0f, r);
@@ -1089,8 +1097,12 @@ void launch_group_vec(const ActQuantOut& out, const int32_t* masked_m, int max_m
 
 /// Per-group dispatch: the vectorized body whenever the host can prove 16 B alignment of every row
 /// start and of the output pack, the scalar warp-per-group body otherwise. The vector body picks
-/// its quotient at compile time from ActQuantOut::math (kDivPow2 instead of kDivMarkstein when the
-/// scales are UE8M0 powers of two); the scalar fallback always divides exactly.
+/// its quotient at compile time:
+///   kExact      16-bit payloads: Markstein correction (identical bytes, no FCHK slow path);
+///               fp32: `__fdiv_rn` (the 16-bit sweep does not prove the correction for fp32);
+///   kReciprocal raw reciprocal multiply, at most one payload code away from kExact;
+///   UE8M0       exact power-of-two multiply in both modes.
+/// The scalar fallback always divides exactly, so an unaligned shape is correct but not fast.
 template <typename scalar_t, typename out_t, int GROUP_SIZE>
 void launch_group_impl(const ActQuantOut& out, const Tensor& input, const int32_t* masked_m,
                        int max_m, int64_t rows, int64_t cols, int64_t input_row_stride,
@@ -1112,19 +1124,22 @@ void launch_group_impl(const ActQuantOut& out, const Tensor& input, const int32_
                       ((input_row_stride * elem_bytes) & 15) == 0 &&
                       (masked_m == nullptr || ((input_expert_stride * elem_bytes) & 15) == 0) &&
                       (reinterpret_cast<uintptr_t>(out.q) & 15u) == 0u && (q_stride & 15) == 0;
+  // kExact must emit the correctly rounded bytes. bf16/fp16 reach them through the Markstein
+  // correction (byte-identical, unit-tested over every bit pattern); fp32 keeps `__fdiv_rn`
+  // because that sweep says nothing about arbitrary fp32 payloads.
+  constexpr int kExactMath = sizeof(scalar_t) == 2 ? kDivMarkstein : kDivExact;
   if (vec_ok) {
-    if (out.math == QuantMath::kReciprocal) {
-      if (out.scale_ue8m0) {
-        launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivPow2>(
-            out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
-            q_stride, scale_stride, stream);
-      } else {
-        launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivMarkstein>(
-            out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
-            q_stride, scale_stride, stream);
-      }
+    if (out.scale_ue8m0) {
+      // Power-of-two scale: the multiply is exactly the division in both modes.
+      launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivPow2>(
+          out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
+          q_stride, scale_stride, stream);
+    } else if (out.math == QuantMath::kReciprocal) {
+      launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivRaw>(
+          out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
+          q_stride, scale_stride, stream);
     } else {
-      launch_group_vec<scalar_t, out_t, GROUP_SIZE, kDivExact>(
+      launch_group_vec<scalar_t, out_t, GROUP_SIZE, kExactMath>(
           out, masked_m, max_m, rows, cols, input_row_stride, input_expert_stride, in_ptr,
           q_stride, scale_stride, stream);
     }

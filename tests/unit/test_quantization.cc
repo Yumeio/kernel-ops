@@ -87,6 +87,23 @@ uint8_t e4m3_byte(float x) {
   return static_cast<uint8_t>(__nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3));
 }
 
+/// Rank of an e4m3 code on its magnitude grid: 0 is zero, 1..7 are the subnormals and each
+/// exponent bucket adds eight, so adjacent representable values differ by one and |rank(a) -
+/// rank(b)| <= 1 is exactly "at most one payload code". The sign rides on the rank.
+int e4m3_rank(uint8_t code) {
+  const int mag = 8 * ((code >> 3) & 0xF) + (code & 7);
+  return (code & 0x80u) ? -mag : mag;
+}
+
+bool e4m3_is_nan(uint8_t code) { return (code & 0x7Fu) == 0x7Fu; }
+
+/// Tolerance of the approximate (`QuantMath::kReciprocal`) quotient: the same code, or its
+/// neighbour. NaN has no neighbour, so a NaN payload must match exactly.
+bool within_one_code(uint8_t got, uint8_t want) {
+  if (e4m3_is_nan(got) || e4m3_is_nan(want)) return got == want;
+  return std::abs(e4m3_rank(got) - e4m3_rank(want)) <= 1;
+}
+
 float e2m1_round(uint8_t code) {
   constexpr float kTable[8] = {0.f, 0.5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
   const float v = kTable[code & 7u];
@@ -532,9 +549,9 @@ std::vector<float> pg_adversarial(size_t n, unsigned seed) {
   return v;
 }
 
-/// Shapes 1 x group, one row and a dense grid, every dtype x group x layout. Checks the oracle,
-/// the vectorized body against the scalar fallback (byte for byte) and the two arithmetic modes
-/// against each other.
+/// Shapes 1 x group, one row and a dense grid, every dtype x group x layout. Checks the exact
+/// oracle byte for byte (vectorized and scalar bodies alike) and the approximate mode against it
+/// with the documented one-code tolerance.
 template <typename T>
 void pg_shape_cases(LaunchContext& ctx, int group, ScaleLayout layout, int rows, int cols,
                     bool ue8m0, unsigned seed) {
@@ -574,7 +591,8 @@ void pg_shape_cases(LaunchContext& ctx, int group, ScaleLayout layout, int rows,
       const uint8_t want = want_q[static_cast<size_t>(r) * cols + c];
       KOPS_TEST_CHECK(exact.q[static_cast<size_t>(r) * q_stride + c] == want);
       KOPS_TEST_CHECK(fallback.q[static_cast<size_t>(r) * (q_stride + 3) + c] == want);
-      KOPS_TEST_CHECK(fast.q[static_cast<size_t>(r) * q_stride + c] == want);
+      // kReciprocal is approximate by contract: at most one payload code.
+      KOPS_TEST_CHECK(within_one_code(fast.q[static_cast<size_t>(r) * q_stride + c], want));
     }
     for (int c = cols; c < cols + 3; ++c) {
       KOPS_TEST_CHECK(fallback.q[static_cast<size_t>(r) * (q_stride + 3) + c] == 0xCDu);
@@ -681,8 +699,11 @@ void pg_masked_cases(LaunchContext& ctx, DType dtype, int group, int row_pad, in
                           want.s[static_cast<size_t>(ref_row) * groups + g]);
         }
         for (int c = 0; c < cols; ++c) {
-          KOPS_TEST_CHECK(gq[static_cast<size_t>(out_row) * cols + c] ==
-                          want.q[static_cast<size_t>(ref_row) * cols + c]);
+          const uint8_t want_code = want.q[static_cast<size_t>(ref_row) * cols + c];
+          const uint8_t got_code = gq[static_cast<size_t>(out_row) * cols + c];
+          // The odd-padding case takes the scalar (exact) body while the reference is aligned:
+          // in fast mode those two differ by at most the documented payload code.
+          KOPS_TEST_CHECK(fast ? within_one_code(got_code, want_code) : got_code == want_code);
         }
         ++ref_row;
       } else {
@@ -724,26 +745,46 @@ void test_per_group_masked(LaunchContext& ctx) {
   }
 }
 
-/// Exact vs reciprocal over adversarial data: inf/NaN groups (the reciprocal falls back to the
-/// exact body), the saturation and subnormal boundaries, and every 16-bit bit pattern.
+/// Exact vs the old scalar body vs the approximate mode, over adversarial data: inf/NaN groups
+/// (the reciprocal falls back to the exact body), the saturation and subnormal boundaries, and
+/// every 16-bit bit pattern under many group scales.
 template <typename T>
 void pg_math_compare(LaunchContext& ctx, DType dtype, int group, const std::vector<float>& vals) {
   const int rows = static_cast<int>(vals.size()) / group;
   const int groups = 1;
-  PgBuffers exact, fast;
+  PgBuffers exact, fallback, fast;
   if (!pg_dense<T>(ctx, rows, group, group, ScaleLayout::kRowMajor, false, false, vals, 0, group,
                    groups, rows, &exact)) {
+    return;
+  }
+  // The same launch with a misaligned input and a q row stride that is not 16 B: the host then
+  // takes the scalar warp-per-group kernel, whose bytes are the `__fdiv_rn` reference.
+  if (!pg_dense<T>(ctx, rows, group, group, ScaleLayout::kRowMajor, false, false, vals, 1,
+                   group + 3, groups, rows, &fallback)) {
     return;
   }
   if (!pg_dense<T>(ctx, rows, group, group, ScaleLayout::kRowMajor, false, true, vals, 0, group,
                    groups, rows, &fast)) {
     return;
   }
+  // kExact is a byte contract, whatever arithmetic the vector body used (Markstein for 16-bit,
+  // __fdiv_rn for fp32).
   size_t mismatch = 0;
-  for (size_t i = 0; i < exact.q.size(); ++i) {
-    if (exact.q[i] != fast.q[i]) ++mismatch;
+  for (int r = 0; r < rows; ++r) {
+    for (int c = 0; c < group; ++c) {
+      if (exact.q[static_cast<size_t>(r) * group + c] !=
+          fallback.q[static_cast<size_t>(r) * (group + 3) + c]) {
+        ++mismatch;
+      }
+    }
   }
   KOPS_TEST_CHECK(mismatch == 0);
+  // The approximate mode may differ by at most one code, and the scales are mode independent.
+  size_t outside = 0;
+  for (size_t i = 0; i < exact.q.size(); ++i) {
+    if (!within_one_code(fast.q[i], exact.q[i])) ++outside;
+  }
+  KOPS_TEST_CHECK(outside == 0);
   for (size_t i = 0; i < exact.s.size(); ++i) KOPS_TEST_CHECK(exact.s[i] == fast.s[i]);
   (void)dtype;
 }
@@ -844,7 +885,10 @@ void pg_graph_case(LaunchContext& ctx, bool fast, int rows, int cols, int group)
       std::vector<float> want_s;
       std::vector<uint8_t> want_q;
       pg_oracle(rounded_values(cast_from_float<T>(v)), rows, cols, group, false, &want_s, &want_q);
-      for (size_t i = 0; i < gq.size(); ++i) KOPS_TEST_CHECK(gq[i] == want_q[i]);
+      for (size_t i = 0; i < gq.size(); ++i) {
+        // kReciprocal is approximate by contract, kExact is not.
+        KOPS_TEST_CHECK(fast ? within_one_code(gq[i], want_q[i]) : gq[i] == want_q[i]);
+      }
       for (size_t i = 0; i < gs.size(); ++i) KOPS_TEST_CHECK(gs[i] == want_s[i]);
     }
     cudaGraphExecDestroy(exec);

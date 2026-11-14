@@ -15,10 +15,13 @@ Status absmax(const Tensor& amax_out, const Tensor& input, const LaunchContext& 
 /// the DeepEP masked layout ([E, max_m, cols] with input.stride[0] as the padded expert stride)
 /// and `scale_ue8m0` (scales rounded up to powers of two, stored as fp32). Other scale layouts
 /// return kUnsupportedLayout.
-/// `out.math` is the quotient arithmetic: kExact (default) divides by the scale with __fdiv_rn;
-/// kReciprocal uses one RN reciprocal plus a Markstein correction, which produces the same
-/// payload bytes but is only implemented for kPerGroup (other modes return kUnsupportedLayout)
-/// and only on the vectorized path (an unaligned/unsupported shape falls back to exact maths).
+/// `out.math` is the quotient arithmetic: kExact (default) produces the correctly rounded
+/// quotient - bf16/fp16 inputs use one RN reciprocal plus a Markstein correction that is
+/// byte-identical to the division, fp32 inputs divide - so the payload is a function of the data
+/// alone; kReciprocal is the approximate fast path (one RN reciprocal and a raw multiply, at most
+/// one payload code away from kExact). kReciprocal is only implemented for kPerGroup (other modes
+/// return kUnsupportedLayout) and only on the vectorized path (an unaligned/unsupported shape
+/// falls back to exact maths).
 Status quantize_activation(const ActQuantOut& out, const Tensor& input,
                            const Tensor& masked_m, int32_t max_m, const LaunchContext& ctx);
 Status dequantize(const Tensor& out, const Tensor& q, const Tensor& scales,

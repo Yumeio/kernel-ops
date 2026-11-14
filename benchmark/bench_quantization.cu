@@ -34,7 +34,9 @@ int group_from_id(const std::string& id) {
   return group > 0 ? group : 128;
 }
 
-/// `.fast` suffixes select ActQuantOut::math = kReciprocal (same bytes, opt-in quotient).
+/// `.fast` suffixes select ActQuantOut::math = kReciprocal: the approximate quotient (one RN
+/// reciprocal and a raw multiply, at most one payload code away), which skips the Markstein
+/// correction that kExact uses for 16-bit inputs.
 bool fast_from_id(const std::string& id) { return id.find(".fast") != std::string::npos; }
 
 std::vector<Case> make_cases() {

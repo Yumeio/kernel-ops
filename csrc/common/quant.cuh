@@ -108,13 +108,17 @@ enum class ActQuantMode : uint8_t {
 };
 
 /// Arithmetic used for the quotient x / scale of a per-group activation.
-///   kExact      one correctly rounded fp32 division (`__fdiv_rn`) per element. Default; the
-///               output bytes are a function of the data alone, so they never depend on the
-///               launch shape, vector width or alignment.
-///   kReciprocal one RN reciprocal per group plus a Markstein correction per element. Opt-in;
-///               documented to produce the same payload bytes as kExact (see quantization/quant.cu
-///               for the bound and the fallback). Power-of-two scales (UE8M0/MX/NVFP4) use an
-///               exact multiply instead, so the correction is never applied there.
+///   kExact      the correctly rounded fp32 quotient, so the payload bytes are a function of the
+///               data alone and never depend on the launch shape, vector width, alignment or
+///               arithmetic unit. This is the contract, not an instruction choice: bf16/fp16
+///               inputs reach that quotient with one RN reciprocal plus a Markstein correction
+///               (byte-identical to a division; every 16-bit bit pattern is swept in the unit
+///               test) and keep `__fdiv_rn` for scales outside the proved range (a group whose
+///               amax is +inf or NaN). fp32 inputs always divide. Default.
+///   kReciprocal approximate and cheap: one RN reciprocal per group plus a raw multiply, so the
+///               payload may differ from kExact by at most one code (about one ulp of the
+///               quotient). Opt-in, per-group only; never silently substituted for kExact.
+/// Power-of-two scales (UE8M0) multiply exactly in both modes.
 /// ABI: appended at the end of ActQuantOut, so the existing field offsets and the struct size are
 /// unchanged; the enumerator itself is a new public contract (bump KOPS_ABI_VERSION).
 enum class QuantMath : uint8_t {
@@ -143,7 +147,7 @@ struct ActQuantOut {
   Fp8Encoding fp8 = Fp8Encoding::kOCP;
   // Only ActQuantMode::kPerGroup reads this today; every other mode rejects kReciprocal rather
   // than silently running the exact loop. The per-tensor / per-token / MX / NVFP4 paths keep
-  // kExact arithmetic.
+  // exact arithmetic.
   QuantMath math = QuantMath::kExact;
 };
 
