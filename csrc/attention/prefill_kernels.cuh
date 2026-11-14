@@ -59,7 +59,9 @@ struct RaggedPrefillParams {
  * runtime field params.mask instead.  Variant flags compile a modifier in, its runtime value in
  * params.mod switches it on (CONTRACTS §1e).
  * Tile: Traits::cta_tile_q rows per CTA (128 on the narrow head dims, 64 on 192/256), one warp per
- * 16 rows, two K/V stages of Traits::cta_tile_kv keys.
+ * 16 rows, two K/V stages of Traits::cta_tile_kv keys (64, or 128 on SM90+ where a CTA may opt into
+ * 227 KiB of dynamic shared memory).  The tile policy is part of the plan (plan.kernel_id), so the
+ * grid a plan was built with always matches the kernel run().
  */
 template <typename Traits, typename Variant, MaskMode kMask>
 __global__ void ragged_prefill_kernel(const __grid_constant__ RaggedPrefillParams params);

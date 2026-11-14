@@ -1418,6 +1418,7 @@ struct AttnCase {
   // launch context
   int compute_units = 1;  // 1: never split; large: split whenever the q tiles cannot fill the GPU
   bool batch_invariant = false;
+  int arch_id = 0;  // 0: the device's exact arch; else a forced target (e.g. 860 = SM86 tile policy)
   double atol = 1e-2, rtol = 1e-2, lse_atol = 2e-4;
 };
 
@@ -1742,6 +1743,7 @@ AttnRun run_prefill(const AttnCase& c, const AttnData& d, unsigned page_seed) {
   if (!kops_test::make_context(&ctx)) return res;
   ctx.compute_units = c.compute_units;
   ctx.batch_invariant = c.batch_invariant;
+  if (c.arch_id != 0) ctx.arch_id = c.arch_id;  // prefill tile policy: SM90+ vs the SM86 fallback
   const kops::attn::AttentionSpec spec = spec_of(c);
   std::vector<int32_t> kvl(c.kv_lens.begin(), c.kv_lens.end());
   std::vector<int32_t> qoi(d.qo_indptr);
@@ -1982,6 +1984,24 @@ void test_prefill_modifiers() {  // every rule x every compiled head-dim pair
       run_attn_case(c, seed++);
     }
   }
+  // Tile policies: the narrow (SM86, 99 KiB smem) and wide (SM90+, 227 KiB) tiles must both be
+  // exercised on one GPU; arch_id is forced so the fallback is not dead code on an H100.
+  for (int arch : {860, 900}) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "prefill tile arch%d d128", arch);
+    AttnCase t = ragged_case(name, 128, 128, 8, 2);
+    t.qo_lens = {150, 9, 77};
+    t.kv_lens = {300, 9, 140};
+    t.arch_id = arch;
+    run_attn_case(t, seed++);
+    std::snprintf(name, sizeof(name), "prefill tile arch%d d64 paged", arch);
+    AttnCase q = ragged_case(name, 64, 64, 8, 2);
+    q.qo_lens = {17, 1, 90};
+    q.kv_lens = {120, 33, 90};
+    q.page_size = 16;
+    q.arch_id = arch;
+    run_attn_case(q, seed++);
+  }
   AttnCase c = ragged_case("prefill q_pos_offset + all modifiers", 128, 128, 8, 2);
   c.qo_lens = {40, 70};
   c.kv_lens = {200, 90};
@@ -2017,6 +2037,8 @@ void test_prefill_paged() {
       {64, true, false, DType::kInvalid, false, 128},  {32, true, true, DType::kInvalid, false, 96},
       {16, false, false, DType::kFloat8E4M3, false, 128}, {16, true, true, DType::kFloat8E4M3, true, 128},
       {32, false, true, DType::kFloat8E5M2, false, 64}, {16, false, false, DType::kFloat8E4M3, true, 256},
+      {3, false, true, DType::kInvalid, false, 128},  // non-power-of-two page: dividing page lookup
+      {5, true, false, DType::kInvalid, false, 96},
   };
   for (const P& pc : cases) {
     char name[96];

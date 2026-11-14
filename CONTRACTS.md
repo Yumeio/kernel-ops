@@ -283,6 +283,11 @@ remain the ABI and shape authority.
   other combination uses the generic instantiation with every `AttentionVariant` flag on, which
   reads `params.mask` at runtime (sentinel `kMaskRuntime`). The full per-flag instantiation matrix
   does not fit the 90 s TU budget (ptxas ~2 s per FA2 kernel); the 54-cell matrix above does.
+- **Prefill tile policy.** Two tiles exist: 128 packed query rows / 8 warps with 64 keys per K/V
+  stage (fits the 99 KiB of dynamic shared memory on SM86), and the same rows with 128 keys per
+  stage, which needs the 227 KiB of SM90+. Wide head dims (192/128, 256) keep 64 rows and 32 keys in
+  both. The plan records the policy it was made with (`plan.kernel_id`), so `*_run` replays the same
+  tile, grid and smem; SM90+ picks the wide one when the traced arch is known.
 - **Compiled cells.** Prefill (`prefill.cu`): (Dqk, Dvo) in {64, 80, 96, 128, 256, 192/128} x
   {bf16, fp16} x {ragged, paged}; FP8 e4m3 / e5m2 paged K/V for 64, 128, 256. Decode (`decode.cu`):
   CUDA-core D in {64, 80, 96, 128, 192, 256}, tensor-core and dynamic D in {64, 128, 256}, each
@@ -655,8 +660,8 @@ weights) on this repo's block-sorted MoE path.
   fields and the runtime tactic fields of `ScaledGemmArgs`, and (B8) the runtime `mask` field of
   `RaggedPrefillParams` / `PagedPrefillParams` (the `kMask` template parameter of the two prefill
   kernels became a runtime field; a later perf pass re-added it as a compile-time specialization
-  parameter together with the 128-row / two-stage tile, still inside the unreleased ABI 6) plus the
-  kv-length / capacity arguments of `prefill_plan_kernel` and
+  parameter together with the 128-row / two-stage tile and the arch-selected 128-key stage, still
+  inside the unreleased ABI 6) plus the kv-length / capacity arguments of `prefill_plan_kernel` and
   `assign_decode_tasks_kernel` (§1e), and (B9) the state parameter structs and kernel template
   lists of `conv1d_kernels.cuh`, `ssm_kernels.cuh`, `linear_attention_kernels.cuh`,
   `delta_rule_kernels.cuh` (head strides, slot counts, snapshot / intermediate tables,
