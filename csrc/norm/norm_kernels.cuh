@@ -8,8 +8,12 @@
 // at the end. weight_offset folds "(1 + w)" conventions:
 //   0.0 -> LLaMA/Mistral/Qwen/DeepSeek/Kimi       1.0 -> Gemma 1/2/3, Qwen3-Next/3.5 (zero-centred),
 //   LayerNorm1P (Nemotron) uses weight_offset = 1.0 with LayerNorm.
-// Launch (row kernels): grid = num_rows (or ceil(num_rows / ROWS_PER_CTA)),
-//   block = min(1024, round_up(hidden / VEC_SIZE, 32)); one warp per row when hidden <= 1024.
+// Launch (row kernels): grid = ceil(num_rows / kRows), block = one 16 B pack per
+//   thread (round_up(hidden / VEC_SIZE, 32), 32..512 lanes). kRows = 4 / kPacks is
+//   chosen from (hidden, dtype) only; every thread owns the same column slice of
+//   all kRows rows, so the weight pack is loaded once and the block reduction
+//   costs two barriers for the whole CTA. kPacks == 0 keeps the staged one-row
+//   body (scalar path, per-row weight groups, rows wider than 4 packs per thread).
 // =============================================================================
 
 namespace kops::norm {
@@ -27,7 +31,7 @@ namespace kops::norm {
  * Alias  : out may alias input only if their row layouts are identical.
  * Align  : hidden_size % VEC_SIZE == 0 and 16-byte aligned rows when VEC_SIZE*sizeof(T) == 16.
  */
-template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HasWeight>
+template <typename scalar_t, int VEC_SIZE, int NUM_DIMS, bool HasWeight, int kPacks = 0>
 __global__ void rms_norm_kernel(
     scalar_t* __restrict__ out,           // [num_tokens, hidden_size], row stride out_stride
     const int64_t out_stride,             // out.stride(-2)
@@ -57,7 +61,7 @@ __global__ void rms_norm_kernel(
  * Sandwich norm (Gemma 2/3 post_attention_layernorm + pre_feedforward_layernorm): call
  * rms_norm_kernel on the sublayer output first, then this kernel.
  */
-template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight>
+template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight, int kPacks = 0>
 __global__ void fused_add_rms_norm_kernel(
     scalar_t* __restrict__ input,         // [num_tokens, hidden] in: sublayer output, out: normed
     const int64_t input_stride,           // input.stride(0)
@@ -72,7 +76,7 @@ __global__ void fused_add_rms_norm_kernel(
  *   residual_out = residual_in + input_scale * input;  out = RMSNorm(residual_out)
  * Needed when the sublayer output is consumed twice (AttnRes partial sums, mHC post).
  */
-template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight>
+template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight, int kPacks = 0>
 __global__ void fused_add_rms_norm_out_kernel(
     scalar_t* __restrict__ out,                 // [num_tokens, hidden]
     residual_t* __restrict__ residual_out,      // [num_tokens, hidden]; may alias residual_in
@@ -91,7 +95,7 @@ __global__ void fused_add_rms_norm_out_kernel(
  *          (no bias), StarCoder/StarCoder2, Phi-1/2, Cohere Command-R (no bias), Nemotron
  *          (LayerNorm1P: weight_offset=1), vision towers (CLIP/SigLIP/MoonViT uses RMS).
  */
-template <typename scalar_t, int VEC_SIZE, bool HasWeight, bool HasBias>
+template <typename scalar_t, int VEC_SIZE, bool HasWeight, bool HasBias, int kPacks = 0>
 __global__ void layer_norm_kernel(
     scalar_t* __restrict__ out,           // [num_tokens, hidden]
     const int64_t out_stride,
@@ -106,7 +110,8 @@ __global__ void layer_norm_kernel(
  * Models : GPT-2 / OPT / BLOOM / StarCoder residual + ln_2; parallel-residual models
  *          (GPT-J, NeoX, Falcon, Cohere) use model_ops::residual_add3 instead.
  */
-template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight, bool HasBias>
+template <typename scalar_t, typename residual_t, int VEC_SIZE, bool HasWeight, bool HasBias,
+          int kPacks = 0>
 __global__ void fused_add_layer_norm_kernel(
     scalar_t* __restrict__ input,         // [num_tokens, hidden] in: sublayer out, out: normed
     const int64_t input_stride,
@@ -147,7 +152,7 @@ __global__ void qk_norm_kernel(
  * Models : Gated DeltaNet (Qwen3-Next/3.5) and KDA (Kimi Linear/K3) q,k normalization when
  *          not fused into the delta-rule kernel; Llama-4 uses rms_norm without weight instead.
  */
-template <typename scalar_t, int VEC_SIZE>
+template <typename scalar_t, int VEC_SIZE, int kPacks = 0>
 __global__ void l2_norm_kernel(
     scalar_t* __restrict__ out,          // [num_rows, dim]
     const int64_t out_stride,
@@ -163,7 +168,7 @@ __global__ void l2_norm_kernel(
  * Normalization runs independently over contiguous groups of `group_size` channels
  * (Mamba-2 ngroups; GDN/KDA per value head: group_size = Dv).
  */
-template <typename scalar_t, int VEC_SIZE, ActFn kGateAct, bool kNormBeforeGate>
+template <typename scalar_t, int VEC_SIZE, ActFn kGateAct, bool kNormBeforeGate, int kPacks = 0>
 __global__ void gated_rms_norm_kernel(
     scalar_t* __restrict__ out,          // [num_rows, hidden]
     const int64_t out_stride,

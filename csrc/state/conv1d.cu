@@ -4,8 +4,9 @@
 // (causal_conv1d_fwd_kernel) and as decode / multi-token update (causal_conv1d_update_kernel).
 //
 // A thread owns kVec consecutive channels (8 half or 4 fp32 values per 16-byte access when x is
-// channel-last and aligned, one channel otherwise) and slides a window of the last W inputs down
-// a run of tokens, so x is read once and out written once. The taps accumulate in fp32 as bias,
+// channel-last and aligned, one channel otherwise). Prefill gives a CTA a 64-token chunk and walks it
+// with a rolling register window (8 packs in flight), so the W-1 halo is loaded once per chunk and a
+// chunk reads its inputs once and writes its outputs once. The taps accumulate in fp32 as bias,
 // w[0] x[t-W+1], ..., w[W-1] x[t] with fused multiply-adds, which fixes the rounding independently
 // of the batch composition; the output is rounded once.
 //
@@ -55,8 +56,6 @@ __device__ __forceinline__ T from_float(float v) {
 }
 
 constexpr int kThreads = 128;
-constexpr int kChunkTokens = 64;  // tokens of one sequence handled by a CTA
-constexpr int kUnroll = 8;        // tokens loaded ahead of their arithmetic
 
 template <typename T, int N>
 __device__ __forceinline__ void load_channels(const T* ptr, float (&out)[N], T* raw = nullptr) {
@@ -86,6 +85,86 @@ __device__ __forceinline__ void store_channels(T* ptr, const float (&in)[N]) {
   }
 }
 
+/// N contiguous storage values at p in the widest accesses their byte count allows; p is aligned to that width.
+template <typename T, int N>
+__device__ __forceinline__ void load_contig(const T* p, T (&dst)[N]) {
+  constexpr int kBytes = N * static_cast<int>(sizeof(T));
+  constexpr int kA = kBytes % 16 == 0 ? 16 : kBytes % 8 == 0 ? 8 : kBytes % 4 == 0 ? 4 : static_cast<int>(sizeof(T));
+  using V = std::conditional_t<kA == 16, uint4, std::conditional_t<kA == 8, uint2, std::conditional_t<kA == 4, uint32_t, T>>>;
+#pragma unroll
+  for (int k = 0; k < kBytes / kA; ++k) {
+    const V v = reinterpret_cast<const V*>(p)[k];
+    __builtin_memcpy(reinterpret_cast<char*>(dst) + k * kA, &v, kA);
+  }
+}
+
+template <typename T, int N>
+__device__ __forceinline__ void store_contig(T* p, const T (&src)[N]) {
+  constexpr int kBytes = N * static_cast<int>(sizeof(T));
+  constexpr int kA = kBytes % 16 == 0 ? 16 : kBytes % 8 == 0 ? 8 : kBytes % 4 == 0 ? 4 : static_cast<int>(sizeof(T));
+  using V = std::conditional_t<kA == 16, uint4, std::conditional_t<kA == 8, uint2, std::conditional_t<kA == 4, uint32_t, T>>>;
+#pragma unroll
+  for (int k = 0; k < kBytes / kA; ++k) {
+    V v;
+    __builtin_memcpy(&v, reinterpret_cast<const char*>(src) + k * kA, kA);
+    reinterpret_cast<V*>(p)[k] = v;
+  }
+}
+
+/// Byte alignment of the widest access load_contig / store_contig use for N values of T.
+template <typename T, int N>
+__host__ __device__ constexpr int contig_align() {
+  constexpr int kBytes = N * static_cast<int>(sizeof(T));
+  return kBytes % 16 == 0 ? 16 : kBytes % 8 == 0 ? 8 : kBytes % 4 == 0 ? 4 : static_cast<int>(sizeof(T));
+}
+
+__device__ __forceinline__ bool ptr_aligned(const void* ptr, int64_t byte_stride, int a) {
+  return reinterpret_cast<uintptr_t>(ptr) % a == 0 && byte_stride % a == 0;
+}
+
+/// Taps of channels c0 .. c0+kVec-1 in fp32. The usual [dim, W] weight is contiguous per thread (kVec * W values),
+/// read in 8/16-byte accesses; other strides read one tap at a time.
+template <typename W, int kWidth, int kVec>
+__device__ __forceinline__ void load_taps(const void* weight, int64_t dim_stride, int64_t width_stride, int c0,
+                                          float (&w)[kVec][kWidth]) {
+  const W* base = static_cast<const W*>(weight);
+  if (kVec > 1 && width_stride == 1 && dim_stride == kWidth && ptr_aligned(base, 0, contig_align<W, kVec * kWidth>())) {
+    W wr[kVec * kWidth];
+    load_contig<W, kVec * kWidth>(base + int64_t(c0) * kWidth, wr);
+#pragma unroll
+    for (int c = 0; c < kVec; ++c)
+#pragma unroll
+      for (int j = 0; j < kWidth; ++j) w[c][j] = to_float(wr[c * kWidth + j]);
+    return;
+  }
+#pragma unroll
+  for (int c = 0; c < kVec; ++c) {
+    const W* wp = base + int64_t(c0 + c) * dim_stride;
+#pragma unroll
+    for (int j = 0; j < kWidth; ++j) w[c][j] = to_float(wp[j * width_stride]);
+  }
+}
+
+/// bias[c0 .. c0+kVec-1] in fp32 (zero without a bias), one access when the pointer allows it.
+template <typename W, int kVec>
+__device__ __forceinline__ void load_bias(const void* bias, int c0, float (&out)[kVec]) {
+  const W* base = static_cast<const W*>(bias);
+  if (base == nullptr) {
+#pragma unroll
+    for (int c = 0; c < kVec; ++c) out[c] = 0.0f;
+    return;
+  }
+  if (kVec > 1 && ptr_aligned(base, 0, contig_align<W, kVec>())) {
+    W br[kVec];
+    load_contig<W, kVec>(base + c0, br);
+#pragma unroll
+    for (int c = 0; c < kVec; ++c) out[c] = to_float(br[c]);
+    return;
+  }
+#pragma unroll
+  for (int c = 0; c < kVec; ++c) out[c] = to_float(base[c0 + c]);
+}
+
 }  // namespace
 
 namespace {
@@ -102,17 +181,28 @@ __device__ __forceinline__ float conv_taps(const float (&w)[kWidth], const float
 
 // ---- causal_conv1d_fwd_kernel ----------------------------------------------------------------------------
 
-/** Grid (ceil(dim / (kThreads * kVec)), ceil(max_seqlen / kChunkTokens), B). Chunk 0 of a sequence owns the slot. */
+/** Tokens of one sequence per CTA. A CTA walks its chunk with a rolling window, so a chunk only pays the W-1
+ * halo once: 64 tokens make the halo 4.7% of the input traffic (16 tokens would make it 19%). */
+template <int kVec>
+__host__ __device__ constexpr int fwd_chunk_tokens() { return 64; }
+
+/** Packs of one thread issued ahead of their arithmetic: kUnroll * kVec elements stay in flight. */
+constexpr int kFwdUnroll = 8;
+
+/** Grid (ceil(dim / (kThreads * kVec)), ceil(max_seqlen / kTok), B). Chunk 0 of a sequence owns the slot.
+ * Every thread keeps its kVec channels' taps (kVec * kWidth floats), the last W-1 inputs and kFwdUnroll
+ * input packs in registers; the halo of the chunk is loaded once from x or the slot's state. */
 }  // namespace
 template <typename T, typename W, int kWidth, int kVec>
-__global__ __launch_bounds__(kThreads, 1) void causal_conv1d_fwd_kernel(const __grid_constant__ Conv1dFwdParams p) {
+__global__ __launch_bounds__(kThreads) void causal_conv1d_fwd_kernel(const __grid_constant__ Conv1dFwdParams p) {
   constexpr int kHist = kWidth - 1;
+  constexpr int kTok = fwd_chunk_tokens<kVec>();
   const int b = blockIdx.z;
   const int64_t slot = p.cache_indices ? int64_t(p.cache_indices[b]) : int64_t(b);
   const bool stateful = p.conv_states != nullptr;
   if (stateful && (slot < 0 || slot >= p.num_slots || slot == p.pad_slot_id)) return;
   const int seq_start = p.query_start_loc[b], n = p.query_start_loc[b + 1] - seq_start;
-  const int t0 = blockIdx.y * kChunkTokens;
+  const int t0 = blockIdx.y * kTok;
   const bool owner = blockIdx.y == 0 && stateful;  // the CTA that reads the history and writes the new states
   if (t0 >= n && !owner) return;
   const int c0 = (blockIdx.x * kThreads + threadIdx.x) * kVec;
@@ -123,56 +213,65 @@ __global__ __launch_bounds__(kThreads, 1) void causal_conv1d_fwd_kernel(const __
   T* states = static_cast<T*>(p.conv_states);
   const bool has_init = stateful && p.has_initial_state && p.has_initial_state[b];
   const bool silu = p.act == ActFn::kSiLU;
+  const T* xrow = x + int64_t(seq_start) * p.x_token_stride + int64_t(c0) * p.x_dim_stride;
+  T* orow = out + int64_t(seq_start) * p.out_token_stride + int64_t(c0) * p.out_dim_stride;
 
-  float w[kVec][kWidth], bias[kVec], win[kVec][kHist];
-#pragma unroll
-  for (int c = 0; c < kVec; ++c) {
-    const W* wp = static_cast<const W*>(p.weight) + int64_t(c0 + c) * p.weight_dim_stride;
-#pragma unroll
-    for (int j = 0; j < kWidth; ++j) w[c][j] = to_float(wp[j * p.weight_width_stride]);
-    bias[c] = p.bias ? to_float(static_cast<const W*>(p.bias)[c0 + c]) : 0.0f;
-  }
-  // The window before token t0: inputs t0-W+1 .. t0-1, taken from x inside the sequence and from the history before it.
+  // The taps are the same for every token of the chunk and every channel of this thread.
+  float w[kVec][kWidth], bias[kVec];
+  load_taps<W, kWidth, kVec>(p.weight, p.weight_dim_stride, p.weight_width_stride, c0, w);
+  load_bias<W, kVec>(p.bias, c0, bias);
+  // Window before the chunk: inputs t0-W+1 .. t0-1, from x inside the sequence and from the history before it.
+  float hist[kVec][kHist];
 #pragma unroll
   for (int j = 0; j < kHist; ++j) {
     const int pos = t0 - kHist + j;
     if (pos >= 0) {
-      float v[kVec];
-      load_channels<T, kVec>(x + int64_t(seq_start + pos) * p.x_token_stride + int64_t(c0) * p.x_dim_stride, v);
+      const T* src = xrow + int64_t(pos) * p.x_token_stride;
+      if constexpr (kVec == 1) {
+        hist[0][j] = to_float(*src);
+      } else {
+        dev::Pack<T, kVec> raw = dev::load_pack<kVec>(src);
 #pragma unroll
-      for (int c = 0; c < kVec; ++c) win[c][j] = v[c];
+        for (int c = 0; c < kVec; ++c) hist[c][j] = to_float(raw.x[c]);
+      }
     } else {
 #pragma unroll
       for (int c = 0; c < kVec; ++c)
-        win[c][j] = has_init ? to_float(states[slot * p.conv_state_slot_stride + int64_t(c0 + c) * p.conv_state_dim_stride +
-                                               int64_t(kHist + pos) * p.conv_state_len_stride])
-                             : 0.0f;
+        hist[c][j] = has_init ? to_float(states[slot * p.conv_state_slot_stride +
+                                              int64_t(c0 + c) * p.conv_state_dim_stride +
+                                              int64_t(kHist + pos) * p.conv_state_len_stride])
+                              : 0.0f;
     }
   }
-  const int t_end = min(t0 + kChunkTokens, n);
-  for (int t = t0; t < t_end; t += kUnroll) {
-    float xin[kUnroll][kVec];
+
+  for (int t = t0; t < t0 + kTok; t += kFwdUnroll) {
+    // Every load of the group is issued before the first tap, then the window rolls through registers.
+    dev::Pack<T, kVec> raw[kFwdUnroll];
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u)
-      if (t + u < t_end)
-        load_channels<T, kVec>(x + int64_t(seq_start + t + u) * p.x_token_stride + int64_t(c0) * p.x_dim_stride, xin[u]);
+    for (int u = 0; u < kFwdUnroll; ++u) {
+      if (t + u < n) {
+        const T* src = xrow + int64_t(t + u) * p.x_token_stride;
+        if constexpr (kVec == 1) raw[u].x[0] = *src;
+        else raw[u] = dev::load_pack<kVec>(src);
+      }
+    }
 #pragma unroll
-    for (int u = 0; u < kUnroll; ++u) {
-      if (t + u >= t_end) break;
+    for (int u = 0; u < kFwdUnroll; ++u) {
+      if (t + u >= n) break;
       float y[kVec];
 #pragma unroll
       for (int c = 0; c < kVec; ++c) {
-        y[c] = conv_taps<kWidth>(w[c], win[c], xin[u][c], bias[c], silu);
+        y[c] = conv_taps<kWidth>(w[c], hist[c], to_float(raw[u].x[c]), bias[c], silu);
 #pragma unroll
-        for (int j = 0; j < kHist - 1; ++j) win[c][j] = win[c][j + 1];
-        win[c][kHist - 1] = xin[u][c];
+        for (int j = 0; j < kHist - 1; ++j) hist[c][j] = hist[c][j + 1];
+        hist[c][kHist - 1] = to_float(raw[u].x[c]);
       }
-      store_channels<T, kVec>(out + int64_t(seq_start + t + u) * p.out_token_stride + int64_t(c0) * p.out_dim_stride, y);
+      store_channels<T, kVec>(orow + int64_t(t + u) * p.out_token_stride, y);
     }
   }
 
   if (!owner) return;
-  // State after `count` tokens = the last W-1 entries of [history, x[0:count]], i.e. entries count .. count+W-2 of it.
+  // State after `count` tokens = the last W-1 entries of [history, x[0:count]], i.e. entries count .. count+W-2.
   const auto write_state = [&](int64_t dst, int count) {
 #pragma unroll
     for (int l = 0; l < kHist; ++l) {
@@ -215,7 +314,7 @@ namespace {
  * the matching out, so out may be x. */
 }  // namespace
 template <typename T, typename W, int kWidth, int kVec>
-__global__ __launch_bounds__(kThreads, 1) void causal_conv1d_update_kernel(const __grid_constant__ Conv1dUpdateParams p) {
+__global__ __launch_bounds__(kThreads) void causal_conv1d_update_kernel(const __grid_constant__ Conv1dUpdateParams p) {
   constexpr int kHist = kWidth - 1;
   const int b = blockIdx.y;
   const int64_t slot = p.cache_indices ? int64_t(p.cache_indices[b]) : int64_t(b);
@@ -230,20 +329,41 @@ __global__ __launch_bounds__(kThreads, 1) void causal_conv1d_update_kernel(const
 
   float w[kVec][kWidth], bias[kVec], win[kVec][kHist];
   T raw_win[kVec][kHist];
+  // The usual [slot, dim, W-1] state and [dim, W] weight are contiguous per thread: kVec * (W-1) values and
+  // kVec * W taps, loaded in 8/16-byte accesses instead of one scalar per value.
+  const bool packed_state = kVec > 1 && p.conv_state_len_stride == 1 && p.conv_state_dim_stride == kHist &&
+                            ptr_aligned(states, p.conv_state_slot_stride * int64_t(sizeof(T)), contig_align<T, kVec * kHist>());
+  load_taps<W, kWidth, kVec>(p.weight, p.weight_dim_stride, p.weight_width_stride, c0, w);
+  load_bias<W, kVec>(p.bias, c0, bias);
+  if (packed_state) {
+    T sr[kVec * kHist];
+    load_contig<T, kVec * kHist>(states + slot * p.conv_state_slot_stride + int64_t(c0) * kHist, sr);
 #pragma unroll
-  for (int c = 0; c < kVec; ++c) {
-    const W* wp = static_cast<const W*>(p.weight) + int64_t(c0 + c) * p.weight_dim_stride;
+    for (int c = 0; c < kVec; ++c)
 #pragma unroll
-    for (int j = 0; j < kWidth; ++j) w[c][j] = to_float(wp[j * p.weight_width_stride]);
-    bias[c] = p.bias ? to_float(static_cast<const W*>(p.bias)[c0 + c]) : 0.0f;
+      for (int j = 0; j < kHist; ++j) raw_win[c][j] = sr[c * kHist + j];
+  } else {
 #pragma unroll
-    for (int j = 0; j < kHist; ++j) {
-      raw_win[c][j] = states[slot * p.conv_state_slot_stride + int64_t(c0 + c) * p.conv_state_dim_stride +
-                            int64_t(j) * p.conv_state_len_stride];
-      win[c][j] = to_float(raw_win[c][j]);
-    }
+    for (int c = 0; c < kVec; ++c)
+#pragma unroll
+      for (int j = 0; j < kHist; ++j)
+        raw_win[c][j] = states[slot * p.conv_state_slot_stride + int64_t(c0 + c) * p.conv_state_dim_stride +
+                              int64_t(j) * p.conv_state_len_stride];
   }
+#pragma unroll
+  for (int c = 0; c < kVec; ++c)
+#pragma unroll
+    for (int j = 0; j < kHist; ++j) win[c][j] = to_float(raw_win[c][j]);
   const auto write_state = [&](int64_t dst) {
+    if (packed_state) {
+      T sr[kVec * kHist];
+#pragma unroll
+      for (int c = 0; c < kVec; ++c)
+#pragma unroll
+        for (int j = 0; j < kHist; ++j) sr[c * kHist + j] = raw_win[c][j];
+      store_contig<T, kVec * kHist>(states + dst * p.conv_state_slot_stride + int64_t(c0) * kHist, sr);
+      return;
+    }
 #pragma unroll
     for (int c = 0; c < kVec; ++c)
 #pragma unroll
@@ -303,17 +423,31 @@ bool aligned16(const void* ptr, int64_t elem_stride, int elem_bytes) {
 template <typename T>
 constexpr int vec_width() { return 16 / static_cast<int>(sizeof(T)); }
 
+/// Channels per prefill thread when vectorized: 4 (8 B of half, 16 B of fp32). Together with the 8-pack
+/// lookahead and the W-1 history this keeps ~50-60 registers, so 8 CTAs of 128 threads fit per SM; 8 half
+/// channels would double the taps and the window.
+constexpr int kFwdVec = 4;
+
 template <typename T, typename W, int kWidth>
-void launch_fwd(const Conv1dFwdParams& p, int64_t chunks, cudaStream_t stream, bool vectorize) {
+void launch_fwd(const Conv1dFwdParams& p, cudaStream_t stream, bool vectorize) {
   const auto go = [&](auto vec) {
     constexpr int kVec = decltype(vec)::value;
+    constexpr int kTok = fwd_chunk_tokens<kVec>();
+    const int64_t chunks = std::max<int64_t>(1, (int64_t(p.max_seqlen) + kTok - 1) / kTok);
+    // Channel tiles on x: consecutive CTAs then cover consecutive channel slices of
+    // the same token chunk, so the DRAM pages of one chunk are touched together.
     const dim3 grid(static_cast<unsigned>((int64_t(p.dim) + kThreads * kVec - 1) / (kThreads * kVec)),
                     static_cast<unsigned>(chunks), static_cast<unsigned>(p.batch_size));
     causal_conv1d_fwd_kernel<T, W, kWidth, kVec><<<grid, kThreads, 0, stream>>>(p);
   };
-  if (vectorize) go(std::integral_constant<int, vec_width<T>()>());
+  if (vectorize) go(std::integral_constant<int, kFwdVec>());
   else go(std::integral_constant<int, 1>());
 }
+
+/// Channels per update thread: 4, like the prefill, so the tap window, the state window and the 128
+/// threads fit ~40-50 registers — the decode kernel is latency bound, and 10 CTAs per SM hide more
+/// than a 16 B channel group would.
+constexpr int kUpdVec = 4;
 
 template <typename T, typename W, int kWidth>
 void launch_update(const Conv1dUpdateParams& p, cudaStream_t stream, bool vectorize) {
@@ -323,7 +457,7 @@ void launch_update(const Conv1dUpdateParams& p, cudaStream_t stream, bool vector
                     static_cast<unsigned>(p.batch_size));
     causal_conv1d_update_kernel<T, W, kWidth, kVec><<<grid, kThreads, 0, stream>>>(p);
   };
-  if (vectorize) go(std::integral_constant<int, vec_width<T>()>());
+  if (vectorize) go(std::integral_constant<int, kUpdVec>());
   else go(std::integral_constant<int, 1>());
 }
 
@@ -401,24 +535,27 @@ Status causal_conv1d_fwd(const Conv1dFwdParams& params, DType dtype, const Launc
                              "%s: snapshot_slots needs snapshot_interval > 0 (and vice versa)", fn);
   }
   if (p.max_seqlen == 0) p.max_seqlen = p.total_tokens;
-  const int64_t chunks = std::max<int64_t>(1, (int64_t(p.max_seqlen) + kChunkTokens - 1) / kChunkTokens);
-  if (chunks > 65535) {
-    return detail::set_error(Status::kUnsupportedShape, "%s: max_seqlen %d too large", fn, p.max_seqlen);
+  if ((int64_t(p.dim) + kThreads * kFwdVec - 1) / (kThreads * kFwdVec) > 65535 ||
+      (int64_t(p.max_seqlen) + 63) / 64 > 65535) {
+    return detail::set_error(Status::kUnsupportedShape, "%s: dim %d / max_seqlen %d too large", fn,
+                             p.dim, p.max_seqlen);
   }
   const int eb = dtype_bytes(dtype);
   // Small channel counts need active lanes more than wide accesses (128 channels would use only 16 half lanes).
-  const bool vectorize = p.dim >= kThreads * (16 / eb) && p.x_dim_stride == 1 && p.out_dim_stride == 1 &&
-                         p.dim % (16 / eb) == 0 && aligned16(p.x, p.x_token_stride, eb) &&
-                         aligned16(p.out, p.out_token_stride, eb);
+  const int va = kFwdVec * eb;  // bytes of one vector access
+  const bool vectorize = p.dim >= kThreads * kFwdVec && p.x_dim_stride == 1 && p.out_dim_stride == 1 &&
+                         p.dim % kFwdVec == 0 && reinterpret_cast<uintptr_t>(p.x) % va == 0 &&
+                         (p.x_token_stride * eb) % va == 0 && reinterpret_cast<uintptr_t>(p.out) % va == 0 &&
+                         (p.out_token_stride * eb) % va == 0;
   cudaStream_t stream = stream_of(ctx);
 #define X(XD, WD, XT, WT)                                                                    \
   if (dtype == XD && p.weight_dtype == WD) {                                                 \
-    by_width(p.width, [&](auto w) { launch_fwd<XT, WT, decltype(w)::value>(p, chunks, stream, vectorize); }); \
+    by_width(p.width, [&](auto w) { launch_fwd<XT, WT, decltype(w)::value>(p, stream, vectorize); }); \
   } else
   KOPS_CONV1D_TYPES(X)
 #undef X
   return detail::set_error(Status::kUnsupportedDtype, "%s: unsupported dtype pair", fn);
-  return launch_status(fn);
+  return launch_status(fn);  // reached when a (dtype, weight dtype) row above matched
 }
 
 Status causal_conv1d_update(const Conv1dUpdateParams& params, DType dtype, const LaunchContext& ctx) {
@@ -454,7 +591,7 @@ Status causal_conv1d_update(const Conv1dUpdateParams& params, DType dtype, const
   KOPS_CONV1D_TYPES(X)
 #undef X
   return detail::set_error(Status::kUnsupportedDtype, "%s: unsupported dtype pair", fn);
-  return launch_status(fn);
+  return launch_status(fn);  // reached when a (dtype, weight dtype) row above matched
 }
 
 }  // namespace kops::state
