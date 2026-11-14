@@ -62,6 +62,7 @@
 #include "csrc/attention/lowbit_kernels.cuh"
 #include "csrc/attention/ops.h"
 // 6. hybrid state
+#include "csrc/state/state_mma.cuh"
 #include "csrc/state/conv1d_kernels.cuh"
 #include "csrc/state/ssm_kernels.cuh"
 #include "csrc/state/delta_rule_kernels.cuh"

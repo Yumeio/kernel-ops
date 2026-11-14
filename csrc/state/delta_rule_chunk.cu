@@ -33,6 +33,7 @@
 #include "csrc/common/tensor.h"
 #include "csrc/common/device.cuh"
 #include "csrc/common/device_impl.cuh"
+#include "csrc/state/state_mma.cuh"
 #include "csrc/state/state_cache_kernels.cuh"
 #include "csrc/state/conv1d_kernels.cuh"
 #include "csrc/state/ssm_kernels.cuh"
@@ -106,68 +107,17 @@ __host__ __device__ inline int64_t dr_grid_chunks(const DeltaRuleParams& p) {
   return (bound + kDrChunk - 1) / kDrChunk;
 }
 
-// ---- tensor-core fragments (mma.sync m16n8k16, bf16 operands, fp32 accumulation) ----
-/** Two floats as one bf16x2 register, `lo` in the low half (round to nearest even). */
-__device__ __forceinline__ uint32_t pack_bf16x2(float lo, float hi) {
-  const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
-  return *reinterpret_cast<const uint32_t*>(&v);
-}
-
-/** d += a (16 x 16, bf16) * b (16 x 8, bf16), fp32 accumulation. */
-__device__ __forceinline__ void mma_bf16_16x8x16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#endif
-}
-
-/** d += a (16 x 16, fp16) * b (16 x 8, fp16), fp32 accumulation. */
-__device__ __forceinline__ void mma_f16_16x8x16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
-               : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
-               : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-#endif
-}
-
-__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* smem) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-#endif
-}
-
-__device__ __forceinline__ void ldsm_x4_trans(uint32_t (&r)[4], const void* smem) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  const unsigned a = static_cast<unsigned>(__cvta_generic_to_shared(smem));
-  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
-#endif
-}
-
-/** The A fragment (16 x 16) at (m0, k0) of the row-major bf16 tile tile[m * ld + k]; ld is a multiple of 8 and the tile 16-byte aligned. */
-__device__ __forceinline__ void frag_a(uint32_t (&a)[4], const __nv_bfloat16* tile, int ld, int m0, int k0) {
-  const int l = threadIdx.x & 31;
-  ldsm_x4(a, tile + (m0 + (l & 7) + ((l >> 3) & 1) * 8) * ld + k0 + (l >> 4) * 8);
-}
-
-/** The same A fragment from the transposed tile tile[k * ld + m] (m contiguous). */
-__device__ __forceinline__ void frag_a_trans(uint32_t (&a)[4], const __nv_bfloat16* tile, int ld, int m0, int k0) {
-  const int l = threadIdx.x & 31;
-  ldsm_x4_trans(a, tile + (k0 + (l & 7) + (l >> 4) * 8) * ld + m0 + ((l >> 3) & 1) * 8);
-}
-
-/** The B fragments of two adjacent n8 tiles (b[0], b[1] for columns n0..n0 + 7, b[2], b[3] for n0 + 8..) at k0 from tile[n * ld + k] (k contiguous). */
-__device__ __forceinline__ void frag_b2(uint32_t (&b)[4], const __nv_bfloat16* tile, int ld, int n0, int k0) {
-  const int l = threadIdx.x & 31;
-  ldsm_x4(b, tile + (n0 + (l & 7) + (l >> 4) * 8) * ld + k0 + ((l >> 3) & 1) * 8);
-}
-
-/** The same two B fragments from tile[k * ld + n] (n contiguous). */
-__device__ __forceinline__ void frag_b2_trans(uint32_t (&b)[4], const __nv_bfloat16* tile, int ld, int k0, int n0) {
-  const int l = threadIdx.x & 31;
-  ldsm_x4_trans(b, tile + (k0 + (l & 7) + ((l >> 3) & 1) * 8) * ld + n0 + (l >> 4) * 8);
-}
+// ---- tensor-core fragments (mma.sync m16n8k16, bf16 operands, fp32 accumulation) ----------------
+// The primitives live in state_mma.cuh (shared with SSD and lightning attention).
+using mma::frag_a;
+using mma::frag_a_trans;
+using mma::frag_b2;
+using mma::frag_b2_trans;
+using mma::ldsm_x4;
+using mma::ldsm_x4_trans;
+using mma::mma_bf16_16x8x16;
+using mma::mma_f16_16x8x16;
+using mma::pack_bf16x2;
 
 }  // namespace
 
@@ -727,111 +677,13 @@ using bf16 = __nv_bfloat16;
 constexpr int kTcWarps = 8;
 constexpr int kTcLd64 = kDrChunk + 8;  // bf16 row stride of a 64-column tile: 144 bytes, ldmatrix is conflict-free
 
-/** Row stride (in bf16) of a tile of `cols` columns: 16 bytes more than the data, so that the 8 rows of an ldmatrix hit distinct banks. */
-__host__ __device__ constexpr int tc_ld(int cols) { return cols + 8; }
+// shared device primitives (state_mma.cuh); the staging helpers take the CTA size
+using mma::tc_ld;
+using mma::tc_load8;
+using mma::tc_load8_f32;
+using mma::tc_stage_f32;
+using mma::tc_stage_input;
 
-/** Eight consecutive elements at `p` as fp32; `vec`: 16-bit input with a 16-byte aligned `p` (one vector load). */
-template <typename T>
-__device__ __forceinline__ void tc_load8(float (&v)[8], const T* p, bool vec) {
-  if constexpr (sizeof(T) == 2) {
-    if (vec) {
-      const uint4 raw = *reinterpret_cast<const uint4*>(p);
-      const uint32_t w[4] = {raw.x, raw.y, raw.z, raw.w};
-#pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        if constexpr (std::is_same_v<T, bf16>) {
-          v[2 * i] = __uint_as_float(w[i] << 16);
-          v[2 * i + 1] = __uint_as_float(w[i] & 0xffff0000u);
-        } else {
-          const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&w[i]));
-          v[2 * i] = f.x, v[2 * i + 1] = f.y;
-        }
-      }
-      return;
-    }
-  }
-#pragma unroll
-  for (int i = 0; i < 8; ++i) v[i] = to_float(p[i]);
-}
-
-/** Eight consecutive fp32 at `p` (16-byte aligned when `vec`). */
-__device__ __forceinline__ void tc_load8_f32(float (&v)[8], const float* p, bool vec) {
-  if (vec) {
-    const float4 a = *reinterpret_cast<const float4*>(p), b = *reinterpret_cast<const float4*>(p + 4);
-    v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
-  } else {
-#pragma unroll
-    for (int i = 0; i < 8; ++i) v[i] = p[i];
-  }
-}
-
-/**
- * dst[r * ld + c] = bf16(src[(t0 + r) * stride + c]) for the m valid rows r < m and c < cols; the rows r in [m, 64) are zeroed. 256 threads,
- * eight columns per piece (a 16-byte read when `vec`: 16-bit input, 16-byte aligned base and strides).
- */
-template <typename T>
-__device__ __forceinline__ void tc_stage_input(bf16* dst, int ld, const T* src, int64_t stride, int t0, int m, int cols, bool vec) {
-  const int pieces = cols / 8;
-  for (int idx = threadIdx.x; idx < kDrChunk * pieces; idx += kDrThreads) {
-    const int r = idx / pieces, c = (idx % pieces) * 8;
-    uint4 out = make_uint4(0, 0, 0, 0);
-    if (r < m) {
-      const T* row = src + int64_t(t0 + r) * stride + c;
-      float v[8];
-      if constexpr (sizeof(T) == 2) {
-        if (vec) {
-          const uint4 raw = *reinterpret_cast<const uint4*>(row);
-          if constexpr (std::is_same_v<T, bf16>) {
-            out = raw;  // exact
-          } else {
-            const uint32_t w[4] = {raw.x, raw.y, raw.z, raw.w};
-#pragma unroll
-            for (int i = 0; i < 4; ++i) {
-              const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&w[i]));
-              v[2 * i] = f.x, v[2 * i + 1] = f.y;
-            }
-            out = make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]), pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
-          }
-        } else {
-#pragma unroll
-          for (int i = 0; i < 8; ++i) v[i] = to_float(row[i]);
-          out = make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]), pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
-        }
-      } else {
-#pragma unroll
-        for (int i = 0; i < 8; ++i) v[i] = to_float(row[i]);
-        out = make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]), pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
-      }
-    }
-    *reinterpret_cast<uint4*>(dst + r * ld + c) = out;
-  }
-}
-
-/**
- * dst[r * ld + c] = bf16(src[r * stride + c]) for r < rows, c < cols (the columns past `limit` and the rows past `rows` are zero) from an
- * fp32 workspace buffer; `vec`: stride and base are 16-byte aligned and limit is a multiple of 4. cols is a multiple of 8.
- */
-__device__ __forceinline__ void tc_stage_f32(bf16* dst, int ld, const float* src, int64_t stride, int rows, int nrows, int cols, int limit, bool vec) {
-  const int pieces = cols / 8;
-  for (int idx = threadIdx.x; idx < nrows * pieces; idx += kDrThreads) {
-    const int r = idx / pieces, c = (idx % pieces) * 8;
-    float v[8];
-    if (r < rows) {
-      const float* row = src + int64_t(r) * stride + c;
-      if (vec && c + 8 <= limit) {
-        const float4 a = *reinterpret_cast<const float4*>(row), b = *reinterpret_cast<const float4*>(row + 4);
-        v[0] = a.x, v[1] = a.y, v[2] = a.z, v[3] = a.w, v[4] = b.x, v[5] = b.y, v[6] = b.z, v[7] = b.w;
-      } else {
-#pragma unroll
-        for (int i = 0; i < 8; ++i) v[i] = c + i < limit ? row[i] : 0.0f;
-      }
-    } else {
-#pragma unroll
-      for (int i = 0; i < 8; ++i) v[i] = 0.0f;
-    }
-    *reinterpret_cast<uint4*>(dst + r * ld + c) = make_uint4(pack_bf16x2(v[0], v[1]), pack_bf16x2(v[2], v[3]), pack_bf16x2(v[4], v[5]), pack_bf16x2(v[6], v[7]));
-  }
-}
 
 // ---- chunk_scaled_dot_kkt, tensor cores (3) ------------------------------------------------------------------
 
@@ -853,7 +705,7 @@ __global__ __launch_bounds__(kDrThreads, 2) void chunk_scaled_dot_kkt_tc_kernel(
   const bool vec = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(k) % 16 == 0 && p.k_token_stride % 8 == 0;
   dr_row_rinv(rinv, k, p.k_token_stride, t0, m, kDk, p.use_qk_l2norm);
   if (tid < kDrChunk) gt[tid] = tid < m ? p.gc[int64_t(t0 + tid) * hv + h] : 0.0f;
-  tc_stage_input<T>(ks, kLd, k, p.k_token_stride, t0, m, kDk, vec);
+  tc_stage_input<T, kDrThreads>(ks, kLd, k, p.k_token_stride, t0, m, kDk, vec);
   __syncthreads();
   const int I = wid & 3, half = wid >> 2;
   float acc[4][4] = {};
@@ -1357,14 +1209,14 @@ __global__ __launch_bounds__(kDrThreads, 2) void chunk_output_fwd_tc_kernel(cons
   __syncthreads();
   dr_row_rinv(rk, k, p.k_token_stride, t0, m, kDk, p.use_qk_l2norm);
   if (tid < kDrChunk) gt[tid] = tid < m ? p.gc[int64_t(t0 + tid) * hv + h] : 0.0f;
-  tc_stage_f32(Vb, kLdV, p.v_new + (int64_t(t0) * hv + h) * dv + dv0, int64_t(hv) * dv, m, kDrChunk, kDv, min(kDv, dv - dv0), vec_f);
+  tc_stage_f32<bf16, kDrThreads>(Vb, kLdV, p.v_new + (int64_t(t0) * hv + h) * dv + dv0, int64_t(hv) * dv, m, kDrChunk, kDv, min(kDv, dv - dv0), vec_f);
   const int I = wid & 3, half = wid >> 2;
   float sacc[4][4] = {}, o[kNt1][4] = {};
   for (int d0 = 0; d0 < kDk; d0 += kSl) {
     __syncthreads();  // rk, gt and Vb on the first slice; the previous slice is consumed afterwards
-    tc_stage_input<T>(Qs, kLdQ, q + d0, p.q_token_stride, t0, m, kSl, vec_q);
-    tc_stage_input<T>(Ks, kLdQ, k + d0, p.k_token_stride, t0, m, kSl, vec_k);
-    tc_stage_f32(Hs, kLdV, hbuf + int64_t(d0) * dv + dv0, dv, kSl, kSl, kDv, min(kDv, dv - dv0), vec_f);
+    tc_stage_input<T, kDrThreads>(Qs, kLdQ, q + d0, p.q_token_stride, t0, m, kSl, vec_q);
+    tc_stage_input<T, kDrThreads>(Ks, kLdQ, k + d0, p.k_token_stride, t0, m, kSl, vec_k);
+    tc_stage_f32<bf16, kDrThreads>(Hs, kLdV, hbuf + int64_t(d0) * dv + dv0, dv, kSl, kSl, kDv, min(kDv, dv - dv0), vec_f);
     __syncthreads();
     // S += q k^T over the slice: column pairs 2 half + {0, 1} of 16, only on and below the diagonal
 #pragma unroll
@@ -1670,7 +1522,7 @@ __global__ __launch_bounds__(kDrThreads, 2) void chunk_output_fwd_tc_kda_kernel(
   dr_row_rinv(rq, q, p.q_token_stride, t0, m, kDk, p.use_qk_l2norm);
   __syncthreads();
   dr_row_rinv(rk, k, p.k_token_stride, t0, m, kDk, p.use_qk_l2norm);
-  tc_stage_f32(Vb, kLdV, p.v_new + (int64_t(t0) * hv + h) * dv + dv0, int64_t(hv) * dv, m, kDrChunk, kDv, min(kDv, dv - dv0), vec_f && (dv0 % 4 == 0));
+  tc_stage_f32<bf16, kDrThreads>(Vb, kLdV, p.v_new + (int64_t(t0) * hv + h) * dv + dv0, int64_t(hv) * dv, m, kDrChunk, kDv, min(kDv, dv - dv0), vec_f && (dv0 % 4 == 0));
   const int I = wid & 3, half = wid >> 2;
   int PI = 0, PJ = 0;
   kda_pair_of_warp(wid, PI, PJ);
@@ -1701,7 +1553,7 @@ __global__ __launch_bounds__(kDrThreads, 2) void chunk_output_fwd_tc_kda_kernel(
       }
       *reinterpret_cast<uint4*>(&Qd[i * kLdQ + c8]) = make_uint4(pack_bf16x2(qd[0], qd[1]), pack_bf16x2(qd[2], qd[3]), pack_bf16x2(qd[4], qd[5]), pack_bf16x2(qd[6], qd[7]));
     }
-    tc_stage_f32(Hs, kLdV, hbuf + int64_t(d0) * dv + dv0, dv, kSl, kSl, kDv, min(kDv, dv - dv0), vec_f && (dv0 % 4 == 0));
+    tc_stage_f32<bf16, kDrThreads>(Hs, kLdV, hbuf + int64_t(d0) * dv + dv0, dv, kSl, kSl, kDv, min(kDv, dv - dv0), vec_f && (dv0 % 4 == 0));
     __syncthreads();
 #pragma unroll
     for (int kk = 0; kk < kSl / 16; ++kk) {
@@ -1769,6 +1621,811 @@ __global__ __launch_bounds__(kDrThreads, 2) void chunk_output_fwd_tc_kda_kernel(
   }
 }
 
+
+// ---- fused kkt + solve + w/u, tensor cores -------------------------------------------------------
+
+/**
+ * The shared-memory budget of chunk_kkt_solve_wu_tc_kernel: a staging region (the 16-bit k tile of the
+ * kkt step, or the KDA fp32 slices, or the W/U tiles ts + bs), the strictly lower A tile, the inverse,
+ * the 64-thread substitution scratch and the per-row scalars.
+ */
+template <typename T, int kDk, bool kPer>
+__host__ __device__ constexpr size_t kkt_solve_wu_smem_bytes() {
+  constexpr int kSl = kDk >= 32 ? 32 : 16;
+  constexpr size_t kStg = 2 * size_t(kDrChunk) * kTcLd64 * sizeof(T);
+  const size_t kkt = kPer ? 2 * size_t(kSl) * kDrLd * sizeof(float) : size_t(kDrChunk) * tc_ld(kDk) * sizeof(T);
+  return (kStg > kkt ? kStg : kkt) + 2 * size_t(kDrChunk) * kDrLd * sizeof(float) +
+         (3 * 16 * 17 + 3 * kDrChunk) * sizeof(float);
+}
+
+/**
+ * (I + A)^-1 of the unit lower triangular 64 x 64 inverse in shared memory: 16 x 16 block forward
+ * substitution, the first 64 threads own a column of a diagonal block and then a 4-column strip of a
+ * block row; every thread of the CTA joins the two barriers of a level. L and T are distinct tiles
+ * (row stride ld); rows past the chunk are zero in L.
+ */
+__device__ __forceinline__ void dr_solve_tril_smem(float* L, float* T, int ld, float* S, int m) {
+  const int tid = threadIdx.x;
+  if (tid < kDrChunk) {
+    const int b = tid >> 4, c = tid & 15, base = 16 * b;
+    float x[16];
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      float acc = (i == c) ? 1.0f : 0.0f;
+      if (i >= c) {
+#pragma unroll
+        for (int j = 0; j < i; ++j)
+          if (j >= c) acc = __fmaf_rn(-L[(base + i) * ld + base + j], x[j], acc);
+      }
+      x[i] = (i >= c) ? acc : 0.0f;
+    }
+#pragma unroll
+    for (int i = 0; i < 16; ++i) T[(base + i) * ld + base + c] = x[i];
+  }
+  __syncthreads();
+  const int r = tid >> 2, cq = tid & 3;
+#pragma unroll
+  for (int l = 1; l <= 3; ++l) {
+    if (tid < kDrChunk) {
+      float s_acc[3][4];
+#pragma unroll
+      for (int bi = 0; bi < 3; ++bi) {
+        const int i = l + bi;
+#pragma unroll
+        for (int q = 0; q < 4; ++q) s_acc[bi][q] = 0.0f;
+        if (i <= 3) {
+          const int j = i - l;
+#pragma unroll
+          for (int k = 0; k < 3; ++k) {
+            if (j + k <= i - 1) {
+              const int kb = j + k;
+              for (int kk = 0; kk < 16; ++kk) {
+                const float a = L[(16 * i + r) * ld + 16 * kb + kk];
+#pragma unroll
+                for (int q = 0; q < 4; ++q)
+                  s_acc[bi][q] = __fmaf_rn(a, T[(16 * kb + kk) * ld + 16 * j + 4 * cq + q], s_acc[bi][q]);
+              }
+            }
+          }
+        }
+      }
+#pragma unroll
+      for (int bi = 0; bi < 3; ++bi)
+        if (l + bi <= 3)
+#pragma unroll
+          for (int q = 0; q < 4; ++q) S[(bi * 16 + r) * 17 + 4 * cq + q] = s_acc[bi][q];
+    }
+    __syncthreads();
+    if (tid < kDrChunk) {
+#pragma unroll
+      for (int bi = 0; bi < 3; ++bi) {
+        const int i = l + bi;
+        if (i <= 3) {
+          const int j = i - l;
+          float t[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+          for (int kk = 0; kk < 16; ++kk) {
+            const float d = T[(16 * i + r) * ld + 16 * i + kk];
+#pragma unroll
+            for (int q = 0; q < 4; ++q) t[q] = __fmaf_rn(d, S[(bi * 16 + kk) * 17 + 4 * cq + q], t[q]);
+          }
+#pragma unroll
+          for (int q = 0; q < 4; ++q) T[(16 * i + r) * ld + 16 * j + 4 * cq + q] = -t[q];
+        }
+      }
+    }
+    __syncthreads();
+  }
+}
+
+/**
+ * Grid (chunks, Hv, B), 256 threads. FLA's fwd_kkt_solve: the strictly lower A_jm of a chunk is built on
+ * mma.sync (GDN: k k^T scaled by exp(G_j - G_m); KDA: the decayed pairs channel by channel), inverted in
+ * shared memory by dr_solve_tril_smem, and the inverse immediately multiplies the beta-scaled k rows
+ * (W) and v rows (U) of the same chunk, so A and its inverse never leave the CTA. The inverse is also
+ * written to p.A (the workspace contract) and W/U to p.w / p.u, which the state kernel reads.
+ */
+template <typename T, int kDk, bool kPer>
+__global__ __launch_bounds__(kDrThreads, 2) void chunk_kkt_solve_wu_tc_kernel(const __grid_constant__ DeltaRuleParams p) {
+  constexpr int kLdK = tc_ld(kDk);
+  constexpr int kSl = kDk >= 32 ? 32 : 16;
+  constexpr size_t kStg = 2 * size_t(kDrChunk) * kTcLd64 * sizeof(T);
+  constexpr size_t kKkt = kPer ? 2 * size_t(kSl) * kDrLd * sizeof(float) : size_t(kDrChunk) * kLdK * sizeof(T);
+  constexpr size_t kStgBytes = kStg > kKkt ? kStg : kKkt;
+  extern __shared__ __align__(16) unsigned char fus_smem[];
+  bf16* stg = reinterpret_cast<bf16*>(fus_smem);
+  float* As = reinterpret_cast<float*>(fus_smem + kStgBytes);  // [64][kDrLd]
+  float* Tinv = As + kDrChunk * kDrLd;                         // [64][kDrLd]
+  float* scr = Tinv + kDrChunk * kDrLd;                        // [3][16][17]
+  float* rinv = scr + 3 * 16 * 17;                             // [64]
+  float* gt = rinv + kDrChunk;                                 // [64]
+  float* sm = gt + kDrChunk;                                   // [64]
+  int t0, m;
+  if (!dr_chunk_of(p, blockIdx.x, blockIdx.z, t0, m)) return;  // uniform per CTA
+  const int h = blockIdx.y, hv = p.num_v_heads, hk = h / (hv / p.num_k_heads), dk = p.head_dim_k;
+  const int dv = p.head_dim_v;
+  const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const T* kp = static_cast<const T*>(p.k) + int64_t(hk) * p.k_head_stride;
+  const T* vp = static_cast<const T*>(p.v) + int64_t(h) * p.v_head_stride;
+  const int I = wid & 3, half = wid >> 2;
+  dr_row_rinv(rinv, kp, p.k_token_stride, t0, m, dk, p.use_qk_l2norm);
+  if constexpr (!kPer) {
+    if (tid < kDrChunk) gt[tid] = tid < m ? p.gc[int64_t(t0 + tid) * hv + h] : 0.0f;
+  }
+  if constexpr (!kPer) {
+    // ---- A = beta_j rinv_j rinv_m (k_j . k_m) exp(G_j - G_m), m < j ----
+    const bool vec_k = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(kp) % 16 == 0 && p.k_token_stride % 8 == 0;
+    tc_stage_input<T, kDrThreads>(stg, kLdK, kp, p.k_token_stride, t0, m, kDk, vec_k);
+    __syncthreads();
+    float acc[4][4] = {};
+#pragma unroll
+    for (int kk = 0; kk < kDk / 16; ++kk) {
+      uint32_t a[4];
+      frag_a(a, stg, kLdK, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        if (2 * half + np > I) continue;
+        uint32_t b[4];
+        frag_b2(b, stg, kLdK, 32 * half + 16 * np, 16 * kk);
+        mma_bf16_16x8x16(acc[2 * np], a, b[0], b[1]);
+        mma_bf16_16x8x16(acc[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+      const int i = 16 * I + g + 8 * rr;
+      if (i >= m) continue;
+      const float scale_i = p.beta[int64_t(t0 + i) * hv + h] * rinv[i], gi = gt[i];
+      float* row = As + i * kDrLd;
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+        const int np = nt >> 1, j0 = 32 * half + 16 * np + 8 * (nt & 1) + 2 * t;
+        float v0 = 0.0f, v1 = 0.0f;
+        if (2 * half + np <= I) {
+          v0 = j0 < i ? acc[nt][2 * rr] * scale_i * rinv[j0] * __expf(gi - gt[j0]) : 0.0f;
+          v1 = j0 + 1 < i ? acc[nt][2 * rr + 1] * scale_i * rinv[j0 + 1] * __expf(gi - gt[j0 + 1]) : 0.0f;
+        }
+        row[j0] = v0;
+        row[j0 + 1] = v1;
+      }
+    }
+  } else {
+    // ---- A_jm = beta_j sum_d k_j[d] k_m[d] exp(G_j[d] - G_m[d]), m < j (KDA) ----
+    float* ks = reinterpret_cast<float*>(stg);  // [kSl][kDrLd], feature-major
+    float* gs = ks + kSl * kDrLd;
+    const bool vec_k = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(kp) % 16 == 0 && p.k_token_stride % 8 == 0;
+    const bool vec_g = reinterpret_cast<uintptr_t>(p.gc) % 16 == 0;
+    int PI = 0, PJ = 0;
+    kda_pair_of_warp(wid, PI, PJ);
+    float oacc[2][4] = {}, dfast[2][2][4] = {}, dslow[2][8] = {};
+    for (int d0 = 0; d0 < kDk; d0 += kSl) {
+      __syncthreads();  // the previous slice is consumed
+      for (int idx = tid; idx < kDrChunk * (kSl / 8); idx += kDrThreads) {
+        const int i = idx / (kSl / 8), c8 = (idx % (kSl / 8)) * 8;
+        float kv[8] = {}, gv[8];
+        if (i < m) {
+          tc_load8<T>(kv, kp + int64_t(t0 + i) * p.k_token_stride + d0 + c8, vec_k);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) kv[e] *= rinv[i];
+        }
+        tc_load8_f32(gv, p.gc + (int64_t(t0 + min(i, m - 1)) * hv + h) * dk + d0 + c8, vec_g);
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          ks[(c8 + e) * kDrLd + i] = kv[e];
+          gs[(c8 + e) * kDrLd + i] = gv[e];
+        }
+      }
+      __syncthreads();
+      if (wid < 6) kda_offdiag_slice<kSl>(oacc, ks, ks, gs, PI, PJ);
+      if (wid >= 6) {
+#pragma unroll
+        for (int tt = 0; tt < 2; ++tt) kda_diag_tile_slice<false, kSl>(dfast[tt], dslow[tt], ks, ks, gs, 2 * (wid - 6) + tt);
+      }
+    }
+    if (wid < 6) {
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+          As[(16 * PI + g + 8 * (e >> 1)) * kDrLd + 16 * PJ + 8 * nt + 2 * t + (e & 1)] = oacc[nt][e];
+    }
+    if (wid >= 6) {
+#pragma unroll
+      for (int tt = 0; tt < 2; ++tt) {
+        const int J = 2 * (wid - 6) + tt;
+        kda_diag_store(As + (16 * J) * kDrLd + 16 * J, kDrLd, dfast[tt], dslow[tt]);
+      }
+    }
+    __syncthreads();
+    // beta scaling and the causal mask, in place
+    for (int idx = tid; idx < kDrChunk * (kDrChunk / 4); idx += kDrThreads) {
+      const int i = idx / (kDrChunk / 4), c4 = (idx % (kDrChunk / 4)) * 4;
+      if (i >= m) continue;
+      const float beta = p.beta[int64_t(t0 + i) * hv + h];
+      float* q4 = As + i * kDrLd + c4;
+      q4[0] = c4 + 0 < i ? beta * q4[0] : 0.0f;
+      q4[1] = c4 + 1 < i ? beta * q4[1] : 0.0f;
+      q4[2] = c4 + 2 < i ? beta * q4[2] : 0.0f;
+      q4[3] = c4 + 3 < i ? beta * q4[3] : 0.0f;
+    }
+  }
+  for (int idx = tid; idx < kDrChunk * kDrLd; idx += kDrThreads) {
+    if (idx / kDrLd >= m) As[idx] = 0.0f;
+  }
+  __syncthreads();
+  // ---- the inverse ----
+  dr_solve_tril_smem(As, Tinv, kDrLd, scr, m);
+  if (tid < kDrChunk) {
+    for (int i = 0; i < kDrChunk; ++i)
+      if (i < m) p.A[(int64_t(t0 + i) * hv + h) * kDrChunk + tid] = tid <= i ? Tinv[i * kDrLd + tid] : 0.0f;
+  }
+  __syncthreads();
+  // ---- W = T (beta exp(G) rinv k), U = T (beta v); a column tile of 64 at a time ----
+  bf16* ts = stg;                              // [64][kTcLd64]
+  bf16* bs = stg + kDrChunk * kTcLd64;         // [64][kTcLd64]
+  const int dkt = (dk + kDrChunk - 1) / kDrChunk, dvt = (dv + kDrChunk - 1) / kDrChunk, coltiles = dkt + dvt;
+  for (int ct = 0; ct < coltiles; ++ct) {
+    const bool is_w = ct < dkt;
+    const int c0 = (is_w ? ct : ct - dkt) * kDrChunk;
+    const int width = is_w ? dk : dv;
+    if (tid < kDrChunk) {
+      float s = 0.0f;
+      if (tid < m) {
+        const int64_t tok = int64_t(t0 + tid);
+        s = p.beta[tok * hv + h];
+        if (is_w) s = kPer ? 1.0f : s * __expf(p.gc[tok * hv + h]) * rinv[tid];
+      }
+      sm[tid] = s;
+    }
+    const T* src = is_w ? kp : vp;
+    const int64_t stride = is_w ? p.k_token_stride : p.v_token_stride;
+    for (int idx = tid; idx < kDrChunk * (kDrChunk / 2); idx += kDrThreads) {
+      const int mm = idx / (kDrChunk / 2), cc = (idx % (kDrChunk / 2)) * 2;
+      float x0 = 0.0f, x1 = 0.0f;
+      if (mm < m) {
+        const T* row = src + int64_t(t0 + mm) * stride + c0 + cc;
+        if (c0 + cc < width) x0 = to_float(row[0]);
+        if (c0 + cc + 1 < width) x1 = to_float(row[1]);
+        if constexpr (kPer) {
+          if (is_w) {
+            const int64_t tk = int64_t(t0 + mm);
+            const float f = p.beta[tk * hv + h] * rinv[mm];
+            const float* gcp = p.gc + (tk * hv + h) * dk + c0 + cc;
+            x0 = c0 + cc < width ? x0 * f * __expf(gcp[0]) : 0.0f;
+            x1 = c0 + cc + 1 < width ? x1 * f * __expf(gcp[1]) : 0.0f;
+          }
+        }
+      }
+      *reinterpret_cast<uint32_t*>(&bs[mm * kTcLd64 + cc]) = pack_bf16x2(x0, x1);
+    }
+    __syncthreads();  // sm and bs are visible
+    for (int idx = tid; idx < kDrChunk * (kDrChunk / 4); idx += kDrThreads) {
+      const int j = idx / (kDrChunk / 4), mm = (idx % (kDrChunk / 4)) * 4;
+      float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f, x3 = 0.0f;
+      if (j < m && mm <= j) {
+        x0 = mm <= j ? Tinv[j * kDrLd + mm] * sm[mm] : 0.0f;
+        x1 = mm + 1 <= j ? Tinv[j * kDrLd + mm + 1] * sm[mm + 1] : 0.0f;
+        x2 = mm + 2 <= j ? Tinv[j * kDrLd + mm + 2] * sm[mm + 2] : 0.0f;
+        x3 = mm + 3 <= j ? Tinv[j * kDrLd + mm + 3] * sm[mm + 3] : 0.0f;
+      }
+      *reinterpret_cast<uint2*>(&ts[j * kTcLd64 + mm]) =
+          make_uint2(pack_bf16x2(x0, x1), pack_bf16x2(x2, x3));
+    }
+    __syncthreads();
+    float acc[4][4] = {};
+    for (int kk = 0; kk <= I; ++kk) {
+      uint32_t a[4];
+      frag_a(a, ts, kTcLd64, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        uint32_t b[4];
+        frag_b2_trans(b, bs, kTcLd64, 16 * kk, 32 * half + 16 * np);
+        mma_bf16_16x8x16(acc[2 * np], a, b[0], b[1]);
+        mma_bf16_16x8x16(acc[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+    float* out = is_w ? p.w : p.u;
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+      const int j = 16 * I + g + 8 * rr;
+      if (j >= m) continue;
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+        const int col = c0 + 32 * half + 8 * nt + 2 * t;
+        float* o = out + (int64_t(t0 + j) * hv + h) * width + col;
+        if (col < width) o[0] = acc[nt][2 * rr];
+        if (col + 1 < width) o[1] = acc[nt][2 * rr + 1];
+      }
+    }
+  }
+}
+
+// ---- fused chunk state + output, tensor cores ----------------------------------------------------
+
+/** Dynamic shared memory of chunk_state_output_tc_kernel: Sb [Dk][kLdS], Vb [64][kLdS], Wb [64][kLdK]
+ * (also the raw v_new tile of the GDN output), Kt [2][64][kLdK], Pb [64][kTcLd64], the GDN q tile
+ * Qs [64][kLdK] (the KDA slice tiles qs/ks/gs [kSl][kDrLd], their Qd [64][kLdQ] and the diagonal
+ * scratch take its place), and the fp32 rinv [2][64], gt [2][64], gl [2][Dk], rq [64]. */
+template <typename T, bool kPer, int kDk, int kDv>
+__host__ __device__ constexpr size_t tc_state_output_smem_bytes() {
+  constexpr int kSl = kDk >= 32 ? 32 : 16;
+  constexpr size_t k16 = (size_t(kDk) * tc_ld(kDv) + 2 * size_t(kDrChunk) * tc_ld(kDv) + 3 * size_t(kDrChunk) * tc_ld(kDk) +
+                          size_t(kDrChunk) * kTcLd64) *
+                         sizeof(__nv_bfloat16);
+  constexpr size_t kOut = kPer ? (3 * size_t(kSl) * kDrLd * sizeof(float) + size_t(kDrChunk) * tc_ld(kSl) * sizeof(__nv_bfloat16))
+                               : size_t(kDrChunk) * tc_ld(kDk) * sizeof(__nv_bfloat16);
+  return k16 + kOut + (5 * kDrChunk + 2 * kDk) * sizeof(float);
+}
+
+/**
+ * Grid (ceil(Dv / kDv), Hv, B): one persistent CTA per (sequence, value head, V tile) walks the chunks
+ * in order with the state S[:, dv tile] in the fp32 accumulator registers of its owner warps. The
+ * previous pipeline wrote the state entering every chunk to the h workspace and read it back in a second
+ * chunk-parallel kernel; here each chunk's output is formed immediately after its v_new, from the same
+ * registers that the recurrence carries, so h never goes through memory.
+ *
+ * Per chunk, after v_new = U - W S (fp32 to the v_new workspace, 16-bit to the update operand):
+ *   GDN: o = scale (rq exp(G) (q S) + P v_new), P_ij = rq_i rk_j (q_i . k_j) exp(G_i - G_j), j <= i
+ *   KDA: o = scale ((q rq exp(G)) S + P v_new), P_ij = sum_d q_i[d] k_j[d] rq_i rk_j exp(G_i[d] - G_j[d])
+ * The q k^T and P v_new products are mma.sync on 16-bit tiles; the KDA pairs keep the per-channel decay
+ * with the per-16-token reference of the chunked output kernel. The state update is unchanged.
+ */
+template <typename T, bool kPer, int kDk, int kDv>
+__global__ __launch_bounds__(kDrThreads, 1) void chunk_state_output_tc_kernel(const __grid_constant__ DeltaRuleParams p) {
+  constexpr int kNmt = kDk / 16, kNts = kDv / 8;
+  constexpr int kWpm = (8 / kNmt) < kNts ? (8 / kNmt) : kNts;
+  constexpr int kNtw = kNts / kWpm;
+  constexpr int kNtv = kNts / 2;
+  constexpr int kLdS = tc_ld(kDv), kLdK = tc_ld(kDk);
+  constexpr int kPieces = kDk / 8;
+  constexpr int kPerThread = (kDrChunk * kPieces + kDrThreads - 1) / kDrThreads;
+  constexpr int kSl = kDk >= 32 ? 32 : 16, kLdQ = tc_ld(kSl);
+  static_assert(kNtv >= 2 && kNtv % 2 == 0, "v_new is formed two n8 tiles at a time");
+  extern __shared__ __align__(16) unsigned char tc_smem[];
+  bf16* Sb = reinterpret_cast<bf16*>(tc_smem);   // [kDk][kLdS]: the state, k-major for the B fragments
+  bf16* Vb = Sb + kDk * kLdS;                    // [64][kLdS]: v_new scaled for the state update
+  bf16* Wb = Vb + kDrChunk * kLdS;               // [64][kLdK]: the W tile, then the raw v_new tile
+  bf16* Kt = Wb + kDrChunk * kLdK;               // [2][64][kLdK]: k scaled for the state update
+  bf16* Pb = Kt + 2 * kDrChunk * kLdK;           // [64][kTcLd64]: the causal attention tile
+  bf16* Vn = Pb + kDrChunk * kTcLd64;            // [64][kLdS]: raw v_new for the P v_new product
+  bf16* Qs = Vn + kDrChunk * kLdS;               // [64][kLdK]: GDN q tile
+  unsigned char* tail = reinterpret_cast<unsigned char*>(Qs) + (kPer ? 0 : size_t(kDrChunk) * kLdK * sizeof(bf16));
+  float* qs_s = reinterpret_cast<float*>(tail);  // KDA: [kSl][kDrLd] q slice, feature-major
+  float* ks_s = qs_s + kSl * kDrLd;
+  float* gs_s = ks_s + kSl * kDrLd;
+  bf16* Qd = reinterpret_cast<bf16*>(gs_s + kSl * kDrLd);  // KDA: [64][kLdQ] q rq exp(G)
+  float* rinv = kPer ? reinterpret_cast<float*>(Qd + kDrChunk * kLdQ) : reinterpret_cast<float*>(tail);  // [2][64]
+  float* gt = rinv + 2 * kDrChunk;               // [2][64]
+  float* gl = gt + 2 * kDrChunk;                 // [2][kDk]
+  float* rq = gl + 2 * kDk;                      // [64]
+  const int dk = kDk, dv = p.head_dim_v, hv = p.num_v_heads;
+  const int b = blockIdx.z, h = blockIdx.y, dv0 = blockIdx.x * kDv;
+  const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  const int64_t slot = p.state_indices ? int64_t(p.state_indices[b]) : int64_t(b);
+  if (slot < 0 || slot >= p.num_slots || slot == p.pad_slot_id) return;  // uniform per CTA
+  const int start = p.cu_seqlens[b], n = p.cu_seqlens[b + 1] - start;
+  const int hk = h / (hv / p.num_k_heads);
+  const bool has_init = p.has_initial_state == nullptr || p.has_initial_state[b];
+  const T* k = static_cast<const T*>(p.k) + int64_t(hk) * p.k_head_stride;
+  const T* q = static_cast<const T*>(p.q) + int64_t(hk) * p.q_head_stride;
+  T* out = static_cast<T*>(p.o) + int64_t(h) * p.o_head_stride;
+  float* pool = p.state_pool + slot * p.state_slot_stride + int64_t(h) * dk * dv;
+  const auto pool_at = [&](int d, int c) -> int64_t { return p.state_transposed ? int64_t(c) * dk + d : int64_t(d) * dv + c; };
+  const int nchunks = (n + kDrChunk - 1) / kDrChunk;
+  const bool vec_q = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(q) % 16 == 0 && p.q_token_stride % 8 == 0;
+  const bool vec_k = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(k) % 16 == 0 && p.k_token_stride % 8 == 0;
+  const bool vec_g = reinterpret_cast<uintptr_t>(p.gc) % 16 == 0;
+  // 16-byte loads of W, the decays and k (aligned bases, rows a whole number of 16-byte pieces
+  // apart) or the scalar fallback
+  const bool vec = reinterpret_cast<uintptr_t>(p.w) % 16 == 0 && reinterpret_cast<uintptr_t>(p.gc) % 16 == 0 &&
+                   reinterpret_cast<uintptr_t>(k) % 16 == 0 && (p.k_token_stride * int64_t(sizeof(T))) % 16 == 0 &&
+                   (p.k_head_stride * int64_t(sizeof(T))) % 16 == 0;
+  // the owner of state tile (row tile mt, columns [8 ntb, 8 (ntb + kNtw))) of this warp
+  const bool owner = wid < kNmt * kWpm;
+  const int mt = wid % kNmt, ntb = (wid / kNmt) * kNtw;
+  const int OI = wid & 3, half = wid >> 2;
+  float S[(kNtw + 1) / 2 * 2][4] = {};
+#pragma unroll
+  for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+    for (int e = 0; e < 4; ++e) {
+      const int d = 16 * mt + g + 8 * (e >> 1), c = 8 * (ntb + nt) + 2 * t + (e & 1);
+      S[nt][e] = (owner && has_init && dv0 + c < dv) ? pool[pool_at(d, dv0 + c)] : 0.0f;
+    }
+  if (owner) {
+#pragma unroll
+    for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+      for (int e2 = 0; e2 < 2; ++e2)
+        *reinterpret_cast<uint32_t*>(&Sb[(16 * mt + g + 8 * e2) * kLdS + 8 * (ntb + nt) + 2 * t]) =
+            pack_bf16x2(S[nt][2 * e2], S[nt][2 * e2 + 1]);
+  }
+
+  // ---- the prefetch of one chunk: the pieces of W (and, for GDN, k) this thread stages, the cumulative decay
+  constexpr bool kRawK = std::is_same_v<T, bf16>;
+  struct Next {
+    float w[kPerThread][8];
+    float k[(!kPer && !kRawK) ? kPerThread : 1][8];
+    uint4 kraw[(!kPer && kRawK) ? kPerThread : 1];
+    float gl8[kPer ? 8 : 1];
+    float gt;
+    int t0, m;
+  } nx;
+  const auto fetch = [&](int chunk) {
+    nx.t0 = start + chunk * kDrChunk;
+    nx.m = min(kDrChunk, n - chunk * kDrChunk);
+#pragma unroll
+    for (int i = 0; i < kPerThread; ++i) {
+      const int piece = tid + kDrThreads * i, r = piece / kPieces, c8 = (piece % kPieces) * 8;
+      (void)r, (void)c8;
+      const bool in = piece < kDrChunk * kPieces && r < nx.m;
+      if (in) {
+        tc_load8_f32(nx.w[i], p.w + (int64_t(nx.t0 + r) * hv + h) * dk + c8, vec);
+        if constexpr (!kPer) {
+          if constexpr (kRawK) {
+            if (vec) {
+              nx.kraw[i] = *reinterpret_cast<const uint4*>(k + int64_t(nx.t0 + r) * p.k_token_stride + c8);
+            } else {
+              float tmp[8];
+              tc_load8<T>(tmp, k + int64_t(nx.t0 + r) * p.k_token_stride + c8, false);
+              nx.kraw[i] = make_uint4(pack_bf16x2(tmp[0], tmp[1]), pack_bf16x2(tmp[2], tmp[3]),
+                                      pack_bf16x2(tmp[4], tmp[5]), pack_bf16x2(tmp[6], tmp[7]));
+            }
+          } else {
+            tc_load8<T>(nx.k[i], k + int64_t(nx.t0 + r) * p.k_token_stride + c8, vec);
+          }
+        }
+      } else {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          nx.w[i][e] = 0.0f;
+          if constexpr (!kPer && !kRawK) nx.k[i][e] = 0.0f;
+        }
+        if constexpr (!kPer && kRawK) nx.kraw[i] = make_uint4(0, 0, 0, 0);
+      }
+    }
+    if constexpr (kPer) {
+      tc_load8_f32(nx.gl8, p.gc + (int64_t(nx.t0 + nx.m - 1) * hv + h) * dk + ((tid % kPieces) * 8), vec);
+    } else {
+      nx.gt = tid < kDrChunk && tid < nx.m ? p.gc[int64_t(nx.t0 + tid) * hv + h] : 0.0f;
+    }
+  };
+  const auto stage = [&](int bf) {
+    bf16* wb = Wb;
+    bf16* kt = Kt + bf * kDrChunk * kLdK;
+    constexpr int kBatch = kPer ? (kPerThread < 2 ? kPerThread : 2) : kPerThread;
+#pragma unroll
+    for (int i0 = 0; i0 < kPerThread; i0 += kBatch) {
+      float kv[kBatch][8];
+      float gcv[kPer ? kBatch : 1][8];
+      (void)gcv;
+#pragma unroll
+      for (int j = 0; j < kBatch; ++j) {
+        const int i = i0 + j, piece = tid + kDrThreads * i, r = piece / kPieces, c8 = (piece % kPieces) * 8;
+        (void)r, (void)c8;
+        if constexpr (kPer) {
+          const bool in = piece < kDrChunk * kPieces && r < nx.m;
+          if (in) {
+            tc_load8<T>(kv[j], k + int64_t(nx.t0 + r) * p.k_token_stride + c8, vec);
+            tc_load8_f32(gcv[j], p.gc + (int64_t(nx.t0 + r) * hv + h) * dk + c8, vec);
+          } else {
+#pragma unroll
+            for (int e = 0; e < 8; ++e) kv[j][e] = 0.0f, gcv[j][e] = 0.0f;
+          }
+        } else if constexpr (kRawK) {
+          const uint32_t wd[4] = {nx.kraw[i].x, nx.kraw[i].y, nx.kraw[i].z, nx.kraw[i].w};
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            kv[j][2 * e] = __uint_as_float(wd[e] << 16);
+            kv[j][2 * e + 1] = __uint_as_float(wd[e] & 0xffff0000u);
+          }
+        } else {
+#pragma unroll
+          for (int e = 0; e < 8; ++e) kv[j][e] = nx.k[i][e];
+        }
+      }
+#pragma unroll
+      for (int j = 0; j < kBatch; ++j) {
+        const int i = i0 + j, piece = tid + kDrThreads * i, r = piece / kPieces, c8 = (piece % kPieces) * 8;
+        (void)r, (void)c8;
+        float sq = 0.0f;
+#pragma unroll
+        for (int e = 0; e < 8; ++e) sq = __fmaf_rn(kv[j][e], kv[j][e], sq);
+#pragma unroll
+        for (int off = kPieces / 2; off > 0; off >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, off);
+        if (piece >= kDrChunk * kPieces) continue;
+        *reinterpret_cast<uint4*>(wb + r * kLdK + c8) = make_uint4(pack_bf16x2(nx.w[i][0], nx.w[i][1]), pack_bf16x2(nx.w[i][2], nx.w[i][3]),
+                                                                     pack_bf16x2(nx.w[i][4], nx.w[i][5]), pack_bf16x2(nx.w[i][6], nx.w[i][7]));
+        const float ri = (r < nx.m && p.use_qk_l2norm) ? rsqrtf(sq + kL2Eps) : 1.0f;
+        if ((tid % kPieces) == 0) rinv[bf * kDrChunk + r] = ri;
+        float x[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) {
+          if constexpr (kPer) x[e] = kv[j][e] * ri * __expf(nx.gl8[e] - gcv[j][e]);
+          else x[e] = kv[j][e];
+        }
+        *reinterpret_cast<uint4*>(kt + r * kLdK + c8) = make_uint4(pack_bf16x2(x[0], x[1]), pack_bf16x2(x[2], x[3]), pack_bf16x2(x[4], x[5]), pack_bf16x2(x[6], x[7]));
+      }
+    }
+    if constexpr (kPer) {
+      if (tid < kPieces) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) gl[bf * kDk + tid * 8 + e] = nx.gl8[e];
+      }
+    } else {
+      if (tid < kDrChunk) gt[bf * kDrChunk + tid] = nx.gt;
+    }
+  };
+
+  if (nchunks > 0) {
+    fetch(0);
+    stage(0);
+  }
+  __syncthreads();
+  const auto iteration = [&](int chunk, auto prefetch) {
+    constexpr bool kPrefetch = decltype(prefetch)::value;
+    const int bf = chunk & 1;
+    const int t0 = start + chunk * kDrChunk, m = min(kDrChunk, n - chunk * kDrChunk);
+    // the loads of the next chunk and of this chunk's u go out before the products
+    float ur[kNtv][4] = {};
+    {
+      const int I = OI;
+#pragma unroll
+      for (int rr = 0; rr < 2; ++rr) {
+        const int j = 16 * I + g + 8 * rr;
+#pragma unroll
+        for (int nt = 0; nt < kNtv; ++nt) {
+          const int c = 8 * (half * kNtv + nt) + 2 * t;
+#pragma unroll
+          for (int e = 0; e < 2; ++e)
+            if (j < m && dv0 + c + e < dv) ur[nt][2 * rr + e] = p.u[(int64_t(t0 + j) * hv + h) * dv + dv0 + c + e];
+        }
+      }
+    }
+    dr_row_rinv(rq, q, p.q_token_stride, t0, m, dk, p.use_qk_l2norm);
+    if constexpr (!kPer) {
+      tc_stage_input<T, kDrThreads>(Qs, kLdK, q, p.q_token_stride, t0, m, dk, vec_q);
+    }
+    // v_new = U - W S: rows OI of the chunk, columns of half
+    float vraw[kNtv][4] = {};
+    {
+      const int I = OI;
+      float acc[kNtv][4] = {};
+      const bf16* wb = Wb;
+#pragma unroll 2
+      for (int kk = 0; kk < kDk / 16; ++kk) {
+        uint32_t a[4];
+        frag_a(a, wb, kLdK, 16 * I, 16 * kk);
+#pragma unroll
+        for (int np = 0; np < kNtv / 2; ++np) {
+          uint32_t bb[4];
+          frag_b2_trans(bb, Sb, kLdS, 16 * kk, 8 * (half * kNtv) + 16 * np);
+          mma_bf16_16x8x16(acc[2 * np], a, bb[0], bb[1]);
+          mma_bf16_16x8x16(acc[2 * np + 1], a, bb[2], bb[3]);
+        }
+      }
+      const float g_last = kPer ? 0.0f : gt[bf * kDrChunk + m - 1];
+#pragma unroll
+      for (int rr = 0; rr < 2; ++rr) {
+        const int j = 16 * I + g + 8 * rr;
+        const float fold = kPer ? 1.0f : (j < m ? rinv[bf * kDrChunk + j] * __expf(g_last - gt[bf * kDrChunk + j]) : 0.0f);
+#pragma unroll
+        for (int nt = 0; nt < kNtv; ++nt) {
+          const int c = 8 * (half * kNtv + nt) + 2 * t;
+          float val[2] = {0.0f, 0.0f};
+#pragma unroll
+          for (int e = 0; e < 2; ++e) {
+            if (j < m && dv0 + c + e < dv) {
+              val[e] = ur[nt][2 * rr + e] - acc[nt][2 * rr + e];
+              p.v_new[(int64_t(t0 + j) * hv + h) * dv + dv0 + c + e] = val[e];
+            }
+            vraw[nt][2 * rr + e] = val[e];
+          }
+          *reinterpret_cast<uint32_t*>(&Vb[j * kLdS + c]) = pack_bf16x2(val[0] * fold, val[1] * fold);
+          *reinterpret_cast<uint32_t*>(&Vn[j * kLdS + c]) = pack_bf16x2(val[0], val[1]);
+        }
+      }
+    }
+    __syncthreads();  // Vb, Vn are complete; every warp is done with Wb
+    if constexpr (kPrefetch) fetch(chunk + 1);
+    // ---- the output of this chunk ----
+    float o[kNtv][4] = {};
+    if constexpr (!kPer) {
+      const bf16* kraw = Kt + bf * kDrChunk * kLdK;  // GDN: the k tile is the raw k of the chunk
+      float sacc[4][4] = {};
+      for (int kk = 0; kk < kDk / 16; ++kk) {
+        uint32_t a[4];
+        frag_a(a, Qs, kLdK, 16 * OI, 16 * kk);
+#pragma unroll
+        for (int np = 0; np < 2; ++np) {
+          if (2 * half + np > OI) continue;
+          uint32_t b[4];
+          frag_b2(b, kraw, kLdK, 32 * half + 16 * np, 16 * kk);
+          mma_bf16_16x8x16(sacc[2 * np], a, b[0], b[1]);
+          mma_bf16_16x8x16(sacc[2 * np + 1], a, b[2], b[3]);
+        }
+#pragma unroll
+        for (int np = 0; np < kNtv / 2; ++np) {
+          uint32_t b[4];
+          frag_b2_trans(b, Sb, kLdS, 16 * kk, 8 * (half * kNtv) + 16 * np);
+          mma_bf16_16x8x16(o[2 * np], a, b[0], b[1]);
+          mma_bf16_16x8x16(o[2 * np + 1], a, b[2], b[3]);
+        }
+      }
+#pragma unroll
+      for (int rr = 0; rr < 2; ++rr) {
+        const int i = 16 * OI + g + 8 * rr;
+        const float ri = rq[i], gi = gt[bf * kDrChunk + i], f = ri * __expf(gi);
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const int np = nt >> 1, j0 = 32 * half + 16 * np + 8 * (nt & 1) + 2 * t;
+          if (2 * half + np > OI) continue;
+          const float v0 = j0 <= i ? sacc[nt][2 * rr] * ri * rinv[bf * kDrChunk + j0] * __expf(gi - gt[bf * kDrChunk + j0]) : 0.0f;
+          const float v1 = j0 + 1 <= i ? sacc[nt][2 * rr + 1] * ri * rinv[bf * kDrChunk + j0 + 1] * __expf(gi - gt[bf * kDrChunk + j0 + 1]) : 0.0f;
+          *reinterpret_cast<uint32_t*>(&Pb[i * kTcLd64 + j0]) = pack_bf16x2(v0, v1);
+        }
+#pragma unroll
+        for (int nt = 0; nt < kNtv; ++nt) {
+          o[nt][2 * rr] *= f;
+          o[nt][2 * rr + 1] *= f;
+        }
+      }
+    } else {
+      int PI = 0, PJ = 0;
+      kda_pair_of_warp(wid, PI, PJ);
+      float oacc[2][4] = {}, dfast[2][2][4] = {}, dslow[2][8] = {};
+      for (int d0 = 0; d0 < kDk; d0 += kSl) {
+        __syncthreads();  // the previous slice is consumed
+        for (int idx = tid; idx < kDrChunk * (kSl / 8); idx += kDrThreads) {
+          const int i = idx / (kSl / 8), c8 = (idx % (kSl / 8)) * 8;
+          float qv[8] = {}, kv[8] = {}, gv[8];
+          if (i < m) {
+            tc_load8<T>(qv, q + int64_t(t0 + i) * p.q_token_stride + d0 + c8, vec_q);
+            tc_load8<T>(kv, k + int64_t(t0 + i) * p.k_token_stride + d0 + c8, vec_k);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) {
+              qv[e] *= rq[i];
+              kv[e] *= rinv[bf * kDrChunk + i];
+            }
+          }
+          tc_load8_f32(gv, p.gc + (int64_t(t0 + min(i, m - 1)) * hv + h) * dk + d0 + c8, vec_g);
+          float qd[8];
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            qs_s[(c8 + e) * kDrLd + i] = qv[e];
+            ks_s[(c8 + e) * kDrLd + i] = kv[e];
+            gs_s[(c8 + e) * kDrLd + i] = gv[e];
+            qd[e] = qv[e] * __expf(gv[e]);
+          }
+          *reinterpret_cast<uint4*>(&Qd[i * kLdQ + c8]) = make_uint4(pack_bf16x2(qd[0], qd[1]), pack_bf16x2(qd[2], qd[3]),
+                                                                    pack_bf16x2(qd[4], qd[5]), pack_bf16x2(qd[6], qd[7]));
+        }
+        __syncthreads();
+        for (int kk = 0; kk < kSl / 16; ++kk) {
+          uint32_t a[4];
+          frag_a(a, Qd, kLdQ, 16 * OI, 16 * kk);
+#pragma unroll
+          for (int np = 0; np < kNtv / 2; ++np) {
+            uint32_t b[4];
+            frag_b2_trans(b, Sb + d0 * kLdS, kLdS, 16 * kk, 8 * (half * kNtv) + 16 * np);
+            mma_bf16_16x8x16(o[2 * np], a, b[0], b[1]);
+            mma_bf16_16x8x16(o[2 * np + 1], a, b[2], b[3]);
+          }
+        }
+        if (wid < 6) kda_offdiag_slice<kSl>(oacc, qs_s, ks_s, gs_s, PI, PJ);
+        if (wid >= 6) {
+#pragma unroll
+          for (int tt = 0; tt < 2; ++tt)
+            kda_diag_tile_slice<true, kSl>(dfast[tt], dslow[tt], qs_s, ks_s, gs_s, 2 * (wid - 6) + tt);
+        }
+      }
+      __syncthreads();  // the slice tiles are consumed: the diagonal scratch and Pb take their place
+      float* td = reinterpret_cast<float*>(tail) + (wid >= 6 ? (wid - 6) * 2 * 16 * 17 : 0);
+      if (wid < 6) {
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+          for (int rr = 0; rr < 2; ++rr)
+            *reinterpret_cast<uint32_t*>(&Pb[(16 * PI + g + 8 * rr) * kTcLd64 + 16 * PJ + 8 * nt + 2 * t]) =
+                pack_bf16x2(oacc[nt][2 * rr], oacc[nt][2 * rr + 1]);
+      }
+      if (wid >= 6) {
+#pragma unroll
+        for (int tt = 0; tt < 2; ++tt) {
+          const int J = 2 * (wid - 6) + tt;
+          kda_diag_store(td + tt * 16 * 17, 17, dfast[tt], dslow[tt]);
+#pragma unroll
+          for (int e = 0; e < 8; ++e) {
+            const int r = lane >> 1, c = 8 * (lane & 1) + e;
+            Pb[(16 * J + r) * kTcLd64 + 16 * J + c] = __float2bfloat16_rn(c <= r ? td[tt * 16 * 17 + r * 17 + c] : 0.0f);
+          }
+        }
+      }
+    }
+    __syncthreads();  // Pb (and the raw v_new tile) are complete
+    for (int kk = 0; kk <= OI; ++kk) {
+      uint32_t a[4];
+      frag_a(a, Pb, kTcLd64, 16 * OI, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < kNtv / 2; ++np) {
+        uint32_t b[4];
+        frag_b2_trans(b, Vn, kLdS, 16 * kk, 8 * (half * kNtv) + 16 * np);
+        mma_bf16_16x8x16(o[2 * np], a, b[0], b[1]);
+        mma_bf16_16x8x16(o[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+      const int i = 16 * OI + g + 8 * rr;
+      if (i >= m) continue;
+#pragma unroll
+      for (int nt = 0; nt < kNtv; ++nt) {
+        const int c = dv0 + 8 * (half * kNtv + nt) + 2 * t;
+        if (c < dv) out[int64_t(t0 + i) * p.o_token_stride + c] = from_float<T>(o[nt][2 * rr] * p.scale);
+        if (c + 1 < dv) out[int64_t(t0 + i) * p.o_token_stride + c + 1] = from_float<T>(o[nt][2 * rr + 1] * p.scale);
+      }
+    }
+    // ---- the state after the chunk: S <- exp(G_last) S + k^T (scaled v_new) ----
+    const int done = t0 + m - start;
+    int64_t snapshot_slot = -1;
+    if (p.snapshot_interval > 0 && done % p.snapshot_interval == 0) {
+      const int j = done / p.snapshot_interval - 1;
+      if (j < p.max_snapshots) snapshot_slot = p.snapshot_slots[int64_t(b) * p.max_snapshots + j];
+    }
+    const bool snapshot = snapshot_slot >= 0 && snapshot_slot < p.num_slots;
+    if (owner) {
+      const float decay_rows[2] = {kPer ? __expf(gl[bf * kDk + 16 * mt + g]) : __expf(gt[bf * kDrChunk + m - 1]),
+                                   kPer ? __expf(gl[bf * kDk + 16 * mt + g + 8]) : __expf(gt[bf * kDrChunk + m - 1])};
+#pragma unroll
+      for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) S[nt][e] *= decay_rows[e >> 1];
+      const bf16* kt = Kt + bf * kDrChunk * kLdK;
+#pragma unroll 1
+      for (int kk = 0; kk < kDrChunk / 16; ++kk) {
+        uint32_t a[4];
+        frag_a_trans(a, kt, kLdK, 16 * mt, 16 * kk);
+#pragma unroll
+        for (int np = 0; np < (kNtw + 1) / 2; ++np) {
+          uint32_t bb[4];
+          frag_b2_trans(bb, Vb, kLdS, 16 * kk, 8 * ntb + 16 * np);
+          mma_bf16_16x8x16(S[2 * np], a, bb[0], bb[1]);
+          mma_bf16_16x8x16(S[2 * np + 1], a, bb[2], bb[3]);
+        }
+      }
+      if (snapshot) {
+#pragma unroll
+        for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const int d = 16 * mt + g + 8 * (e >> 1), c = 8 * (ntb + nt) + 2 * t + (e & 1);
+            if (dv0 + c < dv) p.state_pool[snapshot_slot * p.state_slot_stride + int64_t(h) * dk * dv + pool_at(d, dv0 + c)] = S[nt][e];
+          }
+      }
+    }
+    __syncthreads();  // every read of Sb, Vb and Kt (output and update) is done
+    if constexpr (kPrefetch) stage(bf ^ 1);
+    if (owner) {  // publish the state for the next chunk's Q S
+#pragma unroll
+      for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+        for (int e2 = 0; e2 < 2; ++e2)
+          *reinterpret_cast<uint32_t*>(&Sb[(16 * mt + g + 8 * e2) * kLdS + 8 * (ntb + nt) + 2 * t]) =
+              pack_bf16x2(S[nt][2 * e2], S[nt][2 * e2 + 1]);
+    }
+    __syncthreads();
+  };
+  for (int chunk = 0; chunk + 1 < nchunks; ++chunk) iteration(chunk, std::true_type{});
+  if (nchunks > 0) iteration(nchunks - 1, std::false_type{});
+  if (owner) {
+#pragma unroll
+    for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int d = 16 * mt + g + 8 * (e >> 1), c = 8 * (ntb + nt) + 2 * t + (e & 1);
+        if (dv0 + c < dv) pool[pool_at(d, dv0 + c)] = S[nt][e];
+      }
+  }
+}
 
 }  // namespace
 
@@ -1853,6 +2510,30 @@ cudaError_t launch_output(const DeltaRuleParams& p, cudaStream_t stream) {
 
 // tensor-core bodies (bf16 inputs only) ---------------------------------------------------------
 
+template <bool kPer, int kDk>
+cudaError_t launch_kkt_solve_wu_tc(const DeltaRuleParams& p, cudaStream_t stream) {
+  using T = __nv_bfloat16;
+  constexpr size_t bytes = kkt_solve_wu_smem_bytes<T, kDk, kPer>();
+  cudaError_t e = cudaFuncSetAttribute(chunk_kkt_solve_wu_tc_kernel<T, kDk, kPer>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes));
+  if (e != cudaSuccess) return e;
+  const dim3 grid(unsigned(dr_grid_chunks(p)), p.num_v_heads, p.batch_size);
+  chunk_kkt_solve_wu_tc_kernel<T, kDk, kPer><<<grid, kDrThreads, bytes, stream>>>(p);
+  return cudaSuccess;
+}
+
+template <bool kPer, int kDk, int kDv>
+cudaError_t launch_state_output_tc(const DeltaRuleParams& p, cudaStream_t stream) {
+  using T = __nv_bfloat16;
+  constexpr size_t bytes = tc_state_output_smem_bytes<T, kPer, kDk, kDv>();
+  cudaError_t e = cudaFuncSetAttribute(chunk_state_output_tc_kernel<T, kPer, kDk, kDv>,
+                                       cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes));
+  if (e != cudaSuccess) return e;
+  const dim3 grid((p.head_dim_v + kDv - 1) / kDv, p.num_v_heads, p.batch_size);
+  chunk_state_output_tc_kernel<T, kPer, kDk, kDv><<<grid, kDrThreads, bytes, stream>>>(p);
+  return cudaSuccess;
+}
+
 template <bool kPer, int kDk, int kDv>
 cudaError_t launch_state_tc(const DeltaRuleParams& p, cudaStream_t stream) {
   using T = __nv_bfloat16;
@@ -1906,14 +2587,31 @@ cudaError_t run_pipeline(const DeltaRuleParams& p, DType dtype, cudaStream_t str
     by_dk(p.head_dim_k, [&](auto dk) {
       constexpr int kDk = decltype(dk)::value;
       using T = __nv_bfloat16;
-      if (per) chunk_scaled_dot_kkt_tc_kda_kernel<T, kDk><<<cgrid, kDrThreads, 0, stream>>>(p);
-      else chunk_scaled_dot_kkt_tc_kernel<T, kDk><<<cgrid, kDrThreads, 0, stream>>>(p);
-      solve_tril_kernel<<<cgrid, kDrChunk, 0, stream>>>(p);
       const int64_t tiles = (p.head_dim_k + kDrChunk - 1) / kDrChunk + (p.head_dim_v + kDrChunk - 1) / kDrChunk;
       const dim3 wgrid(unsigned(dr_grid_chunks(p) * tiles), p.num_v_heads, p.batch_size);
-      if (per) recompute_w_u_tc_kernel<T, true><<<wgrid, kDrThreads, 0, stream>>>(p);
-      else recompute_w_u_tc_kernel<T, false><<<wgrid, kDrThreads, 0, stream>>>(p);
-      // the 64-column state tile does not fit the registers with the prefetch at Dk = 128
+      // fused kkt + solve + w/u (one launch, the 64 x 64 matrix stays in shared memory); a shape whose
+      // shared-memory budget does not fit falls back to the three-kernel sequence.
+      const cudaError_t fused = per ? launch_kkt_solve_wu_tc<true, kDk>(p, stream) : launch_kkt_solve_wu_tc<false, kDk>(p, stream);
+      if (fused != cudaSuccess) {
+        (void)cudaGetLastError();
+        if (per) chunk_scaled_dot_kkt_tc_kda_kernel<T, kDk><<<cgrid, kDrThreads, 0, stream>>>(p);
+        else chunk_scaled_dot_kkt_tc_kernel<T, kDk><<<cgrid, kDrThreads, 0, stream>>>(p);
+        solve_tril_kernel<<<cgrid, kDrChunk, 0, stream>>>(p);
+        if (per) recompute_w_u_tc_kernel<T, true><<<wgrid, kDrThreads, 0, stream>>>(p);
+        else recompute_w_u_tc_kernel<T, false><<<wgrid, kDrThreads, 0, stream>>>(p);
+      }
+      // fused state + output: the state entering each chunk stays in registers/shared memory. The
+      // 64-column state tile does not fit the registers with the prefetch at Dk = 128. A shape whose
+      // budget does not fit falls back to the two chunk-parallel kernels.
+      cudaError_t fused_out = cudaSuccess;
+      if constexpr (kDk == 128) {  // the 64-column fused tile does not fit the registers at Dk = 128
+        fused_out = per ? launch_state_output_tc<true, kDk, 32>(p, stream) : launch_state_output_tc<false, kDk, 32>(p, stream);
+      } else {
+        fused_out = per ? (wide ? launch_state_output_tc<true, kDk, 64>(p, stream) : launch_state_output_tc<true, kDk, 32>(p, stream))
+                        : (wide ? launch_state_output_tc<false, kDk, 64>(p, stream) : launch_state_output_tc<false, kDk, 32>(p, stream));
+      }
+      if (fused_out == cudaSuccess) return;
+      (void)cudaGetLastError();
       if constexpr (kDk == 128) {
         e = per ? launch_state_tc<true, kDk, 32>(p, stream) : launch_state_tc<false, kDk, 32>(p, stream);
       } else {

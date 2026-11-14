@@ -28,6 +28,7 @@
 #include "csrc/common/tensor.h"
 #include "csrc/common/device.cuh"
 #include "csrc/common/device_impl.cuh"
+#include "csrc/state/state_mma.cuh"
 #include "csrc/state/state_cache_kernels.cuh"
 #include "csrc/state/conv1d_kernels.cuh"
 #include "csrc/state/ssm_kernels.cuh"
@@ -252,6 +253,224 @@ __global__ __launch_bounds__(kLightThreads, 1) void lightning_attention_prefill_
 }
 namespace {
 
+// ---- lightning_attention_prefill_tc_kernel ----------------------------------------------------------------
+
+constexpr int kLightTcThreads = kLightThreads;
+
+/// Dynamic shared memory of the tensor-core lightning body: q, k [64][tc_ld(Dk)], the raw / decayed v
+/// tiles [64][tc_ld(kDv)] (two copies of the decayed operand, hi + lo), the P tile [64][tc_ld(64)], the
+/// state [Dk][tc_ld(kDv)] and the 65 decay powers.
+__host__ __device__ constexpr size_t lightning_tc_smem_bytes(int dk, int dv_tile) {
+  return (size_t(2) * kLightBlock * mma::tc_ld(dk) + size_t(3) * kLightBlock * mma::tc_ld(dv_tile) +
+          size_t(kLightBlock) * mma::tc_ld(kLightBlock) + size_t(dk) * mma::tc_ld(dv_tile)) *
+             sizeof(__nv_bfloat16) +
+         66 * sizeof(float);
+}
+
+/**
+ * One persistent CTA per (sequence, head, Dv tile): the state S[:, dv tile] lives in the fp32 accumulator
+ * registers of the warps that own its 16-row tiles and is published as a 16-bit shared-memory copy once per
+ * block. Per 64-token block, with the decay powers w^i = exp(-slope i) of the block:
+ *   phase 1  P = (Q K^T) w^(i - j), j <= i                      64 x 64, mma over the Dk features
+ *   phase 2  O = w^(i + 1) (Q S)                                64 x kDv
+ *   phase 3  O += P V                                           64 x kDv (P and V are 16-bit tiles)
+ *   phase 4  S <- w^m S + (w^(m - 1 - j) K)^T V                 Dk x kDv, fp32 accumulator
+ * The state-update operand (the decayed V) is split into a 16-bit hi + lo pair and multiplied twice, so the
+ * fp32 state keeps ~fp32 accuracy across the block walk; the other phases only feed the 16-bit output.
+ * Every tile is staged zero-padded, so a partial block and a partial Dv tile need no special case.
+ */
+}  // namespace
+template <typename T, int kDv>
+__global__ __launch_bounds__(kLightTcThreads, 1) void lightning_attention_prefill_tc_kernel(const __grid_constant__ LinearAttentionParams p) {
+  constexpr int kLdV = mma::tc_ld(kDv), kLdP = mma::tc_ld(kLightBlock);
+  constexpr int kNtw = kDv / 8, kNt1 = kNtw / 2;
+  static_assert(kNt1 >= 2 && kNt1 % 2 == 0, "the output tile is formed two n8 tiles at a time");
+  extern __shared__ __align__(16) unsigned char light_smem[];
+  const int dk = p.head_dim_k, dv = p.head_dim_v, kLd = mma::tc_ld(dk);
+  T* qs = reinterpret_cast<T*>(light_smem);        // [64][kLd]
+  T* ks = qs + kLightBlock * kLd;                  // [64][kLd]
+  T* vs = ks + kLightBlock * kLd;                  // [64][kLdV]: raw V
+  T* vh = vs + kLightBlock * kLdV;                 // [64][kLdV]: w^(m - 1 - j) V, hi half
+  T* vl = vh + kLightBlock * kLdV;                 // [64][kLdV]: the lo half of the same operand
+  T* ps = vl + kLightBlock * kLdV;                 // [64][kLdP]: P (causal, decayed)
+  T* sb = ps + kLightBlock * kLdP;                 // [dk][kLdV]: the state at the start of the block
+  float* pw = reinterpret_cast<float*>(sb + dk * kLdV);  // [65]
+  const int b = blockIdx.z, h = blockIdx.y, dv0 = blockIdx.x * kDv;
+  const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, gq = lane >> 2, t = lane & 3;
+  const int64_t slot = p.state_indices ? int64_t(p.state_indices[b]) : int64_t(b);
+  if (slot < 0 || slot >= p.num_slots || slot == p.pad_slot_id) return;  // uniform per CTA
+  const int row0 = p.cu_seqlens[b], n = p.cu_seqlens[b + 1] - row0;
+  const bool has_init = p.has_initial_state == nullptr || p.has_initial_state[b];
+  const T* q = static_cast<const T*>(p.q) + int64_t(h) * p.q_head_stride;
+  const T* k = static_cast<const T*>(p.k) + int64_t(h) * p.k_head_stride;
+  const T* v = static_cast<const T*>(p.v) + int64_t(h) * p.v_head_stride + dv0;
+  T* o = static_cast<T*>(p.o) + int64_t(h) * p.o_head_stride;
+  float* pool = p.state_pool + slot * p.state_slot_stride + int64_t(h) * dk * dv;
+  const bool vec_q = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(q) % 16 == 0 && p.q_token_stride % 8 == 0;
+  const bool vec_k = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(k) % 16 == 0 && p.k_token_stride % 8 == 0;
+  const int dvcols = min(kDv, dv - dv0);
+  const int I = wid & 3, half = wid >> 2;
+  const bool owner = wid * 16 < dk;
+
+  float S[kNtw][4] = {};
+  if (owner) {
+#pragma unroll
+    for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int d = 16 * wid + gq + 8 * (e >> 1), c = 8 * nt + 2 * t + (e & 1);
+        S[nt][e] = (has_init && dv0 + c < dv) ? pool[int64_t(d) * dv + dv0 + c] : 0.0f;
+      }
+  }
+  if (tid <= kLightBlock) pw[tid] = __expf(-p.slope[h] * float(tid));
+
+  for (int t0 = 0; t0 < n; t0 += kLightBlock) {
+    const int m = min(kLightBlock, n - t0);
+    __syncthreads();  // the previous block is done with every tile and with sb
+    mma::tc_stage_input<T, kLightTcThreads>(qs, kLd, q, p.q_token_stride, row0 + t0, m, dk, vec_q);
+    mma::tc_stage_input<T, kLightTcThreads>(ks, kLd, k, p.k_token_stride, row0 + t0, m, dk, vec_k);
+    for (int idx = tid; idx < kLightBlock * (kDv / 8); idx += kLightTcThreads) {
+      const int j = idx / (kDv / 8), c = (idx % (kDv / 8)) * 8;
+      const bool row_ok = j < m;
+      const float w = row_ok ? pw[m - 1 - j] : 0.0f;
+      float vv[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        vv[i] = (row_ok && c + i < dvcols) ? to_float(v[int64_t(row0 + t0 + j) * p.v_token_stride + c + i]) : 0.0f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        vs[j * kLdV + c + i] = from_float<T>(vv[i]);
+        const T hi = from_float<T>(w * vv[i]);
+        vh[j * kLdV + c + i] = hi;
+        vl[j * kLdV + c + i] = from_float<T>(w * vv[i] - to_float(hi));
+      }
+    }
+    if (owner) {  // the state entering the block, for the Q S product
+#pragma unroll
+      for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+        for (int e2 = 0; e2 < 2; ++e2)
+          *reinterpret_cast<uint32_t*>(&sb[(16 * wid + gq + 8 * e2) * kLdV + 8 * nt + 2 * t]) =
+              mma::Bits16<T>::pack(S[nt][2 * e2], S[nt][2 * e2 + 1]);
+    }
+    __syncthreads();
+    float qk[4][4] = {}, out[kNt1][4] = {};
+    for (int kk = 0; kk < dk / 16; ++kk) {
+      uint32_t a[4];
+      mma::frag_a(a, qs, kLd, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        uint32_t b[4];
+        mma::frag_b2(b, ks, kLd, 32 * half + 16 * np, 16 * kk);
+        mma::Mma16x8x16<T>::run(qk[2 * np], a, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(qk[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+    // phase 2: O = w^(i + 1) (Q S) over the staged state copy
+    for (int kk = 0; kk < dk / 16; ++kk) {
+      uint32_t a[4];
+      mma::frag_a(a, qs, kLd, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < kNt1 / 2; ++np) {
+        uint32_t b[4];
+        mma::frag_b2_trans(b, sb, kLdV, 16 * kk, 8 * (half * kNt1) + 16 * np);
+        mma::Mma16x8x16<T>::run(out[2 * np], a, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(out[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+    // P: the causal decay mask, stored for the P V product; O: the part from before the block
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+      const int i = 16 * I + gq + 8 * rr;
+      const float wi = pw[i + 1];
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+        const int j = 32 * half + 8 * nt + 2 * t;
+        const float p0 = j <= i ? qk[nt][2 * rr] * pw[i - j] : 0.0f;
+        const float p1 = j + 1 <= i ? qk[nt][2 * rr + 1] * pw[i - j - 1] : 0.0f;
+        *reinterpret_cast<uint32_t*>(&ps[i * kLdP + j]) = mma::Bits16<T>::pack(p0, p1);
+      }
+#pragma unroll
+      for (int nt = 0; nt < kNt1; ++nt) {
+        out[nt][2 * rr] *= wi;
+        out[nt][2 * rr + 1] *= wi;
+      }
+    }
+    __syncthreads();  // P is complete
+    for (int kk = 0; kk < kLightBlock / 16; ++kk) {
+      uint32_t a[4];
+      mma::frag_a(a, ps, kLdP, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < kNt1 / 2; ++np) {
+        uint32_t b[4];
+        mma::frag_b2_trans(b, vs, kLdV, 16 * kk, 8 * (half * kNt1) + 16 * np);
+        mma::Mma16x8x16<T>::run(out[2 * np], a, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(out[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+#pragma unroll
+    for (int rr = 0; rr < 2; ++rr) {
+      const int i = 16 * I + gq + 8 * rr;
+      if (i >= m) continue;
+#pragma unroll
+      for (int nt = 0; nt < kNt1; ++nt) {
+        const int c = dv0 + 8 * (half * kNt1 + nt) + 2 * t;
+        if (c < dv) o[int64_t(row0 + t0 + i) * p.o_token_stride + c] = from_float<T>(out[nt][2 * rr] * p.scale);
+        if (c + 1 < dv)
+          o[int64_t(row0 + t0 + i) * p.o_token_stride + c + 1] = from_float<T>(out[nt][2 * rr + 1] * p.scale);
+      }
+    }
+    // phase 4: the state after the block, S <- w^m S + (w^(m - 1 - j) K)^T V (the decayed operand in hi + lo)
+    if (owner) {
+#pragma unroll
+      for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+        for (int e = 0; e < 4; ++e) S[nt][e] *= pw[m];
+      for (int kk = 0; kk < kLightBlock / 16; ++kk) {
+        uint32_t a[4];
+        mma::frag_a_trans(a, ks, kLd, 16 * wid, 16 * kk);
+#pragma unroll
+        for (int np = 0; np < kNtw / 2; ++np) {
+          uint32_t bh[4], bl[4];
+          mma::frag_b2_trans(bh, vh, kLdV, 16 * kk, 16 * np);
+          mma::frag_b2_trans(bl, vl, kLdV, 16 * kk, 16 * np);
+          mma::Mma16x8x16<T>::run(S[2 * np], a, bh[0], bh[1]);
+          mma::Mma16x8x16<T>::run(S[2 * np + 1], a, bh[2], bh[3]);
+          mma::Mma16x8x16<T>::run(S[2 * np], a, bl[0], bl[1]);
+          mma::Mma16x8x16<T>::run(S[2 * np + 1], a, bl[2], bl[3]);
+        }
+      }
+      const int done = t0 + m;
+      int64_t snapshot_slot = -1;
+      if (p.snapshot_interval > 0 && done % p.snapshot_interval == 0) {
+        const int j = done / p.snapshot_interval - 1;
+        if (j < p.max_snapshots) snapshot_slot = p.snapshot_slots[int64_t(b) * p.max_snapshots + j];
+      }
+      if (snapshot_slot >= 0 && snapshot_slot < p.num_slots) {
+        float* snap = p.state_pool + snapshot_slot * p.state_slot_stride + int64_t(h) * dk * dv;
+#pragma unroll
+        for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+          for (int e = 0; e < 4; ++e) {
+            const int d = 16 * wid + gq + 8 * (e >> 1), c = 8 * nt + 2 * t + (e & 1);
+            if (dv0 + c < dv) snap[int64_t(d) * dv + dv0 + c] = S[nt][e];
+          }
+      }
+    }
+  }
+  __syncthreads();
+  if (owner) {
+#pragma unroll
+    for (int nt = 0; nt < kNtw; ++nt)
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        const int d = 16 * wid + gq + 8 * (e >> 1), c = 8 * nt + 2 * t + (e & 1);
+        if (dv0 + c < dv) pool[int64_t(d) * dv + dv0 + c] = S[nt][e];
+      }
+  }
+}
+namespace {
+
 
 }  // namespace
 
@@ -341,6 +560,32 @@ Status lightning_attention_prefill(const LinearAttentionParams& params, DType dt
   cudaStream_t stream = stream_of(ctx);
   const int dk_pad = (p.head_dim_k + kLightKdChunk - 1) / kLightKdChunk * kLightKdChunk;
   cudaError_t attr = cudaSuccess;
+  // 16-bit q/k/v on SM80+ walk 64-token blocks on mma.sync; the fp32 body stays the reference path
+  // (and the fallback when a shape or the shared-memory budget does not fit the tensor-core body).
+  const bool tc = dtype != DType::kFloat32 && (ctx.arch_id == 0 || ctx.arch_id >= KOPS_TARGET_SM80) &&
+                  p.head_dim_k % 16 == 0 && p.head_dim_k <= 128;
+  if (tc) {
+    const auto go_tc = [&](auto tag, auto tile) {
+      using T = decltype(tag);
+      constexpr int kDv = decltype(tile)::value;
+      const size_t bytes = lightning_tc_smem_bytes(p.head_dim_k, kDv);
+      attr = cudaFuncSetAttribute(lightning_attention_prefill_tc_kernel<T, kDv>,
+                                  cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(bytes));
+      if (attr != cudaSuccess) return;
+      const dim3 grid(static_cast<unsigned>((p.head_dim_v + kDv - 1) / kDv), static_cast<unsigned>(p.num_heads),
+                      static_cast<unsigned>(p.batch_size));
+      lightning_attention_prefill_tc_kernel<T, kDv><<<grid, kLightTcThreads, bytes, stream>>>(p);
+    };
+    if (dtype == DType::kBFloat16) {
+      if (p.head_dim_v > 32) go_tc(__nv_bfloat16{}, std::integral_constant<int, 64>{});
+      else go_tc(__nv_bfloat16{}, std::integral_constant<int, 32>{});
+    } else {
+      if (p.head_dim_v > 32) go_tc(__half{}, std::integral_constant<int, 64>{});
+      else go_tc(__half{}, std::integral_constant<int, 32>{});
+    }
+    if (attr == cudaSuccess) return launch_status(fn);
+    (void)cudaGetLastError();  // the tensor-core tile does not fit: run the fp32 body instead
+  }
   by_dtype(dtype, [&](auto tag) {
     using T = decltype(tag);
     const auto go = [&](auto tile) {

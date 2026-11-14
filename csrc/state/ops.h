@@ -24,7 +24,9 @@ Status selective_state_update(const SSMStateUpdateParams& params, DType dtype,
 Status ssd_workspace_requirements(int32_t max_tokens, int32_t max_batch, int32_t nheads,
                                   int32_t headdim, int32_t dstate, int32_t ngroups,
                                   int32_t chunk_size, WorkspaceRequirements* out);
-/// Mamba-2 chunked prefill: the five SSD kernels; chunk_size in {64, 128, 256}.
+/// Mamba-2 chunked prefill: the five SSD kernels; chunk_size in {64, 128, 256}. bf16 / fp16
+/// activations on SM80+ run the three matmul-heavy steps on mma.sync (fp32 state and workspace
+/// unchanged; cumsum and state passing are the same fp32 kernels); fp32 keeps the scalar bodies.
 Status ssd_chunked_scan(const SSDParams& params, DType dtype, const Workspace& ws,
                         const LaunchContext& ctx);
 
@@ -35,9 +37,12 @@ Status delta_rule_workspace_requirements(int32_t max_tokens, int32_t max_batch,
                                          int32_t num_v_heads, int32_t head_dim_k,
                                          int32_t head_dim_v, int32_t chunk_size,
                                          DecayGranularity decay, WorkspaceRequirements* out);
-/// Chunked prefill (6 launches: cumsum, kkt, solve_tril, w/u, state, output); equal to
-/// delta_rule_decode over every token within the numerical contract. params.math selects the
-/// fp32 or tensor-core bodies (kTensorCore: bf16 inputs, SM80+).
+/// Chunked prefill; equal to delta_rule_decode over every token within the numerical contract.
+/// params.math selects the fp32 or tensor-core bodies (kTensorCore: bf16 inputs, SM80+).
+/// kFp32 runs 6 launches (cumsum, kkt, solve_tril, w/u, state, output); kTensorCore runs 3
+/// (cumsum, fused kkt+solve+w/u, fused state+output, with the state entering each chunk kept in
+/// registers/shared memory) and falls back to the unfused tensor-core kernels when a shape does
+/// not fit the fused shared-memory budget.
 Status delta_rule_prefill(const DeltaRuleParams& params, DType dtype, const Workspace& ws,
                           const LaunchContext& ctx);
 /// Fused recurrent kernel over every token of every sequence (decode, spec verification).
@@ -45,7 +50,9 @@ Status delta_rule_decode(const DeltaRuleParams& params, DType dtype, const Launc
 Status fused_delta_decode(const FusedDeltaDecodeParams& params, DType dtype,
                           const LaunchContext& ctx);
 
-/// L02 decayed linear attention (lightning). Dk, Dv in 1..256.
+/// L02 decayed linear attention (lightning). Dk, Dv in 1..256. bf16 / fp16 prefill on SM80+ runs a
+/// persistent tensor-core body (64-token blocks, the state in registers/shared memory); fp32 and
+/// unsupported shapes use the scalar body.
 Status lightning_attention_prefill(const LinearAttentionParams& params, DType dtype,
                                    const LaunchContext& ctx);
 Status linear_attention_decode(const LinearAttentionParams& params, DType dtype,

@@ -35,9 +35,12 @@ struct alignas(64) CUtensorMap_st { unsigned long long opaque[16]; };
 typedef CUtensorMap_st CUtensorMap;
 
 struct uint2 { unsigned x, y; };
+struct uint3 { unsigned x, y, z; };
 struct uint4 { unsigned x, y, z, w; };
 struct int2 { int x, y; };
 struct int4 { int x, y, z, w; };
 struct float2 { float x, y; };
 struct float4 { float x, y, z, w; };
 struct dim3 { unsigned x = 1, y = 1, z = 1; };
+// Built-in launch coordinates used by device helper headers (never executed here).
+extern uint3 threadIdx, blockIdx, blockDim, gridDim;

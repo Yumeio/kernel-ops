@@ -28,6 +28,7 @@
 #include "csrc/common/tensor.h"
 #include "csrc/common/device.cuh"
 #include "csrc/common/device_impl.cuh"
+#include "csrc/state/state_mma.cuh"
 #include "csrc/state/state_cache_kernels.cuh"
 #include "csrc/state/conv1d_kernels.cuh"
 #include "csrc/state/ssm_kernels.cuh"
@@ -423,6 +424,66 @@ __global__ __launch_bounds__(kSsdThreads) void ssd_bmm_chunk_kernel(const __grid
 }
 namespace {
 
+/** Step 2, tensor cores (bf16 / fp16 activations, SM80+). Same tile pair and grid as the fp32 body: C and B are staged
+ * as 16-bit tiles over slices of 64 N features and multiplied by mma.sync m16n8k16. Warp w owns the 16 rows 16 (w & 3)
+ * and the 32 columns 32 (w >> 2); the fp32 accumulator is written to CB. */
+}  // namespace
+template <typename T>
+__global__ __launch_bounds__(kSsdThreads, 2) void ssd_bmm_chunk_tc_kernel(const __grid_constant__ SSDParams p) {
+  constexpr int kLd = mma::tc_ld(kSsdTile);
+  __shared__ __align__(16) T cs[kSsdTile * kLd], bs[kSsdTile * kLd];
+  const int nt = p.chunk_size / kSsdTile, tiles = nt * (nt + 1) / 2;
+  const int tile = blockIdx.x % tiles, cg = blockIdx.x / tiles;
+  const int chunk = cg / p.ngroups, g = cg % p.ngroups;
+  int ti = 0;
+  while ((ti + 1) * (ti + 2) / 2 <= tile) ++ti;
+  const int tj = tile - ti * (ti + 1) / 2;
+  const int s0 = p.cu_chunk_seqlens[chunk], len = p.cu_chunk_seqlens[chunk + 1] - s0;
+  const int i0 = ti * kSsdTile, j0 = tj * kSsdTile;
+  if (i0 >= len) return;  // uniform per CTA; j0 <= i0
+  const int wid = threadIdx.x >> 5, lane = threadIdx.x & 31, gq = lane >> 2, t = lane & 3;
+  const T* C = static_cast<const T*>(p.C) + int64_t(g) * p.C_group_stride;
+  const T* B = static_cast<const T*>(p.B) + int64_t(g) * p.B_group_stride;
+  const bool vec_c = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(C) % 16 == 0 && p.C_token_stride % 8 == 0;
+  const bool vec_b = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(B) % 16 == 0 && p.B_token_stride % 8 == 0;
+  const int I = wid & 3, half = wid >> 2;
+  float acc[4][4] = {};
+  for (int n0 = 0; n0 < p.dstate; n0 += kSsdTile) {
+    __syncthreads();
+    const int cols = min(kSsdTile, p.dstate - n0);
+    mma::tc_stage_input<T, kSsdThreads>(cs, kLd, C + n0, p.C_token_stride, s0 + i0, len - i0, kSsdTile, vec_c, cols);
+    mma::tc_stage_input<T, kSsdThreads>(bs, kLd, B + n0, p.B_token_stride, s0 + j0, len - j0, kSsdTile, vec_b, cols);
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kSsdTile / 16; ++kk) {
+      uint32_t a[4];
+      mma::frag_a(a, cs, kLd, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        uint32_t b[4];
+        mma::frag_b2(b, bs, kLd, 32 * half + 16 * np, 16 * kk);
+        mma::Mma16x8x16<T>::run(acc[2 * np], a, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(acc[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+  }
+  float* out = p.CB + (int64_t(cg) * p.chunk_size) * p.chunk_size;
+#pragma unroll
+  for (int rr = 0; rr < 2; ++rr) {
+    const int i = i0 + 16 * I + gq + 8 * rr;
+    if (i >= len) continue;
+#pragma unroll
+    for (int ntl = 0; ntl < 4; ++ntl) {
+      const int j = j0 + 32 * half + 8 * ntl + 2 * t;
+      const float v0 = j < len ? acc[ntl][2 * rr] : 0.0f;
+      const float v1 = j + 1 < len ? acc[ntl][2 * rr + 1] : 0.0f;
+      *reinterpret_cast<float2*>(out + int64_t(i) * p.chunk_size + j) = make_float2(v0, v1);
+    }
+  }
+}
+
+namespace {
+
 /** Step 3. Grid NC * H * (P tiles) * (N tiles): a 64 x 64 tile of the P x N chunk state, accumulated over the chunk's tokens in slices
  * of 32 from x'[l, p] = dt'[l] exp(dA_last - dA[l]) x[l, p] and B[l, n]. */
 }  // namespace
@@ -471,6 +532,85 @@ __global__ __launch_bounds__(kSsdThreads) void ssd_chunk_state_kernel(const __gr
 }
 namespace {
 
+/** Step 3, tensor cores (bf16 / fp16 activations, SM80+). Grid and tiles as the fp32 body. x' = dt' exp(dA_last - dA) x
+ * is scaled in fp32 and split into a 16-bit hi/lo pair, so the P x N chunk state keeps fp32-level accuracy through two
+ * mma per product (the state is the input of the fp32 state passing and is compared at fp32 tolerance). Warp w owns the
+ * 16 P rows 16 (w & 3) and the 32 N columns 32 (w >> 2). */
+}  // namespace
+template <typename T>
+__global__ __launch_bounds__(kSsdThreads, 1) void ssd_chunk_state_tc_kernel(const __grid_constant__ SSDParams p) {
+  constexpr int kLd = mma::tc_ld(kSsdTile);
+  __shared__ __align__(16) T xs_hi[kSsdTile * kLd], xs_lo[kSsdTile * kLd], bs[kSsdTile * kLd];
+  const int pt = (p.headdim + kSsdTile - 1) / kSsdTile, nt = (p.dstate + kSsdTile - 1) / kSsdTile, tiles = pt * nt;
+  const int tile = blockIdx.x % tiles, ch = blockIdx.x / tiles;
+  const int chunk = ch / p.nheads, h = ch % p.nheads, g = h / (p.nheads / p.ngroups);
+  const int p0 = (tile / nt) * kSsdTile, n0 = (tile % nt) * kSsdTile;
+  const int s0 = p.cu_chunk_seqlens[chunk], len = p.cu_chunk_seqlens[chunk + 1] - s0;
+  const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, gq = lane >> 2, t = lane & 3;
+  const T* x = static_cast<const T*>(p.x) + int64_t(h) * p.x_head_stride;
+  const T* B = static_cast<const T*>(p.B) + int64_t(g) * p.B_group_stride;
+  const float* dA = p.dA_cumsum + (int64_t(h) * p.num_chunks + chunk) * p.chunk_size;
+  const float* dtv = p.dt_proc + (int64_t(h) * p.num_chunks + chunk) * p.chunk_size;
+  const float dA_last = len > 0 ? dA[len - 1] : 0.0f;
+  const int pcols = p.headdim - p0, ncols = p.dstate - n0;
+  const bool vec_b = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(B) % 16 == 0 && p.B_token_stride % 8 == 0;
+  const int I = wid & 3, half = wid >> 2;
+  float acc[4][4] = {};
+  for (int l0 = 0; l0 < len; l0 += kSsdTile) {
+    __syncthreads();
+    const int rows = min(kSsdTile, len - l0);
+    for (int idx = tid; idx < kSsdTile * (kSsdTile / 8); idx += kSsdThreads) {
+      const int r = idx / (kSsdTile / 8), c = (idx % (kSsdTile / 8)) * 8;
+      const bool row_ok = l0 + r < len;
+      const float w = row_ok ? dtv[l0 + r] * __expf(dA_last - dA[l0 + r]) : 0.0f;
+      float xv[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i)
+        xv[i] = (row_ok && c + i < pcols) ? w * to_float(x[int64_t(s0 + l0 + r) * p.x_token_stride + p0 + c + i]) : 0.0f;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        T hi, lo;
+        mma::st16(hi, xv[i]);
+        mma::st16(lo, xv[i] - mma::ld16(hi));
+        xs_hi[r * kLd + c + i] = hi;
+        xs_lo[r * kLd + c + i] = lo;
+      }
+    }
+    mma::tc_stage_input<T, kSsdThreads>(bs, kLd, B + n0, p.B_token_stride, s0 + l0, rows, kSsdTile, vec_b, ncols);
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kSsdTile / 16; ++kk) {
+      uint32_t ahi[4], alo[4];
+      mma::frag_a_trans(ahi, xs_hi, kLd, 16 * I, 16 * kk);
+      mma::frag_a_trans(alo, xs_lo, kLd, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        uint32_t b[4];
+        mma::frag_b2_trans(b, bs, kLd, 16 * kk, 32 * half + 16 * np);
+        mma::Mma16x8x16<T>::run(acc[2 * np], ahi, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(acc[2 * np + 1], ahi, b[2], b[3]);
+        mma::Mma16x8x16<T>::run(acc[2 * np], alo, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(acc[2 * np + 1], alo, b[2], b[3]);
+      }
+    }
+  }
+  float* out = p.chunk_states + ((int64_t(chunk) * p.nheads + h) * p.headdim) * p.dstate;
+#pragma unroll
+  for (int rr = 0; rr < 2; ++rr) {
+    const int pp = p0 + 16 * I + gq + 8 * rr;
+    if (pp >= p.headdim) continue;
+    float* row = out + int64_t(pp) * p.dstate;
+#pragma unroll
+    for (int ntl = 0; ntl < 4; ++ntl) {
+      const int n = n0 + 32 * half + 8 * ntl + 2 * t;
+      if (n < p.dstate) row[n] = acc[ntl][2 * rr];
+      if (n + 1 < p.dstate) row[n + 1] = acc[ntl][2 * rr + 1];
+    }
+  }
+}
+
+namespace {
+
 /** Step 4. Grid (ceil(H P N / 256), B): a thread owns one element (h, p, n) of the state of one sequence and walks the sequence's
  * chunks in order, s <- exp(dA_last) s + states[c], writing the state entering each chunk. The state starts from the slot (zero without
  * has_initial_state or with an invalid slot), goes back to the slot after the last chunk and, at multiples of the snapshot
@@ -503,6 +643,131 @@ __global__ __launch_bounds__(kSsdThreads) void ssd_state_passing_kernel(const __
   }
   if (live) p.ssm_states[slot * p.ssm_state_slot_stride + e] = s;
 }
+namespace {
+
+/** Step 5, tensor cores (bf16 / fp16 activations, SM80+). Grid and tiles as the fp32 body. The part from before the chunk
+ * is C . passed^T over the N features in slices of 64 (passed is fp32 workspace, staged as 16-bit); the part inside the
+ * chunk is M x with M[l, s] = CB[l, s] exp(dA[l] - dA[s]) dt'[s] (s <= l) staged as a 16-bit tile and x staged 16-bit
+ * [token][P]. Both accumulate the same fp32 registers; warp w owns the 16 rows 16 (w & 3) and 32 columns 32 (w >> 2). */
+}  // namespace
+template <typename T>
+__global__ __launch_bounds__(kSsdThreads, 1) void ssd_chunk_scan_tc_kernel(const __grid_constant__ SSDParams p) {
+  constexpr int kLd = mma::tc_ld(kSsdTile);
+  __shared__ __align__(16) T as[kSsdTile * kLd], bs[kSsdTile * kLd];
+  const int lt = p.chunk_size / kSsdTile, pt = (p.headdim + kSsdTile - 1) / kSsdTile, tiles = lt * pt;
+  const int tile = blockIdx.x % tiles, ch = blockIdx.x / tiles;
+  const int chunk = ch / p.nheads, h = ch % p.nheads, g = h / (p.nheads / p.ngroups);
+  const int l0 = (tile / pt) * kSsdTile, p0 = (tile % pt) * kSsdTile;
+  const int s0 = p.cu_chunk_seqlens[chunk], len = p.cu_chunk_seqlens[chunk + 1] - s0;
+  if (l0 >= len) return;  // uniform per CTA
+  const int tid = threadIdx.x, wid = tid >> 5, lane = tid & 31, gq = lane >> 2, t = lane & 3;
+  const T* x = static_cast<const T*>(p.x) + int64_t(h) * p.x_head_stride;
+  const T* C = static_cast<const T*>(p.C) + int64_t(g) * p.C_group_stride;
+  const float* dA = p.dA_cumsum + (int64_t(h) * p.num_chunks + chunk) * p.chunk_size;
+  const float* dtv = p.dt_proc + (int64_t(h) * p.num_chunks + chunk) * p.chunk_size;
+  const float* passed = p.passed_states + (int64_t(chunk) * p.nheads + h) * p.headdim * p.dstate;
+  const float* CB = p.CB + (int64_t(chunk) * p.ngroups + g) * p.chunk_size * p.chunk_size;
+  const int pcols = min(kSsdTile, p.headdim - p0), rows_l = len - l0;
+  const bool vec_c = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(C) % 16 == 0 && p.C_token_stride % 8 == 0;
+  const bool vec_x = sizeof(T) == 2 && reinterpret_cast<uintptr_t>(x) % 16 == 0 && p.x_token_stride % 8 == 0;
+  const bool vec_p = p.dstate % 4 == 0 && reinterpret_cast<uintptr_t>(passed) % 16 == 0;
+  const int I = wid & 3, half = wid >> 2;
+  float acc[4][4] = {};
+  for (int n0 = 0; n0 < p.dstate; n0 += kSsdTile) {  // from before the chunk
+    __syncthreads();
+    const int cols = min(kSsdTile, p.dstate - n0);
+    mma::tc_stage_input<T, kSsdThreads>(as, kLd, C + n0, p.C_token_stride, s0 + l0, rows_l, kSsdTile, vec_c, cols);
+    mma::tc_stage_f32<T, kSsdThreads>(bs, kLd, passed + int64_t(p0) * p.dstate + n0, p.dstate, pcols, kSsdTile,
+                                      kSsdTile, cols, vec_p);
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kSsdTile / 16; ++kk) {
+      uint32_t a[4];
+      mma::frag_a(a, as, kLd, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        uint32_t b[4];
+        mma::frag_b2(b, bs, kLd, 32 * half + 16 * np, 16 * kk);
+        mma::Mma16x8x16<T>::run(acc[2 * np], a, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(acc[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+  }
+#pragma unroll
+  for (int rr = 0; rr < 2; ++rr) {
+    const int l = l0 + 16 * I + gq + 8 * rr;
+    const float w = l < len ? __expf(dA[l]) : 0.0f;
+#pragma unroll
+    for (int ntl = 0; ntl < 4; ++ntl) {
+      acc[ntl][2 * rr] *= w;
+      acc[ntl][2 * rr + 1] *= w;
+    }
+  }
+  const int s_end = min(len, l0 + kSsdTile);
+  for (int sb = 0; sb < s_end; sb += kSsdTile) {  // inside the chunk
+    __syncthreads();
+    for (int idx = tid; idx < kSsdTile * (kSsdTile / 8); idx += kSsdThreads) {
+      const int r = idx / (kSsdTile / 8), c = (idx % (kSsdTile / 8)) * 8;
+      const int l = l0 + r;
+      float mv[8];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int s = sb + c + i;
+        mv[i] = (l < len && s <= l) ? CB[int64_t(l) * p.chunk_size + s] * __expf(dA[l] - dA[s]) * dtv[s] : 0.0f;
+      }
+      uint4 out;
+      out.x = mma::Bits16<T>::pack(mv[0], mv[1]);
+      out.y = mma::Bits16<T>::pack(mv[2], mv[3]);
+      out.z = mma::Bits16<T>::pack(mv[4], mv[5]);
+      out.w = mma::Bits16<T>::pack(mv[6], mv[7]);
+      *reinterpret_cast<uint4*>(as + r * kLd + c) = out;
+    }
+    mma::tc_stage_input<T, kSsdThreads>(bs, kLd, x + p0, p.x_token_stride, s0 + sb, min(kSsdTile, len - sb), kSsdTile,
+                                        vec_x, pcols);
+    __syncthreads();
+#pragma unroll
+    for (int kk = 0; kk < kSsdTile / 16; ++kk) {
+      uint32_t a[4];
+      mma::frag_a(a, as, kLd, 16 * I, 16 * kk);
+#pragma unroll
+      for (int np = 0; np < 2; ++np) {
+        uint32_t b[4];
+        mma::frag_b2_trans(b, bs, kLd, 16 * kk, 32 * half + 16 * np);
+        mma::Mma16x8x16<T>::run(acc[2 * np], a, b[0], b[1]);
+        mma::Mma16x8x16<T>::run(acc[2 * np + 1], a, b[2], b[3]);
+      }
+    }
+  }
+  const T* z = static_cast<const T*>(p.z);
+  T* out = static_cast<T*>(p.out);
+#pragma unroll
+  for (int rr = 0; rr < 2; ++rr) {
+    const int l = l0 + 16 * I + gq + 8 * rr;
+    if (l >= len) continue;
+    const int64_t tok = int64_t(s0 + l);
+#pragma unroll
+    for (int ntl = 0; ntl < 4; ++ntl) {
+      const int pp = p0 + 32 * half + 8 * ntl + 2 * t;
+      if (pp >= p.headdim) continue;
+      float y0 = acc[ntl][2 * rr], y1 = acc[ntl][2 * rr + 1];
+      if (p.D) {
+        y0 = __fmaf_rn(p.D[int64_t(h) * p.D_head_stride + int64_t(pp) * p.D_p_stride],
+                       to_float(x[tok * p.x_token_stride + pp]), y0);
+        if (pp + 1 < p.headdim)
+          y1 = __fmaf_rn(p.D[int64_t(h) * p.D_head_stride + int64_t(pp + 1) * p.D_p_stride],
+                         to_float(x[tok * p.x_token_stride + pp + 1]), y1);
+      }
+      if (z) {
+        y0 *= silu_f(to_float(z[tok * p.z_token_stride + int64_t(h) * p.z_head_stride + pp]));
+        if (pp + 1 < p.headdim)
+          y1 *= silu_f(to_float(z[tok * p.z_token_stride + int64_t(h) * p.z_head_stride + pp + 1]));
+      }
+      out[tok * p.out_token_stride + int64_t(h) * p.out_head_stride + pp] = from_float<T>(y0);
+      if (pp + 1 < p.headdim) out[tok * p.out_token_stride + int64_t(h) * p.out_head_stride + pp + 1] = from_float<T>(y1);
+    }
+  }
+}
+
 namespace {
 
 /** Step 5. Grid NC * H * (L / 64) * (P tiles): a 64 x 64 tile of y for rows l0.. of a chunk. First the part from before the chunk,
@@ -646,6 +911,27 @@ void launch_scan_impl(const SelectiveScanParams& p, cudaStream_t stream) {
 }
 
 constexpr int64_t align256(int64_t bytes) { return (bytes + 255) / 256 * 256; }
+
+/// The five SSD steps. kTc selects the mma.sync bodies of the three matmul-heavy steps (bf16 / fp16
+/// activations on SM80+); cumsum and state passing are the same fp32 kernels in both paths.
+template <typename T, bool kTc>
+void launch_ssd(const SSDParams& p, cudaStream_t stream, unsigned g_cumsum, unsigned g_bmm, unsigned g_state,
+                dim3 g_pass, unsigned g_scan) {
+  ssd_chunk_cumsum_kernel<T><<<g_cumsum, kSsdThreads, 0, stream>>>(p);
+  if constexpr (kTc) {
+    ssd_bmm_chunk_tc_kernel<T><<<g_bmm, kSsdThreads, 0, stream>>>(p);
+    ssd_chunk_state_tc_kernel<T><<<g_state, kSsdThreads, 0, stream>>>(p);
+  } else {
+    ssd_bmm_chunk_kernel<T><<<g_bmm, kSsdThreads, 0, stream>>>(p);
+    ssd_chunk_state_kernel<T><<<g_state, kSsdThreads, 0, stream>>>(p);
+  }
+  ssd_state_passing_kernel<<<g_pass, kSsdThreads, 0, stream>>>(p);
+  if constexpr (kTc) {
+    ssd_chunk_scan_tc_kernel<T><<<g_scan, kSsdThreads, 0, stream>>>(p);
+  } else {
+    ssd_chunk_scan_kernel<T><<<g_scan, kSsdThreads, 0, stream>>>(p);
+  }
+}
 
 struct SsdLayout {
   int64_t dt, dA, CB, states, passed, total;  // byte offsets into the workspace
@@ -813,14 +1099,16 @@ Status ssd_chunked_scan(const SSDParams& params, DType dtype, const Workspace& w
   const int64_t per_seq = int64_t(p.nheads) * p.headdim * p.dstate;
   const dim3 g_pass(static_cast<unsigned>((per_seq + kSsdThreads - 1) / kSsdThreads), static_cast<unsigned>(p.batch_size));
   const unsigned g_scan = static_cast<unsigned>(int64_t(p.num_chunks) * p.nheads * nt * ((p.headdim + kSsdTile - 1) / kSsdTile));
-  by_dtype(dtype, [&](auto tag) {
-    using T = decltype(tag);
-    ssd_chunk_cumsum_kernel<T><<<g_cumsum, kSsdThreads, 0, stream>>>(p);
-    ssd_bmm_chunk_kernel<T><<<g_bmm, kSsdThreads, 0, stream>>>(p);
-    ssd_chunk_state_kernel<T><<<g_state, kSsdThreads, 0, stream>>>(p);
-    ssd_state_passing_kernel<<<g_pass, kSsdThreads, 0, stream>>>(p);
-    ssd_chunk_scan_kernel<T><<<g_scan, kSsdThreads, 0, stream>>>(p);
-  });
+  // 16-bit activations on SM80+: the three matmul steps run on mma.sync (fp32 state and workspace
+  // unchanged); fp32 keeps the scalar bodies.
+  const bool tc = dtype != DType::kFloat32 && (ctx.arch_id == 0 || ctx.arch_id >= KOPS_TARGET_SM80);
+  if (tc && dtype == DType::kBFloat16) {
+    launch_ssd<__nv_bfloat16, true>(p, stream, g_cumsum, g_bmm, g_state, g_pass, g_scan);
+  } else if (tc) {
+    launch_ssd<__half, true>(p, stream, g_cumsum, g_bmm, g_state, g_pass, g_scan);
+  } else {
+    launch_ssd<float, false>(p, stream, g_cumsum, g_bmm, g_state, g_pass, g_scan);
+  }
   return launch_status(fn);
 }
 

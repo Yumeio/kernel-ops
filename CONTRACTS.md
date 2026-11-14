@@ -333,8 +333,12 @@ remain the ABI and shape authority.
   **Intermediate states** (speculative decoding): `intermediate_state_slots[b, i]` receives the
   state after token i (conv update, SSM update, recurrent delta rule); B10's
   `state_commit_accepted` picks one.
-- **Numerics.** States are fp32; every product is an fp32 FMA in a fixed order that does not
-  depend on the batch, so a sequence's result is independent of the others. Gates use the fast
+- **Numerics.** States are fp32; in the scalar bodies every product is an fp32 FMA in a fixed
+  order that does not depend on the batch, so a sequence's result is independent of the others.
+  The 16-bit tensor-core bodies (SSD bmm / chunk state / scan, lightning prefill, chunked delta
+  rule) use mma.sync m16n8k16 with fp32 accumulation; the SSD chunk state and the lightning state
+  update multiply a 16-bit hi + lo split of the decayed operand, so the fp32 state keeps
+  fp32-level accuracy. The fp32 bodies are unchanged and stay the reference path. Gates use the fast
   exponential (`dev::sigmoid_f`, `softplus_f`: torch threshold 20). Every decay factor is the exp
   of a difference of cumulative sums with the later position first (<= 0): nothing overflows,
   KDA pairs are formed per channel. Conv histories are raw storage bits. Lightning, selective scan
@@ -349,11 +353,15 @@ remain the ABI and shape authority.
   input dtype at the same boundaries as the unfused chain (Kimi Linear: sigmoid gate, eps 1e-5).
   Projections (q/k/v, f_a/f_b, b, g_a/g_b, o_proj) stay outside.
 - **Chunked delta rule.** 64-token chunks from each sequence start; `h` row of a chunk =
-  `(first token >> 6) + b`. `ChunkMath::kFp32` (default) or `kTensorCore` (bf16 mma.sync for
-  kkt, w/u, state, output; cumsum and `solve_tril` stay fp32; bf16 inputs only, SM80+); the
-  tensor-core result differs from the fp32 one by the bf16 rounding of the operands (~4e-3 of
-  the oracle). `delta_rule_prefill` always runs the chunked pipeline; the recurrent kernel is
-  `delta_rule_decode`.
+  `(first token >> 6) + b`. `ChunkMath::kFp32` (default) or `kTensorCore` (bf16 mma.sync; bf16
+  inputs only, SM80+); the tensor-core result differs from the fp32 one by the bf16 rounding of
+  the operands (~4e-3 of the oracle). kFp32 runs six launches (cumsum, kkt, solve_tril, w/u,
+  state, output); the tensor-core path runs three: cumsum, a fused kkt + solve_tril + w/u kernel
+  (the 64 x 64 matrix stays in shared memory) and a fused state + output kernel that keeps the
+  state entering each chunk in registers/shared memory instead of writing h to the workspace. A
+  shape whose shared memory does not fit the fused kernels falls back to the unfused
+  tensor-core kernels. `delta_rule_prefill` always runs the chunked pipeline; the recurrent
+  kernel is `delta_rule_decode`.
 - **Compiled cells.** conv1d width 2..4, x fp32/fp16/bf16 with weights in x's dtype or fp32,
   SiLU / Identity. SSM update dstate 8..256 (powers of two); selective scan dstate 8/16/32
   (`dim / ngroups` a multiple of 16, 8 for dstate 32); SSD chunk 64/128/256, P and N 1..256.

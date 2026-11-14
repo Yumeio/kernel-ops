@@ -1299,6 +1299,15 @@ void test_linear_attention(LaunchContext& ctx, int dk, int dv, bool prefill) {
   }
   compare_out(got, want, prefill ? "lightning out" : "linear decode out");
   kops_test::compare(got_st, want_st, 1e-5, 2e-4, prefill ? "lightning state" : "linear decode state");
+  if (prefill && std::is_same<T, __nv_bfloat16>::value) {  // graph replay of the persistent body is bitwise
+    kops_test::copy_in(st, st0);
+    kops_test::copy_in(o, std::vector<T>(v.size(), to_t<T>(7.0)));
+    KOPS_TEST_CHECK(capture_replay(ctx, [&](const LaunchContext& g) {
+      return kops::state::lightning_attention_prefill(p, dtype_of<T>(), g);
+    }));
+    KOPS_TEST_CHECK(count_bit_diffs(kops_test::copy_out(o, v.size()), got) == 0);
+    KOPS_TEST_CHECK(count_bit_diffs(kops_test::copy_out(st, st0.size()), got_st) == 0);
+  }
 }
 
 // ---- B9 rows 3 and 7: gated delta rule ----------------------------------------------------------
