@@ -38,6 +38,11 @@ using namespace kops_bench;
 using kops::DType;
 using kops::Status;
 
+/// --breakdown (bench_mla only): for split cases also time the decode launch and the merge alone,
+/// so a regression can be attributed to the scan or the combine. The reported case stays the whole
+/// op (decode + merge), exactly like the JSON columns.
+bool g_mla_breakdown = false;
+
 constexpr int64_t kNope = 512;
 constexpr int64_t kPe = 64;
 constexpr int64_t kRow = kNope + kPe;
@@ -79,6 +84,17 @@ const std::vector<MlaBench>& mla_benches() {
       {"mla_decode.bf16.kv256k.q1.s32", 1, 128, 1 << 18, 1, 16, 32, false},
       {"mla_decode.bf16.kv1m.q1.s16", 1, 128, 1 << 20, 1, 16, 16, false},
       {"mla_decode.bf16.kv1m.q1.s32", 1, 128, 1 << 20, 1, 16, 32, false},
+      // MTP q_len 4 sweep (the auto case is one entry above): the four query rows share the latent
+      // scan, so the per-split grid is 4x wider and the best split count differs from q_len 1.
+      {"mla_decode.bf16.kv64k.q4.s8", 1, 128, 1 << 16, 4, 16, 8, false},
+      {"mla_decode.bf16.kv64k.q4.s16", 1, 128, 1 << 16, 4, 16, 16, false},
+      {"mla_decode.bf16.kv64k.q4.s32", 1, 128, 1 << 16, 4, 16, 32, false},
+      {"mla_decode.bf16.kv256k.q4.s8", 1, 128, 1 << 18, 4, 16, 8, false},
+      {"mla_decode.bf16.kv256k.q4.s16", 1, 128, 1 << 18, 4, 16, 16, false},
+      {"mla_decode.bf16.kv256k.q4.s32", 1, 128, 1 << 18, 4, 16, 32, false},
+      {"mla_decode.bf16.kv1m.q4.s4", 1, 128, 1 << 20, 4, 16, 4, false},
+      {"mla_decode.bf16.kv1m.q4.s16", 1, 128, 1 << 20, 4, 16, 16, false},
+      {"mla_decode.bf16.kv1m.q4.s32", 1, 128, 1 << 20, 4, 16, 32, false},
       {"mla_decode.fp8.kv64k.q1.s16", 1, 128, 1 << 16, 1, 16, 16, true},
       {"mla_decode.fp8.kv64k.q1.s32", 1, 128, 1 << 16, 1, 16, 32, true},
       {"mla_decode.fp8.kv64k.q1.s64", 1, 128, 1 << 16, 1, 16, 64, true},
@@ -326,14 +342,26 @@ bool run_mla_decode(const Case& c, const kops::LaunchContext& ctx, Stats* st) {
   }();
   const kops::attn::SplitKVBuffers merge_split{p.split.o_partial, p.split.lse_partial,
                                                p.split.merge_indptr, S};
+  const bool auto_split = b->splits == 0;
+  std::fprintf(stderr, "[bench] %s: S=%d%s\n", c.id.c_str(), S, auto_split ? " (auto)" : "");
+  auto decode = [&]() { return kops::attn::mla_decode_run(plan, p, ws, ctx); };
+  auto merge = [&]() {
+    return kops::attn::merge_split_kv(t_o, t_lse, merge_split, kops::Tensor{}, ctx);
+  };
   auto call = [&]() {
-    kops::Status st = kops::attn::mla_decode_run(plan, p, ws, ctx);
-    if (st == kops::Status::kSuccess && S > 1) {
-      st = kops::attn::merge_split_kv(t_o, t_lse, merge_split, kops::Tensor{}, ctx);
-    }
+    kops::Status st = decode();
+    if (st == kops::Status::kSuccess && S > 1) st = merge();
     return st;
   };
   ok = status_ok(call(), c.id.c_str());
+  if (ok && g_mla_breakdown && S > 1) {
+    Stats ds{};
+    Stats ms{};
+    if (measure(c, [&] { (void)decode(); }, &ds) && measure(c, [&] { (void)merge(); }, &ms)) {
+      std::fprintf(stderr, "[bench] %s: S=%d decode %.4f ms, merge %.4f ms, sum %.4f ms\n",
+                   c.id.c_str(), S, ds.median_ms, ms.median_ms, ds.median_ms + ms.median_ms);
+    }
+  }
   if (ok) ok = measure(c, [&] { (void)call(); }, st);
   for (void* ptr : {static_cast<void*>(qn), static_cast<void*>(qp), static_cast<void*>(o),
                     static_cast<void*>(lse), static_cast<void*>(opart),
@@ -410,6 +438,9 @@ std::vector<Case> make_cases() {
 
 int main(int argc, char** argv) {
   using namespace kops_bench;
+  for (int i = 1; i < argc; ++i) {
+    if (std::strcmp(argv[i], "--breakdown") == 0) g_mla_breakdown = true;
+  }
   const Options opt = parse_options(argc, argv);
   if (!cuda_ok(cudaSetDevice(0), "cudaSetDevice")) return 1;
   DeviceInfo dev{};

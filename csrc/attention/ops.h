@@ -84,11 +84,17 @@ Status mla_decode_run(const AttentionPlan& plan, const MLADecodeParams& params,
 /// request plus the sizes of the three partial buffers mla_decode_run() then consumes.
 ///
 /// The count scales the natural grid — q_len * ceil(H / 16) CTAs per request, one per 16-head
-/// tile — to `waves` full waves of ctx (occupancy.h), capped by max_splits and by at least 512
-/// visible keys per split. `kv_len` is a host-known length bound (a capacity, the benchmark's
-/// fixed context length, a max over the batch the caller already computed); the function never
-/// reads seq_lens, num_splits or any other device array, so it stays valid across CUDA-graph
-/// capture and replay. splits == 1 means the plan needs no partial buffers at all.
+/// tile — to the `waves * ctx.compute_units` CTA budget (occupancy.h). It is the largest count
+/// whose grid still fits that budget, not the closest rounding up: this body runs two CTAs per SM
+/// (128 threads, 92 KiB smem), so waves = 2 is exactly one resident grid, and a count one step
+/// above it adds a partial second residency whose tail runs at a fraction of the bandwidth
+/// (measured 1.3-1.4x slower for one extra split at 1M tokens). max_splits and at least 512
+/// visible keys per split bound it from above.
+///
+/// `kv_len` is a host-known length bound (a capacity, the benchmark's fixed context length, a max
+/// over the batch the caller already computed); the function never reads seq_lens, num_splits or
+/// any other device array, so it stays valid across CUDA-graph capture and replay. splits == 1
+/// means the plan needs no partial buffers at all.
 ///
 /// The caller owns the buffers and fills num_splits[b] = b * splits and
 /// merge_indptr[row] = row * splits (FlashMLA cumulative convention) before mla_decode_run;

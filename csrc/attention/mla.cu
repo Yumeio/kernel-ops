@@ -1541,9 +1541,15 @@ Status mla_decode_run(const AttentionPlan& plan, const MLADecodeParams& params,
 // the context is long. Splitting the key range S ways multiplies the grid by S and divides each
 // CTA's scan by S; the partials are merged by merge_split_kv (sink folded exactly once there).
 //
-// 512 keys per split is the floor: below it a CTA spends more time on its Q tile (16 x 576) and
-// the fp32 partial row (16 x 512) than on the keys it adds, and the merge traffic (S * H * 512
-// fp32 per query row) dominates. `kv_len` is host data; no device array is read.
+// Two bounds decide S, in this order:
+//   1. grid quantization: one resident grid is 2 * compute_units CTAs (the body is 128 threads
+//      and 92 KiB of dynamic smem, so two CTAs fit per SM). S = floor((waves * compute_units) /
+//      base) keeps the grid inside that budget; rounding up instead adds a partial extra
+//      residency whose few tail CTAs run at a fraction of the memory bandwidth.
+//   2. at least 512 visible keys per split: below it a CTA spends more time on its Q tile
+//      (16 x 576) and the fp32 partial row (16 x 512) than on the keys it adds, and the merge
+//      traffic (S * H * 512 fp32 per query row) dominates.
+// `kv_len` is host data; no device array is read.
 // -----------------------------------------------------------------------------
 namespace {
 
@@ -1587,12 +1593,24 @@ Status mla_decode_split_hint(int32_t batch_size, int32_t q_len, int32_t num_head
 
   const int32_t head_tiles = (num_heads + kMlaDecodeHeads - 1) / kMlaDecodeHeads;
   const int32_t base_ctas = head_tiles * q_len;
-  out->splits = occupancy_split_count(base_ctas, kv_len, kMlaSplitMinKeys, waves, max_splits, ctx);
-  if (out->splits <= 1) {
+  int32_t splits = occupancy_split_count(base_ctas, kv_len, kMlaSplitMinKeys, waves, max_splits, ctx);
+  // Grid quantization: this body runs two CTAs per SM (92 KiB smem, 128 threads), so
+  // `waves * compute_units` CTAs is exactly one resident grid and a split count one step above it
+  // adds a partial second residency. That tail costs ~1/3 of the runtime because every CTA owns
+  // the same key range and the last few run at a fraction of the bandwidth (H100, q_len 4, 1M
+  // tokens: S=9 -> 15.7 ms vs S=8 -> 11.7 ms; 256k q4: 3.9 vs 2.7 ms). Reduce the count until the
+  // grid fits the budget; the per-split key floor above already bounds it from below.
+  if (splits > 1) {
+    const int64_t budget = occupancy_target_ctas(waves, ctx);
+    const int64_t fit = budget / base_ctas;
+    if (fit < splits) splits = fit >= 1 ? static_cast<int32_t>(fit) : 1;
+  }
+  if (splits <= 1) {
     out->splits = 1;
     return Status::kSuccess;
   }
-  const int64_t partial_rows = total_q * out->splits;
+  out->splits = splits;
+  const int64_t partial_rows = total_q * splits;
   out->o_partial_bytes = static_cast<size_t>(partial_rows) * num_heads * kMlaNope * sizeof(float);
   out->lse_partial_bytes = static_cast<size_t>(partial_rows) * num_heads * sizeof(float);
   out->merge_indptr_bytes = static_cast<size_t>(total_q + 1) * sizeof(int32_t);

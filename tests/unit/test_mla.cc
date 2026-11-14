@@ -833,6 +833,21 @@ void test_split_hint() {
   KOPS_TEST_CHECK(fallback.splits > 1);
   KOPS_TEST_CHECK(fallback.splits <= (1 << 20) / 512);
 
+  // Grid quantization: the decode body runs two CTAs per SM, so the split grid must not exceed
+  // `waves * compute_units` (one resident grid at waves = 2). q_len 4 is 32 base CTAs, where the
+  // ceiling and the floor of the budget used to disagree (9 vs 8); the tail residency cost 1.3x.
+  kops::attn::MLASplitHint q4{};
+  KOPS_EXPECT_OK(kops::attn::mla_decode_split_hint(1, 4, 128, 1 << 20, 64, 2, ctx, &q4),
+                 "split hint q4 1M");
+  KOPS_TEST_CHECK(q4.splits == (2 * units) / 32);
+  KOPS_TEST_CHECK(static_cast<int64_t>(q4.splits) * 32 <= 2 * units);
+  KOPS_TEST_CHECK(q4.splits > 1);
+  kops::attn::MLASplitHint q8h{};
+  KOPS_EXPECT_OK(kops::attn::mla_decode_split_hint(1, 8, 128, 1 << 20, 64, 2, ctx, &q8h),
+                 "split hint q8 1M");
+  KOPS_TEST_CHECK(q8h.splits == (2 * units) / 64);
+  KOPS_TEST_CHECK(static_cast<int64_t>(q8h.splits) * 64 <= 2 * units);
+
   // Monotone in the visible length and inverse in the head-tile count.
   kops::attn::MLASplitHint short_kv{};
   KOPS_EXPECT_OK(kops::attn::mla_decode_split_hint(1, 1, 128, 256, 64, 2, ctx, &short_kv),
@@ -843,6 +858,12 @@ void test_split_hint() {
                  "split hint q8");
   KOPS_TEST_CHECK(q8.splits <= h.splits);
   KOPS_TEST_CHECK(q8.total_q == 8);
+  // The visible-key floor still wins over the grid budget when it is the tighter bound: 4 Ki
+  // keys allow 8 splits per query row, well below the 33 the budget would allow.
+  kops::attn::MLASplitHint kv4k{};
+  KOPS_EXPECT_OK(kops::attn::mla_decode_split_hint(1, 1, 128, 4096, 64, 2, ctx, &kv4k),
+                 "split hint 4k");
+  KOPS_TEST_CHECK(kv4k.splits == 4096 / 512);
 
   // Contract: the cap, the shape and the required arguments.
   KOPS_EXPECT_STATUS(kops::attn::mla_decode_split_hint(1, 1, 128, 4096, 1, 2, ctx, &h),
