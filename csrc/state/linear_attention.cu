@@ -564,6 +564,9 @@ Status lightning_attention_prefill(const LinearAttentionParams& params, DType dt
   // (and the fallback when a shape or the shared-memory budget does not fit the tensor-core body).
   const bool tc = dtype != DType::kFloat32 && (ctx.arch_id == 0 || ctx.arch_id >= KOPS_TARGET_SM80) &&
                   p.head_dim_k % 16 == 0 && p.head_dim_k <= 128;
+  // Dynamic shared-memory budget of the tensor-core body for this exact architecture: SM90+ opts
+  // in to 160 KiB per block, SM80..SM89 keeps the 99 KiB envelope.
+  const size_t tc_budget = (ctx.arch_id == 0 || ctx.arch_id >= KOPS_TARGET_SM90A) ? size_t(160) * 1024 : size_t(99) * 1024;
   if (tc) {
     const auto go_tc = [&](auto tag, auto tile) {
       using T = decltype(tag);
@@ -576,11 +579,17 @@ Status lightning_attention_prefill(const LinearAttentionParams& params, DType dt
                       static_cast<unsigned>(p.batch_size));
       lightning_attention_prefill_tc_kernel<T, kDv><<<grid, kLightTcThreads, bytes, stream>>>(p);
     };
+    // Dv tile ladder: 128 halves the q/k staging and the duplicated q k^T of a second column tile,
+    // 64/32 cover the smaller budgets and head widths.
+    const bool wide128 = p.head_dim_v > 64 && lightning_tc_smem_bytes(p.head_dim_k, 128) <= tc_budget;
+    const bool wide64 = p.head_dim_v > 32 && lightning_tc_smem_bytes(p.head_dim_k, 64) <= tc_budget;
     if (dtype == DType::kBFloat16) {
-      if (p.head_dim_v > 32) go_tc(__nv_bfloat16{}, std::integral_constant<int, 64>{});
+      if (wide128) go_tc(__nv_bfloat16{}, std::integral_constant<int, 128>{});
+      else if (wide64) go_tc(__nv_bfloat16{}, std::integral_constant<int, 64>{});
       else go_tc(__nv_bfloat16{}, std::integral_constant<int, 32>{});
     } else {
-      if (p.head_dim_v > 32) go_tc(__half{}, std::integral_constant<int, 64>{});
+      if (wide128) go_tc(__half{}, std::integral_constant<int, 128>{});
+      else if (wide64) go_tc(__half{}, std::integral_constant<int, 64>{});
       else go_tc(__half{}, std::integral_constant<int, 32>{});
     }
     if (attr == cudaSuccess) return launch_status(fn);

@@ -1629,7 +1629,7 @@ __global__ __launch_bounds__(kDrThreads, 2) void chunk_output_fwd_tc_kda_kernel(
  * kkt step, or the KDA fp32 slices, or the W/U tiles ts + bs), the strictly lower A tile, the inverse,
  * the 64-thread substitution scratch and the per-row scalars.
  */
-template <typename T, int kDk, bool kPer>
+template <typename T, int kDk, bool kPer, bool kWu = true>
 __host__ __device__ constexpr size_t kkt_solve_wu_smem_bytes() {
   constexpr int kSl = kDk >= 32 ? 32 : 16;
   constexpr size_t kStg = 2 * size_t(kDrChunk) * kTcLd64 * sizeof(T);
@@ -1724,7 +1724,7 @@ __device__ __forceinline__ void dr_solve_tril_smem(float* L, float* T, int ld, f
  * (W) and v rows (U) of the same chunk, so A and its inverse never leave the CTA. The inverse is also
  * written to p.A (the workspace contract) and W/U to p.w / p.u, which the state kernel reads.
  */
-template <typename T, int kDk, bool kPer>
+template <typename T, int kDk, bool kPer, bool kWu>
 __global__ __launch_bounds__(kDrThreads, 2) void chunk_kkt_solve_wu_tc_kernel(const __grid_constant__ DeltaRuleParams p) {
   constexpr int kLdK = tc_ld(kDk);
   constexpr int kSl = kDk >= 32 ? 32 : 16;
@@ -1859,6 +1859,7 @@ __global__ __launch_bounds__(kDrThreads, 2) void chunk_kkt_solve_wu_tc_kernel(co
       if (i < m) p.A[(int64_t(t0 + i) * hv + h) * kDrChunk + tid] = tid <= i ? Tinv[i * kDrLd + tid] : 0.0f;
   }
   __syncthreads();
+  if constexpr (!kWu) return;  // the caller runs recompute_w_u_tc_kernel instead
   // ---- W = T (beta exp(G) rinv k), U = T (beta v); a column tile of 64 at a time ----
   bf16* ts = stg;                              // [64][kTcLd64]
   bf16* bs = stg + kDrChunk * kTcLd64;         // [64][kTcLd64]
@@ -2186,7 +2187,6 @@ __global__ __launch_bounds__(kDrThreads, 1) void chunk_state_output_tc_kernel(co
       tc_stage_input<T, kDrThreads>(Qs, kLdK, q, p.q_token_stride, t0, m, dk, vec_q);
     }
     // v_new = U - W S: rows OI of the chunk, columns of half
-    float vraw[kNtv][4] = {};
     {
       const int I = OI;
       float acc[kNtv][4] = {};
@@ -2218,7 +2218,6 @@ __global__ __launch_bounds__(kDrThreads, 1) void chunk_state_output_tc_kernel(co
               val[e] = ur[nt][2 * rr + e] - acc[nt][2 * rr + e];
               p.v_new[(int64_t(t0 + j) * hv + h) * dv + dv0 + c + e] = val[e];
             }
-            vraw[nt][2 * rr + e] = val[e];
           }
           *reinterpret_cast<uint32_t*>(&Vb[j * kLdS + c]) = pack_bf16x2(val[0] * fold, val[1] * fold);
           *reinterpret_cast<uint32_t*>(&Vn[j * kLdS + c]) = pack_bf16x2(val[0], val[1]);
@@ -2510,22 +2509,31 @@ cudaError_t launch_output(const DeltaRuleParams& p, cudaStream_t stream) {
 
 // tensor-core bodies (bf16 inputs only) ---------------------------------------------------------
 
-template <bool kPer, int kDk>
-cudaError_t launch_kkt_solve_wu_tc(const DeltaRuleParams& p, cudaStream_t stream) {
+/// Dynamic shared-memory budget of the fused tensor-core bodies for an exact architecture: SM90+
+/// opts in to 160 KiB per block (H100/H200 allow 227 KiB), SM80..SM89 keeps the 99 KiB envelope of
+/// a 48 KiB-default part. A shape above the budget runs the unfused chunk-parallel kernels.
+__host__ constexpr size_t fused_smem_budget(int32_t arch_id) {
+  return (arch_id == 0 || arch_id >= KOPS_TARGET_SM90A) ? size_t(160) * 1024 : size_t(99) * 1024;
+}
+
+template <bool kPer, int kDk, bool kWu>
+cudaError_t launch_kkt_solve_wu_tc(const DeltaRuleParams& p, cudaStream_t stream, size_t budget) {
   using T = __nv_bfloat16;
-  constexpr size_t bytes = kkt_solve_wu_smem_bytes<T, kDk, kPer>();
-  cudaError_t e = cudaFuncSetAttribute(chunk_kkt_solve_wu_tc_kernel<T, kDk, kPer>,
+  constexpr size_t bytes = kkt_solve_wu_smem_bytes<T, kDk, kPer, kWu>();
+  if (bytes > budget) return cudaErrorInvalidValue;
+  cudaError_t e = cudaFuncSetAttribute(chunk_kkt_solve_wu_tc_kernel<T, kDk, kPer, kWu>,
                                        cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes));
   if (e != cudaSuccess) return e;
   const dim3 grid(unsigned(dr_grid_chunks(p)), p.num_v_heads, p.batch_size);
-  chunk_kkt_solve_wu_tc_kernel<T, kDk, kPer><<<grid, kDrThreads, bytes, stream>>>(p);
+  chunk_kkt_solve_wu_tc_kernel<T, kDk, kPer, kWu><<<grid, kDrThreads, bytes, stream>>>(p);
   return cudaSuccess;
 }
 
 template <bool kPer, int kDk, int kDv>
-cudaError_t launch_state_output_tc(const DeltaRuleParams& p, cudaStream_t stream) {
+cudaError_t launch_state_output_tc(const DeltaRuleParams& p, cudaStream_t stream, size_t budget) {
   using T = __nv_bfloat16;
   constexpr size_t bytes = tc_state_output_smem_bytes<T, kPer, kDk, kDv>();
+  if (bytes > budget) return cudaErrorInvalidValue;
   cudaError_t e = cudaFuncSetAttribute(chunk_state_output_tc_kernel<T, kPer, kDk, kDv>,
                                        cudaFuncAttributeMaxDynamicSharedMemorySize, int(bytes));
   if (e != cudaSuccess) return e;
@@ -2577,7 +2585,7 @@ cudaError_t launch_output_tc(const DeltaRuleParams& p, cudaStream_t stream) {
 }
 
 /// Steps 2..6 of the pipeline (cumsum, kkt, solve_tril, w/u, state, output).
-cudaError_t run_pipeline(const DeltaRuleParams& p, DType dtype, cudaStream_t stream) {
+cudaError_t run_pipeline(const DeltaRuleParams& p, DType dtype, cudaStream_t stream, size_t smem_budget) {
   const bool per = p.decay == DecayGranularity::kPerChannel, wide = p.head_dim_v > 32;
   const dim3 cgrid(unsigned(dr_grid_chunks(p)), p.num_v_heads, p.batch_size);
   if (per) chunk_local_cumsum_kernel<DecayGranularity::kPerChannel><<<cgrid, 128, 0, stream>>>(p);
@@ -2591,7 +2599,12 @@ cudaError_t run_pipeline(const DeltaRuleParams& p, DType dtype, cudaStream_t str
       const dim3 wgrid(unsigned(dr_grid_chunks(p) * tiles), p.num_v_heads, p.batch_size);
       // fused kkt + solve + w/u (one launch, the 64 x 64 matrix stays in shared memory); a shape whose
       // shared-memory budget does not fit falls back to the three-kernel sequence.
-      const cudaError_t fused = per ? launch_kkt_solve_wu_tc<true, kDk>(p, stream) : launch_kkt_solve_wu_tc<false, kDk>(p, stream);
+      // Fused kkt + solve: the 64 x 64 inverse never leaves the CTA. KDA also folds W/U into the
+      // same launch (its separate w/u kernel re-reads the per-channel decay for every chunk); GDN
+      // keeps the chunk-parallel w/u kernel, whose 4x wider grid beats the serial 64-column tiles
+      // inside the kkt CTA (measured H100).
+      const cudaError_t fused = per ? launch_kkt_solve_wu_tc<true, kDk, true>(p, stream, smem_budget)
+                                    : launch_kkt_solve_wu_tc<false, kDk, false>(p, stream, smem_budget);
       if (fused != cudaSuccess) {
         (void)cudaGetLastError();
         if (per) chunk_scaled_dot_kkt_tc_kda_kernel<T, kDk><<<cgrid, kDrThreads, 0, stream>>>(p);
@@ -2599,16 +2612,23 @@ cudaError_t run_pipeline(const DeltaRuleParams& p, DType dtype, cudaStream_t str
         solve_tril_kernel<<<cgrid, kDrChunk, 0, stream>>>(p);
         if (per) recompute_w_u_tc_kernel<T, true><<<wgrid, kDrThreads, 0, stream>>>(p);
         else recompute_w_u_tc_kernel<T, false><<<wgrid, kDrThreads, 0, stream>>>(p);
+      } else if (!per) {
+        recompute_w_u_tc_kernel<T, false><<<wgrid, kDrThreads, 0, stream>>>(p);
       }
       // fused state + output: the state entering each chunk stays in registers/shared memory. The
       // 64-column state tile does not fit the registers with the prefetch at Dk = 128. A shape whose
       // budget does not fit falls back to the two chunk-parallel kernels.
       cudaError_t fused_out = cudaSuccess;
-      if constexpr (kDk == 128) {  // the 64-column fused tile does not fit the registers at Dk = 128
-        fused_out = per ? launch_state_output_tc<true, kDk, 32>(p, stream) : launch_state_output_tc<false, kDk, 32>(p, stream);
+      if constexpr (kDk == 128) {  // Dk = 128 needs the 64-column tile to keep the SALU work down
+        fused_out = per ? launch_state_output_tc<true, kDk, 64>(p, stream, smem_budget)
+                        : launch_state_output_tc<false, kDk, 64>(p, stream, smem_budget);
+        if (fused_out != cudaSuccess) {  // a 99 KiB budget only fits the 32-column tile
+          fused_out = per ? launch_state_output_tc<true, kDk, 32>(p, stream, smem_budget)
+                          : launch_state_output_tc<false, kDk, 32>(p, stream, smem_budget);
+        }
       } else {
-        fused_out = per ? (wide ? launch_state_output_tc<true, kDk, 64>(p, stream) : launch_state_output_tc<true, kDk, 32>(p, stream))
-                        : (wide ? launch_state_output_tc<false, kDk, 64>(p, stream) : launch_state_output_tc<false, kDk, 32>(p, stream));
+        fused_out = per ? (wide ? launch_state_output_tc<true, kDk, 64>(p, stream, smem_budget) : launch_state_output_tc<true, kDk, 32>(p, stream, smem_budget))
+                        : (wide ? launch_state_output_tc<false, kDk, 64>(p, stream, smem_budget) : launch_state_output_tc<false, kDk, 32>(p, stream, smem_budget));
       }
       if (fused_out == cudaSuccess) return;
       (void)cudaGetLastError();
@@ -2730,7 +2750,7 @@ Status delta_rule_prefill(const DeltaRuleParams& params, DType dtype, const Work
   p.u = reinterpret_cast<float*>(base + layout.u);
   p.h = reinterpret_cast<float*>(base + layout.h);
   p.v_new = reinterpret_cast<float*>(base + layout.v_new);
-  const cudaError_t e = run_pipeline(p, dtype, stream_of(ctx));
+  const cudaError_t e = run_pipeline(p, dtype, stream_of(ctx), fused_smem_budget(ctx.arch_id));
   if (e != cudaSuccess) {
     (void)cudaGetLastError();
     return detail::set_backend_error(Status::kCudaError, static_cast<int32_t>(e), "%s: %s", fn, cudaGetErrorString(e));
