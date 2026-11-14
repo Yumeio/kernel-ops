@@ -139,6 +139,58 @@ def git_info() -> dict:
     }
 
 
+def thirdparty_pin(name: str) -> str:
+    """Pinned ref from the checked-in manifest (works when 3rd/ is absent)."""
+    manifest = REPO_ROOT / "tools" / "dev" / "3rd_manifest.tsv"
+    try:
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if cols and cols[0] == name:
+                return cols[2] if len(cols) > 2 else ""
+    except OSError:
+        pass
+    return ""
+
+
+def thirdparty_git(name: str) -> dict:
+    """Commit/dirty state of a cloned 3rd-party tree (3rd/ is gitignored)."""
+    root = REPO_ROOT / "3rd" / name
+    out = {"commit": thirdparty_pin(name), "dirty": None, "source": "manifest"}
+    if not (root / ".git").exists():
+        return out
+
+    def run(*args):
+        try:
+            return subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                                  text=True, timeout=30).stdout.strip()
+        except Exception:
+            return ""
+
+    commit = run("rev-parse", "HEAD")
+    if commit:
+        out["commit"] = commit
+        out["source"] = "git"
+        out["dirty"] = bool(run("status", "--porcelain", "--untracked-files=no"))
+    return out
+
+
+def bench_env(git: dict) -> dict:
+    """Provenance variables read by benchmark/compare/external/ext_timing.h."""
+    env = {
+        "KOPS_BENCH_COMMIT": git.get("commit", "") or "unknown",
+        "KOPS_BENCH_DIRTY": "1" if git.get("dirty") else "0",
+    }
+    tp = thirdparty_git("attention.rs")
+    if tp["commit"]:
+        env["KOPS_THIRDPARTY"] = "attention.rs"
+        env["KOPS_THIRDPARTY_COMMIT"] = tp["commit"]
+        if tp["dirty"] is not None:
+            env["KOPS_THIRDPARTY_DIRTY"] = "1" if tp["dirty"] else "0"
+    return env
+
+
 def python_impls() -> dict[str, dict]:
     """Return {impl: {available, reason}} for the adapters in thirdparty.py."""
     def spec(name):
@@ -226,11 +278,14 @@ def kops_bin(build_dir: Path, family: str) -> Path | None:
     return None
 
 
-def subprocess_env(device: int | None) -> dict:
+def subprocess_env(device: int | None, provenance: dict | None = None) -> dict:
     env = os.environ.copy()
     if device is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(device)
     env["PYTHONUNBUFFERED"] = "1"
+    # External harnesses embed these in their JSON so a baseline number can be
+    # tied to the checkout and to the 3rd-party tree that produced it.
+    env.update(provenance or {})
     return env
 
 
@@ -522,7 +577,17 @@ def run_external(state: RunState, family: str, name: str, path: Path, cases_path
                      state.logs / f"external-{name}-convert.log", 120, args.dry_run, env)
         return out if r2.returncode == 0 and out.exists() else None
     if name in ("attention_rs_lowbit", "attention_rs_w2"):
-        cmd = [str(path), "--json", str(out)]
+        # Same cold protocol as the kops side: one timed launch per sample after
+        # the L2 flush, repeated `rounds` times. --only/--skip make a per-case
+        # run (and interleave.py) possible without timing the whole table.
+        cmd = [str(path), "--json", str(out), "--flush-mb", str(args.flush_l2),
+               "--rounds", str(args.rounds)]
+        if args.iters:
+            cmd += ["--iters", str(args.iters)]
+        if args.only:
+            cmd += ["--only", args.only]
+        if args.skip:
+            cmd += ["--skip", args.skip]
     elif name in ("hpc_sampler", "sglang_tree"):
         cmd = [str(path), "--json", str(out), "--flush-mb", str(args.flush_l2)]
     elif name == "nccl":
@@ -533,9 +598,16 @@ def run_external(state: RunState, family: str, name: str, path: Path, cases_path
     else:
         state.skipped.append({"family": family, "impl": name, "reason": "unknown external"})
         return None
+    ext_env = dict(env)
+    sources = {
+        "attention_rs_lowbit": "benchmark/compare/external/attention_rs_lowbit_baseline.cu",
+        "attention_rs_w2": "benchmark/compare/external/attention_rs_moe_w2_baseline.cu",
+    }
+    if name in sources:
+        ext_env["KOPS_BENCH_SOURCE"] = sources[name]
     r = run_cmd(state, f"external/{name}/{family}", cmd,
                 state.logs / f"external-{name}-{family}.log", args.timeout,
-                args.dry_run, env)
+                args.dry_run, ext_env)
     if r.returncode != 0 or not out.exists():
         state.skipped.append({"family": family, "impl": name,
                               "reason": r.error or f"rc={r.returncode}"})
@@ -967,9 +1039,11 @@ def main() -> int:
               state.torch, state.external, state.compare):
         d.mkdir(parents=True, exist_ok=True)
 
+    bench_git = git_info()
     env_info = {
         "gpu": gpu,
-        "git": git_info(),
+        "git": bench_git,
+        "thirdparty": {"attention.rs": thirdparty_git("attention.rs")},
         "python": sys.version.split()[0],
         "python_exe": sys.executable,
         "platform": sys.platform,
@@ -984,7 +1058,7 @@ def main() -> int:
     log(f"[run] output: {out_dir}")
     log(f"[run] GPU: {gpu['name']} ({gpu['arch']}, {gpu['vram_gb']:.1f} GiB)")
 
-    env = subprocess_env(args.device)
+    env = subprocess_env(args.device, bench_env(bench_git))
     coverage: dict[str, dict] = {}
     cases_per_family: dict[str, int] = {}
     all_case_ids: dict[str, set[str]] = {}

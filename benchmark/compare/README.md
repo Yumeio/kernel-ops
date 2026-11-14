@@ -279,6 +279,65 @@ multi-GPU harness (`deepep_baseline.py`). DeepGEMM Mega MoE, TensorRT-LLM
 containers and full FlashMLA sparse still need their own hardware/package
 setup. The third-party numbers are comparisons, not registry evidence.
 
+## B17 low-bit: cold protocol and interleaved A/B
+
+`tools/dev/build_lowbit_baselines.sh` builds two dev-only harnesses under
+`build/compare/`: `attention_rs_lowbit` (TurboQuant store/decode/prefill) and
+`attention_rs_moe_w2` (Moet W2 pack). Both link nothing from kops.
+
+The low-bit harness launches the upstream kernels with the exact grids from
+`3rd/attention.rs/src/kernels/src/flash/flash_instantiate.cu`:
+
+| op | grid | threads |
+|---|---|---|
+| store | `(num_tokens, num_kv_heads)` | 32 |
+| decode | `(num_q_heads, num_seqs)` | 256 |
+| prefill | `(num_q_heads, ceil(q_len/32), num_seqs)` | 128 (head_dim 128) |
+
+Timing follows `benchmark/harness.h` (`ext_timing.h`): in cold mode
+(`--flush-mb N > 0`) each sample is one launch after an N MiB D2D L2 flush and
+one event pair; hot mode (`--flush-mb 0`) times groups of 20 launches. The JSON
+carries `flush_l2_mb`, `rounds`, `protocol`, per-row
+`median/p10/p90/min/samples/gbs`, and a `provenance` object with the kops commit
+and the `3rd/attention.rs` commit. `run_thirdparty.py` passes its
+`--flush-l2/--rounds/--only/--skip` to both harnesses, so a per-case run is:
+
+```bash
+build/compare/attention_rs_lowbit --only lowbit.decode.bf16.d128.b8.kv4096.h32x8.turbo4 \
+    --flush-mb 256 --rounds 3 --json out/b17/one-case.json
+```
+
+To cancel clock drift between the two sides, `interleave.py` runs A/B/B/A in one
+process window and merges the per-run medians:
+
+```bash
+# attention.rs low-bit vs kops bench_merge, per lowbit case
+python benchmark/compare/interleave.py \
+    --a-bin build/bench/benchmark/bench_merge \
+    --b-bin build/compare/attention_rs_lowbit \
+    --family merge --only lowbit \
+    --a-args "--rounds 3 --flush-l2 256" \
+    --b-args "--flush-mb 256 --rounds 3" \
+    --repeats 3 --out out/b17/interleave-lowbit.json
+
+# old kops binary vs new kops binary (before/after)
+python benchmark/compare/interleave.py \
+    --a-bin /path/to/old/bench/benchmark/bench_merge \
+    --b-bin build/bench/benchmark/bench_merge \
+    --family merge --only lowbit.decode \
+    --repeats 3 --out out/b17/interleave-before-after.json
+```
+
+`--a-cmd/--b-cmd` templates with `{case}` and `{out}` are supported for any
+binary that writes the shared JSON schema. The merged file records both sides'
+protocols and provenance, a `protocol-mismatch` warning when they differ, and
+per-case `ratio = B/A` (plus `speedup_b_over_a`). Raw per-run JSONs and logs are
+kept under `<out>.runs/`. Nothing is built by this script.
+
+The kops JSON now also carries `protocol` and per-row `samples`; older binaries
+simply omit those fields and the interleaver falls back to comparing medians
+only.
+
 ## Clone the pinned 3rd-party trees
 
 `tools/dev/clone_3rd.sh` reads `tools/dev/3rd_manifest.tsv` and clones/updates

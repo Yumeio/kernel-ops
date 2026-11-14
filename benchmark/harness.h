@@ -73,6 +73,7 @@ struct Stats {
   double p90_ms = 0.0;
   double p99_ms = 0.0;
   double min_ms = 0.0;
+  int samples = 0;
 };
 
 struct Result {
@@ -356,6 +357,7 @@ inline bool measure(const Case& c, Fn fn, Stats* out) {
   out->p10_ms = samples[n / 10];
   out->p90_ms = samples[std::min(n - 1, (n * 9) / 10)];
   out->p99_ms = samples[std::min(n - 1, (n * 99) / 100)];
+  out->samples = static_cast<int>(n);
   return true;
 }
 
@@ -411,10 +413,16 @@ inline void write_results(const char* path, const std::vector<Result>& results,
   json_string(f, KOPS_BUILD_ARCHS);
   std::fprintf(f, ",\"toolkit\":");
   json_string(f, KOPS_TOOLKIT_VERSION);
-  std::fprintf(f, "},\"device\":{\"name\":");
+  // Timing protocol next to the numbers: a cold-mode sample is exactly one launch
+  // after a flush, a hot-mode sample is a group of 20 launches divided by 20.
+  std::fprintf(f, "},\"protocol\":{\"mode\":\"%s\",\"flush_l2_mb\":%d,\"rounds\":%d,"
+               "\"samples_per_launch\":%d,\"iters\":%d},\"device\":{\"name\":",
+               g_options.flush_l2_mb > 0 ? "cold" : "hot", g_options.flush_l2_mb,
+               std::max(1, g_options.rounds), g_options.flush_l2_mb > 0 ? 1 : 20,
+               g_options.iters);
   json_string(f, dev.name);
   std::fprintf(f, ",\"cc\":\"%d.%d\",\"sms\":%d,\"driver\":%d,\"runtime\":%d,"
-               "\"clock_khz\":%d,\"memory_clock_khz\":%d,\"bus_width\":%d,\"peak_gbs\":%.1f},\"results\":[",
+                  "\"clock_khz\":%d,\"memory_clock_khz\":%d,\"bus_width\":%d,\"peak_gbs\":%.1f},\"results\":[",
                dev.major, dev.minor, dev.sms, dev.driver, dev.runtime, dev.clock_khz,
                dev.memory_clock_khz, dev.bus_width, dev.peak_gbs);
   for (size_t i = 0; i < results.size(); ++i) {
@@ -439,12 +447,12 @@ inline void write_results(const char* path, const std::vector<Result>& results,
     json_string(f, c.op.c_str());
     std::fprintf(f, ",\"dtype\":\"%s\",\"rows\":%lld,\"cols\":%lld,\"bytes\":%lld,"
                  "\"flops\":%lld,\"median_ms\":%.6f,\"p10_ms\":%.6f,\"p90_ms\":%.6f,"
-                 "\"p99_ms\":%.6f,\"min_ms\":%.6f,\"gbs\":%.2f,\"tflops\":%.4f,"
+                 "\"p99_ms\":%.6f,\"min_ms\":%.6f,\"samples\":%d,\"gbs\":%.2f,\"tflops\":%.4f,"
                  "\"over_peak\":%s}",
                  dtype_label(c.dtype), static_cast<long long>(c.rows),
                  static_cast<long long>(c.cols), static_cast<long long>(c.bytes),
                  static_cast<long long>(c.flops), r.s.median_ms, r.s.p10_ms, r.s.p90_ms,
-                 r.s.p99_ms, r.s.min_ms, gbs, tflops, over_peak ? "true" : "false");
+                 r.s.p99_ms, r.s.min_ms, r.s.samples, gbs, tflops, over_peak ? "true" : "false");
   }
   std::fprintf(f, "]}\n");
   std::fclose(f);
