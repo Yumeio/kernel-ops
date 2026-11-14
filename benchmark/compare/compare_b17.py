@@ -36,18 +36,24 @@ def by_id(doc):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dir", default="out/b17")
+    ap.add_argument("--dir", default="out/b17",
+                    help="directory for the default four input files")
+    ap.add_argument("--kops-lowbit", default=None)
+    ap.add_argument("--ref-lowbit", default=None)
+    ap.add_argument("--kops-w2", default=None)
+    ap.add_argument("--ref-w2", default=None)
+    ap.add_argument("--quality", default=None)
     ap.add_argument("--markdown", default=None)
     args = ap.parse_args()
     d = args.dir
-    kops = by_id(load(os.path.join(d, "lowbit-bench.json")))
-    rs = by_id(load(os.path.join(d, "attention-rs-lowbit.json")))
-    w2 = by_id(load(os.path.join(d, "w2-bench.json")))
-    w2rs = by_id(load(os.path.join(d, "attention-rs-w2.json")))
-    quality = load(os.path.join(d, "lowbit-quality.json"))
+    kops = by_id(load(args.kops_lowbit or os.path.join(d, "lowbit-bench.json")))
+    rs = by_id(load(args.ref_lowbit or os.path.join(d, "attention-rs-lowbit.json")))
+    w2 = by_id(load(args.kops_w2 or os.path.join(d, "w2-bench.json")))
+    w2rs = by_id(load(args.ref_w2 or os.path.join(d, "attention-rs-w2.json")))
+    quality = load(args.quality or os.path.join(d, "lowbit-quality.json"))
 
     lines = ["# B17 benchmark: kernel-ops vs 3rd-party references", "",
-             "GPU: RTX 5060 Ti (SM120), CUDA events, 50-100 iterations, median. "
+             "CUDA events, median over repeated samples. "
              "The attention.rs entries are dev-only builds of `3rd/attention.rs` "
              "(MIT) through `tools/dev/build_lowbit_baselines.sh`; they are never "
              "linked into kernel-ops.", ""]

@@ -1,0 +1,26 @@
+# Third-party reference checkouts for kernel-ops.
+# Dev-only: 3rd/ is gitignored and is never linked into the shipped library.
+#
+# Columns (tab-separated):
+#   name  url  ref  dest  group  license  extra_refs
+#
+# ref may be a tag, a branch, or a full 40-hex commit. extra_refs is a
+# comma-separated list of additional commits to fetch (e.g. FlashMLA ba89a34).
+#
+# Keep the pins in sync with ROADMAP.md / THIRD_PARTY_NOTICES.md. The clone
+# script writes 3rd/MANIFEST.lock with the resolved SHAs.
+vllm	https://github.com/vllm-project/vllm.git	v0.33.0	3rd/vllm	core	Apache-2.0	
+sglang	https://github.com/sgl-project/sglang.git	v0.5.16	3rd/sglang	core	Apache-2.0	
+hpc-ops	https://github.com/Tencent/hpc-ops.git	2a2e26562433a8ba4b504858f1c938eb7612c901	3rd/hpc-ops	core	MIT	
+attention.rs	https://github.com/guoqingbao/attention.rs.git	c0f19f22078a7701b109b8430db2d0b6b71733df	3rd/attention.rs	core	MIT	
+FlashMLA	https://github.com/deepseek-ai/FlashMLA.git	395cb3afbb331fef7b1b21e9340861b9436b42d8	3rd/FlashMLA	core	MIT	ba89a3466e9470ad08ab39738d4e7bb66989e1e7
+DeepGEMM	https://github.com/deepseek-ai/DeepGEMM.git	5081f8513af57e61696de4f4f04b0e707ffb503e	3rd/DeepGEMM	core	MIT	
+llama.cpp	https://github.com/ggml-org/llama.cpp.git	0ec4027a2a0183de87c007069adddc06e665f7de	3rd/llama.cpp	core	MIT	
+TensorRT-LLM	https://github.com/NVIDIA/TensorRT-LLM.git	09198b7ca2a92d02e808bc09c5cbb8ff531ca47b	3rd/TensorRT-LLM	core	Apache-2.0	
+any4	https://github.com/facebookresearch/any4.git	02a6011279bf691844e245917b18244040b4ead2	3rd/any4	core	MIT	
+llm-awq	https://github.com/mit-han-lab/llm-awq.git	d6e797a42b9ef7778de8ee2352116e0f48a78d61	3rd/llm-awq	core	MIT	
+mistral.rs	https://github.com/EricLBuehler/mistral.rs.git	v0.9.4	3rd/mistral.rs	core	MIT	
+DeepEP	https://github.com/deepseek-ai/DeepEP.git	v1.2.1	3rd/DeepEP	core	MIT	
+flash-linear-attention	https://github.com/fla-org/flash-linear-attention.git	v0.6.0	3rd/flash-linear-attention	core	MIT	
+mamba	https://github.com/state-spaces/mamba.git	v2.3.2	3rd/mamba	core	Apache-2.0	
+causal-conv1d	https://github.com/Dao-AILab/causal-conv1d.git	v1.7.0	3rd/causal-conv1d	core	BSD-3-Clause	

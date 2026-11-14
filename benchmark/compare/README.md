@@ -194,3 +194,97 @@ g++ -O2 -std=c++17 -I/usr/local/cuda/include \
 The harness flushes once per group, not once per launch, so its numbers are
 **hot-L2** and only comparable to a kops run without `--flush-l2`. Use the same
 protocol on both sides or add a per-launch flush before quoting a ratio.
+
+## One-command third-party benchmark
+
+`run_thirdparty.py` is the dev-only orchestrator for every adapter that is
+already installed or built. It does not clone or build a third-party library;
+it records missing references with a reason.
+
+```bash
+python benchmark/compare/run_thirdparty.py --all --rounds 3 --flush-l2 256
+```
+
+On Linux/WSL, `tools/dev/bench_thirdparty.sh` is a thin wrapper that picks
+`~/venv-3rd/bin/python` when present:
+
+```bash
+bash tools/dev/bench_thirdparty.sh --all --rounds 3 --flush-l2 256 \
+    --report out/thirdparty/report.md
+```
+
+Useful variants:
+
+```bash
+# availability and the family -> adapter matrix
+python benchmark/compare/run_thirdparty.py --check
+python benchmark/compare/run_thirdparty.py --list
+
+# one family, one library
+python benchmark/compare/run_thirdparty.py --families norm --impl vllm --rounds 1
+
+# also run the PyTorch baseline (otherwise only third-party is compared)
+python benchmark/compare/run_thirdparty.py --all --torch --torch-style hf
+
+# reuse kops JSONs from a previous run, only run third-party
+python benchmark/compare/run_thirdparty.py --all --kops-dir out/bench/kops --no-kops
+
+# reuse both dumped cases and kops JSONs (no benchmark binary needed)
+python benchmark/compare/run_thirdparty.py --all \
+    --cases-dir out/bench/cases --kops-dir out/bench/kops --no-kops
+
+# spot-instance friendly: skip completed JSONs
+python benchmark/compare/run_thirdparty.py --all --resume
+```
+
+VRAM below 8 GiB automatically enables `--skip-large` (1M/128k/256k cases and
+cases whose traffic exceeds ~55% of VRAM). Use `--no-skip-large` to force every
+case.
+
+Output goes to `out/thirdparty/<arch>-<gpu>-<date>/`:
+
+```text
+env.json  summary.json  report.md
+cases/<family>.json
+kops/<family>.json
+thirdparty/<impl>/<family>.json
+torch/<style>/<family>.json
+external/<name>/<family>.json
+compare/<family>.json
+logs/
+```
+
+The report includes a coverage table (`wired`, `not_wired`, `needs_hardware`,
+`reference_only`), the per-case best third-party ratio, and the known
+references that are not wired yet (DeepEP, FLA, mamba_ssm, FlashMLA, DeepGEMM,
+TensorRT-LLM, DeepGEMM Mega MoE). The third-party numbers are comparisons, not
+registry evidence.
+
+## Clone the pinned 3rd-party trees
+
+`tools/dev/clone_3rd.sh` reads `tools/dev/3rd_manifest.tsv` and clones/updates
+the pinned checkouts into `3rd/`. It is separate from the benchmark runner and
+is never called by it.
+
+```bash
+bash tools/dev/clone_3rd.sh --all --jobs 4
+bash tools/dev/clone_3rd.sh --only sglang --force       # SGLang v0.5.16
+bash tools/dev/clone_3rd.sh --check                     # verify HEAD against pins
+bash tools/dev/clone_3rd.sh --list
+bash tools/dev/clone_3rd.sh --root 3rd-full --all       # do not touch 3rd/
+bash tools/dev/clone_3rd.sh --all --quiet               # file logs only
+```
+
+Every git command is written to `<root>/.clone-logs/<name>.log` and, unless
+`--quiet` is passed, streamed to the terminal as `[<name>] ...`, so a parallel
+run still shows what failed. Existing non-git directories are moved to
+`3rd/.backup/<name>-<stamp>` before a fresh clone; existing git trees are
+updated in place and are left untouched if dirty unless `--force` is given
+(`--force` discards local changes there and repairs a checkout that failed
+halfway). The run writes `3rd/MANIFEST.lock` with the resolved SHAs. `3rd/` is
+gitignored.
+
+On Windows, `sglang` and `TensorRT-LLM` contain paths longer than `MAX_PATH`
+(260). The script sets `core.longpaths` for its own git calls and stores it in
+each checkout, so a plain `git status` inside those trees works too.
+
